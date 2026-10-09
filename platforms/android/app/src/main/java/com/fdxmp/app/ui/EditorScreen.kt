@@ -32,10 +32,13 @@ import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Crop
+import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.filled.WaterDrop
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -71,6 +74,7 @@ import com.fdxmp.app.media.PreviewRenderer
 import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -219,8 +223,10 @@ fun EditorScreen(
     var presetName by remember(record.uri) { mutableStateOf(record.presetName) }
     var showInfo by remember { mutableStateOf(false) }
     var showCurve by remember { mutableStateOf(false) }
+    var curveChannel by remember { mutableStateOf(CurveChannel.Rgb) }
     var curvePoints by remember(record.uri) { mutableStateOf(parseCurvePoints(record.paramsJson)) }
     var parametric by remember(record.uri) { mutableStateOf(parseParametric(record.paramsJson)) }
+    var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
     val redoStack = remember { mutableStateListOf<List<Float>>() }
@@ -253,6 +259,13 @@ fun EditorScreen(
     LaunchedEffect(previewBitmap) {
         val bitmap = previewBitmap
         histogram = if (bitmap != null) computeHistogram(bitmap) else null
+    }
+
+    // 实时渲染：滑块 / 曲线每次变化后 140ms 防抖，只保留最后一次。
+    LaunchedEffect(pendingRender) {
+        if (pendingRender == 0) return@LaunchedEffect
+        delay(140)
+        renderVersion += 1
     }
 
     fun pushHistory(before: List<Float>) {
@@ -338,19 +351,32 @@ fun EditorScreen(
                 CircularProgressIndicator()
             }
 
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .pointerInput(record.uri) {
-                        detectTapGestures(
-                            onPress = {
-                                pressingOriginal = true
-                                tryAwaitRelease()
-                                pressingOriginal = false
-                            },
-                        )
+            if (showCurve) {
+                CurveSurface(
+                    points = curvePoints,
+                    parametric = parametric,
+                    channel = curveChannel,
+                    modifier = Modifier.fillMaxSize(),
+                    onPointsChange = { target, updated ->
+                        curvePoints = curvePoints + (target to updated)
+                        pendingRender += 1
                     },
-            )
+                )
+            } else {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(record.uri) {
+                            detectTapGestures(
+                                onPress = {
+                                    pressingOriginal = true
+                                    tryAwaitRelease()
+                                    pressingOriginal = false
+                                },
+                            )
+                        },
+                )
+            }
 
             HistogramOverlay(
                 data = histogram,
@@ -402,42 +428,64 @@ fun EditorScreen(
             Column {
                 Box(modifier = Modifier.fillMaxWidth().height(278.dp)) {
                     when (tool) {
-                        EditorTool.Edit -> Column(modifier = Modifier.fillMaxSize()) {
-                            PanelHeader(
-                                presetName = presetName,
-                                onReset = {
-                                    pushHistory(values)
-                                    values = EDITOR_SLIDERS.map { it.defaultValue }
-                                    curvePoints = identityCurveMap()
-                                    parametric = ParametricUi()
-                                    presetName = "原片"
-                                    renderVersion += 1
+                        EditorTool.Edit -> if (showCurve) {
+                            CurveControls(
+                                channel = curveChannel,
+                                onChannelChange = { curveChannel = it },
+                                parametric = parametric,
+                                onParametricChange = {
+                                    parametric = it
+                                    pendingRender += 1
                                 },
-                            )
-                            SlidersPanel(
-                                category = category,
-                                effectTab = effectTab,
-                                values = values,
-                                modifier = Modifier.weight(1f),
-                                onEffectTabChange = { effectTab = it },
-                                onValueChange = { index, newValue ->
-                                    if (dragSnapshot == null) dragSnapshot = values
-                                    values = values.toMutableList().also { it[index] = newValue }
-                                },
-                                onValueChangeFinished = {
-                                    dragSnapshot?.let { before ->
-                                        if (before != values) pushHistory(before)
-                                    }
-                                    dragSnapshot = null
+                                onDone = {
+                                    showCurve = false
                                     presetName = "自定义"
                                     renderVersion += 1
                                 },
                             )
-                            CategoryRow(
-                                selected = category,
-                                onSelect = { category = it },
-                                onCurve = { showCurve = true },
-                            )
+                        } else {
+                            Column(modifier = Modifier.fillMaxSize()) {
+                                PanelHeader(
+                                    presetName = presetName,
+                                    onReset = {
+                                        pushHistory(values)
+                                        values = EDITOR_SLIDERS.map { it.defaultValue }
+                                        curvePoints = identityCurveMap()
+                                        parametric = ParametricUi()
+                                        presetName = "原片"
+                                        renderVersion += 1
+                                    },
+                                )
+                                SlidersPanel(
+                                    category = category,
+                                    effectTab = effectTab,
+                                    values = values,
+                                    modifier = Modifier.weight(1f),
+                                    onEffectTabChange = { effectTab = it },
+                                    onValueChange = { index, newValue ->
+                                        if (dragSnapshot == null) dragSnapshot = values
+                                        values = values.toMutableList().also { it[index] = newValue }
+                                        pendingRender += 1
+                                    },
+                                    onValueChangeFinished = {
+                                        dragSnapshot?.let { before ->
+                                            if (before != values) pushHistory(before)
+                                        }
+                                        dragSnapshot = null
+                                        presetName = "自定义"
+                                        renderVersion += 1
+                                    },
+                                )
+                                CategoryRow(
+                                    selected = category,
+                                    onSelect = { category = it },
+                                    curveActive = showCurve,
+                                    onCurve = {
+                                        showCurve = true
+                                        presetName = "自定义"
+                                    },
+                                )
+                            }
                         }
 
                         EditorTool.Presets -> PresetPanel(
@@ -465,22 +513,6 @@ fun EditorScreen(
         }
         }
 
-        if (showCurve) {
-            CurveEditorOverlay(
-                image = previewBitmap,
-                points = curvePoints,
-                parametric = parametric,
-                onPointsChange = { target, updated ->
-                    curvePoints = curvePoints + (target to updated)
-                },
-                onParametricChange = { parametric = it },
-                onDone = {
-                    showCurve = false
-                    presetName = "自定义"
-                    renderVersion += 1
-                },
-            )
-        }
     }
 }
 
@@ -650,6 +682,7 @@ private fun SlidersPanel(
 private fun CategoryRow(
     selected: EditCategory,
     onSelect: (EditCategory) -> Unit,
+    curveActive: Boolean,
     onCurve: () -> Unit,
 ) {
     Row(
@@ -658,35 +691,30 @@ private fun CategoryRow(
         verticalAlignment = Alignment.CenterVertically,
     ) {
         CategoryChip(
+            icon = Icons.Filled.LightMode,
             label = EditCategory.Light.label,
-            active = selected == EditCategory.Light,
+            active = selected == EditCategory.Light && !curveActive,
             onClick = { onSelect(EditCategory.Light) },
             modifier = Modifier.weight(1f),
         )
-        Box(
-            modifier = Modifier
-                .size(44.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(Color(0xFF1E1E1E))
-                .clickable(onClick = onCurve),
-            contentAlignment = Alignment.Center,
-        ) {
-            Icon(
-                Icons.Filled.Timeline,
-                contentDescription = "曲线",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.size(22.dp),
-            )
-        }
         CategoryChip(
+            icon = Icons.Filled.Timeline,
+            label = "曲线",
+            active = curveActive,
+            onClick = onCurve,
+            modifier = Modifier.weight(1f),
+        )
+        CategoryChip(
+            icon = Icons.Filled.WaterDrop,
             label = EditCategory.Color.label,
-            active = selected == EditCategory.Color,
+            active = selected == EditCategory.Color && !curveActive,
             onClick = { onSelect(EditCategory.Color) },
             modifier = Modifier.weight(1f),
         )
         CategoryChip(
+            icon = Icons.Filled.CenterFocusStrong,
             label = EditCategory.Effects.label,
-            active = selected == EditCategory.Effects,
+            active = selected == EditCategory.Effects && !curveActive,
             onClick = { onSelect(EditCategory.Effects) },
             modifier = Modifier.weight(1f),
         )
@@ -695,24 +723,36 @@ private fun CategoryRow(
 
 @Composable
 private fun CategoryChip(
+    icon: ImageVector,
     label: String,
     active: Boolean,
     onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Text(
-        label,
-        textAlign = TextAlign.Center,
-        style = MaterialTheme.typography.labelMedium,
-        color = if (active) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
         modifier = modifier
             .clip(RoundedCornerShape(10.dp))
             .background(
                 if (active) MaterialTheme.colorScheme.primary else Color(0xFF1E1E1E),
             )
             .clickable(onClick = onClick)
-            .padding(vertical = 9.dp),
-    )
+            .padding(vertical = 6.dp),
+    ) {
+        Icon(
+            icon,
+            contentDescription = label,
+            tint = if (active) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.size(18.dp),
+        )
+        Spacer(Modifier.height(2.dp))
+        Text(
+            label,
+            textAlign = TextAlign.Center,
+            style = MaterialTheme.typography.labelSmall,
+            color = if (active) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
 }
 
 @Composable

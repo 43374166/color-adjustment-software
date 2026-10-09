@@ -1,8 +1,6 @@
 package com.fdxmp.app.ui
 
-import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -11,16 +9,17 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -38,22 +37,19 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.hypot
-import java.util.Locale
 
 /** 曲线上的一个控制点（归一化坐标）。 */
 data class CurvePointUi(val x: Float, val y: Float)
@@ -91,21 +87,18 @@ fun identityCurveMap(): Map<CurveChannel, List<CurvePointUi>> = mapOf(
 )
 
 /**
- * 全屏曲线编辑器（手机 Lightroom 版式）：
- * 图片 + 网格 + 可拖拽控制点；底部「曲线 / 完成」与通道选择（白 / 红 / 绿 / 蓝 / 参数）。
+ * 透明曲线覆盖层：直接叠在图片上，只画网格 + 曲线 + 控制点，不遮挡画面。
  *
- * 交互：点空白添加控制点、点已有控制点删除、拖动控制点调整。
+ * 交互：点空白添加控制点、点已有控制点删除、拖动控制点调整（参数模式不可拖点）。
  */
 @Composable
-fun CurveEditorOverlay(
-    image: Bitmap?,
+fun CurveSurface(
     points: Map<CurveChannel, List<CurvePointUi>>,
     parametric: ParametricUi,
+    channel: CurveChannel,
+    modifier: Modifier = Modifier,
     onPointsChange: (CurveChannel, List<CurvePointUi>) -> Unit,
-    onParametricChange: (ParametricUi) -> Unit,
-    onDone: () -> Unit,
 ) {
-    var channel by remember { mutableStateOf(CurveChannel.Rgb) }
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
     var draggingIndex by remember { mutableStateOf(-1) }
 
@@ -114,158 +107,222 @@ fun CurveEditorOverlay(
 
     val pointsState = rememberUpdatedState(activePoints)
     val channelState = rememberUpdatedState(channel)
-    val parametricState = rememberUpdatedState(parametric)
     val changeState = rememberUpdatedState(onPointsChange)
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(Color.Black)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
-    ) {
-        Box(
+    Box(modifier = modifier) {
+        Canvas(
             modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-        ) {
-            if (image != null) {
-                Image(
-                    bitmap = image.asImageBitmap(),
-                    contentDescription = null,
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier.fillMaxSize().alpha(0.5f),
-                )
-            }
-            Box(modifier = Modifier.fillMaxSize().background(Color(0x66000000)))
-
-            Canvas(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(12.dp)
-                    .onSizeChanged { canvasSize = it }
-                    .pointerInput(Unit) {
-                        detectTapGestures { position ->
-                            val currentChannel = channelState.value
-                            if (currentChannel == CurveChannel.Parametric) return@detectTapGestures
-                            val current = pointsState.value
-                            val threshold = 56f
-                            val nearest = nearestIndex(current, position, size.toIntSizeSafe(), threshold)
-                            if (nearest >= 0) {
-                                if (nearest in 1 until current.size - 1) {
-                                    changeState.value(currentChannel, current.filterIndexed { i, _ -> i != nearest })
-                                }
-                            } else {
-                                val x = (position.x / size.width).coerceIn(0.02f, 0.98f)
-                                val y = (1f - position.y / size.height).coerceIn(0f, 1f)
+                .fillMaxSize()
+                .onSizeChanged { canvasSize = it }
+                .pointerInput(Unit) {
+                    detectTapGestures { position ->
+                        val currentChannel = channelState.value
+                        if (currentChannel == CurveChannel.Parametric) return@detectTapGestures
+                        val current = pointsState.value
+                        val nearest = nearestIndex(current, position, size, 56f)
+                        if (nearest >= 0) {
+                            if (nearest in 1 until current.size - 1) {
                                 changeState.value(
                                     currentChannel,
-                                    (current + CurvePointUi(x, y)).sortedBy { it.x },
+                                    current.filterIndexed { index, _ -> index != nearest },
                                 )
                             }
+                        } else {
+                            val x = (position.x / size.width).coerceIn(0.02f, 0.98f)
+                            val y = (1f - position.y / size.height).coerceIn(0f, 1f)
+                            changeState.value(
+                                currentChannel,
+                                (current + CurvePointUi(x, y)).sortedBy { it.x },
+                            )
                         }
                     }
-                    .pointerInput(Unit) {
-                        detectDragGestures(
-                            onDragStart = { position ->
-                                val currentChannel = channelState.value
-                                if (currentChannel == CurveChannel.Parametric) return@detectDragGestures
-                                draggingIndex = nearestIndex(
-                                    pointsState.value,
-                                    position,
-                                    size.toIntSizeSafe(),
-                                    72f,
-                                )
-                            },
-                            onDrag = { change, _ ->
-                                val currentChannel = channelState.value
-                                if (currentChannel == CurveChannel.Parametric) return@detectDragGestures
-                                val index = draggingIndex
-                                val current = pointsState.value
-                                if (index in current.indices) {
-                                    change.consume()
-                                    val rawX = (change.position.x / size.width).coerceIn(0f, 1f)
-                                    val rawY = (1f - change.position.y / size.height).coerceIn(0f, 1f)
-                                    val left = if (index > 0) current[index - 1].x + 0.015f else 0f
-                                    val right = if (index < current.size - 1) current[index + 1].x - 0.015f else 1f
-                                    val x = when (index) {
-                                        0 -> 0f
-                                        current.size - 1 -> 1f
-                                        else -> rawX.coerceIn(left, right)
-                                    }
-                                    val updated = current.toMutableList().also {
-                                        it[index] = CurvePointUi(x, rawY)
-                                    }
-                                    changeState.value(currentChannel, updated)
+                }
+                .pointerInput(Unit) {
+                    detectDragGestures(
+                        onDragStart = { position ->
+                            val currentChannel = channelState.value
+                            if (currentChannel == CurveChannel.Parametric) {
+                                return@detectDragGestures
+                            }
+                            draggingIndex = nearestIndex(
+                                pointsState.value,
+                                position,
+                                size,
+                                72f,
+                            )
+                        },
+                        onDrag = { change, _ ->
+                            val currentChannel = channelState.value
+                            if (currentChannel == CurveChannel.Parametric) {
+                                return@detectDragGestures
+                            }
+                            val index = draggingIndex
+                            val current = pointsState.value
+                            if (index in current.indices) {
+                                change.consume()
+                                val rawX = (change.position.x / size.width).coerceIn(0f, 1f)
+                                val rawY = (1f - change.position.y / size.height).coerceIn(0f, 1f)
+                                val left = if (index > 0) current[index - 1].x + 0.015f else 0f
+                                val right = if (index < current.size - 1) {
+                                    current[index + 1].x - 0.015f
+                                } else {
+                                    1f
                                 }
-                            },
-                            onDragEnd = { draggingIndex = -1 },
-                            onDragCancel = { draggingIndex = -1 },
-                        )
-                    },
-            ) {
-                val gridColor = Color(0x33FFFFFF)
-                for (step in 1..3) {
-                    val x = size.width * step / 4f
-                    val y = size.height * step / 4f
-                    drawLine(gridColor, Offset(x, 0f), Offset(x, size.height), strokeWidth = 1f)
-                    drawLine(gridColor, Offset(0f, y), Offset(size.width, y), strokeWidth = 1f)
-                }
-                drawLine(gridColor, Offset(0f, 0f), Offset(size.width, size.height), strokeWidth = 1f)
+                                val x = when (index) {
+                                    0 -> 0f
+                                    current.size - 1 -> 1f
+                                    else -> rawX.coerceIn(left, right)
+                                }
+                                changeState.value(
+                                    currentChannel,
+                                    current.toMutableList().also {
+                                        it[index] = CurvePointUi(x, rawY)
+                                    },
+                                )
+                            }
+                        },
+                        onDragEnd = { draggingIndex = -1 },
+                        onDragCancel = { draggingIndex = -1 },
+                    )
+                },
+        ) {
+            val gridColor = Color(0x33FFFFFF)
+            for (step in 1..3) {
+                val x = size.width * step / 4f
+                val y = size.height * step / 4f
+                drawLine(gridColor, Offset(x, 0f), Offset(x, size.height), strokeWidth = 1f)
+                drawLine(gridColor, Offset(0f, y), Offset(size.width, y), strokeWidth = 1f)
+            }
+            drawLine(Color(0x22FFFFFF), Offset(0f, 0f), Offset(size.width, size.height), 1f)
 
-                val currentChannel = channel
-                val path = Path()
-                val samples = 128
-                for (index in 0..samples) {
-                    val x = index / samples.toFloat()
-                    val y = if (currentChannel == CurveChannel.Parametric) {
-                        evalParametric(x, parametric)
-                    } else {
-                        evalCurve(activePoints, x)
-                    }
-                    val px = x * size.width
-                    val py = (1f - y) * size.height
-                    if (index == 0) path.moveTo(px, py) else path.lineTo(px, py)
+            val path = Path()
+            val samples = 128
+            for (index in 0..samples) {
+                val x = index / samples.toFloat()
+                val y = if (isParametric) {
+                    evalParametric(x, parametric)
+                } else {
+                    evalCurve(activePoints, x)
                 }
-                drawPath(path, color = channelColor(currentChannel), style = Stroke(width = 4f))
+                val px = x * size.width
+                val py = (1f - y) * size.height
+                if (index == 0) path.moveTo(px, py) else path.lineTo(px, py)
+            }
+            drawPath(path, color = channelColor(channel), style = Stroke(width = 4f))
 
-                if (!isParametric) {
-                    activePoints.forEach { point ->
-                        val center = Offset(point.x * size.width, (1f - point.y) * size.height)
-                        drawCircle(Color(0xCC000000), radius = 13f, center = center)
-                        drawCircle(Color.White, radius = 10f, center = center)
-                        drawCircle(Color(0x66000000), radius = 10f, center = center, style = Stroke(2f))
-                    }
+            if (!isParametric) {
+                activePoints.forEach { point ->
+                    val center = Offset(point.x * size.width, (1f - point.y) * size.height)
+                    drawCircle(Color(0x99000000), radius = 13f, center = center)
+                    drawCircle(Color.White, radius = 10f, center = center)
+                    drawCircle(Color(0x66000000), radius = 10f, center = center, style = Stroke(2f))
                 }
             }
         }
 
-        if (isParametric) {
-            ParametricSliders(
-                parametric = parametric,
-                onChange = onParametricChange,
+        if (!isParametric) {
+            Text(
+                "点空白加点 · 点控制点删除 · 拖动调整",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color(0x99FFFFFF),
+                textAlign = TextAlign.Center,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 8.dp)
+                    .background(Color(0x66000000), RoundedCornerShape(6.dp))
+                    .padding(horizontal = 8.dp, vertical = 3.dp),
             )
         }
+    }
+}
 
+/** 曲线控制面板：标题 + 完成 + 通道选择（参数模式带 5 个滑块）。 */
+@Composable
+fun CurveControls(
+    channel: CurveChannel,
+    onChannelChange: (CurveChannel) -> Unit,
+    parametric: ParametricUi,
+    onParametricChange: (ParametricUi) -> Unit,
+    onDone: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxSize()) {
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .background(Color(0xFF141414))
-                .padding(horizontal = 16.dp, vertical = 8.dp),
+                .padding(horizontal = 16.dp, vertical = 4.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Text("曲线", style = MaterialTheme.typography.titleMedium, color = Color.White)
+            Text("曲线", style = MaterialTheme.typography.titleMedium)
             Spacer(Modifier.weight(1f))
             OutlinedButton(onClick = onDone, shape = RoundedCornerShape(12.dp)) {
                 Text("完成")
             }
         }
 
+        if (channel == CurveChannel.Parametric) {
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth().weight(1f),
+                contentPadding = PaddingValues(horizontal = 16.dp),
+            ) {
+                items(
+                    items = listOf(
+                        Triple("高光", parametric.highlights) { value: Float ->
+                            onParametricChange(parametric.copy(highlights = value))
+                        },
+                        Triple("中间调", parametric.midtones) { value: Float ->
+                            onParametricChange(parametric.copy(midtones = value))
+                        },
+                        Triple("阴影", parametric.shadows) { value: Float ->
+                            onParametricChange(parametric.copy(shadows = value))
+                        },
+                        Triple("高光分界", parametric.highlightsSplit) { value: Float ->
+                            onParametricChange(parametric.copy(highlightsSplit = value))
+                        },
+                        Triple("中间调分界", parametric.midtonesSplit) { value: Float ->
+                            onParametricChange(parametric.copy(midtonesSplit = value))
+                        },
+                    ),
+                    key = { it.first },
+                ) { (label, value, updater) ->
+                    Column {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(
+                                label,
+                                style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.weight(1f),
+                            )
+                            Text(
+                                if (label.contains("分界")) {
+                                    String.format(Locale.US, "%.2f", value)
+                                } else {
+                                    String.format(Locale.US, "%+.0f", value)
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        val range = if (label == "高光分界") {
+                            0.5f..1f
+                        } else if (label == "中间调分界") {
+                            0f..0.5f
+                        } else {
+                            -100f..100f
+                        }
+                        Slider(
+                            value = value,
+                            onValueChange = { updater(it) },
+                            valueRange = range,
+                        )
+                    }
+                }
+            }
+        } else {
+            Spacer(Modifier.weight(1f))
+        }
+
         Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xFF141414))
-                .padding(vertical = 10.dp),
+            modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically,
         ) {
@@ -273,7 +330,7 @@ fun CurveEditorOverlay(
                 ChannelButton(
                     channel = item,
                     selected = item == channel,
-                    onClick = { channel = item },
+                    onClick = { onChannelChange(item) },
                 )
             }
         }
@@ -299,7 +356,7 @@ private fun ChannelButton(
             Icon(
                 Icons.Filled.Timeline,
                 contentDescription = channel.label,
-                tint = if (selected) Color.White else Color(0xFFAAAAAA),
+                tint = if (selected) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.size(24.dp),
             )
         } else {
@@ -314,68 +371,6 @@ private fun ChannelButton(
     }
 }
 
-@Composable
-private fun ParametricSliders(
-    parametric: ParametricUi,
-    onChange: (ParametricUi) -> Unit,
-) {
-    Column(
-        modifier = Modifier
-            .fillMaxWidth()
-            .background(Color(0xFF141414))
-            .padding(horizontal = 16.dp, vertical = 4.dp),
-    ) {
-        ParametricSlider("高光", parametric.highlights, -100f..100f) {
-            onChange(parametric.copy(highlights = it))
-        }
-        ParametricSlider("中间调", parametric.midtones, -100f..100f) {
-            onChange(parametric.copy(midtones = it))
-        }
-        ParametricSlider("阴影", parametric.shadows, -100f..100f) {
-            onChange(parametric.copy(shadows = it))
-        }
-        ParametricSlider("高光分界", parametric.highlightsSplit, 0.5f..1f) {
-            onChange(parametric.copy(highlightsSplit = it))
-        }
-        ParametricSlider("中间调分界", parametric.midtonesSplit, 0f..0.5f) {
-            onChange(parametric.copy(midtonesSplit = it))
-        }
-    }
-}
-
-@Composable
-private fun ParametricSlider(
-    label: String,
-    value: Float,
-    range: ClosedFloatingPointRange<Float>,
-    onValueChange: (Float) -> Unit,
-) {
-    Column {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                label,
-                style = MaterialTheme.typography.bodySmall,
-                color = Color(0xFFDDDDDD),
-                modifier = Modifier.weight(1f),
-            )
-            Text(
-                if (range.endInclusive <= 1f) {
-                    String.format(Locale.US, "%.2f", value)
-                } else {
-                    String.format(Locale.US, "%+.0f", value)
-                },
-                style = MaterialTheme.typography.labelSmall,
-                color = Color(0xFFAAAAAA),
-            )
-        }
-        Slider(
-            value = value,
-            onValueChange = onValueChange,
-            valueRange = range,
-        )
-    }
-}
-
 private fun channelColor(channel: CurveChannel): Color = when (channel) {
     CurveChannel.Rgb -> Color.White
     CurveChannel.Red -> Color(0xFFFF4D4D)
@@ -383,8 +378,6 @@ private fun channelColor(channel: CurveChannel): Color = when (channel) {
     CurveChannel.Blue -> Color(0xFF4D8DFF)
     CurveChannel.Parametric -> Color.White
 }
-
-private fun androidx.compose.ui.unit.IntSize.toIntSizeSafe(): IntSize = this
 
 private fun nearestIndex(
     points: List<CurvePointUi>,
