@@ -177,7 +177,7 @@ fun MaskOverlay(
                                 val stroke = strokes[strokeIndex].toMutableList()
                                 val last = stroke.lastOrNull()
                                 if (last == null ||
-                                    (normalized - last).getDistance() > 0.004f
+                                    (normalized - last).getDistance() > 0.01f
                                 ) {
                                     stroke.add(normalized)
                                     strokes[strokeIndex] = stroke

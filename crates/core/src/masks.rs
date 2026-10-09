@@ -291,6 +291,8 @@ pub fn brush_mask(settings: &BrushSettings, width: u32, height: u32) -> MaskRast
         if stroke.is_empty() {
             continue;
         }
+        // 点过多时抽稀：距离场开销 ≈ 像素数 × 段数，超长笔画必须限幅。
+        let stroke = &simplify_stroke(stroke);
         // 只用笔画包围盒 + 半径范围内的像素参与计算
         let mut min_x = f32::MAX;
         let mut max_x = f32::MIN;
@@ -348,6 +350,22 @@ pub fn brush_mask(settings: &BrushSettings, width: u32, height: u32) -> MaskRast
             });
     }
     raster
+}
+
+/// 笔画点抽稀（超过 128 点时等间隔采样，保留末点）。
+fn simplify_stroke(stroke: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    const MAX_POINTS: usize = 128;
+    if stroke.len() <= MAX_POINTS {
+        return stroke.to_vec();
+    }
+    let step = (stroke.len() as f32 / MAX_POINTS as f32).ceil() as usize;
+    let mut out: Vec<[f32; 2]> = stroke.iter().step_by(step.max(1)).copied().collect();
+    if let Some(last) = stroke.last() {
+        if out.last() != Some(last) {
+            out.push(*last);
+        }
+    }
+    out
 }
 
 fn distance_to_polyline(point: &[f32; 2], stroke: &[[f32; 2]]) -> f32 {

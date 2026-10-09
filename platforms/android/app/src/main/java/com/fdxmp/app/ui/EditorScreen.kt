@@ -256,6 +256,7 @@ fun EditorScreen(
     var rendererLabel by remember { mutableStateOf("CPU") }
     var gpuPreparing by remember { mutableStateOf(false) }
     var gpuAttempt by remember { mutableStateOf(0) }
+    val renderBusy = remember { java.util.concurrent.atomic.AtomicBoolean(false) }
     var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
@@ -297,6 +298,8 @@ fun EditorScreen(
 
     LaunchedEffect(sourceFile, renderVersion, tool) {
         val file = sourceFile ?: return@LaunchedEffect
+        // 阻塞式 JNI 渲染无法取消：上一帧还在跑时先不排队，避免线程堆积。
+        if (!renderBusy.compareAndSet(false, true)) return@LaunchedEffect
         isRendering = true
         failure = null
         val json = buildParamsJson(
@@ -311,7 +314,8 @@ fun EditorScreen(
             detail = detailUi,
             lens = lensUi,
         )
-        val bitmap = withContext(Dispatchers.Default) {
+        val deferred = kotlinx.coroutines.CompletableDeferred<Pair<Bitmap?, String>>()
+        kotlin.concurrent.thread(name = "fdxmp-render") {
             val renderStart = System.nanoTime()
             var result: Bitmap? = null
             if (useGpu && PreviewRenderer.isGpuReady()) {
@@ -320,7 +324,7 @@ fun EditorScreen(
             if (result == null) {
                 result = PreviewRenderer.render(file.path, json, 1440)
             }
-            rendererLabel = when {
+            val label = when {
                 useGpu && PreviewRenderer.isGpuReady() && PreviewRenderer.isGpuActive() -> {
                     android.util.Log.i(
                         "fdxmp",
@@ -341,25 +345,29 @@ fun EditorScreen(
 
                 else -> "CPU"
             }
-            result
-                .also {
-                    val elapsed = (System.nanoTime() - renderStart) / 1_000_000.0
-                    android.util.Log.i(
-                        "fdxmp",
-                        String.format(
-                            java.util.Locale.US,
-                            "预览耗时 %.0f ms（%s）",
-                            elapsed,
-                            rendererLabel,
-                        ),
-                    )
-                }
+            android.util.Log.i(
+                "fdxmp",
+                String.format(
+                    java.util.Locale.US,
+                    "预览耗时 %.0f ms（%s）",
+                    (System.nanoTime() - renderStart) / 1_000_000.0,
+                    label,
+                ),
+            )
+            renderBusy.set(false)
+            deferred.complete(Pair(result, label))
         }
-        previewBitmap = bitmap
-        if (bitmap == null) {
-            failure = "无法渲染这张图片（RAW 需要核心启用 raw 解码）"
-        }
+        val outcome = kotlinx.coroutines.withTimeoutOrNull(25_000) { deferred.await() }
         isRendering = false
+        if (outcome == null) {
+            failure = "渲染超时：这张照片的编辑参数过重（例如画笔笔画过多）。\n可重置蒙版或换一张照片。"
+        } else {
+            rendererLabel = outcome.second
+            previewBitmap = outcome.first
+            if (outcome.first == null) {
+                failure = "无法渲染这张图片（RAW 需要核心启用 raw 解码）"
+            }
+        }
     }
 
     LaunchedEffect(previewBitmap) {

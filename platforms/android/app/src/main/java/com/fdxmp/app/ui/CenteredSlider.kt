@@ -1,8 +1,8 @@
 package com.fdxmp.app.ui
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -20,6 +20,7 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
 import kotlin.math.abs
 
@@ -46,8 +47,17 @@ fun CenteredSlider(
     val span = (end - start).coerceAtLeast(1e-6f)
     val neutralValue = neutral.coerceIn(start, end)
     val activeColor = MaterialTheme.colorScheme.primary
+    val density = LocalDensity.current
+    val thumbRadius = with(density) { 10.dp.toPx() }
+    val thumbRingRadius = with(density) { 13.dp.toPx() }
+    val trackHeight = with(density) { 5.dp.toPx() }
+    val trackHalf = trackHeight / 2f
+    val tickHalf = with(density) { 9.dp.toPx() }
+    val tickWidth = with(density) { 2.dp.toPx() }
 
     var width by remember { mutableStateOf(1f) }
+    var lastTapTime by remember { mutableStateOf(0L) }
+    var lastTapX by remember { mutableStateOf(-1f) }
     val valueState = rememberUpdatedState(value)
     val changeState = rememberUpdatedState(onValueChange)
     val finishState = rememberUpdatedState(onValueChangeFinished)
@@ -61,37 +71,47 @@ fun CenteredSlider(
             .height(42.dp)
             .onSizeChanged { width = it.width.toFloat().coerceAtLeast(1f) }
             .pointerInput(valueRange, neutralValue, step) {
-                detectTapGestures(
-                    onTap = { position ->
-                        val current = valueState.value
-                        val thumbX = valueToX(current, size.width.toFloat())
-                        val delta = if (position.x >= thumbX) step else -step
-                        val next = (current + delta).coerceIn(start, end)
-                        if (next != current) {
-                            changeState.value(next)
-                            finishState.value()
+                // 单手势循环：>24px 视为拖动（连续），否则视为点击（±step / 双击归零）。
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    val startX = down.position.x
+                    var moved = false
+                    var lastX = startX
+                    while (true) {
+                        val event = awaitPointerEvent()
+                        val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                        if (!change.pressed) break
+                        if (abs(change.position.x - startX) > 24f) {
+                            moved = true
+                            change.consume()
+                            lastX = change.position.x
+                            val target = start +
+                                (lastX / size.width.toFloat()).coerceIn(0f, 1f) * span
+                            changeState.value(target.coerceIn(start, end))
                         }
-                    },
-                    onDoubleTap = { position ->
+                    }
+                    if (moved) {
+                        finishState.value()
+                    } else {
                         val current = valueState.value
                         val thumbX = valueToX(current, size.width.toFloat())
-                        if (abs(position.x - thumbX) <= 80f) {
+                        val now = System.currentTimeMillis()
+                        // 双击判定按两次点击的位置：圆点在两次点击之间会移动。
+                        val doubleTap = now - lastTapTime < 320 &&
+                            lastTapX >= 0f &&
+                            abs(startX - lastTapX) <= 60f
+                        lastTapTime = now
+                        lastTapX = startX
+                        if (doubleTap) {
                             changeState.value(neutralValue)
-                            finishState.value()
+                        } else {
+                            val delta = if (startX >= thumbX) step else -step
+                            val next = (current + delta).coerceIn(start, end)
+                            if (next != current) changeState.value(next)
                         }
-                    },
-                )
-            }
-            .pointerInput(valueRange) {
-                detectDragGestures(
-                    onDrag = { change, _ ->
-                        change.consume()
-                        val target = start +
-                            (change.position.x / size.width.toFloat()).coerceIn(0f, 1f) * span
-                        changeState.value(target.coerceIn(start, end))
-                    },
-                    onDragEnd = { finishState.value() },
-                )
+                        finishState.value()
+                    }
+                }
             },
     ) {
         Canvas(modifier = Modifier.fillMaxWidth().height(42.dp)) {
@@ -103,30 +123,29 @@ fun CenteredSlider(
             // 轨道
             drawRoundRect(
                 color = trackColor,
-                topLeft = Offset(0f, centerY - 2.5f),
-                size = Size(size.width, 5f),
-                cornerRadius = CornerRadius(2.5f),
+                topLeft = Offset(0f, centerY - trackHalf),
+                size = Size(size.width, trackHeight),
+                cornerRadius = CornerRadius(trackHalf),
             )
             // 中性点刻度
             drawLine(
                 color = Color(0x66FFFFFF),
-                start = Offset(neutralX, centerY - 9f),
-                end = Offset(neutralX, centerY + 9f),
-                strokeWidth = 2f,
+                start = Offset(neutralX, centerY - tickHalf),
+                end = Offset(neutralX, centerY + tickHalf),
+                strokeWidth = tickWidth,
             )
             // 进度：仅当偏离中性值时显示，从中性点画到当前值
             if (abs(value - neutralValue) > 1e-4f && abs(thumbX - neutralX) > 0.5f) {
                 drawRoundRect(
                     color = activeColor,
-                    topLeft = Offset(minOf(neutralX, thumbX), centerY - 2.5f),
-                    size = Size(abs(thumbX - neutralX), 5f),
-                    cornerRadius = CornerRadius(2.5f),
+                    topLeft = Offset(minOf(neutralX, thumbX), centerY - trackHalf),
+                    size = Size(abs(thumbX - neutralX), trackHeight),
+                    cornerRadius = CornerRadius(trackHalf),
                 )
             }
             // 滑块圆点
-            // 圆点尺寸：外圈略收，视觉上更接近原 Material 滑块的 20dp 直径。
-            drawCircle(Color(0xFF101010), radius = 12.5f, center = Offset(thumbX, centerY))
-            drawCircle(activeColor, radius = 10f, center = Offset(thumbX, centerY))
+            drawCircle(Color(0xFF101010), radius = thumbRingRadius, center = Offset(thumbX, centerY))
+            drawCircle(activeColor, radius = thumbRadius, center = Offset(thumbX, centerY))
         }
     }
 }
