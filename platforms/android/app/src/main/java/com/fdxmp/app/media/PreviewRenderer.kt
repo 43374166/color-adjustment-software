@@ -15,6 +15,8 @@ import java.io.File
  */
 object PreviewRenderer {
 
+    private val gpuLock = Any()
+
     private var gpuHandle: Long = 0L
     private var gpuPath: String? = null
 
@@ -22,13 +24,99 @@ object PreviewRenderer {
     private var gpuActive = false
 
     @Volatile
+    private var gpuPreparing = false
+
+    @Volatile
+    private var gpuDisabled = false
+
+    @Volatile
     private var lastError: String? = null
 
     /** 最近一次预览是否由 GPU 渲染。 */
     fun isGpuActive(): Boolean = gpuActive
 
+    /** GPU 会话是否已就绪（可走 GPU 渲染）。 */
+    fun isGpuReady(): Boolean = gpuHandle != 0L
+
+    /** 是否已判定 GPU 不可用（初始化失败 / 超时）。 */
+    fun isGpuDisabled(): Boolean = gpuDisabled
+
+    /** 允许重新尝试初始化 GPU（用户手动切回 GPU 时调用）。 */
+    fun resetGpuDisabled() {
+        gpuDisabled = false
+    }
+
+    /** 标记 GPU 不可用并释放会话（例如初始化超时）。 */
+    fun markGpuDisabled(reason: String) {
+        synchronized(gpuLock) {
+            gpuDisabled = true
+            lastError = reason
+            val handle = gpuHandle
+            gpuHandle = 0L
+            gpuPath = null
+            if (handle != 0L) {
+                runCatching { NativeBridge.nativeGpuSessionFree(handle) }
+            }
+        }
+        gpuActive = false
+    }
+
     /** 最近一次 GPU 失败原因。 */
     fun lastGpuError(): String? = lastError
+
+    /**
+     * 后台准备 GPU 会话（**阻塞式 JNI 调用**，必须在工作线程执行）。
+     * 同一路径已就绪直接返回 true；失败 / 超时后置 `gpuDisabled`。
+     */
+    fun prepareGpu(path: String, maxEdge: Int = 1440): Boolean {
+        synchronized(gpuLock) {
+            if (gpuHandle != 0L && gpuPath == path) return true
+            if (gpuPreparing || gpuDisabled) return gpuHandle != 0L
+            gpuPreparing = true
+        }
+        val handle = runCatching {
+            NativeBridge.nativeGpuSessionNew(path, maxEdge)
+        }.getOrDefault(0L)
+        synchronized(gpuLock) {
+            gpuPreparing = false
+            if (gpuDisabled) {
+                if (handle != 0L) {
+                    runCatching { NativeBridge.nativeGpuSessionFree(handle) }
+                }
+                return false
+            }
+            if (handle == 0L) {
+                lastError = runCatching { NativeBridge.nativeGpuLastError() }.getOrNull()
+                gpuDisabled = true
+                return false
+            }
+            val previous = gpuHandle
+            gpuHandle = handle
+            gpuPath = path
+            if (previous != 0L) {
+                runCatching { NativeBridge.nativeGpuSessionFree(previous) }
+            }
+            return true
+        }
+    }
+
+    /** 会话已就绪时用 GPU 渲染一帧；未就绪返回 null（调用方走 CPU）。 */
+    fun renderGpuIfReady(path: String, paramsJson: String): Bitmap? {
+        val handle = synchronized(gpuLock) {
+            if (gpuHandle != 0L && gpuPath == path) gpuHandle else 0L
+        }
+        if (handle == 0L) return null
+        val payload = runCatching {
+            NativeBridge.nativeGpuSessionRender(handle, paramsJson)
+        }.getOrNull()
+        if (payload == null) {
+            markGpuDisabled("渲染失败")
+            return null
+        }
+        val bitmap = decodePayload(payload)
+        gpuActive = bitmap != null
+        return bitmap
+    }
 
     /** GPU 后端名称（无会话返回 null）。 */
     fun gpuBackend(): String? {
@@ -107,19 +195,19 @@ object PreviewRenderer {
             render(path, paramsJson, maxEdge)
             cpuNanos += System.nanoTime() - start
         }
+        val handle = synchronized(gpuLock) {
+            if (gpuHandle != 0L && gpuPath == path) gpuHandle else 0L
+        }
+        if (handle == 0L) {
+            return Pair(cpuNanos / 1e6 / frames, -1.0)
+        }
         var gpuNanos = 0L
-        val handle = runCatching {
-            NativeBridge.nativeGpuSessionNew(path, maxEdge)
-        }.getOrDefault(0L)
-        if (handle != 0L) {
-            // 预热一帧（首帧含管线编译/纹理分配）。
+        // 预热一帧（首帧可能包含管线状态刷新）。
+        runCatching { NativeBridge.nativeGpuSessionRender(handle, paramsJson) }
+        repeat(frames) {
+            val start = System.nanoTime()
             runCatching { NativeBridge.nativeGpuSessionRender(handle, paramsJson) }
-            repeat(frames) {
-                val start = System.nanoTime()
-                runCatching { NativeBridge.nativeGpuSessionRender(handle, paramsJson) }
-                gpuNanos += System.nanoTime() - start
-            }
-            runCatching { NativeBridge.nativeGpuSessionFree(handle) }
+            gpuNanos += System.nanoTime() - start
         }
         val cpuMs = cpuNanos / 1e6 / frames
         val gpuMs = if (gpuNanos > 0) gpuNanos / 1e6 / frames else -1.0

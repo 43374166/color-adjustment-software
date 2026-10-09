@@ -254,6 +254,8 @@ fun EditorScreen(
     var exporting by remember { mutableStateOf(false) }
     var useGpu by remember { mutableStateOf(true) }
     var rendererLabel by remember { mutableStateOf("CPU") }
+    var gpuPreparing by remember { mutableStateOf(false) }
+    var gpuAttempt by remember { mutableStateOf(0) }
     var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
@@ -271,6 +273,26 @@ fun EditorScreen(
         originalBitmap = withContext(Dispatchers.IO) {
             file?.let { PreviewRenderer.decodeSource(it.path) }
         }
+    }
+
+    // GPU 会话后台准备：界面先用 CPU 出图，就绪后自动切换；15s 超时则固定 CPU。
+    LaunchedEffect(sourceFile, gpuAttempt, useGpu) {
+        val file = sourceFile ?: return@LaunchedEffect
+        if (!useGpu || PreviewRenderer.isGpuReady()) return@LaunchedEffect
+        gpuPreparing = true
+        val deferred = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        kotlin.concurrent.thread(name = "fdxmp-gpu-prepare") {
+            deferred.complete(
+                runCatching { PreviewRenderer.prepareGpu(file.path, 1440) }.getOrDefault(false),
+            )
+        }
+        val ready = kotlinx.coroutines.withTimeoutOrNull(15_000) { deferred.await() } ?: false
+        if (!ready && !PreviewRenderer.isGpuReady()) {
+            PreviewRenderer.markGpuDisabled("初始化超时（15s）")
+            android.util.Log.w("fdxmp", "GPU 初始化超时，已固定使用 CPU")
+        }
+        gpuPreparing = false
+        renderVersion += 1
     }
 
     LaunchedEffect(sourceFile, renderVersion, tool) {
@@ -291,26 +313,32 @@ fun EditorScreen(
         )
         val bitmap = withContext(Dispatchers.Default) {
             var result: Bitmap? = null
-            if (useGpu) {
-                result = PreviewRenderer.renderGpu(file.path, json, 1440)
+            if (useGpu && PreviewRenderer.isGpuReady()) {
+                result = PreviewRenderer.renderGpuIfReady(file.path, json)
             }
             if (result == null) {
                 result = PreviewRenderer.render(file.path, json, 1440)
             }
-            rendererLabel = if (useGpu && PreviewRenderer.isGpuActive()) {
-                android.util.Log.i(
-                    "fdxmp",
-                    "GPU 预览输出 " + (result?.width ?: 0) + "x" + (result?.height ?: 0),
-                )
-                "GPU · " + (PreviewRenderer.gpuBackend() ?: "vulkan")
-            } else {
-                if (useGpu) {
+            rendererLabel = when {
+                useGpu && PreviewRenderer.isGpuReady() && PreviewRenderer.isGpuActive() -> {
+                    android.util.Log.i(
+                        "fdxmp",
+                        "GPU 预览输出 " + (result?.width ?: 0) + "x" + (result?.height ?: 0),
+                    )
+                    "GPU · " + (PreviewRenderer.gpuBackend() ?: "vulkan")
+                }
+
+                useGpu && (gpuPreparing || !PreviewRenderer.isGpuDisabled()) -> "GPU 准备中…"
+
+                useGpu -> {
                     android.util.Log.w(
                         "fdxmp",
-                        "GPU 回退 CPU：" + (PreviewRenderer.lastGpuError() ?: "unknown"),
+                        "GPU 不可用：" + (PreviewRenderer.lastGpuError() ?: "unknown"),
                     )
+                    "CPU"
                 }
-                "CPU"
+
+                else -> "CPU"
             }
             result
         }
@@ -627,7 +655,11 @@ fun EditorScreen(
                                             }
                                             val text = String.format(
                                                 java.util.Locale.US,
-                                                "性能：CPU %.0f ms/帧 · GPU %.0f ms/帧",
+                                                if (gpuMs < 0) {
+                                                    "性能：CPU %.0f ms/帧 · GPU 未就绪"
+                                                } else {
+                                                    "性能：CPU %.0f ms/帧 · GPU %.0f ms/帧"
+                                                },
                                                 cpuMs,
                                                 gpuMs,
                                             )
@@ -637,7 +669,12 @@ fun EditorScreen(
                                     },
                                     onToggleRenderer = {
                                         useGpu = !useGpu
-                                        if (!useGpu) PreviewRenderer.releaseGpu()
+                                        if (useGpu) {
+                                            PreviewRenderer.resetGpuDisabled()
+                                            gpuAttempt += 1
+                                        } else {
+                                            PreviewRenderer.releaseGpu()
+                                        }
                                         renderVersion += 1
                                     },
                                     onReset = {
