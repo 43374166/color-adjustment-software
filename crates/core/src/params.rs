@@ -667,6 +667,9 @@ pub enum MaskKind {
         radii: [f32; 2],
         /// 旋转角度。
         rotation: f32,
+        /// 内圈缩放（0..=0.98，缺省 0.75；越小过渡越柔）。
+        #[serde(default)]
+        inner: Option<f32>,
     },
     /// 颜色范围。
     ColorRange {

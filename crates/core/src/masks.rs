@@ -85,7 +85,8 @@ pub fn generate_mask(
             center,
             radii,
             rotation,
-        } => radial_mask(*center, *radii, *rotation, width, height),
+            inner,
+        } => radial_mask(*center, *radii, *rotation, *inner, width, height),
         MaskKind::ColorRange {
             color,
             range,
@@ -178,6 +179,7 @@ pub fn radial_mask(
     center: [f32; 2],
     radii: [f32; 2],
     rotation: f32,
+    inner: Option<f32>,
     width: u32,
     height: u32,
 ) -> MaskRaster {
@@ -185,6 +187,7 @@ pub fn radial_mask(
     let (sin, cos) = rotation.to_radians().sin_cos();
     let rx = radii[0].max(1e-3);
     let ry = radii[1].max(1e-3);
+    let inner_scale = inner.unwrap_or(0.75).clamp(0.0, 0.98);
     raster
         .weights
         .par_chunks_mut(width as usize)
@@ -196,7 +199,7 @@ pub fn radial_mask(
                 let local_x = px * cos + py * sin;
                 let local_y = -px * sin + py * cos;
                 let distance = ((local_x / rx).powi(2) + (local_y / ry).powi(2)).sqrt();
-                *weight = 1.0 - smoothstep(0.75, 1.0, distance);
+                *weight = 1.0 - smoothstep(inner_scale, 1.0, distance);
             }
         });
     raster
@@ -486,7 +489,7 @@ mod tests {
 
     #[test]
     fn radial_gradient_is_centered() {
-        let raster = radial_mask([0.5, 0.5], [0.25, 0.25], 0.0, 64, 64);
+        let raster = radial_mask([0.5, 0.5], [0.25, 0.25], 0.0, None, 64, 64);
         assert!(raster.get(32, 32) > 0.95, "中心应为 1");
         assert!(raster.get(0, 0) < 0.05, "角落应为 0");
     }

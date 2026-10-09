@@ -59,6 +59,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -227,6 +228,10 @@ fun EditorScreen(
     var curvePoints by remember(record.uri) { mutableStateOf(parseCurvePoints(record.paramsJson)) }
     var parametric by remember(record.uri) { mutableStateOf(parseParametric(record.paramsJson)) }
     var cropUi by remember(record.uri) { mutableStateOf(parseCrop(record.paramsJson)) }
+    var masks by remember(record.uri) { mutableStateOf(parseMasks(record.paramsJson)) }
+    var selectedMask by remember { mutableStateOf(0) }
+    var maskCategory by remember { mutableStateOf(EditCategory.Light) }
+    var maskEffectTab by remember { mutableStateOf(EffectTab.Effects) }
     var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
@@ -252,6 +257,7 @@ fun EditorScreen(
             parametric = parametric,
             crop = cropUi,
             applyCropRect = tool != EditorTool.Crop,
+            masks = masks,
         )
         val bitmap = withContext(Dispatchers.Default) {
             PreviewRenderer.render(file.path, json, 1440)
@@ -292,6 +298,11 @@ fun EditorScreen(
         renderVersion += 1
     }
 
+    fun updateMask(index: Int, transform: (MaskUi) -> MaskUi) {
+        if (index !in masks.indices) return
+        masks = masks.toMutableList().also { it[index] = transform(it[index]) }
+    }
+
     Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         Column(
             modifier = Modifier
@@ -327,6 +338,7 @@ fun EditorScreen(
                         parametric = parametric,
                         crop = cropUi,
                         applyCropRect = true,
+                        masks = masks,
                     ),
                     presetName = presetName,
                     updatedAt = System.currentTimeMillis(),
@@ -382,6 +394,20 @@ fun EditorScreen(
                         it.width.toFloat() / it.height.coerceAtLeast(1)
                     } ?: 1f,
                     onCropChange = { updated -> cropUi = updated },
+                    modifier = Modifier.fillMaxSize(),
+                )
+
+                tool == EditorTool.Mask -> MaskOverlay(
+                    mask = masks.getOrNull(
+                        selectedMask.coerceIn(0, (masks.size - 1).coerceAtLeast(0)),
+                    ),
+                    imageAspect = previewBitmap?.let {
+                        it.width.toFloat() / it.height.coerceAtLeast(1)
+                    } ?: 1f,
+                    onMaskChange = { updated ->
+                        updateMask(selectedMask) { updated }
+                        pendingRender += 1
+                    },
                     modifier = Modifier.fillMaxSize(),
                 )
 
@@ -539,14 +565,102 @@ fun EditorScreen(
                             },
                         )
 
-                        EditorTool.Mask -> ToolPlaceholder(
-                            title = "蒙版",
-                            detail = "画笔 / 线性渐变 / 径向渐变 / 颜色范围 / AI，下一步接入",
-                        )
+                        EditorTool.Mask -> Column(modifier = Modifier.fillMaxSize()) {
+                            MaskChipRow(
+                                masks = masks,
+                                selectedIndex = selectedMask.coerceIn(
+                                    0,
+                                    (masks.size - 1).coerceAtLeast(0),
+                                ),
+                                onSelect = { selectedMask = it },
+                                onAdd = { kind ->
+                                    masks = masks + defaultMask(
+                                        kind = kind,
+                                        index = masks.size,
+                                        defaults = EDITOR_SLIDERS.map { it.defaultValue },
+                                    )
+                                    selectedMask = masks.lastIndex
+                                    tool = EditorTool.Mask
+                                },
+                                onRemove = { index ->
+                                    masks = masks.filterIndexed { i, _ -> i != index }
+                                    selectedMask = selectedMask.coerceIn(
+                                        0,
+                                        (masks.size - 1).coerceAtLeast(0),
+                                    )
+                                    pendingRender += 1
+                                },
+                                onDone = {
+                                    tool = EditorTool.Edit
+                                    renderVersion += 1
+                                },
+                            )
+
+                            val currentMask = masks.getOrNull(selectedMask)
+                            if (currentMask == null) {
+                                Box(
+                                    modifier = Modifier.weight(1f).fillMaxWidth(),
+                                    contentAlignment = Alignment.Center,
+                                ) {
+                                    Text(
+                                        "点右上「＋」添加线性 / 径向蒙版",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            } else {
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                ) {
+                                    CategoryChip(
+                                        icon = Icons.Filled.LightMode,
+                                        label = "亮度",
+                                        active = maskCategory == EditCategory.Light,
+                                        onClick = { maskCategory = EditCategory.Light },
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    CategoryChip(
+                                        icon = Icons.Filled.WaterDrop,
+                                        label = "颜色",
+                                        active = maskCategory == EditCategory.Color,
+                                        onClick = { maskCategory = EditCategory.Color },
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                    CategoryChip(
+                                        icon = Icons.Filled.CenterFocusStrong,
+                                        label = "效果",
+                                        active = maskCategory == EditCategory.Effects,
+                                        onClick = { maskCategory = EditCategory.Effects },
+                                        modifier = Modifier.weight(1f),
+                                    )
+                                }
+                                SlidersPanel(
+                                    category = maskCategory,
+                                    effectTab = maskEffectTab,
+                                    values = currentMask.values,
+                                    modifier = Modifier.weight(1f),
+                                    onEffectTabChange = { maskEffectTab = it },
+                                    onValueChange = { index, value ->
+                                        updateMask(selectedMask) { mask ->
+                                            mask.copy(
+                                                values = mask.values.toMutableList().also {
+                                                    it[index] = value
+                                                },
+                                            )
+                                        }
+                                        pendingRender += 1
+                                    },
+                                    onValueChangeFinished = { renderVersion += 1 },
+                                )
+                            }
+                        }
                     }
                 }
 
-                if (!showCurve && tool != EditorTool.Crop) {
+                if (!showCurve && tool != EditorTool.Crop && tool != EditorTool.Mask) {
                     EditorToolBar(
                         selected = tool,
                         onSelect = { tool = it },
@@ -989,12 +1103,56 @@ private fun parseCrop(paramsJson: String): CropUi {
     )
 }
 
+private fun parseMasks(paramsJson: String): List<MaskUi> {
+    val array = runCatching {
+        JSONObject(paramsJson).optJSONArray("masks")
+    }.getOrNull() ?: return emptyList()
+    val masks = mutableListOf<MaskUi>()
+    for (index in 0 until array.length()) {
+        val item = array.optJSONObject(index) ?: continue
+        val kindJson = item.optJSONObject("kind") ?: continue
+        val kind = MaskKindUi.entries.firstOrNull {
+            it.serdeName == kindJson.optString("type")
+        } ?: continue
+        val data = kindJson.optJSONObject("data")
+        val adjustments = item.optJSONObject("adjustments")
+        val values = EDITOR_SLIDERS.map { slider ->
+            adjustments
+                ?.optJSONObject(slider.category.groupKey)
+                ?.optDouble(slider.key, slider.defaultValue.toDouble())
+                ?.toFloat()
+                ?: slider.defaultValue
+        }
+        fun pair(name: String, fallbackX: Float, fallbackY: Float): Offset {
+            val json = data?.optJSONArray(name) ?: return Offset(fallbackX, fallbackY)
+            return Offset(
+                json.optDouble(0, fallbackX.toDouble()).toFloat(),
+                json.optDouble(1, fallbackY.toDouble()).toFloat(),
+            )
+        }
+        masks += MaskUi(
+            id = item.optString("id", "mask-$index"),
+            name = item.optString("name", "蒙版 ${index + 1}"),
+            kind = kind,
+            start = pair("start", 0.5f, 0.32f),
+            end = pair("end", 0.5f, 0.68f),
+            center = pair("center", 0.5f, 0.5f),
+            radii = pair("radii", 0.34f, 0.30f),
+            rotation = data?.optDouble("rotation", 0.0)?.toFloat() ?: 0f,
+            inner = data?.optDouble("inner", 0.75)?.toFloat() ?: 0.75f,
+            values = values,
+        )
+    }
+    return masks
+}
+
 private fun buildParamsJson(
     values: List<Float>,
     curves: Map<CurveChannel, List<CurvePointUi>>,
     parametric: ParametricUi,
     crop: CropUi,
     applyCropRect: Boolean,
+    masks: List<MaskUi>,
 ): String {
     fun value(key: String): Double =
         values[EDITOR_SLIDERS.indexOfFirst { it.key == key }].toDouble()
@@ -1060,6 +1218,93 @@ private fun buildParamsJson(
                 put("flip_vertical", crop.flipVertical)
                 put("grid", "thirds")
                 put("auto_compose", false)
+            },
+        )
+        put(
+            "masks",
+            JSONArray().apply {
+                masks.forEach { mask ->
+                    put(
+                        JSONObject().apply {
+                            put("id", mask.id)
+                            put("name", mask.name)
+                            put(
+                                "kind",
+                                JSONObject().apply {
+                                    put("type", mask.kind.serdeName)
+                                    put(
+                                        "data",
+                                        JSONObject().apply {
+                                            when (mask.kind) {
+                                                MaskKindUi.Linear -> {
+                                                    put(
+                                                        "start",
+                                                        JSONArray().apply {
+                                                            put(mask.start.x.toDouble())
+                                                            put(mask.start.y.toDouble())
+                                                        },
+                                                    )
+                                                    put(
+                                                        "end",
+                                                        JSONArray().apply {
+                                                            put(mask.end.x.toDouble())
+                                                            put(mask.end.y.toDouble())
+                                                        },
+                                                    )
+                                                }
+
+                                                MaskKindUi.Radial -> {
+                                                    put(
+                                                        "center",
+                                                        JSONArray().apply {
+                                                            put(mask.center.x.toDouble())
+                                                            put(mask.center.y.toDouble())
+                                                        },
+                                                    )
+                                                    put(
+                                                        "radii",
+                                                        JSONArray().apply {
+                                                            put(mask.radii.x.toDouble())
+                                                            put(mask.radii.y.toDouble())
+                                                        },
+                                                    )
+                                                    put("rotation", mask.rotation.toDouble())
+                                                    put("inner", mask.inner.toDouble())
+                                                }
+                                            }
+                                        },
+                                    )
+                                },
+                            )
+                            put("inverted", false)
+                            put("feather", 0.0)
+                            put("opacity", 100.0)
+                            put("overlay", "red")
+                            put(
+                                "adjustments",
+                                JSONObject().apply {
+                                    grouped.forEach { (category, sliders) ->
+                                        put(
+                                            category.groupKey,
+                                            JSONObject().apply {
+                                                sliders.forEach { slider ->
+                                                    put(
+                                                        slider.key,
+                                                        mask.values[
+                                                            EDITOR_SLIDERS.indexOfFirst {
+                                                                it.key == slider.key
+                                                            }
+                                                        ].toDouble(),
+                                                    )
+                                                }
+                                            },
+                                        )
+                                    }
+                                },
+                            )
+                        },
+                    )
+                }
             },
         )
     }.toString()

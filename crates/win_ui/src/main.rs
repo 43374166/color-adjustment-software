@@ -378,6 +378,7 @@ fn mask_tool_default(tool: MaskTool) -> (fdxmp_core::params::MaskKind, &'static 
                 center: [0.5, 0.5],
                 radii: [0.3, 0.3],
                 rotation: 0.0,
+                inner: None,
             },
             "径向渐变",
         ),
@@ -3442,6 +3443,7 @@ impl FdxmpApp {
                         center: [0.5, 0.5],
                         radii: [0.3, 0.3],
                         rotation: 0.0,
+                        inner: None,
                     },
                     "径向渐变",
                 );
@@ -3694,13 +3696,16 @@ impl FdxmpApp {
                 center,
                 radii,
                 rotation,
+                inner,
             } => {
+                let inner_value = inner.unwrap_or(0.75);
                 for (label, value, range, slot) in [
                     ("中心 X", center[0], 0.0..=1.0, 0usize),
                     ("中心 Y", center[1], 0.0..=1.0, 1),
                     ("半径 X", radii[0], 0.02..=1.0, 2),
                     ("半径 Y", radii[1], 0.02..=1.0, 3),
                     ("旋转", rotation, -180.0..=180.0, 4),
+                    ("内圈", inner_value, 0.0..=0.98, 5),
                 ] {
                     if let Some(new_value) = value_slider(ui, label, value, range) {
                         let apply = move |target: &mut fdxmp_core::params::MaskParams| {
@@ -3708,6 +3713,7 @@ impl FdxmpApp {
                                 center,
                                 radii,
                                 rotation,
+                                inner,
                             } = &mut target.kind
                             {
                                 match slot {
@@ -3715,7 +3721,8 @@ impl FdxmpApp {
                                     1 => center[1] = new_value,
                                     2 => radii[0] = new_value,
                                     3 => radii[1] = new_value,
-                                    _ => *rotation = new_value,
+                                    4 => *rotation = new_value,
+                                    _ => *inner = Some(new_value),
                                 }
                             }
                         };

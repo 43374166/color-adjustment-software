@@ -30,7 +30,8 @@ pub fn render_preview_rgba(path: &Path, params_json: &str, max_edge: u32) -> Res
     let decoded = crate::decode::decode_preview(path)?;
     let proxy = decoded.display_proxy(max_edge.clamp(64, 4096));
     let rendered = render_preview_image(&proxy, &params);
-    let geometry = apply_geometry(&rendered, &params.crop);
+    let mut geometry = apply_geometry(&rendered, &params.crop);
+    apply_masks(&mut geometry, &params);
     Ok(PreviewRgba {
         width: geometry.width(),
         height: geometry.height(),
@@ -155,8 +156,6 @@ fn crop_rect(source: &RgbaImage, rect: [f32; 4]) -> RgbaImage {
 pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImage {
     let width = source.width().max(1) as f32;
     let height = source.height().max(1) as f32;
-    let light = &params.light;
-    let color = &params.color;
     let effects = &params.effects;
     let curves = CurveLuts::new(&params.curves);
     let mut out = source.clone();
@@ -175,89 +174,10 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
             linear_to_srgb(base[2]),
         ];
 
-        // 分区色调：用平滑权重整体加减，保持通道比例。
-        let luma = luminance(rgb);
-        let highlights = light.highlights / 100.0;
-        if highlights != 0.0 {
-            let weight = smoothstep(0.5, 1.0, luma);
-            for channel in &mut rgb {
-                *channel += highlights * weight * 0.35;
-            }
-        }
-        let shadows = light.shadows / 100.0;
-        if shadows != 0.0 {
-            let weight = 1.0 - smoothstep(0.0, 0.5, luma);
-            for channel in &mut rgb {
-                *channel += shadows * weight * 0.35;
-            }
-        }
-        let whites = light.whites / 100.0;
-        if whites != 0.0 {
-            let weight = luma * luma;
-            for channel in &mut rgb {
-                *channel += whites * weight * 0.30;
-            }
-        }
-        let blacks = light.blacks / 100.0;
-        if blacks != 0.0 {
-            let weight = (1.0 - luma) * (1.0 - luma);
-            for channel in &mut rgb {
-                *channel += blacks * weight * 0.30;
-            }
-        }
-        for channel in &mut rgb {
-            *channel = channel.clamp(0.0, 1.0);
-        }
+        // 全局基础调色：分区色调 → 曲线 → 饱和度 / 自然饱和度。
+        rgb = adjust_pixel(rgb, params, &curves);
 
-        // 曲线：参数曲线 → RGB → 单通道。
-        rgb = curves.apply(rgb);
-
-        // 饱和度 / 自然饱和度。
-        let luminance_now = luminance(rgb);
-        let max = rgb[0].max(rgb[1]).max(rgb[2]);
-        let min = rgb[0].min(rgb[1]).min(rgb[2]);
-        let pixel_saturation = if max <= f32::EPSILON {
-            0.0
-        } else {
-            ((max - min) / max).clamp(0.0, 1.0)
-        };
-        let saturation_factor = 1.0 + color.saturation / 100.0;
-        let vibrance_factor = 1.0 + (color.vibrance / 100.0) * (1.0 - pixel_saturation);
-        let factor = saturation_factor * vibrance_factor;
-        for channel in &mut rgb {
-            *channel = luminance_now + (*channel - luminance_now) * factor;
-        }
-
-        // 暗角（负值提亮四角）。
-        let vignette = effects.vignette / 100.0;
-        if vignette != 0.0 {
-            let nx = x as f32 / (width - 1.0).max(1.0) - 0.5;
-            let ny = y as f32 / (height - 1.0).max(1.0) - 0.5;
-            let distance = (nx * nx + ny * ny).sqrt() / std::f32::consts::FRAC_1_SQRT_2;
-            let midpoint = (effects.vignette_midpoint / 100.0).clamp(0.0, 1.0);
-            let feather = (effects.vignette_feather / 100.0).clamp(0.0, 1.0);
-            let start = (midpoint * 0.85).clamp(0.0, 0.95);
-            let width = (0.12 + feather * 0.55).max(0.05);
-            let weight = smoothstep(start, (start + width).min(1.0), distance);
-            let factor = (1.0 - vignette * 0.9 * weight).clamp(0.0, 2.0);
-            for channel in &mut rgb {
-                *channel *= factor;
-            }
-        }
-
-        // 颗粒。
-        let grain = effects.grain / 100.0;
-        if grain != 0.0 {
-            let noise = grain_noise(
-                x,
-                y,
-                effects.grain_size,
-                (effects.grain_roughness / 100.0).clamp(0.0, 1.0),
-            );
-            for channel in &mut rgb {
-                *channel += noise * grain * 0.06;
-            }
-        }
+        rgb = apply_effects(rgb, effects, x, y, width, height);
 
         for channel in &mut rgb {
             *channel = channel.clamp(0.0, 1.0);
@@ -271,6 +191,180 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
     }
 
     out
+}
+
+/// 按蒙版对图像做局部调整（在全局调色之后、几何裁剪之前）。
+pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
+    if params.masks.is_empty() {
+        return;
+    }
+    let contexts: Vec<MaskContext> = params
+        .masks
+        .iter()
+        .filter_map(|mask| {
+            let raster =
+                crate::masks::generate_mask(mask, image, image.width(), image.height()).ok()?;
+            Some(MaskContext {
+                raster,
+                curves: CurveLuts::new(&mask.adjustments.curves),
+                params: (*mask.adjustments).clone(),
+            })
+        })
+        .collect();
+    if contexts.is_empty() {
+        return;
+    }
+
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let [r, g, b, a] = pixel.0;
+        let mut rgb = [
+            r as f32 / 255.0,
+            g as f32 / 255.0,
+            b as f32 / 255.0,
+        ];
+        let mut changed = false;
+        for context in &contexts {
+            let weight = context.raster.get(x, y);
+            if weight > 0.001 {
+                let adjusted = adjust_with_reference(rgb, &context.params, &context.curves);
+                for channel in 0..3 {
+                    rgb[channel] += (adjusted[channel] - rgb[channel]) * weight;
+                }
+                changed = true;
+            }
+        }
+        if changed {
+            pixel.0 = [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), a];
+        }
+    }
+}
+
+/// 蒙版上下文：权重栅格 + 该蒙版的曲线 LUT 与调色参数。
+struct MaskContext {
+    raster: crate::masks::MaskRaster,
+    curves: CurveLuts,
+    params: EditParams,
+}
+
+/// 单像素调色：分区色调 → 曲线 → 饱和度 / 自然饱和度（局部调整复用）。
+fn adjust_with_reference(rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [f32; 3] {
+    // 局部调整同样包含白平衡 / 曝光 / 对比度（参考实现）。
+    let linear = [
+        srgb_to_linear(rgb[0]),
+        srgb_to_linear(rgb[1]),
+        srgb_to_linear(rgb[2]),
+    ];
+    let base = crate::pipeline::apply_reference(linear, params);
+    adjust_pixel(
+        [
+            linear_to_srgb(base[0]),
+            linear_to_srgb(base[1]),
+            linear_to_srgb(base[2]),
+        ],
+        params,
+        curves,
+    )
+}
+
+fn adjust_pixel(mut rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [f32; 3] {
+    let light = &params.light;
+    let color = &params.color;
+
+    // 分区色调：用平滑权重整体加减，保持通道比例。
+    let luma = luminance(rgb);
+    let highlights = light.highlights / 100.0;
+    if highlights != 0.0 {
+        let weight = smoothstep(0.5, 1.0, luma);
+        for channel in &mut rgb {
+            *channel += highlights * weight * 0.35;
+        }
+    }
+    let shadows = light.shadows / 100.0;
+    if shadows != 0.0 {
+        let weight = 1.0 - smoothstep(0.0, 0.5, luma);
+        for channel in &mut rgb {
+            *channel += shadows * weight * 0.35;
+        }
+    }
+    let whites = light.whites / 100.0;
+    if whites != 0.0 {
+        let weight = luma * luma;
+        for channel in &mut rgb {
+            *channel += whites * weight * 0.30;
+        }
+    }
+    let blacks = light.blacks / 100.0;
+    if blacks != 0.0 {
+        let weight = (1.0 - luma) * (1.0 - luma);
+        for channel in &mut rgb {
+            *channel += blacks * weight * 0.30;
+        }
+    }
+    for channel in &mut rgb {
+        *channel = channel.clamp(0.0, 1.0);
+    }
+
+    // 曲线：参数曲线 → RGB → 单通道。
+    rgb = curves.apply(rgb);
+
+    // 饱和度 / 自然饱和度。
+    let luminance_now = luminance(rgb);
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    let pixel_saturation = if max <= f32::EPSILON {
+        0.0
+    } else {
+        ((max - min) / max).clamp(0.0, 1.0)
+    };
+    let saturation_factor = 1.0 + color.saturation / 100.0;
+    let vibrance_factor = 1.0 + (color.vibrance / 100.0) * (1.0 - pixel_saturation);
+    let factor = saturation_factor * vibrance_factor;
+    for channel in &mut rgb {
+        *channel = luminance_now + (*channel - luminance_now) * factor;
+    }
+    rgb
+}
+
+/// 全局效果：暗角 + 颗粒。
+fn apply_effects(
+    mut rgb: [f32; 3],
+    effects: &crate::params::EffectParams,
+    x: u32,
+    y: u32,
+    width: f32,
+    height: f32,
+) -> [f32; 3] {
+    // 暗角（负值提亮四角）。
+    let vignette = effects.vignette / 100.0;
+    if vignette != 0.0 {
+        let nx = x as f32 / (width - 1.0).max(1.0) - 0.5;
+        let ny = y as f32 / (height - 1.0).max(1.0) - 0.5;
+        let distance = (nx * nx + ny * ny).sqrt() / std::f32::consts::FRAC_1_SQRT_2;
+        let midpoint = (effects.vignette_midpoint / 100.0).clamp(0.0, 1.0);
+        let feather = (effects.vignette_feather / 100.0).clamp(0.0, 1.0);
+        let start = (midpoint * 0.85).clamp(0.0, 0.95);
+        let transition = (0.12 + feather * 0.55).max(0.05);
+        let weight = smoothstep(start, (start + transition).min(1.0), distance);
+        let factor = (1.0 - vignette * 0.9 * weight).clamp(0.0, 2.0);
+        for channel in &mut rgb {
+            *channel *= factor;
+        }
+    }
+
+    // 颗粒。
+    let grain = effects.grain / 100.0;
+    if grain != 0.0 {
+        let noise = grain_noise(
+            x,
+            y,
+            effects.grain_size,
+            (effects.grain_roughness / 100.0).clamp(0.0, 1.0),
+        );
+        for channel in &mut rgb {
+            *channel += noise * grain * 0.06;
+        }
+    }
+    rgb
 }
 
 fn luminance(rgb: [f32; 3]) -> f32 {
@@ -491,5 +585,26 @@ mod tests {
         crop.flip_horizontal = true;
         let out = apply_geometry(&source, &crop);
         assert_eq!(out.get_pixel(0, 0).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn linear_mask_brightens_masked_side() {
+        let source = RgbaImage::from_pixel(4, 4, Rgba([64, 64, 64, 255]));
+        let mut params = EditParams::default();
+        let mut mask = crate::params::MaskParams::default();
+        mask.kind = crate::params::MaskKind::LinearGradient {
+            start: [0.0, 0.0],
+            end: [0.0, 1.0],
+        };
+        let mut local = EditParams::default();
+        local.light.exposure = 1.0;
+        mask.adjustments = Box::new(local);
+        params.masks = vec![mask];
+
+        let mut out = render_preview_image(&source, &params);
+        apply_masks(&mut out, &params);
+        let top = out.get_pixel(0, 0).0[0];
+        let bottom = out.get_pixel(0, 3).0[0];
+        assert!(top > bottom + 10, "top={top} bottom={bottom}");
     }
 }

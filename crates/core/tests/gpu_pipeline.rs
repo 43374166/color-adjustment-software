@@ -968,6 +968,7 @@ fn gpu_preview_frame_time_smoke_test() {
             center: [0.7, 0.4],
             radii: [0.2, 0.25],
             rotation: 0.0,
+            inner: None,
         },
     ]
     .into_iter()
