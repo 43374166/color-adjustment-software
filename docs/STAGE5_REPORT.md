@@ -59,3 +59,17 @@
 阶段 5 在**可在 Windows 上完成的范围**内交付：三端工程骨架、三大 Tab 结构、
 权限声明、桥接接入点与构建文档全部就绪；实际编译与真机运行需要对应 SDK / 工具链。
 
+---
+
+## 5. 后续更新：设备 Tab 实现（2026-10-09）
+
+三端设备 Tab 从占位骨架升级为可用界面（编辑 / 我的两个 Tab 仍为占位）：
+
+| 平台 | 实现 | 验证 |
+| --- | --- | --- |
+| Android | `MainActivity.kt` + `ui/DeviceTab.kt` / `ui/PhotoViewer.kt` / `media/MediaStoreRepository.kt`：运行时权限（含 Android 14 部分授权）、MediaStore 网格 / 列表、搜索 / 排序 / 筛选、长按多选、全屏预览（左右滑动 + 双击 / 双指缩放）、导入 / 相机 / 分享 | `gradle assembleDebug` 通过；API 35 x86_64 模拟器实测通过 |
+| HarmonyOS | `pages/Index.ets` + `model/PhotoItem.ets`：`photoAccessHelper` 相册查询、运行时权限、网格 / 列表、搜索 / 排序 / 筛选、长按多选、全屏 Swiper 预览、系统相册导入 / 相机 | `hvigorw assembleHap` 通过（未签名 HAP） |
+| iOS | `DeviceTabView.swift`：Photos 权限、`PHAsset` 网格 / 列表、搜索 / 排序 / 筛选、长按多选、全屏分页预览、PhotosPicker 导入、相机、系统分享 | 代码就绪，需 macOS + Xcode 编译验证 |
+
+RAW 文件会在网格中标记，但预览需要 Rust 核心解码（阶段 6 接入），
+当前显示提示文案。

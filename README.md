@@ -140,6 +140,6 @@ cargo run -p fdxmp-packer-ui    # 单文件打包器
 | 2 | 色彩管线（曲线 / HSL / 分级 / 细节） | ✅ 已完成（[阶段 2 报告](docs/STAGE2_REPORT.md)） |
 | 3 | 蒙版系统（画笔 / 渐变 / 范围 / AI） | ✅ 已完成（[阶段 3 报告](docs/STAGE3_REPORT.md)，AI 蒙版接口预留） |
 | 4 | 预设与导出（.fdxmp / XMP 导入） | ✅ 已完成（[阶段 4 报告](docs/STAGE4_REPORT.md)） |
-| 5 | 移动端 UI（三大 Tab + 编辑界面） | ⏳ 待开始 |
+| 5 | 移动端 UI（三大 Tab + 编辑界面） | 🟡 三端设备 Tab 已实现（权限 / 网格 / 列表 / 预览 / 多选），编辑界面待做 |
 | 6 | Windows UI 与打包器 | ⏳ 待开始 |
 | 7 | AI 蒙版与性能优化 | ⏳ 待开始 |
