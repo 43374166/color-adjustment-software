@@ -25,7 +25,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Image
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -67,7 +66,6 @@ fun PhotoViewer(
 ) {
     if (images.isEmpty()) return
 
-    val context = LocalContext.current
     val pagerState = rememberPagerState(
         initialPage = initialIndex.coerceIn(0, images.lastIndex),
     ) { images.size }
@@ -147,23 +145,7 @@ fun PhotoViewer(
                 label = "编辑",
                 onClick = { onEdit(current) },
             )
-            BottomViewerAction(
-                icon = Icons.Filled.Share,
-                label = "分享",
-                onClick = { shareImage(context, current) },
-            )
         }
-    }
-}
-
-private fun shareImage(context: android.content.Context, image: MediaImage) {
-    val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-        type = "image/*"
-        putExtra(android.content.Intent.EXTRA_STREAM, image.uri)
-        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
-    }
-    runCatching {
-        context.startActivity(android.content.Intent.createChooser(intent, "分享照片"))
     }
 }
 

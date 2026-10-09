@@ -46,7 +46,6 @@ import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SelectAll
-import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -194,17 +193,6 @@ fun DeviceTab(
             .toList()
     }
 
-    fun shareImages(targets: List<MediaImage>) {
-        if (targets.isEmpty()) return
-        val intent = Intent(Intent.ACTION_SEND_MULTIPLE).apply {
-            type = "image/*"
-            putParcelableArrayListExtra(Intent.EXTRA_STREAM, ArrayList(targets.map { it.uri }))
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        runCatching { context.startActivity(Intent.createChooser(intent, "分享照片")) }
-            .onFailure { Toast.makeText(context, "没有可用的分享应用", Toast.LENGTH_SHORT).show() }
-    }
-
     val takePictureLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.TakePicture(),
     ) { saved ->
@@ -266,7 +254,6 @@ fun DeviceTab(
                 count = selectedIds.size,
                 onSelectAll = { selectedIds = visibleImages.map { it.id }.toSet() },
                 onClear = { selectedIds = emptySet() },
-                onShare = { shareImages(visibleImages.filter { it.id in selectedIds }) },
                 onDone = {
                     selectionMode = false
                     selectedIds = emptySet()
@@ -337,7 +324,6 @@ fun DeviceTab(
         }
 
         BottomActionBar(
-            selectedCount = selectedIds.size,
             onImport = {
                 importLauncher.launch(
                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
@@ -354,10 +340,9 @@ fun DeviceTab(
                             pendingCaptureUri = null
                             MediaStoreRepository.discardCameraImage(context, uri)
                             Toast.makeText(context, "没有可用的相机应用", Toast.LENGTH_SHORT).show()
-                        }
+                    }
                 }
             },
-            onShare = { shareImages(visibleImages.filter { it.id in selectedIds }) },
         )
     }
 
@@ -540,7 +525,6 @@ private fun SelectionBar(
     count: Int,
     onSelectAll: () -> Unit,
     onClear: () -> Unit,
-    onShare: () -> Unit,
     onDone: () -> Unit,
 ) {
     Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxWidth()) {
@@ -559,9 +543,6 @@ private fun SelectionBar(
                 Text("全选")
             }
             TextButton(onClick = onClear, enabled = count > 0) { Text("取消全选") }
-            IconButton(onClick = onShare, enabled = count > 0) {
-                Icon(Icons.Filled.Share, contentDescription = "分享")
-            }
             TextButton(onClick = onDone) { Text("完成") }
         }
     }
@@ -569,10 +550,8 @@ private fun SelectionBar(
 
 @Composable
 private fun BottomActionBar(
-    selectedCount: Int,
     onImport: () -> Unit,
     onCamera: () -> Unit,
-    onShare: () -> Unit,
 ) {
     Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth()) {
         Row(
@@ -588,12 +567,6 @@ private fun BottomActionBar(
                 icon = Icons.Filled.CameraAlt,
                 label = "相机",
                 onClick = onCamera,
-            )
-            BottomAction(
-                icon = Icons.Filled.Share,
-                label = if (selectedCount > 0) "分享($selectedCount)" else "分享",
-                enabled = selectedCount > 0,
-                onClick = onShare,
             )
         }
     }
