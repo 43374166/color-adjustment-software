@@ -312,6 +312,7 @@ fun EditorScreen(
             lens = lensUi,
         )
         val bitmap = withContext(Dispatchers.Default) {
+            val renderStart = System.nanoTime()
             var result: Bitmap? = null
             if (useGpu && PreviewRenderer.isGpuReady()) {
                 result = PreviewRenderer.renderGpuIfReady(file.path, json)
@@ -341,6 +342,18 @@ fun EditorScreen(
                 else -> "CPU"
             }
             result
+                .also {
+                    val elapsed = (System.nanoTime() - renderStart) / 1_000_000.0
+                    android.util.Log.i(
+                        "fdxmp",
+                        String.format(
+                            java.util.Locale.US,
+                            "预览耗时 %.0f ms（%s）",
+                            elapsed,
+                            rendererLabel,
+                        ),
+                    )
+                }
         }
         previewBitmap = bitmap
         if (bitmap == null) {
