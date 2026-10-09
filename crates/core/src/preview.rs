@@ -11,7 +11,8 @@ use image::RgbaImage;
 
 use crate::error::Result;
 use crate::params::{
-    eval_curve, CropParams, CurveParams, EditParams, ParametricCurve, ToneCurve,
+    eval_curve, ColorGradingParams, CropParams, CurveParams, DetailParams, EditParams, HslParams,
+    ParametricCurve, ToneCurve,
 };
 
 /// CPU 预览渲染结果：尺寸 + RGBA8 像素（行优先）。
@@ -160,7 +161,8 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
     let curves = CurveLuts::new(&params.curves);
     let mut out = source.clone();
 
-    for (x, y, pixel) in out.enumerate_pixels_mut() {
+    // 第一遍：逐像素颜色（基础 → 分区 → 曲线 → 饱和度 → HSL → 分级）。
+    for pixel in out.pixels_mut() {
         let [r, g, b, a] = pixel.0;
         let linear = [
             srgb_to_linear(r as f32 / 255.0),
@@ -173,21 +175,22 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
             linear_to_srgb(base[1]),
             linear_to_srgb(base[2]),
         ];
-
-        // 全局基础调色：分区色调 → 曲线 → 饱和度 / 自然饱和度。
         rgb = adjust_pixel(rgb, params, &curves);
+        pixel.0 = [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), a];
+    }
 
+    // 第二遍：细节（锐化 / 降噪）需要邻域。
+    apply_detail(&mut out, &params.detail);
+
+    // 第三遍：全局效果（暗角 / 颗粒）。
+    for (x, y, pixel) in out.enumerate_pixels_mut() {
+        let [r, g, b, a] = pixel.0;
+        let mut rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
         rgb = apply_effects(rgb, effects, x, y, width, height);
-
         for channel in &mut rgb {
             *channel = channel.clamp(0.0, 1.0);
         }
-        pixel.0 = [
-            to_u8(rgb[0]),
-            to_u8(rgb[1]),
-            to_u8(rgb[2]),
-            a,
-        ];
+        pixel.0 = [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), a];
     }
 
     out
@@ -322,7 +325,11 @@ fn adjust_pixel(mut rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [
     for channel in &mut rgb {
         *channel = luminance_now + (*channel - luminance_now) * factor;
     }
-    rgb
+
+    // HSL 八色带。
+    rgb = apply_hsl(rgb, &params.hsl);
+    // 颜色分级（阴影 / 中间调 / 高光）。
+    apply_grading(rgb, &params.grading)
 }
 
 /// 全局效果：暗角 + 颗粒。
@@ -369,6 +376,290 @@ fn apply_effects(
 
 fn luminance(rgb: [f32; 3]) -> f32 {
     0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+/// HSL 八色带中心（色相圈 0..1）。
+const HSL_BAND_CENTERS: [f32; 8] = [
+    0.0,
+    30.0 / 360.0,
+    60.0 / 360.0,
+    120.0 / 360.0,
+    180.0 / 360.0,
+    240.0 / 360.0,
+    280.0 / 360.0,
+    320.0 / 360.0,
+];
+
+/// HSL：按色相把 8 个色带的调整平滑混合后应用。
+fn apply_hsl(rgb: [f32; 3], hsl: &HslParams) -> [f32; 3] {
+    let bands = [
+        &hsl.red,
+        &hsl.orange,
+        &hsl.yellow,
+        &hsl.green,
+        &hsl.aqua,
+        &hsl.blue,
+        &hsl.purple,
+        &hsl.magenta,
+    ];
+    if bands
+        .iter()
+        .all(|band| band.hue == 0.0 && band.saturation == 0.0 && band.luminance == 0.0)
+    {
+        return rgb;
+    }
+    let (hue, saturation, value) = rgb_to_hsv(rgb);
+    if saturation <= 0.02 {
+        return rgb;
+    }
+
+    const RADIUS: f32 = 0.10;
+    let mut hue_shift = 0.0f32;
+    let mut saturation_shift = 0.0f32;
+    let mut luminance_shift = 0.0f32;
+    let mut weight_total = 0.0f32;
+    for (index, center) in HSL_BAND_CENTERS.iter().enumerate() {
+        let mut distance = (hue - center).abs();
+        if distance > 0.5 {
+            distance = 1.0 - distance;
+        }
+        let weight = (1.0 - distance / RADIUS).max(0.0);
+        if weight > 0.0 {
+            let band = bands[index];
+            hue_shift += band.hue / 100.0 * weight;
+            saturation_shift += band.saturation / 100.0 * weight;
+            luminance_shift += band.luminance / 100.0 * weight;
+            weight_total += weight;
+        }
+    }
+    if weight_total <= 0.0 {
+        return rgb;
+    }
+    hue_shift /= weight_total;
+    saturation_shift /= weight_total;
+    luminance_shift /= weight_total;
+
+    let visible = smoothstep(0.02, 0.22, saturation);
+    let new_hue = (hue + hue_shift * visible * 0.08).rem_euclid(1.0);
+    let new_saturation = (saturation * (1.0 + saturation_shift * visible)).clamp(0.0, 1.0);
+    let new_value = (value + luminance_shift * visible * 0.22).clamp(0.0, 1.0);
+    hsv_to_rgb(new_hue, new_saturation, new_value)
+}
+
+/// 颜色分级：阴影 / 中间调 / 高光三个区域的色相、饱和度、明亮度。
+fn apply_grading(rgb: [f32; 3], grading: &ColorGradingParams) -> [f32; 3] {
+    let zones = [&grading.shadows, &grading.midtones, &grading.highlights];
+    if zones
+        .iter()
+        .all(|zone| zone.saturation <= 0.01 && zone.luminance == 0.0)
+    {
+        return rgb;
+    }
+    let luma = luminance(rgb);
+    let balanced = (luma + grading.balance / 100.0 * 0.15).clamp(0.0, 1.0);
+    let blend = (grading.blending / 100.0).clamp(0.0, 1.0);
+    let exponent = 1.0 + blend * 1.5;
+    let weights = [
+        (1.0 - smoothstep(0.0, 0.55, balanced)).powf(exponent),
+        (1.0 - (balanced - 0.5).abs() * 2.0).max(0.0).powf(exponent),
+        smoothstep(0.45, 1.0, balanced).powf(exponent),
+    ];
+
+    let mut out = rgb;
+    for (zone, weight) in zones.iter().zip(weights) {
+        if weight <= 0.001 {
+            continue;
+        }
+        let strength = (zone.saturation / 100.0).clamp(0.0, 1.0) * weight;
+        if strength > 0.0 {
+            let tint = hsv_to_rgb((zone.hue / 360.0).rem_euclid(1.0), 1.0, 1.0);
+            for channel in 0..3 {
+                out[channel] += (tint[channel] - out[channel]) * strength * 0.5;
+            }
+        }
+        if zone.luminance != 0.0 {
+            let factor = 1.0 + (zone.luminance / 100.0) * weight * 0.25;
+            for channel in &mut out {
+                *channel *= factor;
+            }
+        }
+    }
+    out
+}
+
+/// 细节：USM 锐化 + 亮度 / 颜色降噪（颜色管线之后、效果之前）。
+pub fn apply_detail(image: &mut RgbaImage, detail: &DetailParams) {
+    let sharpen = &detail.sharpen;
+    let noise = &detail.noise;
+    let need_sharpen = sharpen.amount > 0.01;
+    let need_luminance_nr = noise.luminance > 0.01;
+    let need_color_nr = noise.color > 0.01;
+    if !need_sharpen && !need_luminance_nr && !need_color_nr {
+        return;
+    }
+
+    let radius = if need_sharpen {
+        (sharpen.radius.max(0.5).round() as u32).clamp(1, 4)
+    } else {
+        2
+    };
+    let blurred = blur_rgb(image, radius);
+    let (width, height) = image.dimensions();
+
+    for y in 0..height {
+        for x in 0..width {
+            let index = (y as usize) * width as usize + x as usize;
+            let source = image.get_pixel(x, y).0;
+            let mut rgb = [
+                source[0] as f32 / 255.0,
+                source[1] as f32 / 255.0,
+                source[2] as f32 / 255.0,
+            ];
+            let blur = blurred[index];
+
+            if need_luminance_nr {
+                let amount = (noise.luminance / 100.0).clamp(0.0, 1.0) * 0.85;
+                let detail_factor = (0.4 + noise.luminance_detail / 100.0 * 0.6).clamp(0.2, 1.0);
+                let weight = amount * detail_factor;
+                for channel in 0..3 {
+                    rgb[channel] += (blur[channel] - rgb[channel]) * weight;
+                }
+            }
+            if need_color_nr {
+                let amount = (noise.color / 100.0).clamp(0.0, 1.0) * 0.85;
+                let detail_factor = (0.4 + noise.color_detail / 100.0 * 0.6).clamp(0.2, 1.0);
+                let weight = amount * detail_factor;
+                let luminance_original = luminance(rgb);
+                let luminance_blurred = luminance(blur);
+                for channel in 0..3 {
+                    let chroma_original = rgb[channel] - luminance_original;
+                    let chroma_blurred = blur[channel] - luminance_blurred;
+                    rgb[channel] = luminance_original
+                        + chroma_original
+                        + (chroma_blurred - chroma_original) * weight;
+                }
+            }
+            if need_sharpen {
+                let amount = (sharpen.amount / 100.0).clamp(0.0, 1.5);
+                let detail_factor = (0.5 + sharpen.detail / 100.0).clamp(0.5, 1.5);
+                let masking = (sharpen.masking / 100.0).clamp(0.0, 1.0);
+                let diff = [
+                    rgb[0] - blur[0],
+                    rgb[1] - blur[1],
+                    rgb[2] - blur[2],
+                ];
+                let edge = (diff[0].abs() + diff[1].abs() + diff[2].abs()) / 3.0;
+                let mask_weight = if masking <= 0.001 {
+                    1.0
+                } else {
+                    let threshold = 0.004 + masking * 0.05;
+                    smoothstep(0.0, threshold, edge)
+                };
+                let scale = amount * detail_factor * mask_weight;
+                for channel in 0..3 {
+                    rgb[channel] += diff[channel] * scale;
+                }
+            }
+
+            for channel in &mut rgb {
+                *channel = channel.clamp(0.0, 1.0);
+            }
+            image.put_pixel(
+                x,
+                y,
+                image::Rgba([to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), source[3]]),
+            );
+        }
+    }
+}
+
+/// 可分离盒式模糊（两次横向 + 纵向，近似高斯）。
+fn blur_rgb(image: &RgbaImage, radius: u32) -> Vec<[f32; 3]> {
+    let (width, height) = image.dimensions();
+    let w = width as usize;
+    let h = height as usize;
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let source: Vec<[f32; 3]> = image
+        .pixels()
+        .map(|pixel| {
+            [
+                pixel.0[0] as f32 / 255.0,
+                pixel.0[1] as f32 / 255.0,
+                pixel.0[2] as f32 / 255.0,
+            ]
+        })
+        .collect();
+    let radius = radius.max(1) as isize;
+    let mut horizontal = vec![[0f32; 3]; source.len()];
+    let mut out = vec![[0f32; 3]; source.len()];
+
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0f32; 3];
+            let mut count = 0f32;
+            for offset in -radius..=radius {
+                let sx = (x as isize + offset).clamp(0, w as isize - 1) as usize;
+                let sample = source[y * w + sx];
+                for channel in 0..3 {
+                    sum[channel] += sample[channel];
+                }
+                count += 1.0;
+            }
+            horizontal[y * w + x] = [sum[0] / count, sum[1] / count, sum[2] / count];
+        }
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let mut sum = [0f32; 3];
+            let mut count = 0f32;
+            for offset in -radius..=radius {
+                let sy = (y as isize + offset).clamp(0, h as isize - 1) as usize;
+                let sample = horizontal[sy * w + x];
+                for channel in 0..3 {
+                    sum[channel] += sample[channel];
+                }
+                count += 1.0;
+            }
+            out[y * w + x] = [sum[0] / count, sum[1] / count, sum[2] / count];
+        }
+    }
+    out
+}
+
+fn rgb_to_hsv(rgb: [f32; 3]) -> (f32, f32, f32) {
+    let max = rgb[0].max(rgb[1]).max(rgb[2]);
+    let min = rgb[0].min(rgb[1]).min(rgb[2]);
+    let delta = max - min;
+    let hue = if delta <= f32::EPSILON {
+        0.0
+    } else if max == rgb[0] {
+        ((rgb[1] - rgb[2]) / delta).rem_euclid(6.0) / 6.0
+    } else if max == rgb[1] {
+        (((rgb[2] - rgb[0]) / delta) + 2.0) / 6.0
+    } else {
+        (((rgb[0] - rgb[1]) / delta) + 4.0) / 6.0
+    };
+    let saturation = if max <= f32::EPSILON { 0.0 } else { delta / max };
+    (hue.rem_euclid(1.0), saturation, max)
+}
+
+fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
+    let h = hue.rem_euclid(1.0) * 6.0;
+    let index = h.floor();
+    let fraction = h - index;
+    let p = value * (1.0 - saturation);
+    let q = value * (1.0 - saturation * fraction);
+    let t = value * (1.0 - saturation * (1.0 - fraction));
+    match index as i32 % 6 {
+        0 => [value, t, p],
+        1 => [q, value, p],
+        2 => [p, value, t],
+        3 => [p, q, value],
+        4 => [t, p, value],
+        _ => [value, p, q],
+    }
 }
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -606,5 +897,52 @@ mod tests {
         let top = out.get_pixel(0, 0).0[0];
         let bottom = out.get_pixel(0, 3).0[0];
         assert!(top > bottom + 10, "top={top} bottom={bottom}");
+    }
+
+    #[test]
+    fn hsl_red_band_desaturates_red() {
+        let source = RgbaImage::from_pixel(2, 2, Rgba([200, 40, 40, 255]));
+        let mut params = EditParams::default();
+        params.hsl.red.saturation = -100.0;
+        let out = render_preview_image(&source, &params);
+        let pixel = out.get_pixel(0, 0).0;
+        assert!(
+            (pixel[1] as i32 - pixel[0] as i32).abs() < 40,
+            "红色饱和度降低后应更接近灰色：{pixel:?}"
+        );
+    }
+
+    #[test]
+    fn grading_tints_shadows_blue() {
+        let source = RgbaImage::from_pixel(2, 2, Rgba([30, 30, 30, 255]));
+        let mut params = EditParams::default();
+        params.grading.shadows.hue = 240.0;
+        params.grading.shadows.saturation = 100.0;
+        let out = render_preview_image(&source, &params);
+        let pixel = out.get_pixel(0, 0).0;
+        assert!(pixel[2] > pixel[0], "阴影应偏蓝：{pixel:?}");
+    }
+
+    #[test]
+    fn sharpen_increases_edge_contrast() {
+        let mut source = RgbaImage::new(4, 1);
+        for x in 0..4 {
+            source.put_pixel(
+                x,
+                0,
+                if x < 2 {
+                    Rgba([80, 80, 80, 255])
+                } else {
+                    Rgba([140, 140, 140, 255])
+                },
+            );
+        }
+        let mut params = EditParams::default();
+        params.detail.sharpen.amount = 100.0;
+        params.detail.sharpen.radius = 1.0;
+        let out = render_preview_image(&source, &params);
+        let left = out.get_pixel(1, 0).0[0] as i32;
+        let right = out.get_pixel(2, 0).0[0] as i32;
+        assert!(right - left > 60, "锐化后边缘对比应增大：left={left} right={right}");
     }
 }

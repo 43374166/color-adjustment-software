@@ -33,6 +33,7 @@ import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.CenterFocusStrong
+import androidx.compose.material.icons.filled.Details
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Save
@@ -84,6 +85,7 @@ private enum class EditCategory(val label: String, val groupKey: String) {
     Light("亮度", "light"),
     Color("颜色", "color"),
     Effects("效果", "effects"),
+    Detail("细节", "detail"),
 }
 
 private enum class EffectTab(val label: String) {
@@ -232,6 +234,13 @@ fun EditorScreen(
     var selectedMask by remember { mutableStateOf(0) }
     var maskCategory by remember { mutableStateOf(EditCategory.Light) }
     var maskEffectTab by remember { mutableStateOf(EffectTab.Effects) }
+    var colorTab by remember { mutableStateOf(ColorTab.Base) }
+    var colorTabHslBand by remember { mutableStateOf(HslBandKind.Red) }
+    var hslUi by remember(record.uri) { mutableStateOf(parseHsl(record.paramsJson)) }
+    var gradingZone by remember { mutableStateOf(GradingZoneKind.Shadows) }
+    var gradingUi by remember(record.uri) { mutableStateOf(parseGrading(record.paramsJson)) }
+    var detailTab by remember { mutableStateOf(DetailTab.Sharpen) }
+    var detailUi by remember(record.uri) { mutableStateOf(parseDetail(record.paramsJson)) }
     var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
@@ -258,6 +267,9 @@ fun EditorScreen(
             crop = cropUi,
             applyCropRect = tool != EditorTool.Crop,
             masks = masks,
+            hsl = hslUi,
+            grading = gradingUi,
+            detail = detailUi,
         )
         val bitmap = withContext(Dispatchers.Default) {
             PreviewRenderer.render(file.path, json, 1440)
@@ -339,6 +351,9 @@ fun EditorScreen(
                         crop = cropUi,
                         applyCropRect = true,
                         masks = masks,
+                        hsl = hslUi,
+                        grading = gradingUi,
+                        detail = detailUi,
                     ),
                     presetName = presetName,
                     updatedAt = System.currentTimeMillis(),
@@ -502,30 +517,109 @@ fun EditorScreen(
                                         values = EDITOR_SLIDERS.map { it.defaultValue }
                                         curvePoints = identityCurveMap()
                                         parametric = ParametricUi()
+                                        hslUi = HslUi()
+                                        gradingUi = GradingUi()
+                                        detailUi = DetailUi()
                                         presetName = "原片"
                                         renderVersion += 1
                                     },
                                 )
-                                SlidersPanel(
-                                    category = category,
-                                    effectTab = effectTab,
-                                    values = values,
-                                    modifier = Modifier.weight(1f),
-                                    onEffectTabChange = { effectTab = it },
-                                    onValueChange = { index, newValue ->
-                                        if (dragSnapshot == null) dragSnapshot = values
-                                        values = values.toMutableList().also { it[index] = newValue }
-                                        pendingRender += 1
-                                    },
-                                    onValueChangeFinished = {
-                                        dragSnapshot?.let { before ->
-                                            if (before != values) pushHistory(before)
+                                Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+                                    when (category) {
+                                        EditCategory.Detail -> DetailPanel(
+                                            detail = detailUi,
+                                            selectedTab = detailTab,
+                                            onSelectTab = { detailTab = it },
+                                            onChange = {
+                                                detailUi = it
+                                                presetName = "自定义"
+                                                pendingRender += 1
+                                            },
+                                            modifier = Modifier.fillMaxSize(),
+                                        )
+
+                                        EditCategory.Color -> Column(Modifier.fillMaxSize()) {
+                                            PanelSubTabs(
+                                                labels = ColorTab.entries.map { it.label },
+                                                selectedIndex = colorTab.ordinal,
+                                                onSelect = { colorTab = ColorTab.entries[it] },
+                                            )
+                                            when (colorTab) {
+                                                ColorTab.Base -> SlidersPanel(
+                                                    category = EditCategory.Color,
+                                                    effectTab = effectTab,
+                                                    values = values,
+                                                    modifier = Modifier.weight(1f),
+                                                    onEffectTabChange = { effectTab = it },
+                                                    onValueChange = { index, newValue ->
+                                                        if (dragSnapshot == null) {
+                                                            dragSnapshot = values
+                                                        }
+                                                        values = values.toMutableList().also {
+                                                            it[index] = newValue
+                                                        }
+                                                        pendingRender += 1
+                                                    },
+                                                    onValueChangeFinished = {
+                                                        dragSnapshot?.let { before ->
+                                                            if (before != values) pushHistory(before)
+                                                        }
+                                                        dragSnapshot = null
+                                                        presetName = "自定义"
+                                                        renderVersion += 1
+                                                    },
+                                                )
+
+                                                ColorTab.Hsl -> HslPanel(
+                                                    hsl = hslUi,
+                                                    selectedBand = colorTabHslBand,
+                                                    onSelectBand = { colorTabHslBand = it },
+                                                    onChange = {
+                                                        hslUi = it
+                                                        presetName = "自定义"
+                                                        pendingRender += 1
+                                                    },
+                                                    modifier = Modifier.weight(1f),
+                                                )
+
+                                                ColorTab.Grading -> GradingPanel(
+                                                    grading = gradingUi,
+                                                    selectedZone = gradingZone,
+                                                    onSelectZone = { gradingZone = it },
+                                                    onChange = {
+                                                        gradingUi = it
+                                                        presetName = "自定义"
+                                                        pendingRender += 1
+                                                    },
+                                                    modifier = Modifier.weight(1f),
+                                                )
+                                            }
                                         }
-                                        dragSnapshot = null
-                                        presetName = "自定义"
-                                        renderVersion += 1
-                                    },
-                                )
+
+                                        else -> SlidersPanel(
+                                            category = category,
+                                            effectTab = effectTab,
+                                            values = values,
+                                            modifier = Modifier.fillMaxSize(),
+                                            onEffectTabChange = { effectTab = it },
+                                            onValueChange = { index, newValue ->
+                                                if (dragSnapshot == null) dragSnapshot = values
+                                                values = values.toMutableList().also {
+                                                    it[index] = newValue
+                                                }
+                                                pendingRender += 1
+                                            },
+                                            onValueChangeFinished = {
+                                                dragSnapshot?.let { before ->
+                                                    if (before != values) pushHistory(before)
+                                                }
+                                                dragSnapshot = null
+                                                presetName = "自定义"
+                                                renderVersion += 1
+                                            },
+                                        )
+                                    }
+                                }
                                 CategoryRow(
                                     selected = category,
                                     onSelect = { category = it },
@@ -875,6 +969,13 @@ private fun CategoryRow(
             onClick = { onSelect(EditCategory.Effects) },
             modifier = Modifier.weight(1f),
         )
+        CategoryChip(
+            icon = Icons.Filled.Details,
+            label = EditCategory.Detail.label,
+            active = selected == EditCategory.Detail && !curveActive,
+            onClick = { onSelect(EditCategory.Detail) },
+            modifier = Modifier.weight(1f),
+        )
     }
 }
 
@@ -1146,6 +1247,65 @@ private fun parseMasks(paramsJson: String): List<MaskUi> {
     return masks
 }
 
+private fun parseHsl(paramsJson: String): HslUi {
+    val json = runCatching { JSONObject(paramsJson).optJSONObject("hsl") }.getOrNull()
+        ?: return HslUi()
+    return HslUi(
+        bands = HslBandKind.entries.map { kind ->
+            val band = json.optJSONObject(kind.serde) ?: return@map HslBandUi()
+            HslBandUi(
+                hue = band.optDouble("hue", 0.0).toFloat(),
+                saturation = band.optDouble("saturation", 0.0).toFloat(),
+                luminance = band.optDouble("luminance", 0.0).toFloat(),
+            )
+        },
+    )
+}
+
+private fun parseGrading(paramsJson: String): GradingUi {
+    val json = runCatching { JSONObject(paramsJson).optJSONObject("grading") }.getOrNull()
+        ?: return GradingUi()
+    fun zone(name: String): GradingZoneUi {
+        val zoneJson = json.optJSONObject(name) ?: return GradingZoneUi()
+        return GradingZoneUi(
+            hue = zoneJson.optDouble("hue", 0.0).toFloat(),
+            saturation = zoneJson.optDouble("saturation", 0.0).toFloat(),
+            luminance = zoneJson.optDouble("luminance", 0.0).toFloat(),
+        )
+    }
+    return GradingUi(
+        shadows = zone("shadows"),
+        midtones = zone("midtones"),
+        highlights = zone("highlights"),
+        blending = json.optDouble("blending", 50.0).toFloat(),
+        balance = json.optDouble("balance", 0.0).toFloat(),
+    )
+}
+
+private fun parseDetail(paramsJson: String): DetailUi {
+    val json = runCatching { JSONObject(paramsJson).optJSONObject("detail") }.getOrNull()
+        ?: return DetailUi()
+    val sharpenJson = json.optJSONObject("sharpen")
+    val noiseJson = json.optJSONObject("noise")
+    val radius = sharpenJson?.optDouble("radius", 1.0)?.toFloat() ?: 1f
+    return DetailUi(
+        sharpen = SharpenUi(
+            amount = sharpenJson?.optDouble("amount", 0.0)?.toFloat() ?: 0f,
+            radius = if (radius < 0.3f) 1f else radius,
+            detail = sharpenJson?.optDouble("detail", 25.0)?.toFloat() ?: 25f,
+            masking = sharpenJson?.optDouble("masking", 0.0)?.toFloat() ?: 0f,
+        ),
+        noise = NoiseUi(
+            luminance = noiseJson?.optDouble("luminance", 0.0)?.toFloat() ?: 0f,
+            luminanceDetail = noiseJson?.optDouble("luminance_detail", 50.0)?.toFloat() ?: 50f,
+            luminanceContrast = noiseJson?.optDouble("luminance_contrast", 0.0)?.toFloat() ?: 0f,
+            color = noiseJson?.optDouble("color", 0.0)?.toFloat() ?: 0f,
+            colorDetail = noiseJson?.optDouble("color_detail", 50.0)?.toFloat() ?: 50f,
+            colorSmoothness = noiseJson?.optDouble("color_smoothness", 50.0)?.toFloat() ?: 50f,
+        ),
+    )
+}
+
 private fun buildParamsJson(
     values: List<Float>,
     curves: Map<CurveChannel, List<CurvePointUi>>,
@@ -1153,13 +1313,16 @@ private fun buildParamsJson(
     crop: CropUi,
     applyCropRect: Boolean,
     masks: List<MaskUi>,
+    hsl: HslUi,
+    grading: GradingUi,
+    detail: DetailUi,
 ): String {
     fun value(key: String): Double =
         values[EDITOR_SLIDERS.indexOfFirst { it.key == key }].toDouble()
 
-    val grouped = EditCategory.entries.associateWith { category ->
-        EDITOR_SLIDERS.filter { it.category == category }
-    }
+    val grouped = EditCategory.entries
+        .filter { it != EditCategory.Detail }
+        .associateWith { category -> EDITOR_SLIDERS.filter { it.category == category } }
     return JSONObject().apply {
         put("version", 1)
         grouped.forEach { (category, sliders) ->
@@ -1305,6 +1468,62 @@ private fun buildParamsJson(
                         },
                     )
                 }
+            },
+        )
+        put(
+            "hsl",
+            JSONObject().apply {
+                HslBandKind.entries.forEachIndexed { index, kind ->
+                    val band = hsl.bands.getOrElse(index) { HslBandUi() }
+                    put(
+                        kind.serde,
+                        JSONObject().apply {
+                            put("hue", band.hue.toDouble())
+                            put("saturation", band.saturation.toDouble())
+                            put("luminance", band.luminance.toDouble())
+                        },
+                    )
+                }
+            },
+        )
+        put(
+            "grading",
+            JSONObject().apply {
+                fun zoneJson(zone: GradingZoneUi): JSONObject = JSONObject().apply {
+                    put("hue", zone.hue.toDouble())
+                    put("saturation", zone.saturation.toDouble())
+                    put("luminance", zone.luminance.toDouble())
+                }
+                put("shadows", zoneJson(grading.shadows))
+                put("midtones", zoneJson(grading.midtones))
+                put("highlights", zoneJson(grading.highlights))
+                put("blending", grading.blending.toDouble())
+                put("balance", grading.balance.toDouble())
+            },
+        )
+        put(
+            "detail",
+            JSONObject().apply {
+                put(
+                    "sharpen",
+                    JSONObject().apply {
+                        put("amount", detail.sharpen.amount.toDouble())
+                        put("radius", detail.sharpen.radius.toDouble())
+                        put("detail", detail.sharpen.detail.toDouble())
+                        put("masking", detail.sharpen.masking.toDouble())
+                    },
+                )
+                put(
+                    "noise",
+                    JSONObject().apply {
+                        put("luminance", detail.noise.luminance.toDouble())
+                        put("luminance_detail", detail.noise.luminanceDetail.toDouble())
+                        put("luminance_contrast", detail.noise.luminanceContrast.toDouble())
+                        put("color", detail.noise.color.toDouble())
+                        put("color_detail", detail.noise.colorDetail.toDouble())
+                        put("color_smoothness", detail.noise.colorSmoothness.toDouble())
+                    },
+                )
             },
         )
     }.toString()
