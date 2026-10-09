@@ -10,7 +10,9 @@ use std::path::Path;
 use image::RgbaImage;
 
 use crate::error::Result;
-use crate::params::{eval_curve, CurveParams, EditParams, ParametricCurve, ToneCurve};
+use crate::params::{
+    eval_curve, CropParams, CurveParams, EditParams, ParametricCurve, ToneCurve,
+};
 
 /// CPU 预览渲染结果：尺寸 + RGBA8 像素（行优先）。
 pub struct PreviewRgba {
@@ -28,11 +30,125 @@ pub fn render_preview_rgba(path: &Path, params_json: &str, max_edge: u32) -> Res
     let decoded = crate::decode::decode_preview(path)?;
     let proxy = decoded.display_proxy(max_edge.clamp(64, 4096));
     let rendered = render_preview_image(&proxy, &params);
+    let geometry = apply_geometry(&rendered, &params.crop);
     Ok(PreviewRgba {
-        width: rendered.width(),
-        height: rendered.height(),
-        rgba: rendered.into_raw(),
+        width: geometry.width(),
+        height: geometry.height(),
+        rgba: geometry.into_raw(),
     })
+}
+
+/// 几何处理：翻转 → 旋转（自动放大避免黑角）→ 按归一化矩形裁剪。
+pub fn apply_geometry(source: &RgbaImage, crop: &CropParams) -> RgbaImage {
+    let mut image = source.clone();
+    if crop.flip_horizontal {
+        image = flip_horizontal(&image);
+    }
+    if crop.flip_vertical {
+        image = flip_vertical(&image);
+    }
+    if crop.rotation_deg.abs() > 0.01 {
+        image = rotate(&image, crop.rotation_deg);
+    }
+    crop_rect(&image, crop.rect)
+}
+
+fn flip_horizontal(source: &RgbaImage) -> RgbaImage {
+    let (width, height) = (source.width(), source.height());
+    let mut out = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            out.put_pixel(width - 1 - x, y, *source.get_pixel(x, y));
+        }
+    }
+    out
+}
+
+fn flip_vertical(source: &RgbaImage) -> RgbaImage {
+    let (width, height) = (source.width(), source.height());
+    let mut out = RgbaImage::new(width, height);
+    for y in 0..height {
+        for x in 0..width {
+            out.put_pixel(x, height - 1 - y, *source.get_pixel(x, y));
+        }
+    }
+    out
+}
+
+/// 旋转并自动放大到覆盖整帧（直线校正后不出现黑角）。
+fn rotate(source: &RgbaImage, degrees: f32) -> RgbaImage {
+    let width = source.width();
+    let height = source.height();
+    if width == 0 || height == 0 {
+        return source.clone();
+    }
+    let radians = degrees.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let w = width as f32;
+    let h = height as f32;
+    // 旋转后包围盒 / 原尺寸的较大者，作为放大系数保证画面铺满。
+    let zoom = ((w * cos.abs() + h * sin.abs()) / w)
+        .max((w * sin.abs() + h * cos.abs()) / h)
+        .max(1.0);
+    let center_x = (width as f32 - 1.0) * 0.5;
+    let center_y = (height as f32 - 1.0) * 0.5;
+    let mut out = RgbaImage::new(width, height);
+
+    for y in 0..height {
+        for x in 0..width {
+            let dx = (x as f32 - center_x) / zoom;
+            let dy = (y as f32 - center_y) / zoom;
+            let sx = center_x + dx * cos + dy * sin;
+            let sy = center_y - dx * sin + dy * cos;
+            out.put_pixel(x, y, sample_bilinear(source, sx, sy));
+        }
+    }
+    out
+}
+
+fn sample_bilinear(source: &RgbaImage, x: f32, y: f32) -> image::Rgba<u8> {
+    let max_x = source.width().saturating_sub(1) as f32;
+    let max_y = source.height().saturating_sub(1) as f32;
+    let x = x.clamp(0.0, max_x);
+    let y = y.clamp(0.0, max_y);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(source.width().saturating_sub(1));
+    let y1 = (y0 + 1).min(source.height().saturating_sub(1));
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+
+    let mut channels = [0u8; 4];
+    for channel in 0..4 {
+        let p00 = source.get_pixel(x0, y0).0[channel] as f32;
+        let p10 = source.get_pixel(x1, y0).0[channel] as f32;
+        let p01 = source.get_pixel(x0, y1).0[channel] as f32;
+        let p11 = source.get_pixel(x1, y1).0[channel] as f32;
+        let top = p00 + (p10 - p00) * fx;
+        let bottom = p01 + (p11 - p01) * fx;
+        channels[channel] = (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8;
+    }
+    image::Rgba(channels)
+}
+
+fn crop_rect(source: &RgbaImage, rect: [f32; 4]) -> RgbaImage {
+    let width = source.width();
+    let height = source.height();
+    if width == 0 || height == 0 {
+        return source.clone();
+    }
+    let x = rect[0].clamp(0.0, 0.99);
+    let y = rect[1].clamp(0.0, 0.99);
+    let w = rect[2].clamp(0.01, 1.0 - x.max(0.0));
+    let h = rect[3].clamp(0.01, 1.0 - y.max(0.0));
+    let left = (x * width as f32).round() as u32;
+    let top = (y * height as f32).round() as u32;
+    let crop_width = ((w * width as f32).round() as u32).clamp(1, width - left.min(width - 1));
+    let crop_height = ((h * height as f32).round() as u32).clamp(1, height - top.min(height - 1));
+    if left == 0 && top == 0 && crop_width == width && crop_height == height {
+        return source.clone();
+    }
+    image::imageops::crop_imm(source, left, top, crop_width, crop_height).to_image()
 }
 
 /// 把编辑参数应用到 sRGB RGBA 图像。
@@ -345,5 +461,35 @@ mod tests {
         ];
         let rendered = render_preview_image(&source, &params);
         assert!(rendered.get_pixel(0, 0).0[0] < 110);
+    }
+
+    #[test]
+    fn crop_rect_halves_image() {
+        let source = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
+        let mut crop = CropParams::default();
+        crop.rect = [0.0, 0.0, 0.5, 0.5];
+        let out = apply_geometry(&source, &crop);
+        assert_eq!(out.width(), 4);
+        assert_eq!(out.height(), 4);
+    }
+
+    #[test]
+    fn rotation_keeps_size() {
+        let source = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
+        let mut crop = CropParams::default();
+        crop.rotation_deg = 10.0;
+        let out = apply_geometry(&source, &crop);
+        assert_eq!(out.dimensions(), (8, 8));
+    }
+
+    #[test]
+    fn flip_horizontal_mirrors_pixels() {
+        let mut source = RgbaImage::new(2, 1);
+        source.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        source.put_pixel(1, 0, Rgba([0, 255, 0, 255]));
+        let mut crop = CropParams::default();
+        crop.flip_horizontal = true;
+        let out = apply_geometry(&source, &crop);
+        assert_eq!(out.get_pixel(0, 0).0, [0, 255, 0, 255]);
     }
 }

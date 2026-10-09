@@ -226,6 +226,7 @@ fun EditorScreen(
     var curveChannel by remember { mutableStateOf(CurveChannel.Rgb) }
     var curvePoints by remember(record.uri) { mutableStateOf(parseCurvePoints(record.paramsJson)) }
     var parametric by remember(record.uri) { mutableStateOf(parseParametric(record.paramsJson)) }
+    var cropUi by remember(record.uri) { mutableStateOf(parseCrop(record.paramsJson)) }
     var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
@@ -241,11 +242,17 @@ fun EditorScreen(
         }
     }
 
-    LaunchedEffect(sourceFile, renderVersion) {
+    LaunchedEffect(sourceFile, renderVersion, tool) {
         val file = sourceFile ?: return@LaunchedEffect
         isRendering = true
         failure = null
-        val json = buildParamsJson(values, curvePoints, parametric)
+        val json = buildParamsJson(
+            values = values,
+            curves = curvePoints,
+            parametric = parametric,
+            crop = cropUi,
+            applyCropRect = tool != EditorTool.Crop,
+        )
         val bitmap = withContext(Dispatchers.Default) {
             PreviewRenderer.render(file.path, json, 1440)
         }
@@ -314,7 +321,13 @@ fun EditorScreen(
             },
             onSave = {
                 val updated = record.copy(
-                    paramsJson = buildParamsJson(values, curvePoints, parametric),
+                    paramsJson = buildParamsJson(
+                        values = values,
+                        curves = curvePoints,
+                        parametric = parametric,
+                        crop = cropUi,
+                        applyCropRect = true,
+                    ),
                     presetName = presetName,
                     updatedAt = System.currentTimeMillis(),
                 )
@@ -351,8 +364,8 @@ fun EditorScreen(
                 CircularProgressIndicator()
             }
 
-            if (showCurve) {
-                CurveSurface(
+            when {
+                showCurve -> CurveSurface(
                     points = curvePoints,
                     parametric = parametric,
                     channel = curveChannel,
@@ -362,8 +375,17 @@ fun EditorScreen(
                         pendingRender += 1
                     },
                 )
-            } else {
-                Box(
+
+                tool == EditorTool.Crop -> CropOverlay(
+                    crop = cropUi,
+                    imageAspect = previewBitmap?.let {
+                        it.width.toFloat() / it.height.coerceAtLeast(1)
+                    } ?: 1f,
+                    onCropChange = { updated -> cropUi = updated },
+                    modifier = Modifier.fillMaxSize(),
+                )
+
+                else -> Box(
                     modifier = Modifier
                         .fillMaxSize()
                         .pointerInput(record.uri) {
@@ -378,14 +400,16 @@ fun EditorScreen(
                 )
             }
 
-            HistogramOverlay(
-                data = histogram,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .fillMaxWidth(0.84f)
-                    .height(80.dp)
-                    .padding(top = 8.dp),
-            )
+            if (tool != EditorTool.Crop) {
+                HistogramOverlay(
+                    data = histogram,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .fillMaxWidth(0.84f)
+                        .height(80.dp)
+                        .padding(top = 8.dp),
+                )
+            }
 
             if (pressingOriginal) {
                 Text(
@@ -493,9 +517,26 @@ fun EditorScreen(
                             onPick = ::applyPreset,
                         )
 
-                        EditorTool.Crop -> ToolPlaceholder(
-                            title = "裁切",
-                            detail = "自由裁剪 / 固定比例 / 旋转 / 翻转，下一步接入",
+                        EditorTool.Crop -> CropControls(
+                            crop = cropUi,
+                            imageAspect = previewBitmap?.let {
+                                it.width.toFloat() / it.height.coerceAtLeast(1)
+                            } ?: 1f,
+                            onCropChange = { updated ->
+                                val needsRender = updated.rotation != cropUi.rotation ||
+                                    updated.flipHorizontal != cropUi.flipHorizontal ||
+                                    updated.flipVertical != cropUi.flipVertical
+                                cropUi = updated
+                                if (needsRender) pendingRender += 1
+                            },
+                            onReset = {
+                                cropUi = CropUi()
+                                pendingRender += 1
+                            },
+                            onDone = {
+                                tool = EditorTool.Edit
+                                renderVersion += 1
+                            },
                         )
 
                         EditorTool.Mask -> ToolPlaceholder(
@@ -505,7 +546,7 @@ fun EditorScreen(
                     }
                 }
 
-                if (!showCurve) {
+                if (!showCurve && tool != EditorTool.Crop) {
                     EditorToolBar(
                         selected = tool,
                         onSelect = { tool = it },
@@ -922,10 +963,38 @@ private fun parseParametric(paramsJson: String): ParametricUi {
     )
 }
 
+private fun parseCrop(paramsJson: String): CropUi {
+    val json = runCatching {
+        JSONObject(paramsJson).optJSONObject("crop")
+    }.getOrNull() ?: return CropUi()
+    val aspect = CropAspect.entries.firstOrNull { it.serdeName == json.optString("aspect") }
+        ?: CropAspect.Free
+    val rectJson = json.optJSONArray("rect")
+    val rect = if (rectJson != null && rectJson.length() >= 4) {
+        CropRect(
+            x = rectJson.optDouble(0, 0.0).toFloat().coerceIn(0f, 1f),
+            y = rectJson.optDouble(1, 0.0).toFloat().coerceIn(0f, 1f),
+            w = rectJson.optDouble(2, 1.0).toFloat().coerceIn(0.01f, 1f),
+            h = rectJson.optDouble(3, 1.0).toFloat().coerceIn(0.01f, 1f),
+        )
+    } else {
+        CropRect(0f, 0f, 1f, 1f)
+    }
+    return CropUi(
+        rect = rect,
+        aspect = aspect,
+        rotation = json.optDouble("rotation_deg", 0.0).toFloat().coerceIn(-45f, 45f),
+        flipHorizontal = json.optBoolean("flip_horizontal", false),
+        flipVertical = json.optBoolean("flip_vertical", false),
+    )
+}
+
 private fun buildParamsJson(
     values: List<Float>,
     curves: Map<CurveChannel, List<CurvePointUi>>,
     parametric: ParametricUi,
+    crop: CropUi,
+    applyCropRect: Boolean,
 ): String {
     fun value(key: String): Double =
         values[EDITOR_SLIDERS.indexOfFirst { it.key == key }].toDouble()
@@ -970,6 +1039,27 @@ private fun buildParamsJson(
                         put("midtones_split", parametric.midtonesSplit.toDouble())
                     },
                 )
+            },
+        )
+        put(
+            "crop",
+            JSONObject().apply {
+                val rect = crop.rect
+                put(
+                    "rect",
+                    JSONArray().apply {
+                        put(if (applyCropRect) rect.x.toDouble() else 0.0)
+                        put(if (applyCropRect) rect.y.toDouble() else 0.0)
+                        put(if (applyCropRect) rect.w.toDouble() else 1.0)
+                        put(if (applyCropRect) rect.h.toDouble() else 1.0)
+                    },
+                )
+                put("aspect", crop.aspect.serdeName)
+                put("rotation_deg", crop.rotation.toDouble())
+                put("flip_horizontal", crop.flipHorizontal)
+                put("flip_vertical", crop.flipVertical)
+                put("grid", "thirds")
+                put("auto_compose", false)
             },
         )
     }.toString()
