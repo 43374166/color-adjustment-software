@@ -505,10 +505,12 @@ fun EditorScreen(
                     }
                 }
 
-                EditorToolBar(
-                    selected = tool,
-                    onSelect = { tool = it },
-                )
+                if (!showCurve) {
+                    EditorToolBar(
+                        selected = tool,
+                        onSelect = { tool = it },
+                    )
+                }
             }
         }
         }
