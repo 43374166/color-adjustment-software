@@ -15,6 +15,6 @@ crate-type = ["cdylib", "rlib"]
 workspace = true
 
 [dependencies]
-fdxmp-core.workspace = true
+fdxmp-core = { workspace = true, features = ["gpu"] }
 jni.workspace = true
-
+serde_json.workspace = true

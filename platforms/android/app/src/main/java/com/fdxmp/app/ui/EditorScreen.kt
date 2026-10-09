@@ -53,6 +53,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
@@ -251,10 +252,16 @@ fun EditorScreen(
     var detailUi by remember(record.uri) { mutableStateOf(parseDetail(record.paramsJson)) }
     var lensUi by remember(record.uri) { mutableStateOf(parseLens(record.paramsJson)) }
     var exporting by remember { mutableStateOf(false) }
+    var useGpu by remember { mutableStateOf(true) }
+    var rendererLabel by remember { mutableStateOf("CPU") }
     var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
     val redoStack = remember { mutableStateListOf<List<Float>>() }
+
+    DisposableEffect(record.uri) {
+        onDispose { PreviewRenderer.releaseGpu() }
+    }
 
     LaunchedEffect(record.uri) {
         val file = withContext(Dispatchers.IO) {
@@ -283,7 +290,29 @@ fun EditorScreen(
             lens = lensUi,
         )
         val bitmap = withContext(Dispatchers.Default) {
-            PreviewRenderer.render(file.path, json, 1440)
+            var result: Bitmap? = null
+            if (useGpu) {
+                result = PreviewRenderer.renderGpu(file.path, json, 1440)
+            }
+            if (result == null) {
+                result = PreviewRenderer.render(file.path, json, 1440)
+            }
+            rendererLabel = if (useGpu && PreviewRenderer.isGpuActive()) {
+                android.util.Log.i(
+                    "fdxmp",
+                    "GPU 预览输出 " + (result?.width ?: 0) + "x" + (result?.height ?: 0),
+                )
+                "GPU · " + (PreviewRenderer.gpuBackend() ?: "vulkan")
+            } else {
+                if (useGpu) {
+                    android.util.Log.w(
+                        "fdxmp",
+                        "GPU 回退 CPU：" + (PreviewRenderer.lastGpuError() ?: "unknown"),
+                    )
+                }
+                "CPU"
+            }
+            result
         }
         previewBitmap = bitmap
         if (bitmap == null) {
@@ -395,7 +424,8 @@ fun EditorScreen(
                             lens = lensUi,
                         )
                         val bitmap = withContext(Dispatchers.Default) {
-                            PreviewRenderer.render(file.path, json, 4096)
+                            PreviewRenderer.renderGpuOnce(file.path, json, 4096)
+                                ?: PreviewRenderer.render(file.path, json, 4096)
                         }
                         val ok = if (bitmap != null) {
                             withContext(Dispatchers.IO) {
@@ -576,6 +606,12 @@ fun EditorScreen(
                             Column(modifier = Modifier.fillMaxSize()) {
                                 PanelHeader(
                                     presetName = presetName,
+                                    rendererLabel = rendererLabel,
+                                    onToggleRenderer = {
+                                        useGpu = !useGpu
+                                        if (!useGpu) PreviewRenderer.releaseGpu()
+                                        renderVersion += 1
+                                    },
                                     onReset = {
                                         pushHistory(values)
                                         values = EDITOR_SLIDERS.map { it.defaultValue }
@@ -930,6 +966,8 @@ private fun EditorTopBar(
 @Composable
 private fun PanelHeader(
     presetName: String,
+    rendererLabel: String,
+    onToggleRenderer: () -> Unit,
     onReset: () -> Unit,
 ) {
     Row(
@@ -944,6 +982,9 @@ private fun PanelHeader(
             color = MaterialTheme.colorScheme.primary,
             modifier = Modifier.weight(1f),
         )
+        TextButton(onClick = onToggleRenderer) {
+            Text(rendererLabel, style = MaterialTheme.typography.labelSmall)
+        }
         TextButton(onClick = onReset) { Text("重置") }
     }
 }
@@ -1474,9 +1515,7 @@ private fun parseLens(paramsJson: String): LensUi {
         vertical = geometry?.optDouble("vertical", 0.0)?.toFloat() ?: 0f,
         horizontal = geometry?.optDouble("horizontal", 0.0)?.toFloat() ?: 0f,
         rotate = geometry?.optDouble("rotate", 0.0)?.toFloat() ?: 0f,
-        scale = geometry?.optDouble("scale", 1.0)?.toFloat()?.let {
-            if (it < 0.3f) 1f else it
-        } ?: 1f,
+        scale = geometry?.optDouble("scale", 0.0)?.toFloat() ?: 0f,
         vignette = json.optDouble("vignette", 0.0).toFloat(),
     )
 }

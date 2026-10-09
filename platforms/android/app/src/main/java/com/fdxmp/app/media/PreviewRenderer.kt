@@ -15,6 +15,80 @@ import java.io.File
  */
 object PreviewRenderer {
 
+    private var gpuHandle: Long = 0L
+    private var gpuPath: String? = null
+
+    @Volatile
+    private var gpuActive = false
+
+    @Volatile
+    private var lastError: String? = null
+
+    /** 最近一次预览是否由 GPU 渲染。 */
+    fun isGpuActive(): Boolean = gpuActive
+
+    /** 最近一次 GPU 失败原因。 */
+    fun lastGpuError(): String? = lastError
+
+    /** GPU 后端名称（无会话返回 null）。 */
+    fun gpuBackend(): String? {
+        val handle = gpuHandle
+        if (handle == 0L) return null
+        return runCatching { NativeBridge.nativeGpuBackend(handle) }.getOrNull()
+    }
+
+    /** GPU 预览：同一路径复用会话，参数变化只重渲染。失败返回 null（调用方回退 CPU）。 */
+    fun renderGpu(path: String, paramsJson: String, maxEdge: Int = 1440): Bitmap? {
+        if (gpuHandle == 0L || gpuPath != path) {
+            releaseGpu()
+            gpuHandle = runCatching {
+                NativeBridge.nativeGpuSessionNew(path, maxEdge)
+            }.getOrDefault(0L)
+            gpuPath = path
+            if (gpuHandle == 0L) {
+                gpuActive = false
+                lastError = runCatching { NativeBridge.nativeGpuLastError() }.getOrNull()
+                return null
+            }
+        }
+        val payload = runCatching {
+            NativeBridge.nativeGpuSessionRender(gpuHandle, paramsJson)
+        }.getOrNull()
+        if (payload == null) {
+            releaseGpu()
+            gpuActive = false
+            return null
+        }
+        val bitmap = decodePayload(payload)
+        gpuActive = bitmap != null
+        return bitmap
+    }
+
+    /** 一次性 GPU 渲染（导出用，渲染完即释放会话）。 */
+    fun renderGpuOnce(path: String, paramsJson: String, maxEdge: Int): Bitmap? {
+        val handle = runCatching {
+            NativeBridge.nativeGpuSessionNew(path, maxEdge)
+        }.getOrDefault(0L)
+        if (handle == 0L) return null
+        return try {
+            runCatching {
+                NativeBridge.nativeGpuSessionRender(handle, paramsJson)
+            }.getOrNull()?.let { decodePayload(it) }
+        } finally {
+            runCatching { NativeBridge.nativeGpuSessionFree(handle) }
+        }
+    }
+
+    fun releaseGpu() {
+        val handle = gpuHandle
+        if (handle != 0L) {
+            runCatching { NativeBridge.nativeGpuSessionFree(handle) }
+        }
+        gpuHandle = 0L
+        gpuPath = null
+        gpuActive = false
+    }
+
     fun cacheSource(context: Context, uri: Uri): File? {
         val dir = File(context.cacheDir, "edit_sources").apply { mkdirs() }
         val file = File(dir, "src_${uri.toString().hashCode().toUInt().toString(16)}.bin")
@@ -32,6 +106,11 @@ object PreviewRenderer {
         val payload = runCatching {
             NativeBridge.nativeRenderPreview(path, paramsJson, maxEdge)
         }.getOrNull() ?: return null
+        gpuActive = false
+        return decodePayload(payload)
+    }
+
+    private fun decodePayload(payload: ByteArray): Bitmap? {
         if (payload.size < 8) return null
 
         val width = ((payload[0].toInt() and 0xFF) shl 24) or

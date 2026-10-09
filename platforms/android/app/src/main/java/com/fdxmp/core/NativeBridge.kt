@@ -22,4 +22,19 @@ object NativeBridge {
      * 失败抛 [IllegalStateException]。
      */
     external fun nativeRenderPreview(path: String, paramsJson: String, maxEdge: Int): ByteArray?
+
+    /** 创建常驻 GPU 预览会话（源图只上传一次），失败返回 0。 */
+    external fun nativeGpuSessionNew(path: String, maxEdge: Int): Long
+
+    /** 用 GPU 会话按参数渲染一帧；返回格式与 [nativeRenderPreview] 相同。 */
+    external fun nativeGpuSessionRender(handle: Long, paramsJson: String): ByteArray?
+
+    /** 释放 GPU 会话。 */
+    external fun nativeGpuSessionFree(handle: Long)
+
+    /** GPU 后端名称（vulkan / gles / …）。 */
+    external fun nativeGpuBackend(handle: Long): String?
+
+    /** 最近一次 GPU 会话创建失败的原因（成功时为 null）。 */
+    external fun nativeGpuLastError(): String?
 }

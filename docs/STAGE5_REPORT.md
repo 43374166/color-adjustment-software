@@ -107,3 +107,13 @@ RAW 文件会在网格中标记，但预览需要 Rust 核心解码（阶段 6 �
 - Android 编辑 Tab：编辑记录列表（缩略图 + 时间 + 预设名），点开继续编辑、删除记录；
 - 验证：API 35 x86_64 模拟器实测通过（设备 → 编辑 → 曝光 +2.9 → 保存 →
   编辑 Tab 出现记录）。
+
+### 5.2 GPU 实时预览（Android，2026-10-09）
+
+- 核心新增 `gpu::PreviewSession`：常驻 wgpu 设备 / 管线 / 源纹理，参数变化只重渲染 + 回读；
+- 设备按 `adapter.limits()/features()` 请求（修复 SwiftShader uniform buffer 限制导致的失败），
+  初始化包 `catch_unwind`，失败自动回退 CPU；
+- Android JNI 新增 GPU 会话接口（新建 / 渲染 / 释放 / 后端名 / 最后错误）；Kotlin 复用会话、
+  面板顶部显示「GPU · vulkan / CPU」并可点按切换；导出优先走一次性 GPU 渲染；
+- 已知取舍：GPU 只做调色（几何趟在部分移动驱动上会缩小画面），裁剪在 CPU 侧完成；
+  「裁剪 + 蒙版」组合自动回退 CPU 保证坐标一致；模拟器 SwiftShader Vulkan 实测通过。

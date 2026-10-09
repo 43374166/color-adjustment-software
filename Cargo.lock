@@ -1310,6 +1310,7 @@ version = "0.1.0"
 dependencies = [
  "fdxmp-core",
  "jni",
+ "serde_json",
 ]
 
 [[package]]

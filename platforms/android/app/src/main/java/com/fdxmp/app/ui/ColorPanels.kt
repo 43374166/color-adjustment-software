@@ -125,7 +125,8 @@ data class LensUi(
     val vertical: Float = 0f,
     val horizontal: Float = 0f,
     val rotate: Float = 0f,
-    val scale: Float = 1f,
+    /** 缩放：0 = 100%（核心约定），正值放大。 */
+    val scale: Float = 0f,
     val vignette: Float = 0f,
 )
 
@@ -522,14 +523,12 @@ fun LensPanel(
             ) { (label, value, updater) ->
                 val range = when (label) {
                     "旋转" -> -45f..45f
-                    "缩放" -> 0.5f..2f
                     else -> -100f..100f
                 }
                 PanelSliderRow(
                     label = label,
                     value = value,
                     range = range,
-                    decimals = if (label == "缩放") 2 else 0,
                     onChange = updater,
                 )
             }
