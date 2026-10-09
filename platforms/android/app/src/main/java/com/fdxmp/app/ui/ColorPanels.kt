@@ -188,6 +188,8 @@ fun PanelSliderRow(
     onChange: (Float) -> Unit,
     decimals: Int = 0,
     preview: String? = null,
+    neutral: Float = 0f,
+    step: Float = 5f,
 ) {
     Column {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -202,10 +204,12 @@ fun PanelSliderRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
-        Slider(
+        CenteredSlider(
             value = value,
             onValueChange = onChange,
             valueRange = range,
+            neutral = neutral,
+            step = step,
         )
     }
 }
@@ -375,6 +379,8 @@ fun GradingPanel(
                     label = label,
                     value = value,
                     range = range,
+                    neutral = if (label == "混合") 50f else 0f,
+                    step = centeredSliderStep(range),
                     onChange = updater,
                 )
             }
@@ -421,16 +427,22 @@ fun DetailPanel(
                     ),
                     key = { it.first },
                 ) { (label, value, updater) ->
+                    val range = when (label) {
+                        "数量" -> 0f..150f
+                        "半径" -> 0.5f..3f
+                        else -> 0f..100f
+                    }
                     PanelSliderRow(
                         label = label,
                         value = value,
-                        range = when (label) {
-                            "数量" -> 0f..150f
-                            "半径" -> 0.5f..3f
-                            "细节" -> 0f..100f
-                            else -> 0f..100f
-                        },
+                        range = range,
                         decimals = if (label == "半径") 1 else 0,
+                        neutral = when (label) {
+                            "半径" -> 1f
+                            "细节" -> 25f
+                            else -> 0f
+                        },
+                        step = centeredSliderStep(range),
                         onChange = updater,
                     )
                 }
@@ -463,6 +475,10 @@ fun DetailPanel(
                         label = label,
                         value = value,
                         range = 0f..100f,
+                        neutral = when (label) {
+                            "亮度细节", "颜色细节", "颜色平滑度" -> 50f
+                            else -> 0f
+                        },
                         onChange = updater,
                     )
                 }
@@ -529,6 +545,7 @@ fun LensPanel(
                     label = label,
                     value = value,
                     range = range,
+                    step = centeredSliderStep(range),
                     onChange = updater,
                 )
             }

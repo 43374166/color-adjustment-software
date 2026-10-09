@@ -439,6 +439,14 @@ fun MaskParamsPanel(
                     value = value,
                     range = range,
                     decimals = if (label == "下界" || label == "上界") 2 else 0,
+                    neutral = when (label) {
+                        "大小" -> 30f
+                        "羽化", "平滑度", "范围" -> 50f
+                        "流动", "密度", "不透明度" -> 100f
+                        "上界" -> 1f
+                        else -> 0f
+                    },
+                    step = if (range.endInclusive - range.start <= 1.5f) 0.05f else 5f,
                     onChange = updater,
                 )
             }

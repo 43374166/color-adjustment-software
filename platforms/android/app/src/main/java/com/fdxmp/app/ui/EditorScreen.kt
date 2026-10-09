@@ -1097,11 +1097,13 @@ private fun SlidersPanel(
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }
-                    Slider(
+                    CenteredSlider(
                         value = values[index],
                         onValueChange = { onValueChange(index, it) },
                         onValueChangeFinished = onValueChangeFinished,
                         valueRange = slider.range,
+                        neutral = slider.defaultValue,
+                        step = centeredSliderStep(slider.range, slider.key),
                     )
                 }
             }
