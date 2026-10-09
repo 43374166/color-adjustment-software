@@ -124,7 +124,8 @@ fun CenteredSlider(
                 )
             }
             // 滑块圆点
-            drawCircle(Color(0xFF101010), radius = 14f, center = Offset(thumbX, centerY))
+            // 圆点尺寸：外圈略收，视觉上更接近原 Material 滑块的 20dp 直径。
+            drawCircle(Color(0xFF101010), radius = 12.5f, center = Offset(thumbX, centerY))
             drawCircle(activeColor, radius = 10f, center = Offset(thumbX, centerY))
         }
     }
