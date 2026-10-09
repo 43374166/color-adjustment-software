@@ -109,60 +109,28 @@ impl PreviewSession {
             // 裁剪 + 蒙版组合在 GPU 下坐标不一致，交给 CPU 预览保证正确性。
             return Err(FdxmpError::Gpu("裁剪与蒙版组合使用 CPU 预览".to_string()));
         }
-        // 几何趟在部分移动驱动上会把画面缩小，这里只用 GPU 做调色，
-        // 裁剪在 CPU 侧做（简单拷贝，代价很小）。
+        // 几何（旋转 / 透视 / 镜头 / 裁剪）全部在 GPU 上完成。
         self.pipeline.render_with(
             &self.context.device,
             &self.context.queue,
             &self.image,
             params,
-            GeometryMode::Full,
+            GeometryMode::Crop,
         );
         let bytes = self.pipeline.readback(
             &self.context.device,
             &self.context.queue,
             &self.image,
         )?;
-        let (full_width, full_height) = self
+        let (width, height) = self
             .pipeline
             .target_size()
             .unwrap_or((self.width, self.height));
-        if bytes.len() < (full_width * full_height * 4) as usize {
-            return Err(FdxmpError::Gpu("GPU 回读数据不完整".to_string()));
-        }
-        crop_rgba(bytes, full_width, full_height, params.crop.rect)
+        Ok((width, height, bytes))
     }
 
     /// 后端名称（vulkan / gles / …）。
     pub fn backend(&self) -> &'static str {
         self.context.backend_name()
     }
-}
-
-/// 按归一化矩形裁剪 RGBA8 数据。
-fn crop_rgba(
-    bytes: Vec<u8>,
-    width: u32,
-    height: u32,
-    rect: [f32; 4],
-) -> Result<(u32, u32, Vec<u8>)> {
-    let x = rect[0].clamp(0.0, 0.99);
-    let y = rect[1].clamp(0.0, 0.99);
-    let w = rect[2].clamp(0.01, 1.0 - x);
-    let h = rect[3].clamp(0.01, 1.0 - y);
-    let left = (x * width as f32).round() as u32;
-    let top = (y * height as f32).round() as u32;
-    let crop_width = ((w * width as f32).round() as u32).clamp(1, width - left.min(width - 1));
-    let crop_height =
-        ((h * height as f32).round() as u32).clamp(1, height - top.min(height - 1));
-    if left == 0 && top == 0 && crop_width == width && crop_height == height {
-        return Ok((width, height, bytes));
-    }
-    let mut out = Vec::with_capacity((crop_width * crop_height * 4) as usize);
-    for row in 0..crop_height {
-        let start = (((top + row) * width + left) * 4) as usize;
-        let end = start + (crop_width * 4) as usize;
-        out.extend_from_slice(&bytes[start..end]);
-    }
-    Ok((crop_width, crop_height, out))
 }

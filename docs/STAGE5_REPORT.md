@@ -115,5 +115,6 @@ RAW 文件会在网格中标记，但预览需要 Rust 核心解码（阶段 6 �
   初始化包 `catch_unwind`，失败自动回退 CPU；
 - Android JNI 新增 GPU 会话接口（新建 / 渲染 / 释放 / 后端名 / 最后错误）；Kotlin 复用会话、
   面板顶部显示「GPU · vulkan / CPU」并可点按切换；导出优先走一次性 GPU 渲染；
-- 已知取舍：GPU 只做调色（几何趟在部分移动驱动上会缩小画面），裁剪在 CPU 侧完成；
+- 几何（旋转 / 透视 / 镜头 / 裁剪）已全部在 GPU 上完成（`GeometryMode::Crop`）；
   「裁剪 + 蒙版」组合自动回退 CPU 保证坐标一致；模拟器 SwiftShader Vulkan 实测通过。
+  面板顶部新增「性能」按钮：CPU / GPU 各 3 帧取平均并写入 logcat（`fdxmp` 标签）。

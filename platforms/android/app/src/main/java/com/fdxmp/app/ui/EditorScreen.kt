@@ -607,6 +607,34 @@ fun EditorScreen(
                                 PanelHeader(
                                     presetName = presetName,
                                     rendererLabel = rendererLabel,
+                                    onBenchmark = {
+                                        val file = sourceFile ?: return@PanelHeader
+                                        scope.launch {
+                                            val json = buildParamsJson(
+                                                values = values,
+                                                curves = curvePoints,
+                                                parametric = parametric,
+                                                crop = cropUi,
+                                                applyCropRect = true,
+                                                masks = masks,
+                                                hsl = hslUi,
+                                                grading = gradingUi,
+                                                detail = detailUi,
+                                                lens = lensUi,
+                                            )
+                                            val (cpuMs, gpuMs) = withContext(Dispatchers.Default) {
+                                                PreviewRenderer.benchmark(file.path, json, 1440, 3)
+                                            }
+                                            val text = String.format(
+                                                java.util.Locale.US,
+                                                "性能：CPU %.0f ms/帧 · GPU %.0f ms/帧",
+                                                cpuMs,
+                                                gpuMs,
+                                            )
+                                            android.util.Log.i("fdxmp", text)
+                                            Toast.makeText(context, text, Toast.LENGTH_LONG).show()
+                                        }
+                                    },
                                     onToggleRenderer = {
                                         useGpu = !useGpu
                                         if (!useGpu) PreviewRenderer.releaseGpu()
@@ -967,6 +995,7 @@ private fun EditorTopBar(
 private fun PanelHeader(
     presetName: String,
     rendererLabel: String,
+    onBenchmark: () -> Unit,
     onToggleRenderer: () -> Unit,
     onReset: () -> Unit,
 ) {
@@ -984,6 +1013,9 @@ private fun PanelHeader(
         )
         TextButton(onClick = onToggleRenderer) {
             Text(rendererLabel, style = MaterialTheme.typography.labelSmall)
+        }
+        TextButton(onClick = onBenchmark) {
+            Text("性能", style = MaterialTheme.typography.labelSmall)
         }
         TextButton(onClick = onReset) { Text("重置") }
     }

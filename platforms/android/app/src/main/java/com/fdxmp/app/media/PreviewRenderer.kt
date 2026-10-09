@@ -89,6 +89,43 @@ object PreviewRenderer {
         gpuActive = false
     }
 
+    /**
+     * 性能基准：各跑 [frames] 帧，返回（CPU 毫秒/帧, GPU 毫秒/帧）。
+     *
+     * CPU 路径包含解码；GPU 路径不含首次上传（会话常驻场景的真实开销）。
+     * GPU 不可用时第二项为 -1。
+     */
+    fun benchmark(
+        path: String,
+        paramsJson: String,
+        maxEdge: Int = 1440,
+        frames: Int = 3,
+    ): Pair<Double, Double> {
+        var cpuNanos = 0L
+        repeat(frames) {
+            val start = System.nanoTime()
+            render(path, paramsJson, maxEdge)
+            cpuNanos += System.nanoTime() - start
+        }
+        var gpuNanos = 0L
+        val handle = runCatching {
+            NativeBridge.nativeGpuSessionNew(path, maxEdge)
+        }.getOrDefault(0L)
+        if (handle != 0L) {
+            // 预热一帧（首帧含管线编译/纹理分配）。
+            runCatching { NativeBridge.nativeGpuSessionRender(handle, paramsJson) }
+            repeat(frames) {
+                val start = System.nanoTime()
+                runCatching { NativeBridge.nativeGpuSessionRender(handle, paramsJson) }
+                gpuNanos += System.nanoTime() - start
+            }
+            runCatching { NativeBridge.nativeGpuSessionFree(handle) }
+        }
+        val cpuMs = cpuNanos / 1e6 / frames
+        val gpuMs = if (gpuNanos > 0) gpuNanos / 1e6 / frames else -1.0
+        return Pair(cpuMs, gpuMs)
+    }
+
     fun cacheSource(context: Context, uri: Uri): File? {
         val dir = File(context.cacheDir, "edit_sources").apply { mkdirs() }
         val file = File(dir, "src_${uri.toString().hashCode().toUInt().toString(16)}.bin")
