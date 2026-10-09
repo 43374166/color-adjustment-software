@@ -1,0 +1,27 @@
+/target
+.tmp/
+**/*.rs.bk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.code-workspace
+
+# 通用依赖与构建产物
+node_modules/
+oh_modules/
+Pods/
+DerivedData/
+platforms/ios/build/
+
+# 打包输出（保留目录占位）
+/dist/**
+!/dist/**/
+!/dist/**/.gitkeep
+
+# Android（本机路径与构建产物）
+platforms/android/local.properties
+platforms/android/.gradle/
+platforms/android/app/build/
+platforms/android/build/
+**/jniLibs/

@@ -1,0 +1,13 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "fdxmp",
+  "version": "0.1.0",
+  "description": "fdxmp HarmonyOS 客户端",
+  "main": "",
+  "author": "fdxmp",
+  "license": "MIT",
+  "dependencies": {
+  },
+  "devDependencies": {
+  }
+}

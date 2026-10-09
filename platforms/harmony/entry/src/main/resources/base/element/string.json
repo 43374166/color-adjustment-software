@@ -1,0 +1,9 @@
+{
+  "string": [
+    { "name": "module_desc", "value": "fdxmp 主模块" },
+    { "name": "EntryAbility_desc", "value": "fdxmp 专业图像处理" },
+    { "name": "EntryAbility_label", "value": "fdxmp" },
+    { "name": "read_media_reason", "value": "读取本地照片用于编辑" }
+  ]
+}
+

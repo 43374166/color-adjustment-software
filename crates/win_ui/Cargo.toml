@@ -1,0 +1,33 @@
+[package]
+name = "fdxmp-win-ui"
+description = "fdxmp Windows UI（egui / eframe）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "fdxmp-win-ui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+gpu = ["fdxmp-core/gpu"]
+raw = ["fdxmp-core/raw"]
+heif = ["fdxmp-core/heif"]
+ai = ["fdxmp-core/ai"]
+full = ["gpu", "raw", "heif", "ai"]
+
+[dependencies]
+fdxmp-core.workspace = true
+eframe.workspace = true
+egui.workspace = true
+rfd.workspace = true
+image.workspace = true
+rayon.workspace = true
+serde.workspace = true
+serde_json.workspace = true

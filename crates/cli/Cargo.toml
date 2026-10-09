@@ -1,0 +1,27 @@
+[package]
+name = "fdxmp-cli"
+description = "fdxmp 命令行测试工具"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "fdxmp-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+gpu = ["fdxmp-core/gpu"]
+raw = ["fdxmp-core/raw"]
+heif = ["fdxmp-core/heif"]
+full = ["gpu", "raw", "heif"]
+
+[dependencies]
+fdxmp-core.workspace = true
+serde_json.workspace = true
+image.workspace = true

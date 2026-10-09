@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>fdxmp</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>读取本地照片用于编辑</string>
+    <key>NSPhotoLibraryAddUsageDescription</key>
+    <string>把导出结果保存到相册</string>
+</dict>
+</plist>
+

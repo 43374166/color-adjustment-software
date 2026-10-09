@@ -1,0 +1,26 @@
+[package]
+name = "fdxmp-ffi"
+description = "fdxmp C ABI 导出层（四端共用）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "fdxmp_ffi"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[features]
+default = []
+gpu = ["fdxmp-core/gpu"]
+raw = ["fdxmp-core/raw"]
+heif = ["fdxmp-core/heif"]
+full = ["gpu", "raw", "heif"]
+
+[dependencies]
+fdxmp-core.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "fdxmp-android-bridge"
+description = "fdxmp Android FFI 桥接（JNI）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "fdxmp_android_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+fdxmp-core.workspace = true
+jni.workspace = true
+

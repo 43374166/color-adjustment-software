@@ -1,0 +1,28 @@
+[package]
+name = "fdxmp-ohos-bridge"
+description = "fdxmp HarmonyOS FFI 桥接（ohos-rs / N-API）"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[lib]
+name = "fdxmp_ohos_bridge"
+crate-type = ["cdylib", "rlib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+fdxmp-core.workspace = true
+
+# ohos-rs（napi-ohos）未发布到 crates.io，需通过 git 引入。
+# 阶段 0 的构建环境无法访问 GitHub git 协议（crates.io 正常），
+# 因此这里不声明依赖，避免整个 workspace 无法解析；启用方式见 README.md。
+#
+# 阶段 5 启用（在能够访问 GitHub git 的环境执行）：
+#
+# [target.'cfg(target_env = "ohos")'.dependencies]
+# napi-ohos = { git = "https://github.com/ohos-rs/ohos-rs", package = "napi-ohos", branch = "main" }
+

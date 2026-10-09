@@ -1,0 +1,25 @@
+[package]
+name = "fdxmp-packer-ui"
+description = "fdxmp 单文件 UI 打包器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "fdxmp-packer-ui"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+egui_extras.workspace = true
+rfd.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+which.workspace = true
+
