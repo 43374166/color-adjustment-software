@@ -31,10 +31,15 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import com.fdxmp.app.media.EditRecord
+import com.fdxmp.app.media.EditStore
 import com.fdxmp.app.media.MediaImage
 import com.fdxmp.app.ui.DeviceTab
+import com.fdxmp.app.ui.EditTab
+import com.fdxmp.app.ui.EditorScreen
 import com.fdxmp.app.ui.FdxmpTheme
 import com.fdxmp.app.ui.PhotoViewer
 import com.fdxmp.core.NativeBridge
@@ -44,7 +49,8 @@ import com.fdxmp.core.NativeBridge
  *
  * 严格按规格实现 Lightroom 移动版式的三大 Tab：
  *   设备（默认）/ 编辑 / 我的。底部导航 + 顶部标题随 Tab 变化，无侧边栏。
- * 设备 Tab 已接入相册（网格 / 列表 / 预览 / 多选）；编辑与我的待后续阶段。
+ * 设备 Tab 已接入相册（网格 / 列表 / 预览 / 多选）；
+ * 编辑 Tab + 基础调色编辑界面（Rust 核心出预览）已接入；我的待后续阶段。
  */
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -66,8 +72,10 @@ private enum class Tab(val label: String, val icon: ImageVector) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FdxmpApp() {
+    val context = LocalContext.current
     var tab by remember { mutableStateOf(Tab.Device) }
-    var pendingEditImage by remember { mutableStateOf<MediaImage?>(null) }
+    var editorRecord by remember { mutableStateOf<EditRecord?>(null) }
+    var editsVersion by remember { mutableStateOf(0) }
     var viewerImages by remember { mutableStateOf<List<MediaImage>>(emptyList()) }
     var viewerStart by remember { mutableStateOf(0) }
     var viewerOpen by remember { mutableStateOf(false) }
@@ -112,8 +120,9 @@ private fun FdxmpApp() {
                 Tab.Device -> DeviceTab(
                     modifier = Modifier.padding(padding),
                     onOpenEditor = { image ->
-                        pendingEditImage = image
-                        tab = Tab.Edit
+                        val uri = image.uri.toString()
+                        editorRecord = EditStore.find(context, uri)
+                            ?: EditRecord.fresh(uri, image.name)
                     },
                     onOpenViewer = { images, start ->
                         viewerImages = images
@@ -122,12 +131,10 @@ private fun FdxmpApp() {
                     },
                 )
 
-                Tab.Edit -> PlaceholderTab(
+                Tab.Edit -> EditTab(
                     modifier = Modifier.padding(padding),
-                    title = "编辑",
-                    detail = pendingEditImage?.let {
-                        "已选择：${it.name}\n\n调色、曲线、蒙版、导出等编辑界面在阶段 6 接入。"
-                    } ?: "还没有选择照片。\n\n去「设备」Tab 点开一张照片，再点「编辑」。",
+                    refreshToken = editsVersion,
+                    onOpenEditor = { editorRecord = it },
                 )
 
                 Tab.Me -> PlaceholderTab(
@@ -145,8 +152,20 @@ private fun FdxmpApp() {
                 onDismiss = { viewerOpen = false },
                 onEdit = { image ->
                     viewerOpen = false
-                    pendingEditImage = image
-                    tab = Tab.Edit
+                    val uri = image.uri.toString()
+                    editorRecord = EditStore.find(context, uri)
+                        ?: EditRecord.fresh(uri, image.name)
+                },
+            )
+        }
+
+        editorRecord?.let { record ->
+            EditorScreen(
+                record = record,
+                onClose = { editorRecord = null },
+                onSaved = {
+                    editsVersion += 1
+                    editorRecord = null
                 },
             )
         }

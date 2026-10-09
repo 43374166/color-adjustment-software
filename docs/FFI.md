@@ -58,6 +58,7 @@
 | `fdxmp_preset_params_json_from_bytes` | 解析 `.fdxmp` → 参数 JSON |
 | `fdxmp_preset_bytes_from_params_json` | 参数 JSON + 名称 + 作者 → `.fdxmp` 字节流 |
 | `fdxmp_probe_json` | 探测格式 / 尺寸 |
+| `fdxmp_render_preview_rgba` | CPU 预览渲染：解码 + 调色 → `width/height + RGBA8` |
 | `fdxmp_cache_total_size` / `fdxmp_cache_clear` | 缓存统计 / 清除 |
 
 ## 4. Android（JNI）
@@ -80,6 +81,7 @@ object NativeBridge {
 | --- | --- |
 | `Java_com_fdxmp_core_NativeBridge_nativeAbiVersion` | `()I` |
 | `Java_com_fdxmp_core_NativeBridge_nativeVersion` | `()Ljava/lang/String;` |
+| `Java_com_fdxmp_core_NativeBridge_nativeRenderPreview` | `(Ljava/lang/String;Ljava/lang/String;I)[B` |
 
 后续接口（阶段 5）按同一模式扩展：`nativeEngineNew`、`nativeApplyParams`、
 `nativeExport` 等，参数使用 JSON 字符串 / 字节数组，避免复杂的 JNI 对象编组。

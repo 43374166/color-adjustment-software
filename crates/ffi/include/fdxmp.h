@@ -55,6 +55,18 @@ uint8_t *fdxmp_preset_bytes_from_params_json(const char *json,
 
 char *fdxmp_probe_json(const char *path);
 
+/* ---- 预览渲染（CPU，移动端 / 无 GPU 环境）----
+ *
+ * 返回缓冲区前 8 字节为大端 width / height，其后为行优先 RGBA8 像素；
+ * 必须用 fdxmp_bytes_free(ptr, len) 释放。失败返回 NULL。
+ */
+uint8_t *fdxmp_render_preview_rgba(const char *path,
+                                   const char *params_json,
+                                   uint32_t max_edge,
+                                   uint32_t *out_width,
+                                   uint32_t *out_height,
+                                   size_t *out_len);
+
 /* ---- 缓存 ---- */
 
 uint64_t fdxmp_cache_total_size(const char *cache_root);
@@ -65,4 +77,3 @@ uint64_t fdxmp_cache_clear(const char *cache_root);
 #endif
 
 #endif /* FDXMP_H */
-

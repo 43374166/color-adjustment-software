@@ -23,6 +23,7 @@ pub mod masks;
 pub mod params;
 pub mod pipeline;
 pub mod preset;
+pub mod preview;
 pub mod white_balance;
 
 #[cfg(feature = "gpu")]

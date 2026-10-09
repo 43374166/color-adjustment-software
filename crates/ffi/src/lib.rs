@@ -424,6 +424,71 @@ pub unsafe extern "C" fn fdxmp_probe_json(path: *const c_char) -> *mut c_char {
     })
 }
 
+/// 解码图像并按 `params_json` 渲染预览，返回 RGBA8 像素缓冲区
+/// （调用方用 `fdxmp_bytes_free(ptr, len)` 释放）；失败返回 NULL。
+///
+/// 缓冲区前 8 字节为大端 `width` / `height`，其后为行优先 RGBA8 像素。
+/// `params_json` 为 `EditParams` 的 JSON（缺省字段自动回落默认值），
+/// `max_edge` 为预览最长边（会限制在 64..=4096）。
+///
+/// # Safety
+///
+/// `path`、`params_json` 必须为合法 C 字符串；`out_width`、`out_height`、
+/// `out_len` 必须为非空可写指针，且未被释放。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_render_preview_rgba(
+    path: *const c_char,
+    params_json: *const c_char,
+    max_edge: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let path = match cstr_to_str(path, "path") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        match fdxmp_core::preview::render_preview_rgba(
+            std::path::Path::new(path),
+            params_json,
+            max_edge,
+        ) {
+            Ok(preview) => {
+                let mut payload = Vec::with_capacity(8 + preview.rgba.len());
+                payload.extend_from_slice(&preview.width.to_be_bytes());
+                payload.extend_from_slice(&preview.height.to_be_bytes());
+                payload.extend_from_slice(&preview.rgba);
+                *out_width = preview.width;
+                *out_height = preview.height;
+                let mut boxed = payload.into_boxed_slice();
+                *out_len = boxed.len();
+                let pointer = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                pointer
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 缓存总大小（字节）；失败返回 [`FDXMP_U64_ERR`]。
 ///
 /// # Safety
