@@ -1,11 +1,15 @@
 package com.fdxmp.app.ui
 
+import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,6 +18,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -25,6 +30,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
@@ -39,9 +45,12 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
@@ -57,6 +66,9 @@ import kotlin.math.sin
 enum class MaskKindUi(val label: String, val serdeName: String) {
     Linear("线性渐变", "linear_gradient"),
     Radial("径向渐变", "radial_gradient"),
+    Brush("画笔", "brush"),
+    ColorRange("颜色范围", "color_range"),
+    LuminanceRange("亮度范围", "luminance_range"),
 }
 
 /**
@@ -74,6 +86,20 @@ data class MaskUi(
     val rotation: Float,
     val inner: Float,
     val values: List<Float>,
+    val opacity: Float = 100f,
+    val feather: Float = 0f,
+    val inverted: Boolean = false,
+    val brushSize: Float = 30f,
+    val brushFeather: Float = 50f,
+    val brushFlow: Float = 100f,
+    val brushDensity: Float = 100f,
+    val strokes: List<List<Offset>> = emptyList(),
+    val color: Triple<Float, Float, Float> = Triple(0.5f, 0.5f, 0.5f),
+    val colorRange: Float = 50f,
+    val colorSmoothness: Float = 50f,
+    val lumMin: Float = 0f,
+    val lumMax: Float = 1f,
+    val lumSmoothness: Float = 50f,
 )
 
 /** 新建蒙版：线性落在画面中部，径向居中。 */
@@ -88,6 +114,15 @@ fun defaultMask(kind: MaskKindUi, index: Int, defaults: List<Float>): MaskUi = M
     rotation = 0f,
     inner = 0.75f,
     values = defaults,
+    opacity = 100f,
+    feather = 0f,
+    inverted = false,
+    color = when (kind) {
+        MaskKindUi.ColorRange -> Triple(0.5f, 0.5f, 0.5f)
+        else -> Triple(0.5f, 0.5f, 0.5f)
+    },
+    lumMin = 0f,
+    lumMax = 1f,
 )
 
 /**
@@ -100,6 +135,7 @@ fun defaultMask(kind: MaskKindUi, index: Int, defaults: List<Float>): MaskUi = M
 fun MaskOverlay(
     mask: MaskUi?,
     imageAspect: Float,
+    previewBitmap: Bitmap?,
     onMaskChange: (MaskUi) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -111,44 +147,112 @@ fun MaskOverlay(
     val maskState = rememberUpdatedState(mask)
     val changeState = rememberUpdatedState(onMaskChange)
     val aspectState = rememberUpdatedState(imageAspect)
+    val bitmapState = rememberUpdatedState(previewBitmap)
 
     Box(
         modifier = modifier
             .onSizeChanged { boxSize = it }
             .pointerInput(boxSize, imageAspect, mask.id) {
-                detectDragGestures(
-                    onDragStart = { position ->
-                        drag = hitTestMask(
-                            mask = maskState.value,
-                            box = boxSize,
-                            imageAspect = aspectState.value,
-                            position = position,
+                when (maskState.value.kind) {
+                    MaskKindUi.Brush -> {
+                        var strokeIndex = -1
+                        detectDragGestures(
+                            onDragStart = { position ->
+                                val normalized = toNormalized(position, boxSize, aspectState.value)
+                                val updated = maskState.value.copy(
+                                    strokes = maskState.value.strokes + listOf(listOf(normalized)),
+                                )
+                                strokeIndex = updated.strokes.lastIndex
+                                changeState.value(updated)
+                            },
+                            onDrag = { change, _ ->
+                                change.consume()
+                                val current = maskState.value
+                                if (strokeIndex !in current.strokes.indices) {
+                                    return@detectDragGestures
+                                }
+                                val normalized =
+                                    toNormalized(change.position, boxSize, aspectState.value)
+                                val strokes = current.strokes.toMutableList()
+                                val stroke = strokes[strokeIndex].toMutableList()
+                                val last = stroke.lastOrNull()
+                                if (last == null ||
+                                    (normalized - last).getDistance() > 0.004f
+                                ) {
+                                    stroke.add(normalized)
+                                    strokes[strokeIndex] = stroke
+                                    changeState.value(current.copy(strokes = strokes))
+                                }
+                            },
+                            onDragEnd = { strokeIndex = -1 },
+                            onDragCancel = { strokeIndex = -1 },
                         )
-                        lastPointer = position
-                    },
-                    onDrag = { change, _ ->
-                        if (drag == MaskDrag.None) return@detectDragGestures
-                        change.consume()
-                        val updated = applyMaskDrag(
-                            mask = maskState.value,
-                            mode = drag,
-                            box = boxSize,
-                            imageAspect = aspectState.value,
-                            position = change.position,
-                            previous = lastPointer,
+                    }
+
+                    MaskKindUi.ColorRange -> detectTapGestures { position ->
+                        val bitmap = bitmapState.value ?: return@detectTapGestures
+                        val normalized = toNormalized(position, boxSize, aspectState.value)
+                        val px = (normalized.x * bitmap.width).toInt()
+                            .coerceIn(0, bitmap.width - 1)
+                        val py = (normalized.y * bitmap.height).toInt()
+                            .coerceIn(0, bitmap.height - 1)
+                        val pixel = bitmap.getPixel(px, py)
+                        changeState.value(
+                            maskState.value.copy(
+                                color = Triple(
+                                    ((pixel shr 16) and 0xFF) / 255f,
+                                    ((pixel shr 8) and 0xFF) / 255f,
+                                    (pixel and 0xFF) / 255f,
+                                ),
+                            ),
                         )
-                        lastPointer = change.position
-                        changeState.value(updated)
-                    },
-                    onDragEnd = { drag = MaskDrag.None },
-                    onDragCancel = { drag = MaskDrag.None },
-                )
+                    }
+
+                    MaskKindUi.LuminanceRange -> Unit
+
+                    else -> detectDragGestures(
+                        onDragStart = { position ->
+                            drag = hitTestMask(
+                                mask = maskState.value,
+                                box = boxSize,
+                                imageAspect = aspectState.value,
+                                position = position,
+                            )
+                            lastPointer = position
+                        },
+                        onDrag = { change, _ ->
+                            if (drag == MaskDrag.None) return@detectDragGestures
+                            change.consume()
+                            val updated = applyMaskDrag(
+                                mask = maskState.value,
+                                mode = drag,
+                                box = boxSize,
+                                imageAspect = aspectState.value,
+                                position = change.position,
+                                previous = lastPointer,
+                            )
+                            lastPointer = change.position
+                            changeState.value(updated)
+                        },
+                        onDragEnd = { drag = MaskDrag.None },
+                        onDragCancel = { drag = MaskDrag.None },
+                    )
+                }
             },
     ) {
         Canvas(modifier = Modifier.fillMaxSize()) {
             drawMask(mask, imageAspect)
         }
     }
+}
+
+private fun toNormalized(position: Offset, box: IntSize, imageAspect: Float): Offset {
+    val fit = maskFitRect(box, imageAspect)
+    if (fit.width <= 0f || fit.height <= 0f) return Offset(0.5f, 0.5f)
+    return Offset(
+        ((position.x - fit.left) / fit.width).coerceIn(0f, 1f),
+        ((position.y - fit.top) / fit.height).coerceIn(0f, 1f),
+    )
 }
 
 /** 蒙版列表行：选择 / 添加（线性、径向）/ 删除 / 完成。 */
@@ -159,6 +263,7 @@ fun MaskChipRow(
     onSelect: (Int) -> Unit,
     onAdd: (MaskKindUi) -> Unit,
     onRemove: (Int) -> Unit,
+    onAddAi: (String) -> Unit,
     onDone: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -231,11 +336,112 @@ fun MaskChipRow(
                         },
                     )
                 }
+                listOf("AI 主体", "AI 天空", "AI 人物").forEach { label ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                "$label（需模型 · 后续接入）",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        },
+                        onClick = {
+                            onAddAi(label)
+                            addMenuOpen = false
+                        },
+                    )
+                }
             }
         }
         Spacer(Modifier.width(8.dp))
         OutlinedButton(onClick = onDone, shape = RoundedCornerShape(12.dp)) {
             Text("完成")
+        }
+    }
+}
+
+/** 蒙版自身参数（按类型）：反转 + 不透明度 / 羽化 / 画笔 / 颜色范围 / 亮度范围。 */
+@Composable
+fun MaskParamsPanel(
+    mask: MaskUi,
+    onChange: (MaskUi) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "反转蒙版",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+            )
+            Switch(
+                checked = mask.inverted,
+                onCheckedChange = { onChange(mask.copy(inverted = it)) },
+            )
+        }
+        val rows: List<Triple<String, Float, (Float) -> Unit>> = when (mask.kind) {
+            MaskKindUi.Brush -> listOf(
+                Triple("大小", mask.brushSize) { onChange(mask.copy(brushSize = it)) },
+                Triple("羽化", mask.brushFeather) { onChange(mask.copy(brushFeather = it)) },
+                Triple("流动", mask.brushFlow) { onChange(mask.copy(brushFlow = it)) },
+                Triple("密度", mask.brushDensity) { onChange(mask.copy(brushDensity = it)) },
+                Triple("不透明度", mask.opacity) { onChange(mask.copy(opacity = it)) },
+            )
+
+            MaskKindUi.ColorRange -> listOf(
+                Triple("范围", mask.colorRange) { onChange(mask.copy(colorRange = it)) },
+                Triple("平滑度", mask.colorSmoothness) {
+                    onChange(mask.copy(colorSmoothness = it))
+                },
+                Triple("不透明度", mask.opacity) { onChange(mask.copy(opacity = it)) },
+            )
+
+            MaskKindUi.LuminanceRange -> listOf(
+                Triple("下界", mask.lumMin) { onChange(mask.copy(lumMin = it)) },
+                Triple("上界", mask.lumMax) { onChange(mask.copy(lumMax = it)) },
+                Triple("平滑度", mask.lumSmoothness) {
+                    onChange(mask.copy(lumSmoothness = it))
+                },
+                Triple("不透明度", mask.opacity) { onChange(mask.copy(opacity = it)) },
+            )
+
+            else -> listOf(
+                Triple("不透明度", mask.opacity) { onChange(mask.copy(opacity = it)) },
+                Triple("羽化", mask.feather) { onChange(mask.copy(feather = it)) },
+            )
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            contentPadding = PaddingValues(horizontal = 16.dp),
+        ) {
+            item(key = "hint") {
+                Text(
+                    when (mask.kind) {
+                        MaskKindUi.Brush -> "在画面上涂抹添加蒙版"
+                        MaskKindUi.ColorRange -> "在画面上点按取色"
+                        MaskKindUi.LuminanceRange -> "按亮度区间选择"
+                        else -> "在画面上拖动调整参考线 / 椭圆"
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            items(items = rows, key = { it.first }) { (label, value, updater) ->
+                val range = when (label) {
+                    "下界", "上界" -> 0f..1f
+                    "大小" -> 2f..100f
+                    else -> 0f..100f
+                }
+                PanelSliderRow(
+                    label = label,
+                    value = value,
+                    range = range,
+                    decimals = if (label == "下界" || label == "上界") 2 else 0,
+                    onChange = updater,
+                )
+            }
         }
     }
 }
@@ -272,6 +478,42 @@ private fun DrawScope.drawMask(mask: MaskUi, imageAspect: Float) {
     when (mask.kind) {
         MaskKindUi.Linear -> drawLinearMask(mask, fit)
         MaskKindUi.Radial -> drawRadialMask(mask, fit)
+        MaskKindUi.Brush -> drawBrushMask(mask, fit)
+        MaskKindUi.ColorRange, MaskKindUi.LuminanceRange -> Unit
+    }
+}
+
+private fun DrawScope.drawBrushMask(mask: MaskUi, fit: MaskFitRect) {
+    if (mask.strokes.isEmpty()) return
+    val longEdge = maxOf(fit.width, fit.height)
+    val radius = (mask.brushSize / 100f).coerceIn(0.002f, 0.5f) * longEdge * 0.5f
+    mask.strokes.forEach { stroke ->
+        val points = stroke.map {
+            Offset(fit.left + it.x * fit.width, fit.top + it.y * fit.height)
+        }
+        if (points.size == 1) {
+            drawCircle(Color(0x55FF3B30), radius = radius, center = points[0])
+            drawCircle(Color(0xCCFFFFFF), radius = radius, center = points[0], style = Stroke(2f))
+        } else if (points.size > 1) {
+            val path = Path()
+            points.forEachIndexed { index, point ->
+                if (index == 0) path.moveTo(point.x, point.y) else path.lineTo(point.x, point.y)
+            }
+            drawPath(
+                path,
+                Color(0x55FF3B30),
+                style = Stroke(
+                    width = radius * 2f,
+                    cap = StrokeCap.Round,
+                    join = StrokeJoin.Round,
+                ),
+            )
+            drawPath(
+                path,
+                Color(0xCCFFFFFF),
+                style = Stroke(width = 2f, cap = StrokeCap.Round, join = StrokeJoin.Round),
+            )
+        }
     }
 }
 
@@ -412,6 +654,7 @@ private fun hitTestMask(
     return when (mask.kind) {
         MaskKindUi.Linear -> hitTestLinear(mask, fit, position)
         MaskKindUi.Radial -> hitTestRadial(mask, fit, position)
+        else -> MaskDrag.None
     }
 }
 

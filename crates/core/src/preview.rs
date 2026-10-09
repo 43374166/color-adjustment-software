@@ -12,7 +12,7 @@ use image::RgbaImage;
 use crate::error::Result;
 use crate::params::{
     eval_curve, ColorGradingParams, CropParams, CurveParams, DetailParams, EditParams, HslParams,
-    ParametricCurve, ToneCurve,
+    LensParams, ParametricCurve, ToneCurve,
 };
 
 /// CPU 预览渲染结果：尺寸 + RGBA8 像素（行优先）。
@@ -31,13 +31,81 @@ pub fn render_preview_rgba(path: &Path, params_json: &str, max_edge: u32) -> Res
     let decoded = crate::decode::decode_preview(path)?;
     let proxy = decoded.display_proxy(max_edge.clamp(64, 4096));
     let rendered = render_preview_image(&proxy, &params);
-    let mut geometry = apply_geometry(&rendered, &params.crop);
+    let corrected = apply_lens(&rendered, &params.lens);
+    let mut geometry = apply_geometry(&corrected, &params.crop);
     apply_masks(&mut geometry, &params);
     Ok(PreviewRgba {
         width: geometry.width(),
         height: geometry.height(),
         rgba: geometry.into_raw(),
     })
+}
+
+/// 镜头校正 / 几何：畸变、透视、旋转、缩放 + 镜头暗角校正（双线性采样）。
+pub fn apply_lens(source: &RgbaImage, lens: &LensParams) -> RgbaImage {
+    let geometry = &lens.geometry;
+    let distortion = (geometry.distortion / 100.0).clamp(-1.0, 1.0);
+    let vertical = (geometry.vertical / 100.0).clamp(-1.0, 1.0);
+    let horizontal = (geometry.horizontal / 100.0).clamp(-1.0, 1.0);
+    let rotate = geometry.rotate.clamp(-45.0, 45.0);
+    let scale = if geometry.scale <= 0.0 {
+        1.0
+    } else {
+        geometry.scale.clamp(0.5, 2.0)
+    };
+    let profile = if lens.profile_correction { -0.06 } else { 0.0 };
+    let k = distortion * 0.25 + profile;
+    let vignette = (lens.vignette / 100.0).clamp(-1.0, 1.0);
+    let identity = k.abs() < 1e-4
+        && vertical.abs() < 1e-4
+        && horizontal.abs() < 1e-4
+        && rotate.abs() < 0.01
+        && (scale - 1.0).abs() < 1e-4
+        && vignette.abs() < 1e-4;
+    if identity {
+        return source.clone();
+    }
+
+    let (width, height) = source.dimensions();
+    if width == 0 || height == 0 {
+        return source.clone();
+    }
+    let half_w = (width as f32 - 1.0) * 0.5;
+    let half_h = (height as f32 - 1.0) * 0.5;
+    let max_half = half_w.max(half_h).max(1.0);
+    let radians = rotate.to_radians();
+    let (sin, cos) = radians.sin_cos();
+    let mut out = RgbaImage::new(width, height);
+
+    for y in 0..height {
+        for x in 0..width {
+            let mut nx = (x as f32 - half_w) / max_half;
+            let mut ny = (y as f32 - half_h) / max_half;
+            nx /= scale;
+            ny /= scale;
+            nx -= vertical * ny * 0.5;
+            ny -= horizontal * nx * 0.5;
+            let rx = nx * cos + ny * sin;
+            let ry = -nx * sin + ny * cos;
+            let radius_squared = rx * rx + ry * ry;
+            let factor = 1.0 + k * radius_squared;
+            let sx = half_w + rx * factor * max_half;
+            let sy = half_h + ry * factor * max_half;
+            let mut pixel = sample_bilinear(source, sx, sy);
+            if vignette.abs() > 1e-4 {
+                let distance =
+                    radius_squared.sqrt() / std::f32::consts::SQRT_2;
+                let weight = smoothstep(0.35, 1.0, distance);
+                let correction = 1.0 + vignette * 0.45 * weight;
+                for channel in 0..3 {
+                    pixel.0[channel] = ((pixel.0[channel] as f32 * correction)
+                        .clamp(0.0, 255.0)) as u8;
+                }
+            }
+            out.put_pixel(x, y, pixel);
+        }
+    }
+    out
 }
 
 /// 几何处理：翻转 → 旋转（自动放大避免黑角）→ 按归一化矩形裁剪。
@@ -944,5 +1012,17 @@ mod tests {
         let left = out.get_pixel(1, 0).0[0] as i32;
         let right = out.get_pixel(2, 0).0[0] as i32;
         assert!(right - left > 60, "锐化后边缘对比应增大：left={left} right={right}");
+    }
+
+    #[test]
+    fn lens_scale_changes_corner_pixels() {
+        let mut source = RgbaImage::new(4, 4);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = Rgba([(x * 60) as u8, (y * 60) as u8, 0, 255]);
+        }
+        let mut lens = LensParams::default();
+        lens.geometry.scale = 1.5;
+        let out = apply_lens(&source, &lens);
+        assert_ne!(out.get_pixel(0, 0).0, source.get_pixel(0, 0).0);
     }
 }

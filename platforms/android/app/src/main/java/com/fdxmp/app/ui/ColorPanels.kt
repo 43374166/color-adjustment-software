@@ -21,6 +21,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
@@ -115,6 +116,17 @@ data class NoiseUi(
 data class DetailUi(
     val sharpen: SharpenUi = SharpenUi(),
     val noise: NoiseUi = NoiseUi(),
+)
+
+/** 镜头校正 / 配置文件。 */
+data class LensUi(
+    val profileCorrection: Boolean = false,
+    val distortion: Float = 0f,
+    val vertical: Float = 0f,
+    val horizontal: Float = 0f,
+    val rotate: Float = 0f,
+    val scale: Float = 1f,
+    val vignette: Float = 0f,
 )
 
 /* ------------------------------------------------------------ 通用控件 */
@@ -453,6 +465,73 @@ fun DetailPanel(
                         onChange = updater,
                     )
                 }
+            }
+        }
+    }
+}
+
+/* ------------------------------------------------------------ 镜头面板 */
+
+@Composable
+fun LensPanel(
+    lens: LensUi,
+    onChange: (LensUi) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "配置文件校正（通用）",
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+            )
+            Switch(
+                checked = lens.profileCorrection,
+                onCheckedChange = { onChange(lens.copy(profileCorrection = it)) },
+            )
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            contentPadding = PaddingValues(horizontal = 16.dp),
+        ) {
+            items(
+                items = listOf(
+                    Triple("畸变", lens.distortion) { value: Float ->
+                        onChange(lens.copy(distortion = value))
+                    },
+                    Triple("垂直", lens.vertical) { value: Float ->
+                        onChange(lens.copy(vertical = value))
+                    },
+                    Triple("水平", lens.horizontal) { value: Float ->
+                        onChange(lens.copy(horizontal = value))
+                    },
+                    Triple("旋转", lens.rotate) { value: Float ->
+                        onChange(lens.copy(rotate = value))
+                    },
+                    Triple("缩放", lens.scale) { value: Float ->
+                        onChange(lens.copy(scale = value))
+                    },
+                    Triple("镜头暗角", lens.vignette) { value: Float ->
+                        onChange(lens.copy(vignette = value))
+                    },
+                ),
+                key = { it.first },
+            ) { (label, value, updater) ->
+                val range = when (label) {
+                    "旋转" -> -45f..45f
+                    "缩放" -> 0.5f..2f
+                    else -> -100f..100f
+                }
+                PanelSliderRow(
+                    label = label,
+                    value = value,
+                    range = range,
+                    decimals = if (label == "缩放") 2 else 0,
+                    onChange = updater,
+                )
             }
         }
     }

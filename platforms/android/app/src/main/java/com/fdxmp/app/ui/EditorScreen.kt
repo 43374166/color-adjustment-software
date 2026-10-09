@@ -34,8 +34,10 @@ import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Details
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LightMode
+import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Tune
@@ -56,6 +58,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -72,11 +75,13 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.fdxmp.app.media.EditRecord
 import com.fdxmp.app.media.EditStore
+import com.fdxmp.app.media.ExportHelper
 import com.fdxmp.app.media.PreviewRenderer
 import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -86,6 +91,7 @@ private enum class EditCategory(val label: String, val groupKey: String) {
     Color("颜色", "color"),
     Effects("效果", "effects"),
     Detail("细节", "detail"),
+    Optics("镜头", "lens"),
 }
 
 private enum class EffectTab(val label: String) {
@@ -209,6 +215,7 @@ fun EditorScreen(
     onSaved: (EditRecord) -> Unit,
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     BackHandler(onBack = onClose)
 
     var values by remember(record.uri) { mutableStateOf(parseValues(record.paramsJson)) }
@@ -234,6 +241,7 @@ fun EditorScreen(
     var selectedMask by remember { mutableStateOf(0) }
     var maskCategory by remember { mutableStateOf(EditCategory.Light) }
     var maskEffectTab by remember { mutableStateOf(EffectTab.Effects) }
+    var maskPanelTab by remember { mutableStateOf(0) }
     var colorTab by remember { mutableStateOf(ColorTab.Base) }
     var colorTabHslBand by remember { mutableStateOf(HslBandKind.Red) }
     var hslUi by remember(record.uri) { mutableStateOf(parseHsl(record.paramsJson)) }
@@ -241,6 +249,8 @@ fun EditorScreen(
     var gradingUi by remember(record.uri) { mutableStateOf(parseGrading(record.paramsJson)) }
     var detailTab by remember { mutableStateOf(DetailTab.Sharpen) }
     var detailUi by remember(record.uri) { mutableStateOf(parseDetail(record.paramsJson)) }
+    var lensUi by remember(record.uri) { mutableStateOf(parseLens(record.paramsJson)) }
+    var exporting by remember { mutableStateOf(false) }
     var pendingRender by remember { mutableStateOf(0) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
@@ -270,6 +280,7 @@ fun EditorScreen(
             hsl = hslUi,
             grading = gradingUi,
             detail = detailUi,
+            lens = lensUi,
         )
         val bitmap = withContext(Dispatchers.Default) {
             PreviewRenderer.render(file.path, json, 1440)
@@ -354,6 +365,7 @@ fun EditorScreen(
                         hsl = hslUi,
                         grading = gradingUi,
                         detail = detailUi,
+                        lens = lensUi,
                     ),
                     presetName = presetName,
                     updatedAt = System.currentTimeMillis(),
@@ -361,6 +373,45 @@ fun EditorScreen(
                 EditStore.upsert(context, updated)
                 Toast.makeText(context, "已保存到编辑记录", Toast.LENGTH_SHORT).show()
                 onSaved(updated)
+            },
+            exporting = exporting,
+            onExport = {
+                val file = sourceFile
+                if (file == null || exporting) {
+                    Toast.makeText(context, "正在准备图片…", Toast.LENGTH_SHORT).show()
+                } else {
+                    scope.launch {
+                        exporting = true
+                        val json = buildParamsJson(
+                            values = values,
+                            curves = curvePoints,
+                            parametric = parametric,
+                            crop = cropUi,
+                            applyCropRect = true,
+                            masks = masks,
+                            hsl = hslUi,
+                            grading = gradingUi,
+                            detail = detailUi,
+                            lens = lensUi,
+                        )
+                        val bitmap = withContext(Dispatchers.Default) {
+                            PreviewRenderer.render(file.path, json, 4096)
+                        }
+                        val ok = if (bitmap != null) {
+                            withContext(Dispatchers.IO) {
+                                ExportHelper.saveToGallery(context, bitmap)
+                            }
+                        } else {
+                            false
+                        }
+                        exporting = false
+                        Toast.makeText(
+                            context,
+                            if (ok) "已导出到相册 Pictures/fdxmp" else "导出失败",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
             },
         )
 
@@ -419,6 +470,7 @@ fun EditorScreen(
                     imageAspect = previewBitmap?.let {
                         it.width.toFloat() / it.height.coerceAtLeast(1)
                     } ?: 1f,
+                    previewBitmap = previewBitmap,
                     onMaskChange = { updated ->
                         updateMask(selectedMask) { updated }
                         pendingRender += 1
@@ -487,6 +539,18 @@ fun EditorScreen(
                     modifier = Modifier.align(Alignment.TopCenter).fillMaxWidth(),
                 )
             }
+
+            if (exporting) {
+                Text(
+                    "导出中…",
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .background(Color(0xBB000000), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 14.dp, vertical = 8.dp),
+                )
+            }
         }
 
         Surface(color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth()) {
@@ -520,6 +584,7 @@ fun EditorScreen(
                                         hslUi = HslUi()
                                         gradingUi = GradingUi()
                                         detailUi = DetailUi()
+                                        lensUi = LensUi()
                                         presetName = "原片"
                                         renderVersion += 1
                                     },
@@ -532,6 +597,16 @@ fun EditorScreen(
                                             onSelectTab = { detailTab = it },
                                             onChange = {
                                                 detailUi = it
+                                                presetName = "自定义"
+                                                pendingRender += 1
+                                            },
+                                            modifier = Modifier.fillMaxSize(),
+                                        )
+
+                                        EditCategory.Optics -> LensPanel(
+                                            lens = lensUi,
+                                            onChange = {
+                                                lensUi = it
                                                 presetName = "自定义"
                                                 pendingRender += 1
                                             },
@@ -684,6 +759,13 @@ fun EditorScreen(
                                     )
                                     pendingRender += 1
                                 },
+                                onAddAi = { label ->
+                                    Toast.makeText(
+                                        context,
+                                        "$label 需要 AI 模型，后续接入",
+                                        Toast.LENGTH_SHORT,
+                                    ).show()
+                                },
                                 onDone = {
                                     tool = EditorTool.Edit
                                     renderVersion += 1
@@ -703,52 +785,68 @@ fun EditorScreen(
                                     )
                                 }
                             } else {
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(horizontal = 8.dp, vertical = 2.dp),
-                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                ) {
-                                    CategoryChip(
-                                        icon = Icons.Filled.LightMode,
-                                        label = "亮度",
-                                        active = maskCategory == EditCategory.Light,
-                                        onClick = { maskCategory = EditCategory.Light },
+                                PanelSubTabs(
+                                    labels = listOf("蒙版", "调整"),
+                                    selectedIndex = maskPanelTab,
+                                    onSelect = { maskPanelTab = it },
+                                )
+                                if (maskPanelTab == 0) {
+                                    MaskParamsPanel(
+                                        mask = currentMask,
+                                        onChange = { updated ->
+                                            updateMask(selectedMask) { updated }
+                                            pendingRender += 1
+                                        },
                                         modifier = Modifier.weight(1f),
                                     )
-                                    CategoryChip(
-                                        icon = Icons.Filled.WaterDrop,
-                                        label = "颜色",
-                                        active = maskCategory == EditCategory.Color,
-                                        onClick = { maskCategory = EditCategory.Color },
+                                } else {
+                                    Row(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .padding(horizontal = 8.dp, vertical = 2.dp),
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    ) {
+                                        CategoryChip(
+                                            icon = Icons.Filled.LightMode,
+                                            label = "亮度",
+                                            active = maskCategory == EditCategory.Light,
+                                            onClick = { maskCategory = EditCategory.Light },
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        CategoryChip(
+                                            icon = Icons.Filled.WaterDrop,
+                                            label = "颜色",
+                                            active = maskCategory == EditCategory.Color,
+                                            onClick = { maskCategory = EditCategory.Color },
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                        CategoryChip(
+                                            icon = Icons.Filled.CenterFocusStrong,
+                                            label = "效果",
+                                            active = maskCategory == EditCategory.Effects,
+                                            onClick = { maskCategory = EditCategory.Effects },
+                                            modifier = Modifier.weight(1f),
+                                        )
+                                    }
+                                    SlidersPanel(
+                                        category = maskCategory,
+                                        effectTab = maskEffectTab,
+                                        values = currentMask.values,
                                         modifier = Modifier.weight(1f),
-                                    )
-                                    CategoryChip(
-                                        icon = Icons.Filled.CenterFocusStrong,
-                                        label = "效果",
-                                        active = maskCategory == EditCategory.Effects,
-                                        onClick = { maskCategory = EditCategory.Effects },
-                                        modifier = Modifier.weight(1f),
+                                        onEffectTabChange = { maskEffectTab = it },
+                                        onValueChange = { index, value ->
+                                            updateMask(selectedMask) { mask ->
+                                                mask.copy(
+                                                    values = mask.values.toMutableList().also {
+                                                        it[index] = value
+                                                    },
+                                                )
+                                            }
+                                            pendingRender += 1
+                                        },
+                                        onValueChangeFinished = { renderVersion += 1 },
                                     )
                                 }
-                                SlidersPanel(
-                                    category = maskCategory,
-                                    effectTab = maskEffectTab,
-                                    values = currentMask.values,
-                                    modifier = Modifier.weight(1f),
-                                    onEffectTabChange = { maskEffectTab = it },
-                                    onValueChange = { index, value ->
-                                        updateMask(selectedMask) { mask ->
-                                            mask.copy(
-                                                values = mask.values.toMutableList().also {
-                                                    it[index] = value
-                                                },
-                                            )
-                                        }
-                                        pendingRender += 1
-                                    },
-                                    onValueChangeFinished = { renderVersion += 1 },
-                                )
                             }
                         }
                     }
@@ -774,11 +872,13 @@ private fun EditorTopBar(
     canUndo: Boolean,
     canRedo: Boolean,
     infoActive: Boolean,
+    exporting: Boolean,
     onBack: () -> Unit,
     onInfo: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
     onSave: () -> Unit,
+    onExport: () -> Unit,
 ) {
     Row(
         modifier = Modifier
@@ -807,6 +907,13 @@ private fun EditorTopBar(
         }
         IconButton(onClick = onRedo, enabled = canRedo) {
             Icon(Icons.AutoMirrored.Filled.Redo, contentDescription = "重做")
+        }
+        IconButton(onClick = onExport, enabled = !exporting) {
+            Icon(
+                Icons.Filled.Download,
+                contentDescription = "导出到相册",
+                tint = MaterialTheme.colorScheme.onSurface,
+            )
         }
         IconButton(onClick = onSave) {
             Icon(
@@ -974,6 +1081,13 @@ private fun CategoryRow(
             label = EditCategory.Detail.label,
             active = selected == EditCategory.Detail && !curveActive,
             onClick = { onSelect(EditCategory.Detail) },
+            modifier = Modifier.weight(1f),
+        )
+        CategoryChip(
+            icon = Icons.Filled.PhotoCamera,
+            label = EditCategory.Optics.label,
+            active = selected == EditCategory.Optics && !curveActive,
+            onClick = { onSelect(EditCategory.Optics) },
             modifier = Modifier.weight(1f),
         )
     }
@@ -1242,9 +1356,53 @@ private fun parseMasks(paramsJson: String): List<MaskUi> {
             rotation = data?.optDouble("rotation", 0.0)?.toFloat() ?: 0f,
             inner = data?.optDouble("inner", 0.75)?.toFloat() ?: 0.75f,
             values = values,
+            opacity = item.optDouble("opacity", 100.0).toFloat(),
+            feather = item.optDouble("feather", 0.0).toFloat(),
+            inverted = item.optBoolean("inverted", false),
+            brushSize = data?.optDouble("size", 30.0)?.toFloat() ?: 30f,
+            brushFeather = data?.optDouble("feather", 50.0)?.toFloat() ?: 50f,
+            brushFlow = data?.optDouble("flow", 100.0)?.toFloat() ?: 100f,
+            brushDensity = data?.optDouble("density", 100.0)?.toFloat() ?: 100f,
+            strokes = parseMaskStrokes(data),
+            color = parseMaskColor(data),
+            colorRange = data?.optDouble("range", 50.0)?.toFloat() ?: 50f,
+            colorSmoothness = data?.optDouble("smoothness", 50.0)?.toFloat() ?: 50f,
+            lumMin = data?.optDouble("min", 0.0)?.toFloat() ?: 0f,
+            lumMax = data?.optDouble("max", 1.0)?.toFloat() ?: 1f,
+            lumSmoothness = data?.optDouble("smoothness", 50.0)?.toFloat() ?: 50f,
         )
     }
     return masks
+}
+
+private fun parseMaskStrokes(data: JSONObject?): List<List<Offset>> {
+    val array = data?.optJSONArray("strokes") ?: return emptyList()
+    return buildList {
+        for (index in 0 until array.length()) {
+            val strokeJson = array.optJSONArray(index) ?: continue
+            val stroke = buildList {
+                for (pointIndex in 0 until strokeJson.length()) {
+                    val point = strokeJson.optJSONArray(pointIndex) ?: continue
+                    add(
+                        Offset(
+                            point.optDouble(0, 0.0).toFloat(),
+                            point.optDouble(1, 0.0).toFloat(),
+                        ),
+                    )
+                }
+            }
+            if (stroke.isNotEmpty()) add(stroke)
+        }
+    }
+}
+
+private fun parseMaskColor(data: JSONObject?): Triple<Float, Float, Float> {
+    val array = data?.optJSONArray("color") ?: return Triple(0.5f, 0.5f, 0.5f)
+    return Triple(
+        array.optDouble(0, 0.5).toFloat(),
+        array.optDouble(1, 0.5).toFloat(),
+        array.optDouble(2, 0.5).toFloat(),
+    )
 }
 
 private fun parseHsl(paramsJson: String): HslUi {
@@ -1306,6 +1464,23 @@ private fun parseDetail(paramsJson: String): DetailUi {
     )
 }
 
+private fun parseLens(paramsJson: String): LensUi {
+    val json = runCatching { JSONObject(paramsJson).optJSONObject("lens") }.getOrNull()
+        ?: return LensUi()
+    val geometry = json.optJSONObject("geometry")
+    return LensUi(
+        profileCorrection = json.optBoolean("profile_correction", false),
+        distortion = geometry?.optDouble("distortion", 0.0)?.toFloat() ?: 0f,
+        vertical = geometry?.optDouble("vertical", 0.0)?.toFloat() ?: 0f,
+        horizontal = geometry?.optDouble("horizontal", 0.0)?.toFloat() ?: 0f,
+        rotate = geometry?.optDouble("rotate", 0.0)?.toFloat() ?: 0f,
+        scale = geometry?.optDouble("scale", 1.0)?.toFloat()?.let {
+            if (it < 0.3f) 1f else it
+        } ?: 1f,
+        vignette = json.optDouble("vignette", 0.0).toFloat(),
+    )
+}
+
 private fun buildParamsJson(
     values: List<Float>,
     curves: Map<CurveChannel, List<CurvePointUi>>,
@@ -1316,6 +1491,7 @@ private fun buildParamsJson(
     hsl: HslUi,
     grading: GradingUi,
     detail: DetailUi,
+    lens: LensUi,
 ): String {
     fun value(key: String): Double =
         values[EDITOR_SLIDERS.indexOfFirst { it.key == key }].toDouble()
@@ -1434,14 +1610,72 @@ private fun buildParamsJson(
                                                     put("rotation", mask.rotation.toDouble())
                                                     put("inner", mask.inner.toDouble())
                                                 }
+
+                                                MaskKindUi.Brush -> {
+                                                    put("size", mask.brushSize.toDouble())
+                                                    put("feather", mask.brushFeather.toDouble())
+                                                    put("flow", mask.brushFlow.toDouble())
+                                                    put("density", mask.brushDensity.toDouble())
+                                                    put("auto_mask", false)
+                                                    put(
+                                                        "strokes",
+                                                        JSONArray().apply {
+                                                            mask.strokes.forEach { stroke ->
+                                                                put(
+                                                                    JSONArray().apply {
+                                                                        stroke.forEach { point ->
+                                                                            put(
+                                                                                JSONArray().apply {
+                                                                                    put(
+                                                                                        point.x
+                                                                                            .toDouble(),
+                                                                                    )
+                                                                                    put(
+                                                                                        point.y
+                                                                                            .toDouble(),
+                                                                                    )
+                                                                                },
+                                                                            )
+                                                                        }
+                                                                    },
+                                                                )
+                                                            }
+                                                        },
+                                                    )
+                                                }
+
+                                                MaskKindUi.ColorRange -> {
+                                                    put(
+                                                        "color",
+                                                        JSONArray().apply {
+                                                            put(mask.color.first.toDouble())
+                                                            put(mask.color.second.toDouble())
+                                                            put(mask.color.third.toDouble())
+                                                        },
+                                                    )
+                                                    put("range", mask.colorRange.toDouble())
+                                                    put(
+                                                        "smoothness",
+                                                        mask.colorSmoothness.toDouble(),
+                                                    )
+                                                }
+
+                                                MaskKindUi.LuminanceRange -> {
+                                                    put("min", mask.lumMin.toDouble())
+                                                    put("max", mask.lumMax.toDouble())
+                                                    put(
+                                                        "smoothness",
+                                                        mask.lumSmoothness.toDouble(),
+                                                    )
+                                                }
                                             }
                                         },
                                     )
                                 },
                             )
-                            put("inverted", false)
-                            put("feather", 0.0)
-                            put("opacity", 100.0)
+                            put("inverted", mask.inverted)
+                            put("feather", mask.feather.toDouble())
+                            put("opacity", mask.opacity.toDouble())
                             put("overlay", "red")
                             put(
                                 "adjustments",
@@ -1522,6 +1756,25 @@ private fun buildParamsJson(
                         put("color", detail.noise.color.toDouble())
                         put("color_detail", detail.noise.colorDetail.toDouble())
                         put("color_smoothness", detail.noise.colorSmoothness.toDouble())
+                    },
+                )
+            },
+        )
+        put(
+            "lens",
+            JSONObject().apply {
+                put("profile_correction", lens.profileCorrection)
+                put("chromatic_aberration", 0.0)
+                put("vignette", lens.vignette.toDouble())
+                put(
+                    "geometry",
+                    JSONObject().apply {
+                        put("auto", false)
+                        put("distortion", lens.distortion.toDouble())
+                        put("vertical", lens.vertical.toDouble())
+                        put("horizontal", lens.horizontal.toDouble())
+                        put("rotate", lens.rotate.toDouble())
+                        put("scale", lens.scale.toDouble())
                     },
                 )
             },
