@@ -34,6 +34,7 @@ import androidx.compose.material.icons.filled.Brush
 import androidx.compose.material.icons.filled.Crop
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Timeline
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
@@ -71,12 +72,19 @@ import java.io.File
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
 import org.json.JSONObject
 
 private enum class EditCategory(val label: String, val groupKey: String) {
     Light("亮度", "light"),
     Color("颜色", "color"),
     Effects("效果", "effects"),
+}
+
+private enum class EffectTab(val label: String) {
+    Effects("效果"),
+    Vignette("晕影"),
+    Grain("颗粒"),
 }
 
 private enum class EditorTool(val label: String, val icon: ImageVector) {
@@ -91,6 +99,8 @@ private data class EditorSlider(
     val label: String,
     val category: EditCategory,
     val range: ClosedFloatingPointRange<Float>,
+    val defaultValue: Float = 0f,
+    val effectTab: EffectTab? = null,
 )
 
 private val EDITOR_SLIDERS = listOf(
@@ -104,11 +114,33 @@ private val EDITOR_SLIDERS = listOf(
     EditorSlider("tint", "色调", EditCategory.Color, -100f..100f),
     EditorSlider("vibrance", "自然饱和度", EditCategory.Color, -100f..100f),
     EditorSlider("saturation", "饱和度", EditCategory.Color, -100f..100f),
-    EditorSlider("texture", "纹理", EditCategory.Effects, -100f..100f),
-    EditorSlider("clarity", "清晰度", EditCategory.Effects, -100f..100f),
-    EditorSlider("dehaze", "去雾", EditCategory.Effects, -100f..100f),
-    EditorSlider("vignette", "暗角", EditCategory.Effects, -100f..100f),
-    EditorSlider("grain", "颗粒", EditCategory.Effects, -100f..100f),
+    EditorSlider("texture", "纹理", EditCategory.Effects, -100f..100f, effectTab = EffectTab.Effects),
+    EditorSlider("clarity", "清晰度", EditCategory.Effects, -100f..100f, effectTab = EffectTab.Effects),
+    EditorSlider("dehaze", "去雾", EditCategory.Effects, -100f..100f, effectTab = EffectTab.Effects),
+    EditorSlider(
+        "vignette", "暗角", EditCategory.Effects, -100f..100f,
+        effectTab = EffectTab.Vignette,
+    ),
+    EditorSlider(
+        "vignette_midpoint", "中点", EditCategory.Effects, 0f..100f,
+        defaultValue = 50f, effectTab = EffectTab.Vignette,
+    ),
+    EditorSlider(
+        "vignette_feather", "羽化", EditCategory.Effects, 0f..100f,
+        defaultValue = 50f, effectTab = EffectTab.Vignette,
+    ),
+    EditorSlider(
+        "grain", "颗粒", EditCategory.Effects, 0f..100f,
+        effectTab = EffectTab.Grain,
+    ),
+    EditorSlider(
+        "grain_size", "大小", EditCategory.Effects, 0f..100f,
+        effectTab = EffectTab.Grain,
+    ),
+    EditorSlider(
+        "grain_roughness", "粗糙度", EditCategory.Effects, 0f..100f,
+        defaultValue = 50f, effectTab = EffectTab.Grain,
+    ),
 )
 
 private data class BuiltinPreset(
@@ -183,8 +215,12 @@ fun EditorScreen(
     var failure by remember { mutableStateOf<String?>(null) }
     var tool by remember { mutableStateOf(EditorTool.Edit) }
     var category by remember { mutableStateOf(EditCategory.Light) }
+    var effectTab by remember { mutableStateOf(EffectTab.Effects) }
     var presetName by remember(record.uri) { mutableStateOf(record.presetName) }
     var showInfo by remember { mutableStateOf(false) }
+    var showCurve by remember { mutableStateOf(false) }
+    var curvePoints by remember(record.uri) { mutableStateOf(parseCurvePoints(record.paramsJson)) }
+    var parametric by remember(record.uri) { mutableStateOf(parseParametric(record.paramsJson)) }
     var dragSnapshot by remember { mutableStateOf<List<Float>?>(null) }
     val undoStack = remember { mutableStateListOf<List<Float>>() }
     val redoStack = remember { mutableStateListOf<List<Float>>() }
@@ -203,7 +239,7 @@ fun EditorScreen(
         val file = sourceFile ?: return@LaunchedEffect
         isRendering = true
         failure = null
-        val json = buildParamsJson(values)
+        val json = buildParamsJson(values, curvePoints, parametric)
         val bitmap = withContext(Dispatchers.Default) {
             PreviewRenderer.render(file.path, json, 1440)
         }
@@ -228,19 +264,21 @@ fun EditorScreen(
     fun applyPreset(preset: BuiltinPreset) {
         pushHistory(values)
         values = List(EDITOR_SLIDERS.size) { index ->
-            preset.params[EDITOR_SLIDERS[index].key] ?: 0f
+            preset.params[EDITOR_SLIDERS[index].key] ?: EDITOR_SLIDERS[index].defaultValue
         }
         presetName = preset.name
+        curvePoints = identityCurveMap()
+        parametric = ParametricUi()
         renderVersion += 1
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .statusBarsPadding()
-            .navigationBarsPadding(),
-    ) {
+    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .statusBarsPadding()
+                .navigationBarsPadding(),
+        ) {
         EditorTopBar(
             canUndo = undoStack.isNotEmpty(),
             canRedo = redoStack.isNotEmpty(),
@@ -263,7 +301,7 @@ fun EditorScreen(
             },
             onSave = {
                 val updated = record.copy(
-                    paramsJson = buildParamsJson(values),
+                    paramsJson = buildParamsJson(values, curvePoints, parametric),
                     presetName = presetName,
                     updatedAt = System.currentTimeMillis(),
                 )
@@ -367,24 +405,21 @@ fun EditorScreen(
                         EditorTool.Edit -> Column(modifier = Modifier.fillMaxSize()) {
                             PanelHeader(
                                 presetName = presetName,
-                                onCurve = {
-                                    Toast.makeText(
-                                        context,
-                                        "曲线面板是下一步：RGB / 参数曲线",
-                                        Toast.LENGTH_SHORT,
-                                    ).show()
-                                },
                                 onReset = {
                                     pushHistory(values)
-                                    values = List(EDITOR_SLIDERS.size) { 0f }
+                                    values = EDITOR_SLIDERS.map { it.defaultValue }
+                                    curvePoints = identityCurveMap()
+                                    parametric = ParametricUi()
                                     presetName = "原片"
                                     renderVersion += 1
                                 },
                             )
                             SlidersPanel(
                                 category = category,
+                                effectTab = effectTab,
                                 values = values,
                                 modifier = Modifier.weight(1f),
+                                onEffectTabChange = { effectTab = it },
                                 onValueChange = { index, newValue ->
                                     if (dragSnapshot == null) dragSnapshot = values
                                     values = values.toMutableList().also { it[index] = newValue }
@@ -401,6 +436,7 @@ fun EditorScreen(
                             CategoryRow(
                                 selected = category,
                                 onSelect = { category = it },
+                                onCurve = { showCurve = true },
                             )
                         }
 
@@ -426,6 +462,24 @@ fun EditorScreen(
                     onSelect = { tool = it },
                 )
             }
+        }
+        }
+
+        if (showCurve) {
+            CurveEditorOverlay(
+                image = previewBitmap,
+                points = curvePoints,
+                parametric = parametric,
+                onPointsChange = { target, updated ->
+                    curvePoints = curvePoints + (target to updated)
+                },
+                onParametricChange = { parametric = it },
+                onDone = {
+                    showCurve = false
+                    presetName = "自定义"
+                    renderVersion += 1
+                },
+            )
         }
     }
 }
@@ -486,7 +540,6 @@ private fun EditorTopBar(
 @Composable
 private fun PanelHeader(
     presetName: String,
-    onCurve: () -> Unit,
     onReset: () -> Unit,
 ) {
     Row(
@@ -502,50 +555,92 @@ private fun PanelHeader(
             modifier = Modifier.weight(1f),
         )
         TextButton(onClick = onReset) { Text("重置") }
-        OutlinedButton(
-            onClick = onCurve,
-            shape = RoundedCornerShape(10.dp),
-        ) { Text("曲线") }
     }
 }
 
 @Composable
 private fun SlidersPanel(
     category: EditCategory,
+    effectTab: EffectTab,
     values: List<Float>,
     modifier: Modifier = Modifier,
+    onEffectTabChange: (EffectTab) -> Unit,
     onValueChange: (Int, Float) -> Unit,
     onValueChangeFinished: () -> Unit,
 ) {
-    val sliders = remember(category) {
-        EDITOR_SLIDERS.withIndex().filter { it.value.category == category }
+    val sliders = remember(category, effectTab) {
+        EDITOR_SLIDERS.withIndex().filter { indexed ->
+            indexed.value.category == category &&
+                (category != EditCategory.Effects || indexed.value.effectTab == effectTab)
+        }
     }
-    LazyColumn(
-        modifier = modifier.fillMaxWidth(),
-        contentPadding = PaddingValues(horizontal = 16.dp),
-    ) {
-        items(items = sliders, key = { it.value.key }) { indexed ->
-            val index = indexed.index
-            val slider = indexed.value
-            Column {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(
-                        slider.label,
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.weight(1f),
-                    )
-                    Text(
-                        formatValue(values[index]),
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    Column(modifier = modifier.fillMaxWidth()) {
+        if (category == EditCategory.Effects) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 2.dp),
+                horizontalArrangement = Arrangement.spacedBy(18.dp),
+            ) {
+                EffectTab.entries.forEach { tab ->
+                    val active = tab == effectTab
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier
+                            .clickable { onEffectTabChange(tab) }
+                            .padding(vertical = 4.dp),
+                    ) {
+                        Text(
+                            tab.label,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = if (active) {
+                                MaterialTheme.colorScheme.onSurface
+                            } else {
+                                MaterialTheme.colorScheme.onSurfaceVariant
+                            },
+                        )
+                        Spacer(Modifier.height(3.dp))
+                        Box(
+                            modifier = Modifier
+                                .width(28.dp)
+                                .height(2.dp)
+                                .background(
+                                    if (active) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        Color.Transparent
+                                    },
+                                ),
+                        )
+                    }
+                }
+            }
+        }
+        LazyColumn(
+            modifier = Modifier.fillMaxWidth().weight(1f),
+            contentPadding = PaddingValues(horizontal = 16.dp),
+        ) {
+            items(items = sliders, key = { it.value.key }) { indexed ->
+                val index = indexed.index
+                val slider = indexed.value
+                Column {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            slider.label,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            formatSliderValue(slider, values[index]),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Slider(
+                        value = values[index],
+                        onValueChange = { onValueChange(index, it) },
+                        onValueChangeFinished = onValueChangeFinished,
+                        valueRange = slider.range,
                     )
                 }
-                Slider(
-                    value = values[index],
-                    onValueChange = { onValueChange(index, it) },
-                    onValueChangeFinished = onValueChangeFinished,
-                    valueRange = slider.range,
-                )
             }
         }
     }
@@ -555,29 +650,69 @@ private fun SlidersPanel(
 private fun CategoryRow(
     selected: EditCategory,
     onSelect: (EditCategory) -> Unit,
+    onCurve: () -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp),
         horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        EditCategory.entries.forEach { category ->
-            val active = category == selected
-            Text(
-                category.label,
-                textAlign = TextAlign.Center,
-                style = MaterialTheme.typography.labelMedium,
-                color = if (active) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier
-                    .weight(1f)
-                    .clip(RoundedCornerShape(10.dp))
-                    .background(
-                        if (active) MaterialTheme.colorScheme.primary else Color(0xFF1E1E1E),
-                    )
-                    .clickable { onSelect(category) }
-                    .padding(vertical = 9.dp),
+        CategoryChip(
+            label = EditCategory.Light.label,
+            active = selected == EditCategory.Light,
+            onClick = { onSelect(EditCategory.Light) },
+            modifier = Modifier.weight(1f),
+        )
+        Box(
+            modifier = Modifier
+                .size(44.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .background(Color(0xFF1E1E1E))
+                .clickable(onClick = onCurve),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                Icons.Filled.Timeline,
+                contentDescription = "曲线",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(22.dp),
             )
         }
+        CategoryChip(
+            label = EditCategory.Color.label,
+            active = selected == EditCategory.Color,
+            onClick = { onSelect(EditCategory.Color) },
+            modifier = Modifier.weight(1f),
+        )
+        CategoryChip(
+            label = EditCategory.Effects.label,
+            active = selected == EditCategory.Effects,
+            onClick = { onSelect(EditCategory.Effects) },
+            modifier = Modifier.weight(1f),
+        )
     }
+}
+
+@Composable
+private fun CategoryChip(
+    label: String,
+    active: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Text(
+        label,
+        textAlign = TextAlign.Center,
+        style = MaterialTheme.typography.labelMedium,
+        color = if (active) Color.White else MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = modifier
+            .clip(RoundedCornerShape(10.dp))
+            .background(
+                if (active) MaterialTheme.colorScheme.primary else Color(0xFF1E1E1E),
+            )
+            .clickable(onClick = onClick)
+            .padding(vertical = 9.dp),
+    )
 }
 
 @Composable
@@ -694,39 +829,119 @@ private fun EditorToolBar(
 
 private fun parseValues(paramsJson: String): List<Float> {
     val root = runCatching { JSONObject(paramsJson) }.getOrNull()
-        ?: return List(EDITOR_SLIDERS.size) { 0f }
     return EDITOR_SLIDERS.map { slider ->
-        root.optJSONObject(slider.category.groupKey)
-            ?.optDouble(slider.key, 0.0)
-            ?.toFloat()
-            ?: 0f
+        val value = root?.optJSONObject(slider.category.groupKey)
+            ?.optDouble(slider.key, Double.NaN)
+        if (value == null || value.isNaN()) slider.defaultValue else value.toFloat()
     }
 }
 
-private fun buildParamsJson(values: List<Float>): String {
+private fun parseCurvePoints(paramsJson: String): Map<CurveChannel, List<CurvePointUi>> {
+    val result = identityCurveMap().toMutableMap()
+    val curves = runCatching {
+        JSONObject(paramsJson).optJSONObject("curves")
+    }.getOrNull() ?: return result
+    val channels = mapOf(
+        CurveChannel.Rgb to "rgb",
+        CurveChannel.Red to "red",
+        CurveChannel.Green to "green",
+        CurveChannel.Blue to "blue",
+    )
+    channels.forEach { (channel, key) ->
+        val pointsJson = curves.optJSONObject(key)?.optJSONArray("points") ?: return@forEach
+        val points = buildList {
+            for (index in 0 until pointsJson.length()) {
+                val point = pointsJson.optJSONObject(index) ?: continue
+                add(
+                    CurvePointUi(
+                        x = point.optDouble("x", 0.0).toFloat(),
+                        y = point.optDouble("y", 0.0).toFloat(),
+                    ),
+                )
+            }
+        }
+        if (points.size >= 2) {
+            result[channel] = points.sortedBy { it.x }
+        }
+    }
+    return result
+}
+
+private fun parseParametric(paramsJson: String): ParametricUi {
+    val json = runCatching {
+        JSONObject(paramsJson).optJSONObject("curves")?.optJSONObject("parametric")
+    }.getOrNull() ?: return ParametricUi()
+    return ParametricUi(
+        highlights = json.optDouble("highlights", 0.0).toFloat(),
+        midtones = json.optDouble("midtones", 0.0).toFloat(),
+        shadows = json.optDouble("shadows", 0.0).toFloat(),
+        highlightsSplit = json.optDouble("highlights_split", 0.75).toFloat(),
+        midtonesSplit = json.optDouble("midtones_split", 0.25).toFloat(),
+    )
+}
+
+private fun buildParamsJson(
+    values: List<Float>,
+    curves: Map<CurveChannel, List<CurvePointUi>>,
+    parametric: ParametricUi,
+): String {
     fun value(key: String): Double =
         values[EDITOR_SLIDERS.indexOfFirst { it.key == key }].toDouble()
 
     val grouped = EditCategory.entries.associateWith { category ->
-        EDITOR_SLIDERS.filter { it.category == category }.map { it.key }
+        EDITOR_SLIDERS.filter { it.category == category }
     }
     return JSONObject().apply {
         put("version", 1)
-        grouped.forEach { (category, keys) ->
+        grouped.forEach { (category, sliders) ->
             put(
                 category.groupKey,
                 JSONObject().apply {
-                    keys.forEach { key -> put(key, value(key)) }
+                    sliders.forEach { put(it.key, value(it.key)) }
                 },
             )
         }
+        put(
+            "curves",
+            JSONObject().apply {
+                fun pointsJson(channel: CurveChannel): JSONArray = JSONArray().apply {
+                    (curves[channel] ?: identityCurve()).forEach { point ->
+                        put(
+                            JSONObject().apply {
+                                put("x", point.x.toDouble())
+                                put("y", point.y.toDouble())
+                            },
+                        )
+                    }
+                }
+                put("rgb", JSONObject().apply { put("points", pointsJson(CurveChannel.Rgb)) })
+                put("red", JSONObject().apply { put("points", pointsJson(CurveChannel.Red)) })
+                put("green", JSONObject().apply { put("points", pointsJson(CurveChannel.Green)) })
+                put("blue", JSONObject().apply { put("points", pointsJson(CurveChannel.Blue)) })
+                put(
+                    "parametric",
+                    JSONObject().apply {
+                        put("highlights", parametric.highlights.toDouble())
+                        put("midtones", parametric.midtones.toDouble())
+                        put("shadows", parametric.shadows.toDouble())
+                        put("highlights_split", parametric.highlightsSplit.toDouble())
+                        put("midtones_split", parametric.midtonesSplit.toDouble())
+                    },
+                )
+            },
+        )
     }.toString()
 }
 
 private fun viewportInfo(values: List<Float>): String {
-    val changed = values.count { it != 0f }
+    val changed = values.withIndex().count { (index, value) ->
+        value != EDITOR_SLIDERS[index].defaultValue
+    }
     return if (changed == 0) "未调整" else "已调整 $changed 项"
 }
 
-private fun formatValue(value: Float): String =
-    String.format(Locale.US, "%+.2f", value)
+private fun formatSliderValue(slider: EditorSlider, value: Float): String = when {
+    slider.key == "exposure" -> String.format(Locale.US, "%+.2f", value)
+    slider.range.start < 0f -> String.format(Locale.US, "%+.0f", value)
+    else -> String.format(Locale.US, "%.0f", value)
+}

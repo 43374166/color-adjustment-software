@@ -10,7 +10,7 @@ use std::path::Path;
 use image::RgbaImage;
 
 use crate::error::Result;
-use crate::params::EditParams;
+use crate::params::{eval_curve, CurveParams, EditParams, ParametricCurve, ToneCurve};
 
 /// CPU 预览渲染结果：尺寸 + RGBA8 像素（行优先）。
 pub struct PreviewRgba {
@@ -42,6 +42,7 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
     let light = &params.light;
     let color = &params.color;
     let effects = &params.effects;
+    let curves = CurveLuts::new(&params.curves);
     let mut out = source.clone();
 
     for (x, y, pixel) in out.enumerate_pixels_mut() {
@@ -92,6 +93,9 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
             *channel = channel.clamp(0.0, 1.0);
         }
 
+        // 曲线：参数曲线 → RGB → 单通道。
+        rgb = curves.apply(rgb);
+
         // 饱和度 / 自然饱和度。
         let luminance_now = luminance(rgb);
         let max = rgb[0].max(rgb[1]).max(rgb[2]);
@@ -114,8 +118,12 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
             let nx = x as f32 / (width - 1.0).max(1.0) - 0.5;
             let ny = y as f32 / (height - 1.0).max(1.0) - 0.5;
             let distance = (nx * nx + ny * ny).sqrt() / std::f32::consts::FRAC_1_SQRT_2;
-            let weight = smoothstep(0.4, 1.0, distance);
-            let factor = (1.0 - vignette * 0.8 * weight).clamp(0.0, 2.0);
+            let midpoint = (effects.vignette_midpoint / 100.0).clamp(0.0, 1.0);
+            let feather = (effects.vignette_feather / 100.0).clamp(0.0, 1.0);
+            let start = (midpoint * 0.85).clamp(0.0, 0.95);
+            let width = (0.12 + feather * 0.55).max(0.05);
+            let weight = smoothstep(start, (start + width).min(1.0), distance);
+            let factor = (1.0 - vignette * 0.9 * weight).clamp(0.0, 2.0);
             for channel in &mut rgb {
                 *channel *= factor;
             }
@@ -124,7 +132,12 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
         // 颗粒。
         let grain = effects.grain / 100.0;
         if grain != 0.0 {
-            let noise = grain_noise(x, y, effects.grain_size);
+            let noise = grain_noise(
+                x,
+                y,
+                effects.grain_size,
+                (effects.grain_roughness / 100.0).clamp(0.0, 1.0),
+            );
             for channel in &mut rgb {
                 *channel += noise * grain * 0.06;
             }
@@ -174,15 +187,115 @@ fn to_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * 255.0 + 0.5) as u8
 }
 
-fn grain_noise(x: u32, y: u32, size: f32) -> f32 {
-    let step = size.max(1.0) as u32;
-    let qx = (x / step) as u64;
-    let qy = (y / step) as u64;
+fn grain_noise(x: u32, y: u32, size: f32, roughness: f32) -> f32 {
+    let step = (1.0 + (size.clamp(0.0, 100.0) / 100.0) * 7.0).round() as u32;
+    let coarse = hash_noise(x / step.max(1), y / step.max(1));
+    let fine = hash_noise(x, y);
+    coarse * (1.0 - roughness) + fine * roughness
+}
+
+fn hash_noise(x: u32, y: u32) -> f32 {
+    let qx = x as u64;
+    let qy = y as u64;
     let mut hash = qx.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ qy.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
     hash ^= hash >> 33;
     hash = hash.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
     hash ^= hash >> 33;
     (hash as f32 / u64::MAX as f32) * 2.0 - 1.0
+}
+
+/// 预设好的曲线 LUT：参数曲线 / RGB / 单通道，恒等映射时为 None。
+struct CurveLuts {
+    parametric: Option<[f32; 257]>,
+    rgb: Option<[f32; 257]>,
+    red: Option<[f32; 257]>,
+    green: Option<[f32; 257]>,
+    blue: Option<[f32; 257]>,
+}
+
+impl CurveLuts {
+    fn new(curves: &CurveParams) -> Self {
+        Self {
+            parametric: build_parametric_lut(&curves.parametric),
+            rgb: build_curve_lut(&curves.rgb),
+            red: build_curve_lut(&curves.red),
+            green: build_curve_lut(&curves.green),
+            blue: build_curve_lut(&curves.blue),
+        }
+    }
+
+    fn apply(&self, input: [f32; 3]) -> [f32; 3] {
+        let mut rgb = input;
+        if let Some(lut) = &self.parametric {
+            for channel in &mut rgb {
+                *channel = sample_lut(lut, *channel);
+            }
+        }
+        if let Some(lut) = &self.rgb {
+            for channel in &mut rgb {
+                *channel = sample_lut(lut, *channel);
+            }
+        }
+        if let Some(lut) = &self.red {
+            rgb[0] = sample_lut(lut, rgb[0]);
+        }
+        if let Some(lut) = &self.green {
+            rgb[1] = sample_lut(lut, rgb[1]);
+        }
+        if let Some(lut) = &self.blue {
+            rgb[2] = sample_lut(lut, rgb[2]);
+        }
+        rgb
+    }
+}
+
+fn build_curve_lut(curve: &ToneCurve) -> Option<[f32; 257]> {
+    if curve.is_identity() {
+        return None;
+    }
+    let mut lut = [0f32; 257];
+    for (index, slot) in lut.iter_mut().enumerate() {
+        *slot = eval_curve(&curve.points, index as f32 / 256.0);
+    }
+    Some(lut)
+}
+
+fn build_parametric_lut(curve: &ParametricCurve) -> Option<[f32; 257]> {
+    if curve.highlights == 0.0 && curve.midtones == 0.0 && curve.shadows == 0.0 {
+        return None;
+    }
+    let highlights_split = if curve.highlights_split <= 0.0 {
+        0.75
+    } else {
+        curve.highlights_split.clamp(0.5, 1.0)
+    };
+    let midtones_split = if curve.midtones_split <= 0.0 {
+        0.25
+    } else {
+        curve.midtones_split.clamp(0.0, 0.5)
+    };
+    let highlights_split = highlights_split.max(midtones_split + 0.1);
+
+    let mut lut = [0f32; 257];
+    for (index, slot) in lut.iter_mut().enumerate() {
+        let x = index as f32 / 256.0;
+        let weight_highlights = smoothstep(midtones_split, highlights_split, x);
+        let weight_shadows = 1.0 - weight_highlights;
+        let weight_midtones = (1.0 - weight_highlights - weight_shadows).max(0.0);
+        let delta = (curve.highlights / 100.0) * weight_highlights * 0.35
+            + (curve.midtones / 100.0) * weight_midtones * 0.35
+            + (curve.shadows / 100.0) * weight_shadows * 0.35;
+        *slot = (x + delta).clamp(0.0, 1.0);
+    }
+    Some(lut)
+}
+
+fn sample_lut(lut: &[f32; 257], value: f32) -> f32 {
+    let position = value.clamp(0.0, 1.0) * 256.0;
+    let index = (position.floor() as usize).min(256);
+    let next = (index + 1).min(256);
+    let fraction = position - index as f32;
+    lut[index] * (1.0 - fraction) + lut[next] * fraction
 }
 
 #[cfg(test)]
@@ -216,5 +329,21 @@ mod tests {
         let rendered = render_preview_image(&source, &params);
         // sRGB 伽马：线性翻倍对应 64 → 约 90。
         assert!(rendered.get_pixel(0, 0).0[0] >= 80);
+    }
+
+    #[test]
+    fn rgb_curve_darkens_midtones() {
+        let mut source = RgbaImage::new(2, 2);
+        for pixel in source.pixels_mut() {
+            *pixel = Rgba([128, 128, 128, 255]);
+        }
+        let mut params = EditParams::default();
+        params.curves.rgb.points = vec![
+            crate::params::CurvePoint { x: 0.0, y: 0.0 },
+            crate::params::CurvePoint { x: 0.5, y: 0.25 },
+            crate::params::CurvePoint { x: 1.0, y: 1.0 },
+        ];
+        let rendered = render_preview_image(&source, &params);
+        assert!(rendered.get_pixel(0, 0).0[0] < 110);
     }
 }
