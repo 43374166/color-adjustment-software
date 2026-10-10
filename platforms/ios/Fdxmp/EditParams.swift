@@ -6,6 +6,7 @@ enum EditCategory: String, CaseIterable, Identifiable {
     case color = "颜色"
     case effects = "效果"
     case detail = "细节"
+    case curves = "曲线"
 
     var id: String { rawValue }
 }

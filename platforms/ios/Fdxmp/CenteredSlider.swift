@@ -65,8 +65,9 @@ struct CenteredSlider: View {
     let onChange: (Float) -> Void
     let onCommit: () -> Void
 
-    @State private var gestureStartValue: Float?
+    @State private var gestureActive = false
     @State private var didDrag = false
+    @State private var maxDistance: CGFloat = 0
     @State private var lastTapTime = Date.distantPast
 
     var body: some View {
@@ -110,15 +111,24 @@ struct CenteredSlider: View {
             }
             .frame(width: width, height: 42)
             .contentShape(Rectangle())
-            .gesture(
+            // 用 simultaneousGesture：纵向滑动交给外层 ScrollView 滚动，
+            // 只有明显的横向拖动才调整数值（否则面板无法上下滚动）。
+            .simultaneousGesture(
                 DragGesture(minimumDistance: 0)
                     .onChanged { gesture in
-                        if gestureStartValue == nil {
-                            gestureStartValue = value
+                        if !gestureActive {
+                            gestureActive = true
                             didDrag = false
+                            maxDistance = 0
                             onBegin()
                         }
-                        if abs(gesture.translation.width) > 10 {
+                        maxDistance = max(
+                            maxDistance,
+                            hypot(gesture.translation.width, gesture.translation.height)
+                        )
+                        if abs(gesture.translation.width) > 8,
+                           abs(gesture.translation.width) > abs(gesture.translation.height)
+                        {
                             didDrag = true
                         }
                         guard didDrag else { return }
@@ -127,12 +137,15 @@ struct CenteredSlider: View {
                         onChange(target.clamped(to: range))
                     }
                     .onEnded { gesture in
-                        gestureStartValue = nil
+                        guard gestureActive else { return }
+                        gestureActive = false
                         if didDrag {
                             didDrag = false
                             onCommit()
                             return
                         }
+                        // 移动距离过大（纵向滚动）时不当作点击。
+                        guard maxDistance < 8 else { return }
                         // 轻点：双击复位，单击按圆点位置 ±step。
                         let now = Date()
                         let doubleTap = now.timeIntervalSince(lastTapTime) < 0.32

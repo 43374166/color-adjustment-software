@@ -716,7 +716,8 @@ struct DeviceTabView: View {
         if selectionMode {
             toggleSelection(asset)
         } else {
-            previewId = asset.localIdentifier
+            // 与 Android 一致：点缩略图直接进入编辑页。
+            onOpenEditor(asset)
         }
     }
 

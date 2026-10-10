@@ -317,6 +317,11 @@ struct MaskPanelView: View {
                     .background(Circle().fill(Color.white.opacity(0.1)))
             }
             .disabled(model.selectedMask == nil)
+            Button("完成") {
+                model.selectTool(.edit)
+            }
+            .font(.caption)
+            .foregroundStyle(Color.accentColor)
             .padding(.trailing, 12)
         }
         .padding(.top, 8)

@@ -5,9 +5,8 @@ import UIKit
 /// 编辑工具（底部工具栏）。
 enum EditorTool: String, CaseIterable, Identifiable {
     case presets = "预设"
-    case edit = "编辑"
-    case curves = "曲线"
     case crop = "裁切"
+    case edit = "编辑"
     case mask = "蒙版"
 
     var id: String { rawValue }
@@ -15,9 +14,8 @@ enum EditorTool: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .presets: return "wand.and.stars"
-        case .edit: return "slider.horizontal.3"
-        case .curves: return "point.topleft.down.curvedto.point.bottomright.up"
         case .crop: return "crop"
+        case .edit: return "slider.horizontal.3"
         case .mask: return "paintbrush.pointed"
         }
     }
@@ -94,7 +92,6 @@ final class EditorModel: ObservableObject {
     private var redoStack: [EditState] = []
     private var renderBusy = false
     private var renderPending = false
-    private var debounce: DispatchWorkItem?
     private let renderQueue = DispatchQueue(label: "fdxmp.ios.render", qos: .userInitiated)
     private static let imageManager = PHCachingImageManager()
 
@@ -474,19 +471,14 @@ final class EditorModel: ObservableObject {
     }
 
     private func scheduleRender(immediate: Bool = false) {
-        debounce?.cancel()
         guard baseBuffer != nil else { return }
-        if immediate {
+        // 空闲时立即渲染；正在渲染则记下待渲染，当前帧结束后自动接着渲染。
+        // （此前的 140ms 防抖在持续拖动时会一直被重置，导致松手才出图。）
+        if renderBusy {
+            renderPending = true
+        } else {
             startRender()
-            return
         }
-        let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor in
-                self?.startRender()
-            }
-        }
-        debounce = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14, execute: work)
     }
 
     private func startRender() {

@@ -188,8 +188,7 @@ struct EditorTabView: View {
     private var panelHeight: CGFloat {
         switch model.tool {
         case .presets: return 210
-        case .edit: return 300
-        case .curves: return 360
+        case .edit: return model.category == .curves ? 360 : 300
         case .crop: return 210
         case .mask: return 320
         }
@@ -204,12 +203,10 @@ struct EditorTabView: View {
                 switch model.tool {
                 case .presets:
                     presetPanel
-                case .edit:
-                    editPanel
-                case .curves:
-                    CurvePanelView(model: model)
                 case .crop:
                     cropPanel
+                case .edit:
+                    editPanel
                 case .mask:
                     MaskPanelView(model: model)
                 }
@@ -289,7 +286,9 @@ struct EditorTabView: View {
     private var editPanel: some View {
         VStack(spacing: 0) {
             categoryRow
-            if model.category == .color {
+            if model.category == .curves {
+                CurvePanelView(model: model)
+            } else if model.category == .color {
                 subTabRow(
                     ColorTab.allCases.map(\.rawValue),
                     selected: ColorTab.allCases.firstIndex(of: model.colorTab) ?? 0
@@ -656,6 +655,10 @@ struct EditorTabView: View {
                 Button("重置") {
                     model.resetCrop()
                 }
+                Button("完成") {
+                    model.selectTool(.edit)
+                }
+                .foregroundStyle(Color.accentColor)
             }
             .font(.caption)
             .padding(.horizontal, 18)

@@ -47,12 +47,6 @@ struct ContentView: View {
             .tag(Tab.me)
         }
         .preferredColorScheme(.dark)
-        .overlay(alignment: .top) {
-            Text("Rust core：\(NativeCore.shared.version)")
-                .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.top, 2)
-        }
     }
 
     private func placeholder(title: String, detail: String) -> some View {
