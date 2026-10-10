@@ -440,6 +440,9 @@ struct DeviceTabView: View {
                 permissionGuide
             }
         }
+        // 网格 / 列表 / 全屏预览里的缩略图使用 @EnvironmentObject 读取该 model，
+        // 必须在根节点注入，否则授权成功后渲染缩略图会直接崩溃。
+        .environmentObject(model)
         .background(Color(white: 0.06))
         .onAppear {
             model.requestAuthorizationAndLoad()
