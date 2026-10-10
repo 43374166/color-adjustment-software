@@ -69,6 +69,9 @@ jobs:
 
       - name: 打包未签名 IPA
         run: |
+          PLIST="platforms/ios/build/Build/Products/Release-iphoneos/Fdxmp.app/Info.plist"
+          echo "CFBundleIdentifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+          echo "CFBundleExecutable: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
           rm -rf dist/ios/Payload
           mkdir -p dist/ios/Payload
           cp -R platforms/ios/build/Build/Products/Release-iphoneos/Fdxmp.app dist/ios/Payload/

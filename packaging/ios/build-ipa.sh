@@ -46,6 +46,9 @@ xcodebuild -project platforms/ios/Fdxmp.xcodeproj \
     build
 
 echo "==> 5/5 打包 IPA"
+PLIST="$APP_PATH/Info.plist"
+echo "CFBundleIdentifier: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$PLIST")"
+echo "CFBundleExecutable: $(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$PLIST")"
 rm -rf dist/ios/Payload dist/ios/Fdxmp-unsigned.ipa
 mkdir -p dist/ios/Payload
 cp -R "$APP_PATH" dist/ios/Payload/
