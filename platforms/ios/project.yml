@@ -1,0 +1,56 @@
+# fdxmp iOS 工程定义（XcodeGen）
+#
+# 生成工程：先构建 Rust 静态库与 dist/ios/FdxmpCore.xcframework，然后
+#   cd platforms/ios && xcodegen generate
+# 或直接执行 packaging/ios/build-ipa.sh（推荐，包含全部步骤）。
+name: Fdxmp
+
+options:
+  bundleIdPrefix: com.fdxmp
+  createIntermediateGroups: true
+  deploymentTarget:
+    iOS: "16.0"
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  Fdxmp:
+    type: application
+    platform: iOS
+    deploymentTarget: "16.0"
+    sources:
+      - path: Fdxmp
+        excludes:
+          - Info.plist
+    dependencies:
+      # Rust 核心静态库（由 packaging/ios/build-ipa.sh 生成）
+      - framework: ../../dist/ios/FdxmpCore.xcframework
+        embed: false
+        codeSign: false
+    settings:
+      base:
+        PRODUCT_NAME: Fdxmp
+        PRODUCT_BUNDLE_IDENTIFIER: com.fdxmp.app
+        INFOPLIST_FILE: Fdxmp/Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: Fdxmp/Fdxmp-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../../crates/ffi/include
+        LD_RUNPATH_SEARCH_PATHS:
+          - $(inherited)
+          - "@executable_path/Frameworks"
+
+schemes:
+  Fdxmp:
+    build:
+      targets:
+        Fdxmp: all
+    run:
+      config: Debug
+    archive:
+      config: Release

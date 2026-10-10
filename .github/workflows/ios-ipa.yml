@@ -1,0 +1,84 @@
+name: iOS 未签名 IPA
+
+# 云打包：在 GitHub 的 macOS 运行器上编译 Rust 静态库 + SwiftUI App，
+# 产出 dist/ios/Fdxmp-unsigned.ipa（未签名，下载后用 Sideloadly / AltStore 签名安装）。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "platforms/ios/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ios-ipa.yml"
+
+jobs:
+  build:
+    name: 构建 Fdxmp iOS
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust iOS 目标
+        run: rustup target add aarch64-apple-ios aarch64-apple-ios-sim
+
+      - name: 缓存 Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ios-${{ hashFiles('Cargo.lock') }}
+
+      - name: 构建 Rust 静态库
+        run: |
+          cargo rustc -p fdxmp-ffi --release --target aarch64-apple-ios --crate-type staticlib
+          cargo rustc -p fdxmp-ffi --release --target aarch64-apple-ios-sim --crate-type staticlib
+
+      - name: 合并 xcframework
+        run: |
+          rm -rf dist/ios/FdxmpCore.xcframework
+          mkdir -p dist/ios
+          xcodebuild -create-xcframework \
+            -library target/aarch64-apple-ios/release/libfdxmp_ffi.a \
+            -library target/aarch64-apple-ios-sim/release/libfdxmp_ffi.a \
+            -output dist/ios/FdxmpCore.xcframework
+
+      - name: 安装 XcodeGen
+        run: brew install xcodegen
+
+      - name: 生成 Xcode 工程
+        working-directory: platforms/ios
+        run: xcodegen generate
+
+      - name: 编译 App（无签名）
+        working-directory: platforms/ios
+        run: |
+          xcodebuild -project Fdxmp.xcodeproj \
+            -scheme Fdxmp \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: 打包未签名 IPA
+        run: |
+          rm -rf dist/ios/Payload
+          mkdir -p dist/ios/Payload
+          cp -R platforms/ios/build/Build/Products/Release-iphoneos/Fdxmp.app dist/ios/Payload/
+          cd dist/ios && zip -qry Fdxmp-unsigned.ipa Payload
+          ls -lh Fdxmp-unsigned.ipa
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: Fdxmp-unsigned-ipa
+          path: dist/ios/Fdxmp-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30

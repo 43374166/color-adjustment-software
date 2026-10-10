@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+    用自己的开发者证书导出 IPA 时的配置模板。
+    用法：
+      xcodebuild -exportArchive -archivePath build/Fdxmp.xcarchive \
+        -exportOptionsPlist packaging/ios/ExportOptions.plist -exportPath dist/ios
+    把 TEAM_ID_HERE 换成你的 Team ID；method 可选 development / ad-hoc / app-store。
+-->
+<plist version="1.0">
+<dict>
+    <key>method</key>
+    <string>development</string>
+    <key>teamID</key>
+    <string>TEAM_ID_HERE</string>
+    <key>compileBitcode</key>
+    <false/>
+    <key>stripSwiftSymbols</key>
+    <true/>
+</dict>
+</plist>

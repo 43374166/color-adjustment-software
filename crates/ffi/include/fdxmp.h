@@ -67,6 +67,20 @@ uint8_t *fdxmp_render_preview_rgba(const char *path,
                                    uint32_t *out_height,
                                    size_t *out_len);
 
+/* ---- 内存图像渲染（系统解码，如 iOS PhotoKit）----
+ *
+ * 输入：行优先 RGBA8 像素（至少 width × height × 4 字节）+ EditParams JSON；
+ * 输出格式与 fdxmp_render_preview_rgba 相同（8 字节大端宽高 + 像素），
+ * 必须用 fdxmp_bytes_free(ptr, len) 释放。失败返回 NULL。
+ */
+uint8_t *fdxmp_render_memory_rgba(const uint8_t *rgba,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  const char *params_json,
+                                  uint32_t *out_width,
+                                  uint32_t *out_height,
+                                  size_t *out_len);
+
 /* ---- 缓存 ---- */
 
 uint64_t fdxmp_cache_total_size(const char *cache_root);

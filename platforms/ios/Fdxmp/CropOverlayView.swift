@@ -1,0 +1,249 @@
+import SwiftUI
+
+/// 裁切叠加层：可拖动的裁剪框 + 三分线 + 角点手柄。
+struct CropOverlayView: View {
+    @ObservedObject var model: EditorModel
+    /// 预览图像的像素尺寸（未裁切）。
+    let imageSize: CGSize
+
+    private enum DragMode {
+        case none
+        case move
+        case topLeft
+        case topRight
+        case bottomLeft
+        case bottomRight
+    }
+
+    @State private var mode: DragMode = .none
+    @State private var startRect: CGRect = .zero
+    @State private var startLocation: CGPoint = .zero
+
+    var body: some View {
+        GeometryReader { geo in
+            let bounds = geo.size
+            let fitted = fittedRect(imageSize: imageSize, in: bounds)
+            let rect = cropRectInPoints(fitted: fitted)
+            Canvas { context, _ in
+                drawDimming(&context, bounds: bounds, rect: rect)
+                drawGrid(&context, rect: rect)
+                drawFrame(&context, rect: rect)
+            }
+            .contentShape(Rectangle())
+            .gesture(dragGesture(fitted: fitted))
+        }
+    }
+
+    // MARK: - 手势
+
+    private func dragGesture(fitted: CGRect) -> some Gesture {
+        DragGesture(minimumDistance: 0)
+            .onChanged { gesture in
+                if mode == .none {
+                    let hit = hitMode(at: gesture.startLocation, rect: cropRectInPoints(fitted: fitted))
+                    guard hit != .none else { return }
+                    mode = hit
+                    startRect = cropRectInPoints(fitted: fitted)
+                    startLocation = gesture.startLocation
+                    model.beginEdit()
+                }
+                let delta = CGSize(
+                    width: gesture.location.x - startLocation.x,
+                    height: gesture.location.y - startLocation.y
+                )
+                let updated: CGRect
+                if mode == .move {
+                    updated = movedRect(start: startRect, delta: delta, fitted: fitted)
+                } else {
+                    updated = resizedRect(
+                        mode: mode,
+                        start: startRect,
+                        delta: delta,
+                        fitted: fitted,
+                        ratio: model.state.crop.aspect.ratio
+                    )
+                }
+                model.updateCropRect(normalized(updated, fitted: fitted), commit: false)
+            }
+            .onEnded { _ in
+                guard mode != .none else { return }
+                mode = .none
+                model.commitEdit()
+            }
+    }
+
+    private func hitMode(at point: CGPoint, rect: CGRect) -> DragMode {
+        let handles: [(DragMode, CGPoint)] = [
+            (.topLeft, CGPoint(x: rect.minX, y: rect.minY)),
+            (.topRight, CGPoint(x: rect.maxX, y: rect.minY)),
+            (.bottomLeft, CGPoint(x: rect.minX, y: rect.maxY)),
+            (.bottomRight, CGPoint(x: rect.maxX, y: rect.maxY)),
+        ]
+        for (handle, position) in handles
+        where hypot(position.x - point.x, position.y - point.y) <= 40 {
+            return handle
+        }
+        if rect.contains(point) {
+            return .move
+        }
+        return .none
+    }
+
+    private func movedRect(start: CGRect, delta: CGSize, fitted: CGRect) -> CGRect {
+        let maxX = max(fitted.maxX - start.width, fitted.minX)
+        let maxY = max(fitted.maxY - start.height, fitted.minY)
+        let x = (start.minX + delta.width)
+            .clamped(to: fitted.minX...maxX)
+        let y = (start.minY + delta.height)
+            .clamped(to: fitted.minY...maxY)
+        return CGRect(x: x, y: y, width: start.width, height: start.height)
+    }
+
+    private func resizedRect(
+        mode: DragMode,
+        start: CGRect,
+        delta: CGSize,
+        fitted: CGRect,
+        ratio: CGFloat?
+    ) -> CGRect {
+        var minX = start.minX
+        var maxX = start.maxX
+        var minY = start.minY
+        var maxY = start.maxY
+        switch mode {
+        case .topLeft:
+            minX += delta.width
+            minY += delta.height
+        case .topRight:
+            maxX += delta.width
+            minY += delta.height
+        case .bottomLeft:
+            minX += delta.width
+            maxY += delta.height
+        case .bottomRight:
+            maxX += delta.width
+            maxY += delta.height
+        case .move, .none:
+            break
+        }
+        minX = minX.clamped(to: fitted.minX...fitted.maxX)
+        maxX = maxX.clamped(to: fitted.minX...fitted.maxX)
+        minY = minY.clamped(to: fitted.minY...fitted.maxY)
+        maxY = maxY.clamped(to: fitted.minY...fitted.maxY)
+
+        var width = max(maxX - minX, 48)
+        var height = max(maxY - minY, 48)
+        if let ratio, ratio > 0 {
+            height = width / ratio
+            if height > fitted.height {
+                height = fitted.height
+                width = height * ratio
+            }
+            if width > fitted.width {
+                width = fitted.width
+                height = width / ratio
+            }
+        }
+        let anchorX: CGFloat = (mode == .topLeft || mode == .bottomLeft) ? maxX : minX
+        let anchorY: CGFloat = (mode == .topLeft || mode == .topRight) ? maxY : minY
+        var originX = (mode == .topLeft || mode == .bottomLeft) ? anchorX - width : anchorX
+        var originY = (mode == .topLeft || mode == .topRight) ? anchorY - height : anchorY
+        originX = originX.clamped(
+            to: fitted.minX...max(fitted.maxX - width, fitted.minX)
+        )
+        originY = originY.clamped(
+            to: fitted.minY...max(fitted.maxY - height, fitted.minY)
+        )
+        return CGRect(x: originX, y: originY, width: width, height: height)
+    }
+
+    // MARK: - 坐标换算
+
+    private func cropRectInPoints(fitted: CGRect) -> CGRect {
+        let rect = clampedCropRect(model.state.crop.rect)
+        return CGRect(
+            x: fitted.minX + rect.minX * fitted.width,
+            y: fitted.minY + rect.minY * fitted.height,
+            width: rect.width * fitted.width,
+            height: rect.height * fitted.height
+        )
+    }
+
+    private func normalized(_ rect: CGRect, fitted: CGRect) -> CGRect {
+        guard fitted.width > 0, fitted.height > 0 else { return model.state.crop.rect }
+        return CGRect(
+            x: (rect.minX - fitted.minX) / fitted.width,
+            y: (rect.minY - fitted.minY) / fitted.height,
+            width: rect.width / fitted.width,
+            height: rect.height / fitted.height
+        )
+    }
+
+    // MARK: - 绘制
+
+    private func drawDimming(_ context: inout GraphicsContext, bounds: CGSize, rect: CGRect) {
+        let color = Color.black.opacity(0.55)
+        let regions = [
+            CGRect(x: 0, y: 0, width: bounds.width, height: max(rect.minY, 0)),
+            CGRect(
+                x: 0, y: rect.maxY,
+                width: bounds.width, height: max(bounds.height - rect.maxY, 0)
+            ),
+            CGRect(x: 0, y: rect.minY, width: max(rect.minX, 0), height: rect.height),
+            CGRect(
+                x: rect.maxX, y: rect.minY,
+                width: max(bounds.width - rect.maxX, 0), height: rect.height
+            ),
+        ]
+        for region in regions where region.width > 0 && region.height > 0 {
+            context.fill(Path(region), with: .color(color))
+        }
+    }
+
+    private func drawGrid(_ context: inout GraphicsContext, rect: CGRect) {
+        var grid = Path()
+        for step in 1..<3 {
+            let ratio = CGFloat(step) / 3
+            let x = rect.minX + rect.width * ratio
+            let y = rect.minY + rect.height * ratio
+            grid.move(to: CGPoint(x: x, y: rect.minY))
+            grid.addLine(to: CGPoint(x: x, y: rect.maxY))
+            grid.move(to: CGPoint(x: rect.minX, y: y))
+            grid.addLine(to: CGPoint(x: rect.maxX, y: y))
+        }
+        context.stroke(grid, with: .color(.white.opacity(0.35)), lineWidth: 1)
+    }
+
+    private func drawFrame(_ context: inout GraphicsContext, rect: CGRect) {
+        context.stroke(
+            Path(rect),
+            with: .color(.white),
+            style: StrokeStyle(lineWidth: 2)
+        )
+        // 角点手柄（L 形）
+        let length: CGFloat = 22
+        let thickness: CGFloat = 4
+        var handles = Path()
+        let corners = [
+            (CGPoint(x: rect.minX, y: rect.minY), CGPoint(x: 1, y: 0), CGPoint(x: 0, y: 1)),
+            (CGPoint(x: rect.maxX, y: rect.minY), CGPoint(x: -1, y: 0), CGPoint(x: 0, y: 1)),
+            (CGPoint(x: rect.minX, y: rect.maxY), CGPoint(x: 1, y: 0), CGPoint(x: 0, y: -1)),
+            (CGPoint(x: rect.maxX, y: rect.maxY), CGPoint(x: -1, y: 0), CGPoint(x: 0, y: -1)),
+        ]
+        for (corner, dx, dy) in corners {
+            handles.move(to: corner)
+            handles.addLine(
+                to: CGPoint(x: corner.x + dx.x * length, y: corner.y + dy.x * length)
+            )
+            handles.move(to: corner)
+            handles.addLine(
+                to: CGPoint(x: corner.x + dx.y * length, y: corner.y + dy.y * length)
+            )
+        }
+        context.stroke(
+            handles,
+            with: .color(.white),
+            style: StrokeStyle(lineWidth: thickness, lineCap: .round)
+        )
+    }
+}

@@ -8,8 +8,9 @@
 use std::path::Path;
 
 use image::RgbaImage;
+use rayon::prelude::*;
 
-use crate::error::Result;
+use crate::error::{FdxmpError, Result};
 use crate::params::{
     eval_curve, ColorGradingParams, CropParams, CurveParams, DetailParams, EditParams, HslParams,
     LensParams, ParametricCurve, ToneCurve,
@@ -30,10 +31,43 @@ pub fn render_preview_rgba(path: &Path, params_json: &str, max_edge: u32) -> Res
     let params: EditParams = serde_json::from_str(params_json)?;
     let decoded = crate::decode::decode_preview(path)?;
     let proxy = decoded.display_proxy(max_edge.clamp(64, 4096));
-    let rendered = render_preview_image(&proxy, &params);
+    finish_preview(proxy, &params)
+}
+
+/// 对调用方提供的内存 RGBA8 图像应用编辑参数（图像已由系统解码的场景，如 iOS）。
+///
+/// `rgba` 为行优先 RGBA8 像素，长度至少 `width × height × 4`；
+/// 处理流程与 [`render_preview_rgba`] 完全一致（调色 → 细节 → 效果 → 镜头 → 几何 → 蒙版）。
+pub fn render_memory_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    params_json: &str,
+) -> Result<PreviewRgba> {
+    let params: EditParams = serde_json::from_str(params_json)?;
+    if width == 0 || height == 0 {
+        return Err(FdxmpError::InvalidArgument(
+            "RGBA 图像宽高必须大于 0".to_string(),
+        ));
+    }
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() < expected {
+        return Err(FdxmpError::InvalidArgument(format!(
+            "RGBA 缓冲区大小不匹配：{width}×{height} 需要 {expected} 字节，实际 {}",
+            rgba.len()
+        )));
+    }
+    let image = RgbaImage::from_raw(width, height, rgba[..expected].to_vec())
+        .ok_or_else(|| FdxmpError::InvalidArgument("无法从 RGBA 缓冲区创建图像".to_string()))?;
+    finish_preview(image, &params)
+}
+
+/// 调色 → 镜头 → 几何 → 蒙版 的公共后处理（解码路径与内存路径共用）。
+fn finish_preview(image: RgbaImage, params: &EditParams) -> Result<PreviewRgba> {
+    let rendered = render_preview_image(&image, params);
     let corrected = apply_lens(&rendered, &params.lens);
     let mut geometry = apply_geometry(&corrected, &params.crop);
-    apply_masks(&mut geometry, &params);
+    apply_masks(&mut geometry, params);
     Ok(PreviewRgba {
         width: geometry.width(),
         height: geometry.height(),
@@ -93,13 +127,12 @@ pub fn apply_lens(source: &RgbaImage, lens: &LensParams) -> RgbaImage {
             let sy = half_h + ry * factor * max_half;
             let mut pixel = sample_bilinear(source, sx, sy);
             if vignette.abs() > 1e-4 {
-                let distance =
-                    radius_squared.sqrt() / std::f32::consts::SQRT_2;
+                let distance = radius_squared.sqrt() / std::f32::consts::SQRT_2;
                 let weight = smoothstep(0.35, 1.0, distance);
                 let correction = 1.0 + vignette * 0.45 * weight;
                 for channel in 0..3 {
-                    pixel.0[channel] = ((pixel.0[channel] as f32 * correction)
-                        .clamp(0.0, 255.0)) as u8;
+                    pixel.0[channel] =
+                        ((pixel.0[channel] as f32 * correction).clamp(0.0, 255.0)) as u8;
                 }
             }
             out.put_pixel(x, y, pixel);
@@ -230,40 +263,50 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
     let mut out = source.clone();
 
     // 第一遍：逐像素颜色（基础 → 分区 → 曲线 → 饱和度 → HSL → 分级）。
-    for pixel in out.pixels_mut() {
-        let [r, g, b, a] = pixel.0;
-        let linear = [
-            srgb8_to_linear(r),
-            srgb8_to_linear(g),
-            srgb8_to_linear(b),
-        ];
-        let base = crate::pipeline::apply_reference(linear, params);
-        let mut rgb = [
-            linear_to_srgb_f32(base[0]),
-            linear_to_srgb_f32(base[1]),
-            linear_to_srgb_f32(base[2]),
-        ];
-        rgb = adjust_pixel(rgb, params, &curves);
-        pixel.0 = [
-            to_u8(rgb[0]),
-            to_u8(rgb[1]),
-            to_u8(rgb[2]),
-            a,
-        ];
+    // 像素之间相互独立，按 4 字节像素并行处理（移动端 CPU 预览约 2–4× 提速）。
+    {
+        let pixels: &mut [u8] = &mut out;
+        pixels.par_chunks_mut(4).for_each(|pixel| {
+            let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+            let linear = [srgb8_to_linear(r), srgb8_to_linear(g), srgb8_to_linear(b)];
+            let base = crate::pipeline::apply_reference(linear, params);
+            let mut rgb = [
+                linear_to_srgb_f32(base[0]),
+                linear_to_srgb_f32(base[1]),
+                linear_to_srgb_f32(base[2]),
+            ];
+            rgb = adjust_pixel(rgb, params, &curves);
+            pixel[0] = to_u8(rgb[0]);
+            pixel[1] = to_u8(rgb[1]);
+            pixel[2] = to_u8(rgb[2]);
+            pixel[3] = a;
+        });
     }
 
     // 第二遍：细节（锐化 / 降噪）需要邻域。
     apply_detail(&mut out, &params.detail);
 
-    // 第三遍：全局效果（暗角 / 颗粒）。
-    for (x, y, pixel) in out.enumerate_pixels_mut() {
-        let [r, g, b, a] = pixel.0;
-        let mut rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
-        rgb = apply_effects(rgb, effects, x, y, width, height);
-        for channel in &mut rgb {
-            *channel = channel.clamp(0.0, 1.0);
-        }
-        pixel.0 = [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), a];
+    // 第三遍：全局效果（暗角 / 颗粒），同样逐像素独立。
+    let out_width = out.width().max(1);
+    {
+        let pixels: &mut [u8] = &mut out;
+        pixels
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(index, pixel)| {
+                let x = (index as u32) % out_width;
+                let y = (index as u32) / out_width;
+                let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                let mut rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+                rgb = apply_effects(rgb, effects, x, y, width, height);
+                for channel in &mut rgb {
+                    *channel = channel.clamp(0.0, 1.0);
+                }
+                pixel[0] = to_u8(rgb[0]);
+                pixel[1] = to_u8(rgb[1]);
+                pixel[2] = to_u8(rgb[2]);
+                pixel[3] = a;
+            });
     }
 
     out
@@ -277,8 +320,7 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
     // 蒙版栅格按降采样分辨率生成：画笔距离场 / 羽化模糊的开销随像素数下降，
     // 权重本身是平滑的，双线性采样后观感一致。
     const MASK_MAX_EDGE: u32 = 512;
-    let (mask_width, mask_height) =
-        scaled_dims(image.width(), image.height(), MASK_MAX_EDGE);
+    let (mask_width, mask_height) = scaled_dims(image.width(), image.height(), MASK_MAX_EDGE);
     let mask_image = if mask_width != image.width() || mask_height != image.height() {
         image::imageops::resize(
             image,
@@ -293,12 +335,7 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
         .masks
         .iter()
         .filter_map(|mask| {
-            let raster = cached_mask(
-                mask,
-                &mask_image,
-                mask_image.width(),
-                mask_image.height(),
-            )?;
+            let raster = cached_mask(mask, &mask_image, mask_image.width(), mask_image.height())?;
             Some(MaskContext {
                 raster,
                 curves: CurveLuts::new(&mask.adjustments.curves),
@@ -312,27 +349,35 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
 
     let full_width = image.width();
     let full_height = image.height();
-    for (x, y, pixel) in image.enumerate_pixels_mut() {
-        let [r, g, b, a] = pixel.0;
-        let mut rgb = [
-            r as f32 / 255.0,
-            g as f32 / 255.0,
-            b as f32 / 255.0,
-        ];
-        let mut changed = false;
-        for context in &contexts {
-            let weight = sample_raster(&context.raster, x, y, full_width, full_height);
-            if weight > 0.001 {
-                let adjusted = adjust_with_reference(rgb, &context.params, &context.curves);
-                for channel in 0..3 {
-                    rgb[channel] += (adjusted[channel] - rgb[channel]) * weight;
+    // 逐像素独立，按 4 字节像素并行合成各蒙版（数学与串行版完全一致）。
+    {
+        let pixels: &mut [u8] = image;
+        pixels
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(index, pixel)| {
+                let x = (index as u32) % full_width;
+                let y = (index as u32) / full_width;
+                let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
+                let mut rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
+                let mut changed = false;
+                for context in &contexts {
+                    let weight = sample_raster(&context.raster, x, y, full_width, full_height);
+                    if weight > 0.001 {
+                        let adjusted = adjust_with_reference(rgb, &context.params, &context.curves);
+                        for channel in 0..3 {
+                            rgb[channel] += (adjusted[channel] - rgb[channel]) * weight;
+                        }
+                        changed = true;
+                    }
                 }
-                changed = true;
-            }
-        }
-        if changed {
-            pixel.0 = [to_u8(rgb[0]), to_u8(rgb[1]), to_u8(rgb[2]), a];
-        }
+                if changed {
+                    pixel[0] = to_u8(rgb[0]);
+                    pixel[1] = to_u8(rgb[1]);
+                    pixel[2] = to_u8(rgb[2]);
+                    pixel[3] = a;
+                }
+            });
     }
 }
 
@@ -377,7 +422,13 @@ fn scaled_dims(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
 }
 
 /// 把（可能降采样的）蒙版权重栅格双线性采样到全分辨率坐标。
-fn sample_raster(raster: &crate::masks::MaskRaster, x: u32, y: u32, width: u32, height: u32) -> f32 {
+fn sample_raster(
+    raster: &crate::masks::MaskRaster,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> f32 {
     if raster.width == width && raster.height == height {
         return raster.get(x, y);
     }
@@ -385,8 +436,12 @@ fn sample_raster(raster: &crate::masks::MaskRaster, x: u32, y: u32, width: u32, 
     let fy = (y as f32 + 0.5) / height.max(1) as f32;
     let sx = fx * raster.width as f32 - 0.5;
     let sy = fy * raster.height as f32 - 0.5;
-    let x0 = sx.floor().clamp(0.0, (raster.width.saturating_sub(1)) as f32) as u32;
-    let y0 = sy.floor().clamp(0.0, (raster.height.saturating_sub(1)) as f32) as u32;
+    let x0 = sx
+        .floor()
+        .clamp(0.0, (raster.width.saturating_sub(1)) as f32) as u32;
+    let y0 = sy
+        .floor()
+        .clamp(0.0, (raster.height.saturating_sub(1)) as f32) as u32;
     let x1 = (x0 + 1).min(raster.width.saturating_sub(1));
     let y1 = (y0 + 1).min(raster.height.saturating_sub(1));
     let tx = (sx - x0 as f32).clamp(0.0, 1.0);
@@ -697,11 +752,7 @@ pub fn apply_detail(image: &mut RgbaImage, detail: &DetailParams) {
                 let amount = (sharpen.amount / 100.0).clamp(0.0, 1.5);
                 let detail_factor = (0.5 + sharpen.detail / 100.0).clamp(0.5, 1.5);
                 let masking = (sharpen.masking / 100.0).clamp(0.0, 1.0);
-                let diff = [
-                    rgb[0] - blur[0],
-                    rgb[1] - blur[1],
-                    rgb[2] - blur[2],
-                ];
+                let diff = [rgb[0] - blur[0], rgb[1] - blur[1], rgb[2] - blur[2]];
                 let edge = (diff[0].abs() + diff[1].abs() + diff[2].abs()) / 3.0;
                 let mask_weight = if masking <= 0.001 {
                     1.0
@@ -795,7 +846,11 @@ fn rgb_to_hsv(rgb: [f32; 3]) -> (f32, f32, f32) {
     } else {
         (((rgb[0] - rgb[1]) / delta) + 4.0) / 6.0
     };
-    let saturation = if max <= f32::EPSILON { 0.0 } else { delta / max };
+    let saturation = if max <= f32::EPSILON {
+        0.0
+    } else {
+        delta / max
+    };
     (hue.rem_euclid(1.0), saturation, max)
 }
 
@@ -1031,6 +1086,69 @@ mod tests {
     }
 
     #[test]
+    fn memory_rgba_applies_exposure() {
+        let rgba: Vec<u8> = [64u8, 64, 64, 255].repeat(4);
+        let out =
+            render_memory_rgba(&rgba, 2, 2, r#"{"version":1,"light":{"exposure":1.0}}"#).unwrap();
+        assert_eq!((out.width, out.height), (2, 2));
+        assert_eq!(out.rgba.len(), 16);
+        // 64（sRGB）≈ 0.051 线性；+1EV 后约 0.103 线性 ≈ 90（sRGB）。
+        assert!(
+            (85..=95).contains(&out.rgba[0]),
+            "曝光 +1EV 后应约为 90：{}",
+            out.rgba[0]
+        );
+    }
+
+    #[test]
+    fn memory_rgba_rejects_short_buffer() {
+        let rgba = vec![0u8; 3 * 4];
+        assert!(render_memory_rgba(&rgba, 2, 2, "{}").is_err());
+    }
+
+    #[test]
+    fn memory_rgba_accepts_full_mobile_params_json() {
+        // 该 JSON 与 iOS `EditJSON.build` 的输出结构一致（曲线 / HSL / 分级 / 裁切 / 蒙版）。
+        let rgba: Vec<u8> = [80u8, 120, 160, 255].repeat(4 * 4);
+        let json = r#"{
+            "version": 1,
+            "light": {"exposure": 0.5, "contrast": 10, "highlights": -20},
+            "color": {"temperature": 5, "tint": -3, "vibrance": 12, "saturation": 4},
+            "effects": {"texture": 5, "clarity": 8, "dehaze": 4, "vignette": -20,
+                        "vignette_midpoint": 50, "vignette_feather": 50, "grain": 10,
+                        "grain_size": 20, "grain_roughness": 50},
+            "curves": {
+                "rgb": {"points": [{"x": 0.0, "y": 0.0}, {"x": 0.5, "y": 0.45}, {"x": 1.0, "y": 1.0}]},
+                "red": {"points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}]},
+                "green": {"points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}]},
+                "blue": {"points": [{"x": 0.0, "y": 0.0}, {"x": 1.0, "y": 1.0}]},
+                "parametric": {"highlights": -10, "midtones": 5, "shadows": 10,
+                               "highlights_split": 0.75, "midtones_split": 0.25}
+            },
+            "hsl": {"red": {"hue": 0, "saturation": -20, "luminance": 5}},
+            "grading": {"shadows": {"hue": 240, "saturation": 20, "luminance": 0},
+                        "midtones": {}, "highlights": {},
+                        "blending": 50, "balance": 0},
+            "detail": {"sharpen": {"amount": 40, "radius": 1.0, "detail": 25, "masking": 0},
+                       "noise": {"luminance": 10, "luminance_detail": 50,
+                                 "luminance_contrast": 0, "color": 5,
+                                 "color_detail": 50, "color_smoothness": 50}},
+            "crop": {"rect": [0.0, 0.0, 0.5, 0.5], "aspect": "free", "rotation_deg": 0,
+                     "flip_horizontal": false, "flip_vertical": false,
+                     "grid": "thirds", "auto_compose": false},
+            "masks": [{
+                "id": "m1", "name": "线性 1",
+                "kind": {"type": "linear_gradient", "data": {"start": [0.0, 0.0], "end": [0.0, 1.0]}},
+                "inverted": false, "feather": 50, "opacity": 100, "overlay": "red",
+                "adjustments": {"light": {"exposure": 1.0}, "color": {}, "effects": {}}
+            }]
+        }"#;
+        let out = render_memory_rgba(&rgba, 4, 4, json).unwrap();
+        assert_eq!((out.width, out.height), (2, 2));
+        assert_eq!(out.rgba.len(), 2 * 2 * 4);
+    }
+
+    #[test]
     fn exposure_brightens_image() {
         let mut source = RgbaImage::new(2, 2);
         for pixel in source.pixels_mut() {
@@ -1154,7 +1272,10 @@ mod tests {
         let out = render_preview_image(&source, &params);
         let left = out.get_pixel(1, 0).0[0] as i32;
         let right = out.get_pixel(2, 0).0[0] as i32;
-        assert!(right - left > 45, "锐化后边缘对比应增大：left={left} right={right}");
+        assert!(
+            right - left > 45,
+            "锐化后边缘对比应增大：left={left} right={right}"
+        );
     }
 
     #[test]
@@ -1178,12 +1299,7 @@ mod tests {
         let height = 932u32;
         let mut source = RgbaImage::new(width, height);
         for (x, y, pixel) in source.enumerate_pixels_mut() {
-            *pixel = Rgba([
-                (x % 256) as u8,
-                (y % 256) as u8,
-                ((x + y) % 256) as u8,
-                255,
-            ]);
+            *pixel = Rgba([(x % 256) as u8, (y % 256) as u8, ((x + y) % 256) as u8, 255]);
         }
 
         let mut params = EditParams::default();

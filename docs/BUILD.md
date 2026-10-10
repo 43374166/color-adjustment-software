@@ -8,7 +8,7 @@
 | Windows | MSVC 工具链（`x86_64-pc-windows-msvc`）**或** GNU 工具链 + MinGW-w64（本机当前方案，见 §0.1） |
 | Android | Android SDK、NDK、JDK 17+、`cargo-ndk`、Gradle |
 | HarmonyOS | DevEco Studio（`DEVECO_SDK_HOME`）、`hvigorw`、ohos 目标工具链 |
-| iOS（占位） | macOS + Xcode（暂不打包） |
+| iOS | macOS + Xcode（本机脚本或 GitHub Actions 云打包，见 `packaging/ios/`） |
 
 ### 0.1 本机 Windows 方案（无 Visual Studio 时的替代）
 
@@ -160,7 +160,17 @@ powershell -File packaging/harmony/build.ps1
 ```
 
 输出统一落在 `dist/{windows,android,harmony,ios}/`。
-iOS 按规格占位，不打包。
+
+iOS（云打包 / macOS）：
+
+```bash
+brew install xcodegen
+./packaging/ios/build-ipa.sh          # → dist/ios/Fdxmp-unsigned.ipa
+```
+
+仓库内置 GitHub Actions 工作流 `.github/workflows/ios-ipa.yml`，
+推送后手动触发即可在云端产出未签名 IPA（用 Sideloadly / AltStore 签名安装），
+详见 [packaging/ios/README.md](../packaging/ios/README.md)。
 
 ## 5. 桌面打包器
 

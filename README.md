@@ -111,6 +111,20 @@ cargo run -p fdxmp-packer-ui    # 单文件打包器
 > Windows 端采用桌面布局而非移动端三 Tab（三 Tab 是移动端规格），设计见
 > [docs/DESKTOP_UI.md](docs/DESKTOP_UI.md)。
 
+### iOS 云打包（无需 Mac）
+
+iOS 端已接入调色编辑界面（SwiftUI + Rust CPU 预览，PhotoKit 负责解码 HEIC / RAW）：
+推送仓库后在 GitHub Actions 手动触发 `iOS 未签名 IPA` 工作流，
+下载产物 `Fdxmp-unsigned.ipa`，用 Sideloadly / AltStore 签名装到手机：
+
+```bash
+brew install xcodegen          # 仅 macOS 本机需要
+./packaging/ios/build-ipa.sh   # → dist/ios/Fdxmp-unsigned.ipa
+```
+
+详见 [packaging/ios/README.md](packaging/ios/README.md) 与
+[platforms/ios/README.md](platforms/ios/README.md)。
+
 ## 阶段 1 验证摘要
 
 - RAW（rsraw/LibRaw）+ 常见格式统一解码；45.7MP Nikon Z8 NEF 实测：
@@ -140,6 +154,6 @@ cargo run -p fdxmp-packer-ui    # 单文件打包器
 | 2 | 色彩管线（曲线 / HSL / 分级 / 细节） | ✅ 已完成（[阶段 2 报告](docs/STAGE2_REPORT.md)） |
 | 3 | 蒙版系统（画笔 / 渐变 / 范围 / AI） | ✅ 已完成（[阶段 3 报告](docs/STAGE3_REPORT.md)，AI 蒙版接口预留） |
 | 4 | 预设与导出（.fdxmp / XMP 导入） | ✅ 已完成（[阶段 4 报告](docs/STAGE4_REPORT.md)） |
-| 5 | 移动端 UI（三大 Tab + 编辑界面） | 🟡 三端设备 Tab 已实现；Android 编辑 Tab + 基础调色编辑界面（Rust 核心出预览）已实现；曲线 / HSL / 蒙版与其余两端编辑界面待做 |
+| 5 | 移动端 UI（三大 Tab + 编辑界面） | 🟡 三端设备 Tab 已实现；Android / iOS 编辑 Tab + 完整调色编辑界面（Rust 核心出预览）已实现，iOS 可云打包 IPA；iOS 曲线 / HSL / 分级 / 裁切 / 蒙版已接入，GPU（Metal）预览待补 |
 | 6 | Windows UI 与打包器 | ⏳ 待开始 |
 | 7 | AI 蒙版与性能优化 | ⏳ 待开始 |

@@ -489,6 +489,71 @@ pub unsafe extern "C" fn fdxmp_render_preview_rgba(
     })
 }
 
+/// 对调用方提供的内存 RGBA8 图像应用编辑参数，返回 RGBA8 像素缓冲区
+/// （调用方用 `fdxmp_bytes_free(ptr, len)` 释放）；失败返回 NULL。
+///
+/// 用于图像已由系统解码的场景（如 iOS PhotoKit）：`rgba` 为行优先 RGBA8，
+/// 长度至少 `width × height × 4`；返回格式与 `fdxmp_render_preview_rgba` 相同
+/// （前 8 字节大端 `width` / `height`，其后为行优先 RGBA8 像素）。
+///
+/// # Safety
+///
+/// `rgba` 必须指向至少 `width * height * 4` 字节的可读缓冲区；
+/// `params_json` 必须为合法 C 字符串；`out_width`、`out_height`、`out_len`
+/// 必须为非空可写指针。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_render_memory_rgba(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    params_json: *const c_char,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if rgba.is_null() || out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("rgba / out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        let Some(expected) = expected else {
+            set_last_error("图像尺寸溢出");
+            return ptr::null_mut();
+        };
+        // SAFETY: 调用方保证缓冲区至少 `width * height * 4` 字节。
+        let buffer = std::slice::from_raw_parts(rgba, expected);
+        match fdxmp_core::preview::render_memory_rgba(buffer, width, height, params_json) {
+            Ok(preview) => {
+                let mut payload = Vec::with_capacity(8 + preview.rgba.len());
+                payload.extend_from_slice(&preview.width.to_be_bytes());
+                payload.extend_from_slice(&preview.height.to_be_bytes());
+                payload.extend_from_slice(&preview.rgba);
+                *out_width = preview.width;
+                *out_height = preview.height;
+                let mut boxed = payload.into_boxed_slice();
+                *out_len = boxed.len();
+                let pointer = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                pointer
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 缓存总大小（字节）；失败返回 [`FDXMP_U64_ERR`]。
 ///
 /// # Safety
@@ -604,6 +669,40 @@ mod tests {
             assert!(json.contains("version"));
             fdxmp_string_free(json_ptr);
             fdxmp_bytes_free(bytes, out_len);
+        }
+    }
+
+    #[test]
+    fn memory_rgba_render_through_ffi() {
+        // SAFETY: 像素缓冲区、参数 C 字符串与输出指针均为本测试构造的合法内存。
+        unsafe {
+            let mut rgba = [64u8; 4 * 4 * 4];
+            for index in (3..rgba.len()).step_by(4) {
+                rgba[index] = 255;
+            }
+            let params = CString::new(r#"{"version":1,"light":{"exposure":1.0}}"#).unwrap();
+            let mut out_width = 0u32;
+            let mut out_height = 0u32;
+            let mut out_len = 0usize;
+            let pointer = fdxmp_render_memory_rgba(
+                rgba.as_ptr(),
+                4,
+                4,
+                params.as_ptr(),
+                &mut out_width,
+                &mut out_height,
+                &mut out_len,
+            );
+            assert!(!pointer.is_null());
+            assert_eq!((out_width, out_height), (4, 4));
+            assert_eq!(out_len, 8 + 4 * 4 * 4);
+            let payload = std::slice::from_raw_parts(pointer, out_len);
+            assert!(
+                (85..=95).contains(&payload[8]),
+                "曝光 +1EV 后应约为 90：{}",
+                payload[8]
+            );
+            fdxmp_bytes_free(pointer, out_len);
         }
     }
 

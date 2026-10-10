@@ -117,11 +117,9 @@ impl PreviewSession {
             params,
             GeometryMode::Crop,
         );
-        let bytes = self.pipeline.readback(
-            &self.context.device,
-            &self.context.queue,
-            &self.image,
-        )?;
+        let bytes =
+            self.pipeline
+                .readback(&self.context.device, &self.context.queue, &self.image)?;
         let (width, height) = self
             .pipeline
             .target_size()

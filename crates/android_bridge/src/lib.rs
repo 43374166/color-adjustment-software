@@ -65,8 +65,8 @@ mod android_jni {
     //! 真机 / 模拟器上的 JNI 导出（仅在 Android 目标下编译）。
 
     use jni::objects::{JClass, JString};
-    use jni::sys::{jbyte, jbyteArray, jint, jlong, jstring};
     use jni::strings::JNIString;
+    use jni::sys::{jbyte, jbyteArray, jint, jlong, jstring};
     use jni::EnvUnowned;
 
     static LAST_GPU_ERROR: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);

@@ -13,6 +13,8 @@ oh_modules/
 Pods/
 DerivedData/
 platforms/ios/build/
+platforms/ios/Fdxmp.xcodeproj/
+xcuserdata/
 
 # 打包输出（保留目录占位）
 /dist/**
