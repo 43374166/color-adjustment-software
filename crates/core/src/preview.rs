@@ -62,6 +62,93 @@ pub fn render_memory_rgba(
     finish_preview(image, &params)
 }
 
+/// 区域渲染（放大 1:1 看细节）：
+///
+/// - 调用方传入**区域像素**（区域 = 可见矩形向外扩 `margin` 再夹到整帧内）；
+/// - `region_*` 是区域左上角在整帧中的像素坐标，`visible_*` 是要输出的可见矩形，
+///   `full_*` 是整帧尺寸；
+/// - 效果（暗角 / 颗粒）与蒙版都按**整帧坐标**计算，细节模糊在区域+余量内做——
+///   只要余量 ≥ 模糊半径，输出与整帧渲染逐像素一致；
+/// - 要求几何 / 镜头为单位变换（裁切 / 旋转 / 畸变请整帧渲染）。
+#[allow(clippy::too_many_arguments)]
+pub fn render_memory_rgba_region(
+    rgba: &[u8],
+    region_width: u32,
+    region_height: u32,
+    params_json: &str,
+    region_x: u32,
+    region_y: u32,
+    visible_x: u32,
+    visible_y: u32,
+    visible_width: u32,
+    visible_height: u32,
+    full_width: u32,
+    full_height: u32,
+) -> Result<PreviewRgba> {
+    let params: EditParams = serde_json::from_str(params_json)?;
+    if !geometry_is_identity(&params) {
+        return Err(FdxmpError::Unsupported(
+            "区域渲染需要单位几何（裁切 / 旋转 / 镜头校正请用整帧渲染）".to_string(),
+        ));
+    }
+    let expected = region_width as usize * region_height as usize * 4;
+    if region_width == 0 || region_height == 0 || rgba.len() < expected {
+        return Err(FdxmpError::InvalidArgument(format!(
+            "区域像素缓冲区大小不匹配：需要 {expected} 字节"
+        )));
+    }
+    let region = RgbaImage::from_raw(region_width, region_height, rgba[..expected].to_vec())
+        .ok_or_else(|| FdxmpError::InvalidArgument("无法从 RGBA 缓冲区创建区域图像".to_string()))?;
+    let origin = FrameOrigin {
+        x: region_x,
+        y: region_y,
+        full_width: full_width.max(1),
+        full_height: full_height.max(1),
+    };
+    let mut rendered = render_preview_image_at(&region, &params, origin);
+    apply_masks_at(&mut rendered, &params, origin)?;
+
+    let left = visible_x.saturating_sub(region_x);
+    let top = visible_y.saturating_sub(region_y);
+    let right = (visible_x + visible_width)
+        .min(region_x + region_width)
+        .saturating_sub(region_x);
+    let bottom = (visible_y + visible_height)
+        .min(region_y + region_height)
+        .saturating_sub(region_y);
+    if right <= left || bottom <= top {
+        return Err(FdxmpError::InvalidArgument(
+            "区域渲染：可见矩形不在提供的像素范围内".to_string(),
+        ));
+    }
+    let cropped =
+        image::imageops::crop_imm(&rendered, left, top, right - left, bottom - top).to_image();
+    Ok(PreviewRgba {
+        width: cropped.width(),
+        height: cropped.height(),
+        rgba: cropped.into_raw(),
+    })
+}
+
+/// 几何 / 镜头是否为单位变换（区域渲染的前提）。
+fn geometry_is_identity(params: &EditParams) -> bool {
+    let crop = &params.crop;
+    let geometry = &params.lens.geometry;
+    crop.rect == [0.0, 0.0, 1.0, 1.0]
+        && crop.rotation_deg.abs() < 1e-3
+        && !crop.flip_horizontal
+        && !crop.flip_vertical
+        && geometry.distortion.abs() < 1e-4
+        && geometry.vertical.abs() < 1e-4
+        && geometry.horizontal.abs() < 1e-4
+        && geometry.rotate.abs() < 1e-3
+        // 与 `apply_lens` 一致：scale ≤ 0 视为 1.0。
+        && (geometry.scale <= 0.0 || (geometry.scale - 1.0).abs() < 1e-4)
+        && !params.lens.profile_correction
+        && params.lens.vignette.abs() < 1e-4
+        && params.lens.chromatic_aberration.abs() < 1e-4
+}
+
 /// 调色 → 镜头 → 几何 → 蒙版 的公共后处理（解码路径与内存路径共用）。
 fn finish_preview(image: RgbaImage, params: &EditParams) -> Result<PreviewRgba> {
     let rendered = render_preview_image(&image, params);
@@ -256,8 +343,49 @@ fn crop_rect(source: &RgbaImage, rect: [f32; 4]) -> RgbaImage {
 
 /// 把编辑参数应用到 sRGB RGBA 图像。
 pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImage {
-    let width = source.width().max(1) as f32;
-    let height = source.height().max(1) as f32;
+    render_preview_image_at(
+        source,
+        params,
+        FrameOrigin::full(source.width(), source.height()),
+    )
+}
+
+/// 帧外坐标：告诉管线"当前这段像素在整帧里从哪开始、整帧多大"。
+///
+/// 用于按区域渲染（放大 1:1 查细节）：暗角 / 颗粒这类"按整帧坐标"算的效果
+/// 必须知道像素的绝对位置，才能和整帧渲染逐像素一致。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameOrigin {
+    /// 本段像素左上角在整帧中的坐标。
+    pub x: u32,
+    /// 同上（纵向）。
+    pub y: u32,
+    /// 整帧宽。
+    pub full_width: u32,
+    /// 整帧高。
+    pub full_height: u32,
+}
+
+impl FrameOrigin {
+    /// 整帧渲染（无偏移）。
+    pub fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            full_width: width.max(1),
+            full_height: height.max(1),
+        }
+    }
+}
+
+/// 把编辑参数应用到"整帧中的一个区域"（带帧外坐标）。
+pub fn render_preview_image_at(
+    source: &RgbaImage,
+    params: &EditParams,
+    origin: FrameOrigin,
+) -> RgbaImage {
+    let full_width = origin.full_width.max(1) as f32;
+    let full_height = origin.full_height.max(1) as f32;
     let effects = &params.effects;
     let curves = CurveLuts::new(&params.curves);
     let mut out = source.clone();
@@ -298,7 +426,15 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
                 let y = (index as u32) / out_width;
                 let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
                 let mut rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
-                rgb = apply_effects(rgb, effects, x, y, width, height);
+                // 暗角 / 颗粒按**整帧**坐标计算（区域渲染时加上原点）。
+                rgb = apply_effects(
+                    rgb,
+                    effects,
+                    origin.x + x,
+                    origin.y + y,
+                    full_width,
+                    full_height,
+                );
                 for channel in &mut rgb {
                     *channel = channel.clamp(0.0, 1.0);
                 }
@@ -317,10 +453,11 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
     if params.masks.iter().all(|mask| !mask.visible) {
         return;
     }
-    // 蒙版栅格按降采样分辨率生成：预览取长边一半（快），导出随分辨率提高
-    // （2048 上限），权重本身是平滑的，双线性采样后观感一致。
-    let edge = mask_raster_edge(image.width().max(image.height()));
-    let (mask_width, mask_height) = scaled_dims(image.width(), image.height(), edge);
+    let (full_width, full_height) = (image.width().max(1), image.height().max(1));
+    // 蒙版栅格按降采样分辨率生成：画笔距离场 / 羽化模糊的开销随像素数下降，
+    // 权重本身是平滑的，双线性采样后观感一致。
+    let edge = mask_raster_edge(full_width.max(full_height));
+    let (mask_width, mask_height) = scaled_dims(full_width, full_height, edge);
     let mask_image = if mask_width != image.width() || mask_height != image.height() {
         image::imageops::resize(
             image,
@@ -331,6 +468,58 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
     } else {
         image.clone()
     };
+    compose_masks(
+        image,
+        params,
+        FrameOrigin::full(full_width, full_height),
+        &mask_image,
+        mask_width,
+        mask_height,
+    );
+}
+
+/// 蒙版合成（带帧外坐标）：区域渲染时按整帧坐标采样蒙版权重栅格。
+///
+/// 依赖参考图内容的蒙版（颜色 / 亮度范围 / AI / 深度）在区域渲染下无法重建栅格，
+/// 返回 `Unsupported` 让调用方回退整帧渲染。
+pub fn apply_masks_at(
+    image: &mut RgbaImage,
+    params: &EditParams,
+    origin: FrameOrigin,
+) -> Result<()> {
+    if params.masks.iter().all(|mask| !mask.visible) {
+        return Ok(());
+    }
+    if params
+        .masks
+        .iter()
+        .any(|mask| mask.visible && mask_kind_needs_reference(&mask.kind))
+    {
+        return Err(FdxmpError::Unsupported(
+            "区域渲染不支持依赖图像内容的蒙版（颜色 / 亮度范围 / AI）".to_string(),
+        ));
+    }
+    let full_width = origin.full_width.max(1);
+    let full_height = origin.full_height.max(1);
+    let edge = mask_raster_edge(full_width.max(full_height));
+    let (mask_width, mask_height) = scaled_dims(full_width, full_height, edge);
+    // 几何型蒙版不依赖图像内容，1×1 占位即可（栅格尺寸与整帧渲染一致 → 缓存命中）。
+    let mask_image = image::RgbaImage::new(1, 1);
+    compose_masks(image, params, origin, &mask_image, mask_width, mask_height);
+    Ok(())
+}
+
+/// 蒙版合成主循环（整帧 / 区域共用）：栅格按 `mask_*` 尺寸生成，采样用**整帧**坐标。
+fn compose_masks(
+    image: &mut RgbaImage,
+    params: &EditParams,
+    origin: FrameOrigin,
+    mask_image: &RgbaImage,
+    mask_width: u32,
+    mask_height: u32,
+) {
+    let full_width = origin.full_width.max(1);
+    let full_height = origin.full_height.max(1);
     let contexts: Vec<MaskContext> = params
         .masks
         .iter()
@@ -338,7 +527,7 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
             if !mask.visible {
                 return None;
             }
-            let raster = cached_mask(mask, &mask_image, mask_image.width(), mask_image.height())?;
+            let raster = cached_mask(mask, mask_image, mask_width, mask_height)?;
             Some(MaskContext {
                 raster,
                 curves: CurveLuts::new(&mask.adjustments.curves),
@@ -350,8 +539,7 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
         return;
     }
 
-    let full_width = image.width();
-    let full_height = image.height();
+    let region_width = image.width().max(1);
     // 逐像素独立，按 4 字节像素并行合成各蒙版（数学与串行版完全一致）。
     {
         let pixels: &mut [u8] = image;
@@ -359,13 +547,16 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
             .par_chunks_mut(4)
             .enumerate()
             .for_each(|(index, pixel)| {
-                let x = (index as u32) % full_width;
-                let y = (index as u32) / full_width;
+                let x = index as u32 % region_width;
+                let y = index as u32 / region_width;
+                let x_abs = origin.x + x;
+                let y_abs = origin.y + y;
                 let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
                 let mut rgb = [r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0];
                 let mut changed = false;
                 for context in &contexts {
-                    let weight = sample_raster(&context.raster, x, y, full_width, full_height);
+                    let weight =
+                        sample_raster(&context.raster, x_abs, y_abs, full_width, full_height);
                     if weight > 0.001 {
                         let adjusted = adjust_with_reference(rgb, &context.params, &context.curves);
                         for channel in 0..3 {
@@ -382,6 +573,22 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
                 }
             });
     }
+}
+
+/// 蒙版类型是否依赖参考图内容（区域渲染无法重建栅格）。
+fn mask_kind_needs_reference(kind: &crate::params::MaskKind) -> bool {
+    use crate::params::MaskKind;
+    matches!(
+        kind,
+        MaskKind::ColorRange { .. }
+            | MaskKind::LuminanceRange { .. }
+            | MaskKind::DepthRange { .. }
+            | MaskKind::AiSubject
+            | MaskKind::AiSky
+            | MaskKind::AiBackground
+            | MaskKind::AiPeople { .. }
+            | MaskKind::AiObject { .. }
+    )
 }
 
 /// 蒙版栅格缓存（按 mask_key + 尺寸）：只调参数 / 滑块时无需重算距离场与模糊。
@@ -1376,6 +1583,138 @@ mod tests {
         assert_eq!(mask_raster_edge(200), 512);
         assert_eq!(mask_raster_edge(4096), 2048);
         assert_eq!(mask_raster_edge(20000), 2048);
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn region_render_matches_full_render() {
+        // 带渐变 + 暗角 / 颗粒 / 细节 / 线性蒙版：区域渲染必须与整帧渲染逐像素一致。
+        let (width, height) = (160u32, 120u32);
+        let mut source = RgbaImage::new(width, height);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = Rgba([
+                (x * 255 / width) as u8,
+                (y * 255 / height) as u8,
+                ((x + y) % 256) as u8,
+                255,
+            ]);
+        }
+        let mut params = EditParams::default();
+        params.light.exposure = 0.4;
+        params.light.contrast = 20.0;
+        params.effects.vignette = -50.0;
+        params.effects.grain = 35.0;
+        params.effects.grain_size = 40.0;
+        params.detail.sharpen.amount = 60.0;
+        params.detail.sharpen.radius = 2.0;
+        params.detail.noise.luminance = 30.0;
+        params.masks = vec![crate::params::MaskParams {
+            visible: true,
+            kind: crate::params::MaskKind::LinearGradient {
+                start: [0.1, 0.2],
+                end: [0.9, 0.8],
+            },
+            adjustments: Box::new(EditParams {
+                light: crate::params::LightParams {
+                    exposure: 1.2,
+                    ..crate::params::LightParams::default()
+                },
+                ..EditParams::default()
+            }),
+            ..crate::params::MaskParams::default()
+        }];
+
+        let mut full = render_preview_image(&source, &params);
+        apply_masks(&mut full, &params);
+
+        // 可见区域 (60, 40) 40×40，向外扩 12px 作为余量。
+        let (vx, vy, vw, vh) = (60u32, 40u32, 40u32, 40u32);
+        let margin = 12u32;
+        let rx = vx.saturating_sub(margin);
+        let ry = vy.saturating_sub(margin);
+        let rw = (vx + vw + margin).min(width) - rx;
+        let rh = (vy + vh + margin).min(height) - ry;
+        let region = image::imageops::crop_imm(&source, rx, ry, rw, rh).to_image();
+        let json = serde_json::to_string(&params).unwrap();
+        let out = render_memory_rgba_region(
+            region.as_raw(),
+            rw,
+            rh,
+            &json,
+            rx,
+            ry,
+            vx,
+            vy,
+            vw,
+            vh,
+            width,
+            height,
+        )
+        .unwrap();
+        assert_eq!((out.width, out.height), (vw, vh));
+        for y in 0..vh {
+            for x in 0..vw {
+                let expected = full.get_pixel(vx + x, vy + y).0;
+                let offset = ((y * vw + x) * 4) as usize;
+                assert_eq!(
+                    &out.rgba[offset..offset + 4],
+                    &expected,
+                    "区域渲染与整帧渲染在 ({x},{y}) 不一致"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn region_render_rejects_crop_and_content_masks() {
+        let source = RgbaImage::from_pixel(32, 32, Rgba([10, 20, 30, 255]));
+        // 有裁切 → 拒绝
+        let mut cropped = EditParams::default();
+        cropped.crop.rect = [0.1, 0.1, 0.8, 0.8];
+        let json = serde_json::to_string(&cropped).unwrap();
+        assert!(render_memory_rgba_region(
+            source.as_raw(),
+            32,
+            32,
+            &json,
+            0,
+            0,
+            0,
+            0,
+            32,
+            32,
+            32,
+            32
+        )
+        .is_err());
+        // 颜色范围蒙版 → 拒绝
+        let mut content_mask = EditParams::default();
+        content_mask.masks = vec![crate::params::MaskParams {
+            visible: true,
+            kind: crate::params::MaskKind::ColorRange {
+                color: [0.5, 0.5, 0.5],
+                range: 30.0,
+                smoothness: 20.0,
+            },
+            ..crate::params::MaskParams::default()
+        }];
+        let json = serde_json::to_string(&content_mask).unwrap();
+        assert!(render_memory_rgba_region(
+            source.as_raw(),
+            32,
+            32,
+            &json,
+            0,
+            0,
+            0,
+            0,
+            32,
+            32,
+            32,
+            32
+        )
+        .is_err());
     }
 
     #[test]

@@ -84,6 +84,49 @@ final class NativeCore {
         return decodePayload(pointer: pointer, outLen: outLen)
     }
 
+    /// 只渲染整帧的一块区域（放大 1:1 看细节；暗角 / 颗粒与蒙版按整帧坐标算）。
+    ///
+    /// `buffer` 是区域像素（已含余量），各坐标都是**该缓冲所对应源图的像素坐标**。
+    /// 阻塞调用，必须在工作线程执行；失败返回 nil（条件不满足时见 `lastError()`）。
+    func renderRegion(
+        buffer: RgbaBuffer,
+        originX: Int,
+        originY: Int,
+        visibleX: Int,
+        visibleY: Int,
+        visibleWidth: Int,
+        visibleHeight: Int,
+        fullWidth: Int,
+        fullHeight: Int,
+        paramsJson: String
+    ) -> RenderResult? {
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in
+            paramsJson.withCString { params in
+                fdxmp_render_region_rgba(
+                    pixels.baseAddress,
+                    UInt32(buffer.width),
+                    UInt32(buffer.height),
+                    params,
+                    UInt32(max(originX, 0)),
+                    UInt32(max(originY, 0)),
+                    UInt32(max(visibleX, 0)),
+                    UInt32(max(visibleY, 0)),
+                    UInt32(max(visibleWidth, 1)),
+                    UInt32(max(visibleHeight, 1)),
+                    UInt32(max(fullWidth, 1)),
+                    UInt32(max(fullHeight, 1)),
+                    &outWidth,
+                    &outHeight,
+                    &outLen
+                )
+            }
+        }
+        return decodePayload(pointer: pointer, outLen: outLen)
+    }
+
     /// 解析 C ABI 返回的「8 字节大端宽高 + RGBA8 像素」缓冲区。
     private func decodePayload(pointer: UnsafeMutablePointer<UInt8>?, outLen: Int) -> RenderResult? {
         guard let pointer, outLen >= 8 else { return nil }

@@ -259,6 +259,8 @@ struct CropState: Equatable {
     var rotation: Float = 0
     var flipHorizontal = false
     var flipVertical = false
+    /// 构图网格样式（与核心 `CropGrid` 的 JSON 值对齐）。
+    var grid: CropGridUi = .thirds
 
     var isIdentity: Bool {
         rect == CGRect(x: 0, y: 0, width: 1, height: 1)
@@ -267,6 +269,32 @@ struct CropState: Equatable {
 
     mutating func reset() {
         self = CropState()
+    }
+}
+
+/// 裁切构图网格（关 / 三分 / 网格 / 对角 / 黄金比例）。
+enum CropGridUi: String, CaseIterable, Identifiable {
+    case none = "关"
+    case thirds = "三分"
+    case grid = "网格"
+    case diagonal = "对角"
+    case golden = "黄金"
+
+    var id: String { rawValue }
+
+    /// JSON 字段名（Rust `CropGrid` 的 snake_case 值）。
+    var jsonName: String {
+        switch self {
+        case .none: return "none"
+        case .thirds: return "thirds"
+        case .grid: return "grid"
+        case .diagonal: return "diagonal"
+        case .golden: return "golden_ratio"
+        }
+    }
+
+    static func from(jsonName: String) -> CropGridUi {
+        allCases.first { $0.jsonName == jsonName } ?? .thirds
     }
 }
 
@@ -323,6 +351,31 @@ struct BrushStrokeUi: Equatable {
     var density: Float = 100
 }
 
+/// 蒙版叠加颜色（与核心 `OverlayColor` 的 JSON 值对齐）。
+enum MaskOverlayColor: String, CaseIterable, Identifiable {
+    case red = "红"
+    case green = "绿"
+    case blue = "蓝"
+    case white = "白"
+    case black = "黑"
+
+    var id: String { rawValue }
+
+    var jsonName: String {
+        switch self {
+        case .red: return "red"
+        case .green: return "green"
+        case .blue: return "blue"
+        case .white: return "white"
+        case .black: return "black"
+        }
+    }
+
+    static func from(jsonName: String) -> MaskOverlayColor {
+        allCases.first { $0.jsonName == jsonName } ?? .red
+    }
+}
+
 /// 单个蒙版的几何 / 笔迹 / 局部调整参数。
 struct MaskUi: Identifiable, Equatable {
     var id: String
@@ -335,6 +388,8 @@ struct MaskUi: Identifiable, Equatable {
     var feather: Float = 0
     /// 蒙版不透明度 0..100。
     var opacity: Float = 100
+    /// 蒙版叠加颜色。
+    var overlay: MaskOverlayColor = .red
     /// 该蒙版的调色参数（与全局滑块同一套 key，只含 light / color / effects）。
     var values: [String: Float] = EditorSpec.defaultValues()
 
@@ -566,7 +621,7 @@ enum EditJSON {
             "rotation_deg": Double(crop.rotation),
             "flip_horizontal": crop.flipHorizontal,
             "flip_vertical": crop.flipVertical,
-            "grid": "thirds",
+            "grid": crop.grid.jsonName,
             "auto_compose": false,
         ]
     }
@@ -615,7 +670,7 @@ enum EditJSON {
             "inverted": mask.inverted,
             "feather": Double(mask.feather),
             "opacity": Double(mask.opacity),
-            "overlay": "red",
+            "overlay": mask.overlay.jsonName,
             "adjustments": [
                 "light": group(mask.values, "light"),
                 "color": group(mask.values, "color"),
@@ -758,6 +813,9 @@ enum EditJSON {
         crop.rotation = (root["rotation_deg"] as? NSNumber)?.floatValue ?? 0
         crop.flipHorizontal = (root["flip_horizontal"] as? NSNumber)?.boolValue ?? false
         crop.flipVertical = (root["flip_vertical"] as? NSNumber)?.boolValue ?? false
+        if let grid = root["grid"] as? String {
+            crop.grid = CropGridUi.from(jsonName: grid)
+        }
         return crop
     }
 
@@ -781,6 +839,9 @@ enum EditJSON {
             mask.visible = (item["visible"] as? NSNumber)?.boolValue ?? true
             mask.feather = (item["feather"] as? NSNumber)?.floatValue ?? 0
             mask.opacity = (item["opacity"] as? NSNumber)?.floatValue ?? 100
+            if let overlay = item["overlay"] as? String {
+                mask.overlay = MaskOverlayColor.from(jsonName: overlay)
+            }
             if let adjustments = item["adjustments"] as? [String: Any] {
                 mask.values = parseAdjustments(adjustments)
             }

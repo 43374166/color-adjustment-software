@@ -4,6 +4,10 @@ import UIKit
 /// 「我的」页：编辑记录、内置预设、导出设置、关于。
 struct MeTabView: View {
     @AppStorage(EditorLimits.exportMaxEdgeKey) private var exportMaxEdge = 4096
+    @AppStorage(EditorLimits.exportFormatKey) private var exportFormat = EditorModel.ExportFormat.jpeg.rawValue
+    @AppStorage(EditorLimits.exportQualityKey) private var exportQuality = 0.92
+    @AppStorage(EditorLimits.exportKeepMetadataKey) private var exportKeepMetadata = true
+    @AppStorage(EditorLimits.exportShareKey) private var exportShare = false
 
     @State private var editCount = 0
     @State private var lastEdited: Date?
@@ -163,7 +167,36 @@ struct MeTabView: View {
                 .pickerStyle(.segmented)
                 .frame(width: 150)
             }
-            Text("导出会把成品按此尺寸渲染后保存到相册「fdxmp」。")
+            HStack {
+                Text("格式")
+                    .font(.footnote)
+                Spacer()
+                Picker("格式", selection: $exportFormat) {
+                    ForEach(EditorModel.ExportFormat.allCases) { format in
+                        Text(format.rawValue).tag(format.rawValue)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 190)
+            }
+            if EditorModel.ExportFormat(rawValue: exportFormat) == .jpeg {
+                HStack {
+                    Text("JPEG 质量")
+                        .font(.footnote)
+                    Slider(value: $exportQuality, in: 0.5...1, step: 0.02)
+                    Text(String(format: "%.0f%%", exportQuality * 100))
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                        .frame(width: 44, alignment: .trailing)
+                }
+            }
+            Toggle("保留拍摄信息（EXIF / GPS）", isOn: $exportKeepMetadata)
+                .font(.footnote)
+                .tint(Color.accentColor)
+            Toggle("导出完成后分享", isOn: $exportShare)
+                .font(.footnote)
+                .tint(Color.accentColor)
+            Text("导出会把成品按此尺寸 / 格式渲染后保存到相册「fdxmp」。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }

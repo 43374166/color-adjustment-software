@@ -554,6 +554,92 @@ pub unsafe extern "C" fn fdxmp_render_memory_rgba(
     })
 }
 
+/// 只渲染整帧的一块区域（放大 1:1 看细节；暗角 / 颗粒 / 蒙版按整帧坐标算）。
+///
+/// 入参是**区域像素**（区域 = 可见矩形向外扩余量后夹到整帧内），
+/// 返回缓冲区格式同 `fdxmp_render_memory_rgba`（8 字节大端宽高 + RGBA8），
+/// 内容为 `visible_*` 指定的可见矩形，必须用 `fdxmp_bytes_free` 释放。
+/// 要求几何 / 镜头为单位变换、且蒙版不依赖图像内容，否则返回 NULL（调用方回退整帧渲染）。
+///
+/// # Safety
+///
+/// `rgba` 指向至少 `region_width * region_height * 4` 字节；`params_json` 为合法 C 字符串；
+/// `out_width`、`out_height`、`out_len` 为非空可写指针。
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn fdxmp_render_region_rgba(
+    rgba: *const u8,
+    region_width: u32,
+    region_height: u32,
+    params_json: *const c_char,
+    region_x: u32,
+    region_y: u32,
+    visible_x: u32,
+    visible_y: u32,
+    visible_width: u32,
+    visible_height: u32,
+    full_width: u32,
+    full_height: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if rgba.is_null() || out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("rgba / out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let expected = (region_width as usize)
+            .checked_mul(region_height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        let Some(expected) = expected else {
+            set_last_error("区域尺寸溢出");
+            return ptr::null_mut();
+        };
+        // SAFETY: 调用方保证缓冲区至少 region_width * region_height * 4 字节。
+        let buffer = std::slice::from_raw_parts(rgba, expected);
+        match fdxmp_core::preview::render_memory_rgba_region(
+            buffer,
+            region_width,
+            region_height,
+            params_json,
+            region_x,
+            region_y,
+            visible_x,
+            visible_y,
+            visible_width,
+            visible_height,
+            full_width,
+            full_height,
+        ) {
+            Ok(preview) => {
+                let mut payload = Vec::with_capacity(8 + preview.rgba.len());
+                payload.extend_from_slice(&preview.width.to_be_bytes());
+                payload.extend_from_slice(&preview.height.to_be_bytes());
+                payload.extend_from_slice(&preview.rgba);
+                *out_width = preview.width;
+                *out_height = preview.height;
+                let mut boxed = payload.into_boxed_slice();
+                *out_len = boxed.len();
+                let pointer = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                pointer
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 生成单个蒙版的叠加层（红色半透明，预乘 RGBA8），返回缓冲区
 /// （调用方用 `fdxmp_bytes_free(ptr, len)` 释放）；失败返回 NULL。
 ///

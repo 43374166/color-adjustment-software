@@ -673,6 +673,7 @@ final class MaskCanvasController {
             if mask.kind == .brush {
                 model.brushCursor = normalized
                 model.beginBrushStroke(at: normalized)
+                Haptics.light()
                 brushing = true
                 drag = nil
                 return
@@ -684,6 +685,7 @@ final class MaskCanvasController {
                 geometry: geometry
             )
             guard mode != .none else { return }
+            Haptics.light()
             drag = MaskDragSession(
                 mode: mode,
                 snapshot: mask,
@@ -692,7 +694,7 @@ final class MaskCanvasController {
                 geometry: geometry
             )
             dragging = true
-            model.beginMaskDrag()
+            model.beginMaskDrag(label: Self.dragLabel(for: mode))
         case .singleMoved(let point):
             if brushing {
                 let normalized = clampedNormalized(
@@ -772,7 +774,7 @@ final class MaskCanvasController {
             rotationActive = true
             rotationAccumulated = 0
             rotationApplied = 0
-            model.beginMaskDrag()
+            model.beginMaskDrag(label: "旋转蒙版")
         }
         rotationAccumulated += Double(radians)
         let step = rotationAccumulated - rotationApplied
@@ -801,6 +803,24 @@ final class MaskCanvasController {
             x: min(max(point.x, 0), 1),
             y: min(max(point.y, 0), 1)
         )
+    }
+
+    /// 拖动模式 → 历史步骤名（撤销提示用）。
+    private static func dragLabel(for mode: MaskDragMode) -> String {
+        switch mode {
+        case .linearMove, .radialMove:
+            return "移动蒙版"
+        case .linearRotate, .radialRotate:
+            return "旋转蒙版"
+        case .linearFeather:
+            return "蒙版过渡"
+        case .radialRadius:
+            return "蒙版大小"
+        case .radialFeather:
+            return "蒙版羽化"
+        case .none:
+            return "调整蒙版"
+        }
     }
 }
 

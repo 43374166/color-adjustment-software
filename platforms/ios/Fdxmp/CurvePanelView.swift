@@ -6,31 +6,37 @@ struct CurvePanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            header
-            CurveEditorCanvas(
-                points: model.curvePoints(model.curveChannel),
-                channel: model.curveChannel,
-                parametric: model.state.curves.parametric,
-                onChange: { points, commit in
-                    model.updateCurve(model.curveChannel, points, commit: commit)
-                },
-                onParametricChange: { values, commit in
-                    model.updateParametric(values, commit: commit)
+            if model.draggingSlider == nil {
+                header
+                CurveEditorCanvas(
+                    points: model.curvePoints(model.curveChannel),
+                    channel: model.curveChannel,
+                    parametric: model.state.curves.parametric,
+                    onChange: { points, commit in
+                        model.updateCurve(model.curveChannel, points, commit: commit)
+                    },
+                    onParametricChange: { values, commit in
+                        model.updateParametric(values, commit: commit)
+                    }
+                )
+                .frame(height: model.curveChannel == .parametric ? 150 : 186)
+                .padding(.horizontal, 16)
+                .padding(.top, 4)
+                if model.curveChannel != .parametric {
+                    Spacer(minLength: 0)
+                    Text("点空白加点 · 点控制点删除 · 拖动调整")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.bottom, 4)
                 }
-            )
-            .frame(height: model.curveChannel == .parametric ? 150 : 186)
-            .padding(.horizontal, 16)
-            .padding(.top, 4)
-            if model.curveChannel == .parametric {
-                parametricSliders
-            } else {
-                Spacer(minLength: 0)
-                Text("点空白加点 · 点控制点删除 · 拖动调整")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.bottom, 4)
             }
-            channelRow
+            if model.curveChannel == .parametric {
+                // 参数曲线滑块（拖动中只留正在拖的那一个）。
+                parametricSliders
+            }
+            if model.draggingSlider == nil {
+                channelRow
+            }
         }
     }
 
@@ -53,75 +59,85 @@ struct CurvePanelView: View {
         let values = model.state.curves.parametric
         return ScrollView {
             VStack(spacing: 0) {
-                ValueSliderRow(
-                    label: "高光",
-                    value: values.highlights,
-                    range: -100...100,
-                    decimals: 0,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.curves.parametric
-                        updated.highlights = value
-                        model.updateParametric(updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
-                ValueSliderRow(
-                    label: "中间调",
-                    value: values.midtones,
-                    range: -100...100,
-                    decimals: 0,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.curves.parametric
-                        updated.midtones = value
-                        model.updateParametric(updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
-                ValueSliderRow(
-                    label: "阴影",
-                    value: values.shadows,
-                    range: -100...100,
-                    decimals: 0,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.curves.parametric
-                        updated.shadows = value
-                        model.updateParametric(updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
-                ValueSliderRow(
-                    label: "高光分界",
-                    value: values.highlightsSplit,
-                    range: 0.5...1,
-                    neutral: 0.75,
-                    step: 0.05,
-                    decimals: 2,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.curves.parametric
-                        updated.highlightsSplit = value
-                        model.updateParametric(updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
-                ValueSliderRow(
-                    label: "中间调分界",
-                    value: values.midtonesSplit,
-                    range: 0...0.5,
-                    neutral: 0.25,
-                    step: 0.05,
-                    decimals: 2,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.curves.parametric
-                        updated.midtonesSplit = value
-                        model.updateParametric(updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
+                if model.sliderVisible("高光") {
+                    ValueSliderRow(
+                        label: "高光",
+                        value: values.highlights,
+                        range: -100...100,
+                        decimals: 0,
+                        onBegin: { model.beginEdit() },
+                        onChange: { value in
+                            var updated = model.state.curves.parametric
+                            updated.highlights = value
+                            model.updateParametric(updated, commit: false)
+                        },
+                        onCommit: { model.commitEdit() }
+                    )
+                }
+                if model.sliderVisible("中间调") {
+                    ValueSliderRow(
+                        label: "中间调",
+                        value: values.midtones,
+                        range: -100...100,
+                        decimals: 0,
+                        onBegin: { model.beginEdit() },
+                        onChange: { value in
+                            var updated = model.state.curves.parametric
+                            updated.midtones = value
+                            model.updateParametric(updated, commit: false)
+                        },
+                        onCommit: { model.commitEdit() }
+                    )
+                }
+                if model.sliderVisible("阴影") {
+                    ValueSliderRow(
+                        label: "阴影",
+                        value: values.shadows,
+                        range: -100...100,
+                        decimals: 0,
+                        onBegin: { model.beginEdit() },
+                        onChange: { value in
+                            var updated = model.state.curves.parametric
+                            updated.shadows = value
+                            model.updateParametric(updated, commit: false)
+                        },
+                        onCommit: { model.commitEdit() }
+                    )
+                }
+                if model.sliderVisible("高光分界") {
+                    ValueSliderRow(
+                        label: "高光分界",
+                        value: values.highlightsSplit,
+                        range: 0.5...1,
+                        neutral: 0.75,
+                        step: 0.05,
+                        decimals: 2,
+                        onBegin: { model.beginEdit() },
+                        onChange: { value in
+                            var updated = model.state.curves.parametric
+                            updated.highlightsSplit = value
+                            model.updateParametric(updated, commit: false)
+                        },
+                        onCommit: { model.commitEdit() }
+                    )
+                }
+                if model.sliderVisible("中间调分界") {
+                    ValueSliderRow(
+                        label: "中间调分界",
+                        value: values.midtonesSplit,
+                        range: 0...0.5,
+                        neutral: 0.25,
+                        step: 0.05,
+                        decimals: 2,
+                        onBegin: { model.beginEdit() },
+                        onChange: { value in
+                            var updated = model.state.curves.parametric
+                            updated.midtonesSplit = value
+                            model.updateParametric(updated, commit: false)
+                        },
+                        onCommit: { model.commitEdit() }
+                    )
+                }
             }
         }
     }
@@ -217,6 +233,7 @@ struct CurveEditorCanvas: View {
                 guard !isParametric else { return }
                 if draggingIndex < 0 {
                     draggingIndex = nearestIndex(to: gesture.startLocation, in: size)
+                    Haptics.prepare()
                 }
                 let index = draggingIndex
                 guard index >= 0, index < points.count else { return }
@@ -243,10 +260,12 @@ struct CurveEditorCanvas: View {
                 if isTap {
                     let index = nearestIndex(to: gesture.startLocation, in: size)
                     if index > 0, index < points.count - 1 {
+                        Haptics.light()
                         var updated = points
                         updated.remove(at: index)
                         onChange(updated, true)
                     } else if index < 0 {
+                        Haptics.light()
                         let x = Float((gesture.startLocation.x / size.width).clamped(to: 0.02...0.98))
                         let y = Float((1 - gesture.startLocation.y / size.height).clamped(to: 0...1))
                         let updated = (points + [CurvePoint(x: x, y: y)]).sorted { $0.x < $1.x }

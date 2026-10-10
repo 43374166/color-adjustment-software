@@ -1,6 +1,24 @@
 import Foundation
 import SwiftUI
 
+/// 正在横向拖动的滑块信息（标签 + 显示数值）——
+/// 面板据此进入沉浸模式，画面顶部的数值浮层也用它。
+struct SliderDragInfo: Equatable {
+    var label: String
+    var text: String
+}
+
+/// 拖动态上报（Lightroom 式沉浸：拖动时只留这一个滑块 + 顶部数值）。
+struct SliderDragPreferenceKey: PreferenceKey {
+    static let defaultValue: SliderDragInfo? = nil
+
+    static func reduce(value: inout SliderDragInfo?, nextValue: () -> SliderDragInfo?) {
+        if let next = nextValue() {
+            value = next
+        }
+    }
+}
+
 /// 通用数值滑块行（标签 + 数值 + 中性点滑块），用于 HSL / 分级 / 参数曲线等面板。
 struct ValueSliderRow: View {
     let label: String
@@ -12,6 +30,8 @@ struct ValueSliderRow: View {
     let onBegin: () -> Void
     let onChange: (Float) -> Void
     let onCommit: () -> Void
+    /// 是否正在横向拖动（点击步进不算）。
+    @State private var dragging = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -31,11 +51,17 @@ struct ValueSliderRow: View {
                 step: step,
                 onBegin: onBegin,
                 onChange: onChange,
-                onCommit: onCommit
+                onCommit: onCommit,
+                onDraggingChange: { dragging = $0 }
             )
             .padding(.horizontal, 18)
         }
         .padding(.vertical, 3)
+        // 上报拖动状态 + 实时数值：面板隐藏其它 UI，画面顶部显示大号数值。
+        .preference(
+            key: SliderDragPreferenceKey.self,
+            value: dragging ? SliderDragInfo(label: label, text: text) : nil
+        )
     }
 
     private var text: String {
@@ -65,12 +91,18 @@ struct CenteredSlider: View {
     let onBegin: () -> Void
     let onChange: (Float) -> Void
     let onCommit: () -> Void
+    /// 横向拖动（>8pt）开始 / 结束回调；点击步进不触发。
+    var onDraggingChange: ((Bool) -> Void)? = nil
 
     @State private var gestureActive = false
     @State private var didDrag = false
     @State private var maxDistance: CGFloat = 0
     @State private var lastTapTime = Date.distantPast
     @State private var pendingStep: DispatchWorkItem?
+    /// 长按进入微调（拖动速度降到 1/5）。
+    @State private var fineMode = false
+    @State private var fineAnchorX: CGFloat?
+    @State private var fineAnchorValue: Float = 0
 
     var body: some View {
         GeometryReader { geo in
@@ -131,21 +163,59 @@ struct CenteredSlider: View {
                             maxDistance,
                             hypot(gesture.translation.width, gesture.translation.height)
                         )
+                        // 长按后进入微调：只按相对位移慢慢走。
+                        if fineMode {
+                            if fineAnchorX == nil {
+                                fineAnchorX = gesture.location.x
+                                fineAnchorValue = value
+                                if !didDrag {
+                                    didDrag = true
+                                    onDraggingChange?(true)
+                                }
+                            }
+                            let delta = (gesture.location.x - (fineAnchorX ?? gesture.location.x)) / width
+                            let target = (fineAnchorValue + Float(delta) * span * 0.2)
+                                .clamped(to: range)
+                            if target != value {
+                                onChange(target)
+                            }
+                            return
+                        }
                         if abs(gesture.translation.width) > 8,
                            abs(gesture.translation.width) > abs(gesture.translation.height)
                         {
+                            if !didDrag {
+                                onDraggingChange?(true)
+                                Haptics.prepare()
+                            }
                             didDrag = true
                         }
                         guard didDrag else { return }
                         let ratio = (gesture.location.x / width).clamped(to: 0...1)
                         let target = range.lowerBound + Float(ratio) * span
-                        onChange(target.clamped(to: range))
+                        let clamped = target.clamped(to: range)
+                        // 跨过中性点给一次"咔哒"（LR 手感）。
+                        if value != neutral, (value - neutral) * (clamped - neutral) <= 0 {
+                            Haptics.tick()
+                        }
+                        onChange(clamped)
                     }
                     .onEnded { gesture in
                         guard gestureActive else { return }
                         gestureActive = false
+                        if fineMode {
+                            fineMode = false
+                            fineAnchorX = nil
+                            if didDrag {
+                                didDrag = false
+                                onDraggingChange?(false)
+                                onCommit()
+                            }
+                            return
+                        }
                         if didDrag {
                             didDrag = false
+                            onDraggingChange?(false)
                             onCommit()
                             return
                         }
@@ -163,6 +233,7 @@ struct CenteredSlider: View {
                             pendingStep?.cancel()
                             pendingStep = nil
                             if onThumb {
+                                Haptics.light()
                                 onChange(neutral.clamped(to: range))
                                 onCommit()
                             } else {
@@ -178,6 +249,16 @@ struct CenteredSlider: View {
                         }
                     }
             )
+            // 按住 0.4s 进入微调（拖动速度 1/5，用于精细对数值）。
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: 0.4, maximumDistance: 12)
+                    .onEnded { _ in
+                        guard !fineMode else { return }
+                        fineMode = true
+                        fineAnchorX = nil
+                        Haptics.light()
+                    }
+            )
         }
         .frame(height: 42)
     }
@@ -187,6 +268,7 @@ struct CenteredSlider: View {
         let delta: Float = x >= thumbX ? step : -step
         let next = (value + delta).clamped(to: range)
         if next != value {
+            Haptics.tick()
             onChange(next)
             onCommit()
         }

@@ -201,19 +201,61 @@ extension Comparable {
 }
 
 /// 编辑记录存储：按照片（PHAsset localIdentifier）保存 EditParams JSON。
+///
+/// 记录写在 `Application Support/fdxmp/edits/<hash>.json`（原子写）——
+/// 蒙版笔迹多的时候 JSON 可能有几百 KB，不再塞进 UserDefaults；
+/// 旧版本的 UserDefaults 记录会在读取时自动迁移到文件。
 enum EditStore {
-    private static let recordsKey = "fdxmp_ios_edit_records"
+    /// 旧版存储键（仅用于迁移）。
+    private static let legacyRecordsKey = "fdxmp_ios_edit_records"
     private static let recentKey = "fdxmp_ios_recent_edits"
 
+    private static var directory: URL {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first ?? FileManager.default.temporaryDirectory
+        let dir = base.appendingPathComponent("fdxmp/edits", isDirectory: true)
+        if !FileManager.default.fileExists(atPath: dir.path) {
+            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        return dir
+    }
+
+    /// 资源 id 含 "/" 等字符，用稳定哈希做文件名。
+    private static func fileURL(assetId: String) -> URL {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in assetId.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        return directory.appendingPathComponent(String(format: "%016llx.json", hash))
+    }
+
     static func json(assetId: String) -> String? {
-        let records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String]
-        return records?[assetId]
+        if let text = try? String(contentsOf: fileURL(assetId: assetId), encoding: .utf8) {
+            return text
+        }
+        // 兼容旧版：从 UserDefaults 读一次并迁移到文件。
+        if let legacy = legacyJson(assetId: assetId) {
+            save(assetId: assetId, json: legacy)
+            return legacy
+        }
+        return nil
     }
 
     static func save(assetId: String, json: String) {
-        var records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String] ?? [:]
-        records[assetId] = json
-        UserDefaults.standard.set(records, forKey: recordsKey)
+        let url = fileURL(assetId: assetId)
+        let tmp = url.appendingPathExtension("tmp")
+        do {
+            try Data(json.utf8).write(to: tmp, options: .atomic)
+            if FileManager.default.fileExists(atPath: url.path) {
+                _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            } else {
+                try FileManager.default.moveItem(at: tmp, to: url)
+            }
+        } catch {
+            try? FileManager.default.removeItem(at: tmp)
+        }
 
         // 记录"最近编辑"顺序，供编辑页的"最近编辑"列表恢复上次进度。
         var recent = UserDefaults.standard.dictionary(forKey: recentKey) as? [String: Double] ?? [:]
@@ -236,9 +278,7 @@ enum EditStore {
 
     /// 删除一条编辑记录。
     static func remove(assetId: String) {
-        var records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String] ?? [:]
-        records.removeValue(forKey: assetId)
-        UserDefaults.standard.set(records, forKey: recordsKey)
+        try? FileManager.default.removeItem(at: fileURL(assetId: assetId))
         var recent = UserDefaults.standard.dictionary(forKey: recentKey) as? [String: Double] ?? [:]
         recent.removeValue(forKey: assetId)
         UserDefaults.standard.set(recent, forKey: recentKey)
@@ -246,8 +286,11 @@ enum EditStore {
 
     /// 已编辑照片数量。
     static func count() -> Int {
-        let records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String] ?? [:]
-        return records.count
+        let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+        return files?.filter { $0.pathExtension == "json" }.count ?? 0
     }
 
     /// 最近一次编辑时间。
@@ -257,7 +300,21 @@ enum EditStore {
 
     /// 清空全部编辑记录。
     static func clearAll() {
-        UserDefaults.standard.removeObject(forKey: recordsKey)
+        if let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) {
+            for file in files {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
+        UserDefaults.standard.removeObject(forKey: legacyRecordsKey)
         UserDefaults.standard.removeObject(forKey: recentKey)
+    }
+
+    /// 旧版 UserDefaults 里的记录（迁移用）。
+    private static func legacyJson(assetId: String) -> String? {
+        let records = UserDefaults.standard.dictionary(forKey: legacyRecordsKey) as? [String: String]
+        return records?[assetId]
     }
 }

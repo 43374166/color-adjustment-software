@@ -68,7 +68,9 @@ struct CropOverlayView: View {
             .onEnded { _ in
                 guard mode != .none else { return }
                 mode = .none
-                model.commitEdit()
+                Haptics.light()
+                // 越界阻尼回弹 + 记一步历史（模型内部缓动，Canvas 每帧重绘）。
+                model.finishCropDrag()
             }
     }
 
@@ -92,11 +94,21 @@ struct CropOverlayView: View {
     private func movedRect(start: CGRect, delta: CGSize, fitted: CGRect) -> CGRect {
         let maxX = max(fitted.maxX - start.width, fitted.minX)
         let maxY = max(fitted.maxY - start.height, fitted.minY)
-        let x = (start.minX + delta.width)
-            .clamped(to: fitted.minX...maxX)
-        let y = (start.minY + delta.height)
-            .clamped(to: fitted.minY...maxY)
+        // 允许最多 5% 的阻尼越界：拖出边界时手感变"软"，松手回弹。
+        let x = damped(start.minX + delta.width, min: fitted.minX, max: maxX, overshoot: fitted.width * 0.05)
+        let y = damped(start.minY + delta.height, min: fitted.minY, max: maxY, overshoot: fitted.height * 0.05)
         return CGRect(x: x, y: y, width: start.width, height: start.height)
+    }
+
+    /// 越界阻尼：正常范围内原样返回，越界部分只保留 30%（上限 overshoot）。
+    private func damped(_ value: CGFloat, min lo: CGFloat, max hi: CGFloat, overshoot: CGFloat) -> CGFloat {
+        if value < lo {
+            return max(lo - overshoot, lo - (lo - value) * 0.3)
+        }
+        if value > hi {
+            return min(hi + overshoot, hi + (value - hi) * 0.3)
+        }
+        return value
     }
 
     private func resizedRect(
@@ -160,7 +172,8 @@ struct CropOverlayView: View {
     // MARK: - 坐标换算
 
     private func cropRectInPoints(fitted: CGRect) -> CGRect {
-        let rect = clampedCropRect(model.state.crop.rect)
+        // 拖动中允许阻尼越界，这里用原始矩形绘制（提交时会夹回合法范围）。
+        let rect = model.state.crop.rect
         return CGRect(
             x: fitted.minX + rect.minX * fitted.width,
             y: fitted.minY + rect.minY * fitted.height,
@@ -202,8 +215,27 @@ struct CropOverlayView: View {
 
     private func drawGrid(_ context: inout GraphicsContext, rect: CGRect) {
         var grid = Path()
-        for step in 1..<3 {
-            let ratio = CGFloat(step) / 3
+        switch model.state.crop.grid {
+        case .none:
+            return
+        case .thirds:
+            addGridLines(&grid, rect: rect, ratios: [1.0 / 3, 2.0 / 3])
+        case .grid:
+            addGridLines(&grid, rect: rect, ratios: [0.25, 0.5, 0.75])
+        case .golden:
+            addGridLines(&grid, rect: rect, ratios: [0.382, 0.618])
+        case .diagonal:
+            grid.move(to: CGPoint(x: rect.minX, y: rect.minY))
+            grid.addLine(to: CGPoint(x: rect.maxX, y: rect.maxY))
+            grid.move(to: CGPoint(x: rect.maxX, y: rect.minY))
+            grid.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
+        }
+        context.stroke(grid, with: .color(.white.opacity(0.35)), lineWidth: 1)
+    }
+
+    /// 按比例加横竖构图线。
+    private func addGridLines(_ grid: inout Path, rect: CGRect, ratios: [CGFloat]) {
+        for ratio in ratios {
             let x = rect.minX + rect.width * ratio
             let y = rect.minY + rect.height * ratio
             grid.move(to: CGPoint(x: x, y: rect.minY))
@@ -211,7 +243,6 @@ struct CropOverlayView: View {
             grid.move(to: CGPoint(x: rect.minX, y: y))
             grid.addLine(to: CGPoint(x: rect.maxX, y: y))
         }
-        context.stroke(grid, with: .color(.white.opacity(0.35)), lineWidth: 1)
     }
 
     private func drawFrame(_ context: inout GraphicsContext, rect: CGRect) {

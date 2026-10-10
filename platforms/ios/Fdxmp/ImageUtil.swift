@@ -123,6 +123,24 @@ enum ImageUtil {
         return RgbaBuffer(pixels: pixels, width: width, height: height)
     }
 
+    /// 从像素缓冲里裁一块（区域渲染只把这一块交给核心）。
+    static func cropped(buffer: RgbaBuffer, x: Int, y: Int, width: Int, height: Int) -> RgbaBuffer? {
+        let x0 = max(0, min(x, buffer.width - 1))
+        let y0 = max(0, min(y, buffer.height - 1))
+        let w = max(1, min(width, buffer.width - x0))
+        let h = max(1, min(height, buffer.height - y0))
+        var pixels = [UInt8](repeating: 0, count: w * h * 4)
+        for row in 0..<h {
+            let sourceStart = ((y0 + row) * buffer.width + x0) * 4
+            let targetStart = row * w * 4
+            pixels.replaceSubrange(
+                targetStart..<(targetStart + w * 4),
+                with: buffer.pixels[sourceStart..<(sourceStart + w * 4)]
+            )
+        }
+        return RgbaBuffer(pixels: pixels, width: w, height: h)
+    }
+
     /// 按最长边缩放并规范化方向（绘制一次同时完成方向校正与缩放）。
     private static func redraw(_ image: UIImage, maxEdge: Int) -> UIImage {
         let pixelWidth = image.size.width * image.scale

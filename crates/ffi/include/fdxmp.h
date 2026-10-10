@@ -81,6 +81,29 @@ uint8_t *fdxmp_render_memory_rgba(const uint8_t *rgba,
                                   uint32_t *out_height,
                                   size_t *out_len);
 
+/* ---- 区域渲染（放大 1:1 看细节）----
+ *
+ * 输入：区域像素（区域 = 可见矩形向外扩余量后夹到整帧内）+ 各矩形坐标；
+ * 输出：可见矩形的像素（格式同 fdxmp_render_memory_rgba，8 字节大端宽高 + RGBA8），
+ * 暗角 / 颗粒与蒙版按整帧坐标计算，与整帧渲染逐像素一致。
+ * 要求几何 / 镜头为单位变换且蒙版不依赖图像内容，否则返回 NULL（调用方回退整帧渲染）。
+ */
+uint8_t *fdxmp_render_region_rgba(const uint8_t *rgba,
+                                  uint32_t region_width,
+                                  uint32_t region_height,
+                                  const char *params_json,
+                                  uint32_t region_x,
+                                  uint32_t region_y,
+                                  uint32_t visible_x,
+                                  uint32_t visible_y,
+                                  uint32_t visible_width,
+                                  uint32_t visible_height,
+                                  uint32_t full_width,
+                                  uint32_t full_height,
+                                  uint32_t *out_width,
+                                  uint32_t *out_height,
+                                  size_t *out_len);
+
 /* ---- 蒙版叠加层（移动端蒙版编辑器 / 蒙版列表缩略图）----
  *
  * 输入：EditParams JSON + 蒙版 id + 目标宽高（预览画布或缩略图尺寸）；

@@ -6,15 +6,21 @@ struct MaskPanelView: View {
     @ObservedObject var model: EditorModel
     @State private var renameTargetId: String?
     @State private var renameText = ""
+    /// 长按分类预览后，短时间内忽略这次点击。
+    @State private var suppressCategoryTapUntil = Date.distantPast
 
     var body: some View {
         VStack(spacing: 0) {
-            subtabRow
+            if model.draggingSlider == nil {
+                subtabRow
+            }
             content
-            Divider()
-                .overlay(Color.white.opacity(0.08))
-            actionRow
-            listRow
+            if model.draggingSlider == nil {
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+                actionRow
+                listRow
+            }
         }
         .alert("重命名蒙版", isPresented: renameAlertBinding) {
             TextField("名称", text: $renameText)
@@ -125,6 +131,21 @@ struct MaskPanelView: View {
             }
             Button {
                 model.selectMask(mask.id)
+                Haptics.light()
+                model.copySelectedMaskSettings()
+            } label: {
+                Label("复制设置", systemImage: "doc.on.doc")
+            }
+            Button {
+                model.selectMask(mask.id)
+                Haptics.light()
+                model.pasteMaskSettings()
+            } label: {
+                Label("粘贴设置", systemImage: "doc.on.clipboard")
+            }
+            .disabled(!model.canPasteMaskSettings)
+            Button {
+                model.selectMask(mask.id)
                 model.duplicateSelectedMask()
             } label: {
                 Label("复制", systemImage: "plus.square.on.square")
@@ -191,6 +212,38 @@ struct MaskPanelView: View {
             ) {
                 model.maskOverlayVisible.toggle()
             }
+            Menu {
+                ForEach(MaskOverlayColor.allCases) { overlay in
+                    Button {
+                        Haptics.tick()
+                        model.applyEdit("叠加颜色") { state in
+                            guard let id = model.selectedMaskId,
+                                  let index = state.masks.firstIndex(where: { $0.id == id })
+                            else { return }
+                            state.masks[index].overlay = overlay
+                        }
+                    } label: {
+                        HStack {
+                            Text(overlay.rawValue)
+                            if model.selectedMask?.overlay == overlay {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                VStack(spacing: 2) {
+                    Circle()
+                        .fill(overlayTint(model.selectedMask?.overlay ?? .red))
+                        .frame(width: 15, height: 15)
+                        .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1))
+                    Text("叠加色")
+                        .font(.system(size: 9))
+                }
+                .frame(maxWidth: .infinity)
+                .foregroundStyle(model.selectedMask == nil ? Color.white.opacity(0.3) : Color.white.opacity(0.85))
+            }
+            .disabled(model.selectedMask == nil)
             actionButton(
                 "复制",
                 icon: "plus.square.on.square",
@@ -243,6 +296,17 @@ struct MaskPanelView: View {
         }
         .buttonStyle(.plain)
         .disabled(!enabled)
+    }
+
+    /// 叠加颜色 → 色块。
+    private func overlayTint(_ overlay: MaskOverlayColor) -> Color {
+        switch overlay {
+        case .red: return Color(red: 1.0, green: 0.25, blue: 0.25)
+        case .green: return Color(red: 0.3, green: 0.85, blue: 0.4)
+        case .blue: return Color(red: 0.3, green: 0.55, blue: 1.0)
+        case .white: return Color.white
+        case .black: return Color(white: 0.25)
+        }
     }
 
     // MARK: - 子页：蒙版（形状）/ 调整（局部调色）
@@ -425,19 +489,21 @@ struct MaskPanelView: View {
     @ViewBuilder
     private func brushControls(_ mask: MaskUi) -> some View {
         hintText("在画面上单指涂抹添加蒙版；双指缩放 / 平移画布")
-        Picker(
-            "",
-            selection: Binding(
-                get: { model.brushErase },
-                set: { model.brushErase = $0 }
-            )
-        ) {
-            Text("画笔").tag(false)
-            Text("擦除").tag(true)
+        if model.draggingSlider == nil {
+            Picker(
+                "",
+                selection: Binding(
+                    get: { model.brushErase },
+                    set: { model.brushErase = $0 }
+                )
+            ) {
+                Text("画笔").tag(false)
+                Text("擦除").tag(true)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
         }
-        .pickerStyle(.segmented)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 4)
         maskSlider(
             "大小",
             value: mask.brushSize,
@@ -483,20 +549,22 @@ struct MaskPanelView: View {
             return copy
         }
         opacitySlider(mask)
-        HStack(spacing: 14) {
-            Text("参数只影响之后的笔画；已画的笔画保留落笔设置。")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-            Spacer()
-            Button("撤销一笔") {
-                model.undoLastStroke()
+        if model.draggingSlider == nil {
+            HStack(spacing: 14) {
+                Text("参数只影响之后的笔画；已画的笔画保留落笔设置。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("撤销一笔") {
+                    model.undoLastStroke()
+                }
+                .font(.caption)
+                .foregroundStyle(Color.accentColor)
+                .disabled(mask.strokes.isEmpty)
             }
-            .font(.caption)
-            .foregroundStyle(Color.accentColor)
-            .disabled(mask.strokes.isEmpty)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 6)
     }
 
     private func opacitySlider(_ mask: MaskUi) -> some View {
@@ -513,16 +581,21 @@ struct MaskPanelView: View {
         }
     }
 
+    @ViewBuilder
     private func hintText(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 10))
-            .foregroundStyle(.secondary)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, 18)
-            .padding(.bottom, 2)
+        // 拖动滑块时只留滑块，提示文字也隐藏。
+        if model.draggingSlider == nil {
+            Text(text)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 18)
+                .padding(.bottom, 2)
+        }
     }
 
     /// 蒙版形状参数滑块（拖动中实时渲染，松手记一步历史）。
+    @ViewBuilder
     private func maskSlider(
         _ label: String,
         value: Float,
@@ -532,19 +605,22 @@ struct MaskPanelView: View {
         decimals: Int = 0,
         apply: @escaping (MaskUi, Float) -> MaskUi
     ) -> some View {
-        ValueSliderRow(
-            label: label,
-            value: value,
-            range: range,
-            neutral: neutral,
-            step: step,
-            decimals: decimals,
-            onBegin: { model.beginEdit() },
-            onChange: { newValue in
-                model.updateSelectedMask { $0 = apply($0, newValue) }
-            },
-            onCommit: { model.commitEdit() }
-        )
+        // 拖动某个滑块时只保留它自己（Lightroom 式沉浸）。
+        if model.sliderVisible(label) {
+            ValueSliderRow(
+                label: label,
+                value: value,
+                range: range,
+                neutral: neutral,
+                step: step,
+                decimals: decimals,
+                onBegin: { model.beginEdit() },
+                onChange: { newValue in
+                    model.updateSelectedMask { $0 = apply($0, newValue) }
+                },
+                onCommit: { model.commitEdit() }
+            )
+        }
     }
 
     // MARK: - 该蒙版的局部调整
@@ -553,7 +629,7 @@ struct MaskPanelView: View {
         VStack(spacing: 0) {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(maskSliders) { spec in
+                    ForEach(maskSliders.filter { model.sliderVisible($0.label) }) { spec in
                         let value = model.selectedMask?.values[spec.key] ?? spec.defaultValue
                         ValueSliderRow(
                             label: spec.label,
@@ -572,9 +648,11 @@ struct MaskPanelView: View {
                 }
                 .padding(.vertical, 6)
             }
-            Divider()
-                .overlay(Color.white.opacity(0.08))
-            categoryRow
+            if model.draggingSlider == nil {
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+                categoryRow
+            }
         }
     }
 
@@ -593,7 +671,8 @@ struct MaskPanelView: View {
             HStack(spacing: 12) {
                 ForEach([EditCategory.light, .color, .effects]) { category in
                     Button {
-                        model.category = category
+                        guard Date() >= suppressCategoryTapUntil else { return }
+                        model.setCategory(category)
                     } label: {
                         VStack(spacing: 5) {
                             Image(systemName: category.icon)
@@ -618,11 +697,30 @@ struct MaskPanelView: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .simultaneousGesture(categoryHoldGesture(category))
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
         }
+    }
+
+    /// 长按分类（0.5s）：临时把该蒙版这一类的局部参数归零，松手恢复（对比用）。
+    private func categoryHoldGesture(_ category: EditCategory) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.5, maximumDistance: 40)
+            .sequenced(before: DragGesture(minimumDistance: 0))
+            .onChanged { value in
+                if case .second(true, _) = value {
+                    if model.previewMaskCategory != category {
+                        Haptics.medium()
+                        model.beginMaskCategoryPreview(category)
+                    }
+                    suppressCategoryTapUntil = Date().addingTimeInterval(0.4)
+                }
+            }
+            .onEnded { _ in
+                model.endMaskCategoryPreview()
+            }
     }
 
     private func step(for spec: SliderSpec) -> Float {

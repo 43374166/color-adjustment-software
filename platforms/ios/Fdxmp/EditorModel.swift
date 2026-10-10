@@ -1,4 +1,5 @@
 import Combine
+import ImageIO
 import Photos
 import UIKit
 
@@ -56,6 +57,33 @@ enum EditorLimits {
     }
     /// 导出尺寸设置键（与「我的」页的 @AppStorage 共用）。
     static let exportMaxEdgeKey = "fdxmp_export_max_edge"
+    /// 导出格式 / 质量 / 保留元数据 / 导出后分享（与「我的」页 @AppStorage 共用）。
+    static let exportFormatKey = "fdxmp_export_format"
+    static let exportQualityKey = "fdxmp_export_quality"
+    static let exportKeepMetadataKey = "fdxmp_export_keep_metadata"
+    static let exportShareKey = "fdxmp_export_share"
+
+    /// 当前导出格式。
+    static var exportFormat: EditorModel.ExportFormat {
+        let stored = UserDefaults.standard.string(forKey: exportFormatKey) ?? ""
+        return EditorModel.ExportFormat(rawValue: stored) ?? .jpeg
+    }
+
+    /// JPEG 质量（0.5..1，其它格式忽略）。
+    static var exportQuality: Double {
+        let stored = UserDefaults.standard.double(forKey: exportQualityKey)
+        return stored > 0 ? stored : 0.92
+    }
+
+    /// 是否保留原图 EXIF / GPS 等拍摄信息。
+    static var exportKeepMetadata: Bool {
+        UserDefaults.standard.object(forKey: exportKeepMetadataKey) as? Bool ?? true
+    }
+
+    /// 导出完成后是否弹出分享面板。
+    static var exportShareAfterSave: Bool {
+        UserDefaults.standard.object(forKey: exportShareKey) as? Bool ?? false
+    }
     /// 放大查看（原像素细节）用的最长边。
     static let detailMaxEdge = 4096
 }
@@ -64,6 +92,12 @@ enum EditorLimits {
 ///
 /// 渲染走 Rust CPU 预览（`fdxmp_render_memory_rgba`）：
 /// 滑块 / 曲线 / 蒙版变化 140ms 防抖，渲染期间只保留最后一次请求。
+/// 一步历史：操作名 + 该操作前的完整状态（用于撤销提示与长按历史列表）。
+struct HistoryEntry {
+    let name: String
+    let state: EditState
+}
+
 @MainActor
 final class EditorModel: ObservableObject {
     // MARK: 渲染与照片
@@ -77,6 +111,10 @@ final class EditorModel: ObservableObject {
     @Published private(set) var isLoading = false
     @Published private(set) var isRendering = false
     @Published private(set) var isExporting = false
+    /// 导出进度（0..1；nil = 未在导出）。
+    @Published private(set) var exportProgress: Double?
+    /// 导出完成后的分享文件（开了"导出后分享"才有值）。
+    @Published var exportShareURL: URL?
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
     @Published private(set) var renderMillis: Double?
@@ -88,6 +126,8 @@ final class EditorModel: ObservableObject {
     @Published var state = EditState()
     @Published private(set) var tool: EditorTool = .edit
     @Published private(set) var presetName = "原片"
+    /// 预设强度 0..100（应用预设后可调；0 = 应用前的样子）。
+    @Published private(set) var presetStrength: Float = 100
 
     // 面板导航
     @Published var category: EditCategory = .light
@@ -111,6 +151,18 @@ final class EditorModel: ObservableObject {
     @Published var brushCursor: CGPoint?
     /// 长按分类导航时临时归零预览的分类（松手恢复；不写历史、不落盘）。
     @Published private(set) var previewCategory: EditCategory?
+    /// 长按蒙版调整页分类：临时把该蒙版这一类的局部参数归零预览。
+    @Published private(set) var previewMaskCategory: EditCategory?
+    /// 正在横向拖动的滑块标签（Lightroom 式沉浸：拖动时只留这一个滑块）。
+    @Published private(set) var draggingSlider: String?
+    /// 拖动滑块的实时数值（显示为画面顶部的大号数值浮层）。
+    @Published private(set) var draggingSliderText: String?
+    /// 对比模式的「调色前」整图（保留当前裁切、全部调整归零，与预览同尺寸）。
+    @Published private(set) var beforeImage: UIImage?
+    /// 正在准备对比帧。
+    @Published private(set) var isPreparingBefore = false
+    /// 预设缩略图（键 = 预设名，用当前照片的小图渲染）。
+    @Published private(set) var presetThumbnails: [String: UIImage] = [:]
 
     private(set) var asset: PHAsset?
 
@@ -121,10 +173,17 @@ final class EditorModel: ObservableObject {
     private(set) var maskInteracting = false
     private var loadToken = 0
     private var detailToken = 0
+    private var beforeToken = 0
+    /// 放大细节帧：上次请求的视口 / 缩放与所用分辨率（用于判断是否需要重取）。
+    private var lastDetailViewport = CGSize(width: 1200, height: 900)
+    private var lastDetailZoom: CGFloat = 2.5
+    private var detailEdgeUsed = 0
     private var detailInFlight = false
     private var dragSnapshot: EditState?
-    private var undoStack: [EditState] = []
-    private var redoStack: [EditState] = []
+    private var undoStack: [HistoryEntry] = []
+    private var redoStack: [HistoryEntry] = []
+    /// 当前编辑的操作名（记入历史时用；不设则记为"编辑"）。
+    private var pendingLabel: String?
     private var renderBusy = false
     private var renderPending = false
     private let renderQueue = DispatchQueue(label: "fdxmp.ios.render", qos: .userInitiated)
@@ -133,6 +192,13 @@ final class EditorModel: ObservableObject {
     private var maskAssetScheduled = false
     /// 进入「调整」子页前的叠加显示状态（用于回来时恢复）。
     private var maskOverlayRestore = true
+    /// 进入曲线前的分类（曲线面板「完成」时恢复）。
+    private var categoryBeforeCurves: EditCategory = .light
+    /// 预设强度的混合快照（应用预设前 / 预设结果）。
+    private var presetBase: EditState?
+    private var presetTarget: EditState?
+    /// 正在拖预设强度滑块（此时不要清掉混合上下文）。
+    private var suppressPresetStrengthReset = false
     private static let imageManager = PHCachingImageManager()
 
     // MARK: - 只读派生值
@@ -171,6 +237,10 @@ final class EditorModel: ObservableObject {
         brushCursor = nil
         brushErase = false
         maskOverlayVisible = true
+        beforeImage = nil
+        isPreparingBefore = false
+        detailRegion = nil
+        pendingRegion = nil
         undoStack.removeAll()
         redoStack.removeAll()
         publishHistory()
@@ -243,16 +313,107 @@ final class EditorModel: ObservableObject {
 
     // MARK: - 放大细节（原像素）
 
+    /// 生成对比用的「调色前」帧：同裁切、无调整，尺寸与预览一致（左原图 / 右调色）。
+    func prepareBeforeImage() {
+        guard let buffer = baseBuffer else { return }
+        beforeToken &+= 1
+        let token = beforeToken
+        isPreparingBefore = true
+        var beforeState = EditState()
+        beforeState.crop = state.crop
+        let json = EditJSON.build(state: beforeState, applyCropRect: true)
+        renderQueue.async { [weak self] in
+            let result = NativeCore.shared.render(buffer: buffer, paramsJson: json)
+            let image = result.flatMap {
+                ImageUtil.image(
+                    from: RgbaBuffer(pixels: $0.pixels, width: $0.width, height: $0.height)
+                )
+            }
+            Task { @MainActor in
+                guard let self, self.beforeToken == token else { return }
+                self.isPreparingBefore = false
+                self.beforeImage = image
+            }
+        }
+    }
+
+    // MARK: - 预设缩略图
+
+    private var presetThumbToken = 0
+
+    /// 用当前照片的小图渲染每个内置预设的效果（进入预设工具时刷新）。
+    func refreshPresetThumbnails() {
+        guard let buffer = baseBuffer else { return }
+        presetThumbToken &+= 1
+        let token = presetThumbToken
+        let crop = state.crop
+        let presets = EditorSpec.presets
+        maskAssetQueue.async { [weak self] in
+            let small = ImageUtil.downscaled(buffer: buffer, maxEdge: 200) ?? buffer
+            var images: [String: UIImage] = [:]
+            for preset in presets {
+                var thumbState = EditState()
+                thumbState.crop = crop
+                var values = EditorSpec.defaultValues()
+                for (key, value) in preset.params {
+                    values[key] = value
+                }
+                thumbState.values = values
+                let json = EditJSON.build(state: thumbState, applyCropRect: true)
+                guard
+                    let result = NativeCore.shared.render(buffer: small, paramsJson: json),
+                    let image = ImageUtil.image(
+                        from: RgbaBuffer(
+                            pixels: result.pixels,
+                            width: result.width,
+                            height: result.height
+                        )
+                    )
+                else {
+                    continue
+                }
+                images[preset.name] = image
+            }
+            Task { @MainActor in
+                guard let self, self.presetThumbToken == token else { return }
+                self.presetThumbnails = images
+            }
+        }
+    }
+
+    /// 关闭对比模式：释放对比帧。
+    func clearBeforeImage() {
+        beforeToken &+= 1
+        isPreparingBefore = false
+        beforeImage = nil
+    }
+
     /// 请求一张高分辨率帧：双指 / 双击放大时用，保证放大后看到的是原始像素而不是放大后的代理图。
-    func requestDetailPreview() {
+    ///
+    /// 分辨率按缩放级别动态取"刚好够用"（视口像素 × 缩放 × 1.15，1200..4096）：
+    /// 不再一律 4096，内存峰值随缩放下降明显（4096² RGBA 约 64MB → 2.5x 时约 36MB）。
+    func requestDetailPreview(
+        viewport: CGSize = CGSize(width: 1200, height: 900),
+        zoom: CGFloat = 2.5,
+        force: Bool = false
+    ) {
         guard let asset, !detailInFlight else { return }
+        let needed = Int(max(viewport.width, viewport.height) * zoom * 1.15)
+        let maxEdge = min(max(needed, 1200), EditorLimits.detailMaxEdge)
+        // 已有一张分辨率相近的帧就不重复请求（避免每档缩放都重渲染）。
+        lastDetailViewport = viewport
+        lastDetailZoom = zoom
+        if !force, detailImage != nil, abs(maxEdge - detailEdgeUsed) <= max(160, detailEdgeUsed / 8) {
+            return
+        }
+        detailEdgeUsed = maxEdge
         detailInFlight = true
         detailToken &+= 1
         let token = detailToken
         let json = currentJson(applyCropRect: true)
         requestImage(
             asset: asset,
-            maxEdge: EditorLimits.detailMaxEdge,
+            maxEdge: maxEdge,
             mode: .highQualityFormat
         ) { [weak self] image, degraded in
             guard let self, self.detailToken == token, !degraded else { return }
@@ -261,7 +422,7 @@ final class EditorModel: ObservableObject {
                 return
             }
             self.renderQueue.async { [weak self] in
-                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.detailMaxEdge)
+                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: maxEdge)
                 let result = buffer.flatMap {
                     NativeCore.shared.render(buffer: $0, paramsJson: json)
                 }
@@ -284,12 +445,154 @@ final class EditorModel: ObservableObject {
         detailToken &+= 1
         detailInFlight = false
         detailImage = nil
+        detailEdgeUsed = 0
+    }
+
+    // MARK: - 放大细节（区域 1:1，核心"帧外坐标"渲染）
+
+    /// 只覆盖 `rect`（归一化，输出坐标系）的高清帧。
+    struct DetailRegion {
+        let image: UIImage
+        let rect: CGRect
+    }
+
+    /// 当前区域高清帧。
+    @Published private(set) var detailRegion: DetailRegion?
+
+    private var detailRegionToken = 0
+    private var regionDebounceToken = 0
+    private var pendingRegion: (visible: CGRect, viewport: CGSize)?
+    private var lastRegionVisible: CGRect = .zero
+
+    /// 是否可用区域渲染（核心要求单位几何；蒙版类型也要能重建）。
+    var canRenderRegionDetail: Bool {
+        let crop = state.crop
+        let identity = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
+            && crop.rotation == 0
+            && !crop.flipHorizontal
+            && !crop.flipVertical
+        guard identity, let asset else { return false }
+        // 只对中等像素量走 1:1（全分辨率解码有内存尖峰，超大图仍用整帧细节帧）。
+        let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
+        return pixels > 0 && pixels <= 24_000_000
+    }
+
+    /// 去抖地请求区域高清帧（缩放 / 平移时反复调用只保留最后一次）。
+    func scheduleDetailRegion(visible: CGRect, viewport: CGSize) {
+        pendingRegion = (visible, viewport)
+        regionDebounceToken &+= 1
+        let token = regionDebounceToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+            guard let self, self.regionDebounceToken == token,
+                  let pending = self.pendingRegion
+            else {
+                return
+            }
+            self.pendingRegion = nil
+            self.performDetailRegionRequest(visible: pending.visible, viewport: pending.viewport)
+        }
+    }
+
+    /// 释放区域高清帧。
+    func clearDetailRegion() {
+        detailRegionToken &+= 1
+        regionDebounceToken &+= 1
+        pendingRegion = nil
+        detailRegion = nil
+        lastRegionVisible = .zero
+    }
+
+    private func performDetailRegionRequest(visible: CGRect, viewport: CGSize) {
+        guard canRenderRegionDetail, let asset else { return }
+        let pixelWidth = CGFloat(asset.pixelWidth)
+        let pixelHeight = CGFloat(asset.pixelHeight)
+        guard pixelWidth > 32, pixelHeight > 32,
+              visible.width > 0.01, visible.height > 0.01
+        else {
+            return
+        }
+        // 源分辨率：让可见区域像素 ≥ 视口像素（上限 = 原图长边）。
+        let needed = max(viewport.width / visible.width, viewport.height / visible.height)
+        let originalLong = max(pixelWidth, pixelHeight)
+        let target = Int(min(originalLong, max(needed, 1400)))
+        // 可见矩形 → 源像素矩形（单位几何：输出 = 源），向外扩余量给细节模糊。
+        let margin: CGFloat = 12
+        let vx = (visible.minX * pixelWidth).rounded()
+        let vy = (visible.minY * pixelHeight).rounded()
+        let vw = (visible.width * pixelWidth).rounded()
+        let vh = (visible.height * pixelHeight).rounded()
+        let rx = max(vx - margin, 0)
+        let ry = max(vy - margin, 0)
+        let rw = min(vx + vw + margin, pixelWidth) - rx
+        let rh = min(vy + vh + margin, pixelHeight) - ry
+        guard rw > 8, rh > 8 else { return }
+        lastRegionVisible = visible
+        detailRegionToken &+= 1
+        let token = detailRegionToken
+        let json = currentJson(applyCropRect: true)
+        requestImage(asset: asset, maxEdge: target, mode: .highQualityFormat) { [weak self] image, degraded in
+            guard let self, self.detailRegionToken == token, !degraded, let image else { return }
+            self.renderQueue.async { [weak self] in
+                guard let self else { return }
+                // 方向校正后按比例把源像素矩形换算成请求图的像素矩形。
+                guard let full = ImageUtil.rgbaBuffer(from: image, maxEdge: target) else { return }
+                let scaleX = CGFloat(full.width) / pixelWidth
+                let scaleY = CGFloat(full.height) / pixelHeight
+                let cropX = Int((rx * scaleX).rounded())
+                let cropY = Int((ry * scaleY).rounded())
+                let cropW = max(8, Int((rw * scaleX).rounded()))
+                let cropH = max(8, Int((rh * scaleY).rounded()))
+                guard
+                    let region = ImageUtil.cropped(
+                        buffer: full,
+                        x: cropX,
+                        y: cropY,
+                        width: cropW,
+                        height: cropH
+                    ),
+                    let result = NativeCore.shared.renderRegion(
+                        buffer: region,
+                        originX: cropX,
+                        originY: cropY,
+                        visibleX: Int((vx * scaleX).rounded()),
+                        visibleY: Int((vy * scaleY).rounded()),
+                        visibleWidth: max(8, Int((vw * scaleX).rounded())),
+                        visibleHeight: max(8, Int((vh * scaleY).rounded())),
+                        fullWidth: full.width,
+                        fullHeight: full.height,
+                        paramsJson: json
+                    ),
+                    let rendered = ImageUtil.image(
+                        from: RgbaBuffer(
+                            pixels: result.pixels,
+                            width: result.width,
+                            height: result.height
+                        )
+                    )
+                else {
+                    // 核心拒绝区域渲染（例如带非单位几何的镜头参数）：回退整帧细节帧。
+                    Task { @MainActor in
+                        guard let self, self.detailRegionToken == token else { return }
+                        self.requestDetailPreview(viewport: viewport, zoom: self.lastDetailZoom)
+                    }
+                    return
+                }
+                Task { @MainActor in
+                    guard let self, self.detailRegionToken == token else { return }
+                    self.detailRegion = DetailRegion(image: rendered, rect: visible)
+                }
+            }
+        }
     }
 
     /// 编辑提交后刷新（放大状态下保持像素级清晰）。
     private func refreshDetailIfNeeded() {
-        if detailImage != nil, !detailInFlight {
-            requestDetailPreview()
+        if detailRegion != nil {
+            // 区域模式：按上次的可见矩形重渲染一块。
+            performDetailRegionRequest(visible: lastRegionVisible, viewport: lastDetailViewport)
+        } else if detailImage != nil, !detailInFlight {
+            // 整帧模式：参数变了，用同一档分辨率强制重渲染。
+            requestDetailPreview(viewport: lastDetailViewport, zoom: lastDetailZoom, force: true)
         }
     }
 
@@ -297,6 +600,7 @@ final class EditorModel: ObservableObject {
     func selectTool(_ newTool: EditorTool) {
         guard tool != newTool else { return }
         tool = newTool
+        draggingSlider = nil
         if newTool == .mask {
             if selectedMaskId == nil {
                 selectedMaskId = state.masks.first?.id
@@ -306,6 +610,9 @@ final class EditorModel: ObservableObject {
                 category = .light
             }
             scheduleMaskAssetsRefresh(immediate: true)
+        } else if newTool == .presets {
+            // 进入预设工具：用当前照片刷一遍预设缩略图。
+            refreshPresetThumbnails()
         } else {
             brushCursor = nil
         }
@@ -316,6 +623,13 @@ final class EditorModel: ObservableObject {
 
     /// 开始一次编辑（滑块按下 / 拖动开始）：记录快照。
     func beginEdit() {
+        if suppressPresetStrengthReset {
+            suppressPresetStrengthReset = false
+        } else {
+            // 又做了别的编辑：预设强度上下文作废。
+            presetBase = nil
+            presetTarget = nil
+        }
         if dragSnapshot == nil {
             dragSnapshot = state
         }
@@ -332,6 +646,8 @@ final class EditorModel: ObservableObject {
             pushUndo(before)
         }
         dragSnapshot = nil
+        draggingSlider = nil
+        draggingSliderText = nil
         presetName = "自定义"
         persist()
         scheduleRender(immediate: true)
@@ -339,10 +655,13 @@ final class EditorModel: ObservableObject {
     }
 
     /// 一次性参数修改（点按类操作）：自动记一步历史。
-    func applyEdit(_ mutate: (inout EditState) -> Void) {
+    func applyEdit(_ label: String = "编辑", _ mutate: (inout EditState) -> Void) {
+        presetBase = nil
+        presetTarget = nil
         let before = state
         mutate(&state)
         guard state != before else { return }
+        pendingLabel = label
         pushUndo(before)
         presetName = "自定义"
         persist()
@@ -351,22 +670,46 @@ final class EditorModel: ObservableObject {
     }
 
     func undo() {
-        guard let previous = undoStack.popLast() else { return }
-        redoStack.append(state)
-        state = previous
+        restoreHistory(stepBack: 1, announce: true)
+    }
+
+    func redo() {
+        guard let entry = redoStack.popLast() else { return }
+        undoStack.append(HistoryEntry(name: entry.name, state: state))
+        state = entry.state
+        presetBase = nil
+        presetTarget = nil
         publishHistory()
         presetName = "自定义"
+        message = "已重做：\(entry.name)"
         persist()
         scheduleRender(immediate: true)
         refreshDetailIfNeeded()
     }
 
-    func redo() {
-        guard let next = redoStack.popLast() else { return }
-        undoStack.append(state)
-        state = next
+    /// 历史步骤名（由近到远，不含"当前"）。
+    var historyNames: [String] {
+        undoStack.reversed().map(\.name)
+    }
+
+    /// 回退 `steps` 步（用于长按撤销键的历史列表；0 = 不动）。
+    func restoreHistory(stepBack steps: Int, announce: Bool = false) {
+        guard steps > 0 else { return }
+        var last: String?
+        for _ in 0..<steps {
+            guard let entry = undoStack.popLast() else { break }
+            redoStack.append(HistoryEntry(name: entry.name, state: state))
+            state = entry.state
+            last = entry.name
+        }
+        guard let name = last else { return }
+        presetBase = nil
+        presetTarget = nil
         publishHistory()
         presetName = "自定义"
+        if announce {
+            message = "已撤销：\(name)"
+        }
         persist()
         scheduleRender(immediate: true)
         refreshDetailIfNeeded()
@@ -379,6 +722,7 @@ final class EditorModel: ObservableObject {
     }
 
     func updateValue(_ key: String, _ newValue: Float) {
+        pendingLabel = EditorSpec.sliders.first { $0.key == key }?.label ?? "调色"
         state.values[key] = newValue
         touchEdit()
     }
@@ -387,7 +731,8 @@ final class EditorModel: ObservableObject {
 
     /// 应用内置预设（与 Android 一致：重置滑块与曲线，保留 HSL / 分级 / 蒙版）。
     func applyPreset(_ preset: BuiltinPreset) {
-        applyEdit { state in
+        let base = state
+        applyEdit(preset.name) { state in
             var values = EditorSpec.defaultValues()
             for (key, value) in preset.params {
                 values[key] = value
@@ -396,11 +741,49 @@ final class EditorModel: ObservableObject {
             state.curves.reset()
         }
         presetName = preset.name
+        // 记住应用前后：预设「强度」在两者之间插值。
+        presetBase = base
+        presetTarget = state
+        presetStrength = 100
+    }
+
+    /// 有可调强度的预设上下文（应用过预设后为 true）。
+    var canAdjustPresetStrength: Bool {
+        presetBase != nil && presetTarget != nil
+    }
+
+    /// 开始拖预设强度滑块（此时不要清掉混合上下文）。
+    func beginPresetStrengthEdit() {
+        suppressPresetStrengthReset = true
+        pendingLabel = "预设强度"
+        beginEdit()
+    }
+
+    /// 拖动预设强度：在「应用前」与「预设结果」之间插值。
+    /// 曲线按 50% 分界切换（与核心 `EditParams::blend` 的桌面行为一致）。
+    func updatePresetStrength(_ value: Float) {
+        guard let base = presetBase, let target = presetTarget else { return }
+        presetStrength = value
+        let t = value / 100
+        var updated = state
+        for spec in EditorSpec.sliders {
+            let from = base.values[spec.key] ?? spec.defaultValue
+            let to = target.values[spec.key] ?? spec.defaultValue
+            updated.values[spec.key] = from + (to - from) * t
+        }
+        updated.curves = t < 0.5 ? base.curves : target.curves
+        state = updated
+        touchEdit()
+    }
+
+    /// 结束预设强度拖动。
+    func commitPresetStrengthEdit() {
+        commitEdit()
     }
 
     /// 全部归零。
     func resetAll() {
-        applyEdit { state in
+        applyEdit("全部重置") { state in
             state = EditState()
         }
         selectedMaskId = nil
@@ -419,6 +802,7 @@ final class EditorModel: ObservableObject {
     /// 更新曲线控制点（拖动中 commit = false）。
     func updateCurve(_ channel: CurveChannel, _ points: [CurvePoint], commit: Bool) {
         beginEdit()
+        pendingLabel = "曲线 · \(channel.rawValue)"
         state.curves.setPoints(channel, points)
         if commit {
             commitEdit()
@@ -430,6 +814,7 @@ final class EditorModel: ObservableObject {
     /// 更新参数曲线（滑块）。
     func updateParametric(_ values: ParametricValues, commit: Bool) {
         beginEdit()
+        pendingLabel = "曲线 · 参数"
         state.curves.parametric = values
         if commit {
             commitEdit()
@@ -439,7 +824,7 @@ final class EditorModel: ObservableObject {
     }
 
     func resetCurve(_ channel: CurveChannel) {
-        applyEdit { state in
+        applyEdit("重置曲线 · \(channel.rawValue)") { state in
             state.curves.setPoints(channel, CurveState.identity)
         }
     }
@@ -448,6 +833,7 @@ final class EditorModel: ObservableObject {
 
     func updateHsl(_ band: HslBandKind, _ value: HslBand, commit: Bool) {
         beginEdit()
+        pendingLabel = "HSL · \(band.rawValue)"
         state.hsl[band] = value
         if commit {
             commitEdit()
@@ -458,6 +844,7 @@ final class EditorModel: ObservableObject {
 
     func updateGrading(_ zone: GradingZoneKind, _ value: GradingZone, commit: Bool) {
         beginEdit()
+        pendingLabel = "分级 · \(zone.rawValue)"
         state.grading[zone] = value
         if commit {
             commitEdit()
@@ -468,6 +855,7 @@ final class EditorModel: ObservableObject {
 
     func updateGradingMix(blending: Float, balance: Float, commit: Bool) {
         beginEdit()
+        pendingLabel = "分级 · 混合"
         state.grading.blending = blending
         state.grading.balance = balance
         if commit {
@@ -481,20 +869,58 @@ final class EditorModel: ObservableObject {
 
     func updateCropRect(_ rect: CGRect, commit: Bool) {
         beginEdit()
-        state.crop.rect = clampedCropRect(rect)
+        pendingLabel = "裁切"
         if commit {
-            // 裁剪框只影响叠加层；裁切结果在切换工具 / 导出时统一渲染。
-            if let before = dragSnapshot, before != state {
-                pushUndo(before)
-            }
-            dragSnapshot = nil
-            presetName = "自定义"
-            persist()
+            state.crop.rect = clampedCropRect(rect)
+            commitCropDrag()
+        } else {
+            // 拖动中允许少量阻尼越界（松手回弹到合法范围）。
+            state.crop.rect = rect
         }
+    }
+
+    /// 裁切拖动结束：带阻尼越界的矩形缓动回合法范围（约 160ms），再记一步历史。
+    func finishCropDrag() {
+        let target = clampedCropRect(state.crop.rect)
+        let start = state.crop.rect
+        guard start != target else {
+            commitCropDrag()
+            return
+        }
+        let steps = 8
+        for step in 1...steps {
+            let t = Double(step) / Double(steps)
+            let eased = CGFloat(1 - pow(1 - t, 3))
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02 * Double(step)) { [weak self] in
+                guard let self else { return }
+                self.state.crop.rect = CGRect(
+                    x: start.minX + (target.minX - start.minX) * eased,
+                    y: start.minY + (target.minY - start.minY) * eased,
+                    width: start.width + (target.width - start.width) * eased,
+                    height: start.height + (target.height - start.height) * eased
+                )
+                if step == steps {
+                    self.commitCropDrag()
+                }
+            }
+        }
+    }
+
+    /// 裁切拖动提交：夹取 + 记历史 + 保存（裁切结果在切换工具 / 导出时统一渲染）。
+    private func commitCropDrag() {
+        state.crop.rect = clampedCropRect(state.crop.rect)
+        if let before = dragSnapshot, before != state {
+            pushUndo(before)
+        }
+        dragSnapshot = nil
+        presetName = "自定义"
+        persist()
+        scheduleRender(immediate: true)
     }
 
     func updateCropRotation(_ value: Float, commit: Bool) {
         beginEdit()
+        pendingLabel = "拉直"
         state.crop.rotation = value.clamped(to: -45...45)
         if commit {
             commitEdit()
@@ -505,7 +931,7 @@ final class EditorModel: ObservableObject {
 
     /// 选择固定比例：按比例调整当前裁剪框（不缩放图像）。
     func setCropAspect(_ aspect: CropAspect, contentSize: CGSize) {
-        applyEdit { state in
+        applyEdit("裁切比例") { state in
             state.crop.aspect = aspect
             guard let ratio = aspect.ratio, contentSize.width > 0, contentSize.height > 0 else {
                 return
@@ -534,7 +960,7 @@ final class EditorModel: ObservableObject {
     }
 
     func toggleCropFlip(horizontal: Bool) {
-        applyEdit { state in
+        applyEdit("翻转") { state in
             if horizontal {
                 state.crop.flipHorizontal.toggle()
             } else {
@@ -544,7 +970,7 @@ final class EditorModel: ObservableObject {
     }
 
     func resetCrop() {
-        applyEdit { state in
+        applyEdit("重置裁切") { state in
             state.crop.reset()
         }
     }
@@ -576,7 +1002,7 @@ final class EditorModel: ObservableObject {
             mask.brushDensity = 100
         }
         mask.values = EditorSpec.defaultValues()
-        applyEdit { state in
+        applyEdit("新建\(kind.rawValue)") { state in
             state.masks.append(mask)
         }
         selectedMaskId = mask.id
@@ -593,7 +1019,7 @@ final class EditorModel: ObservableObject {
         var copy = source
         copy.id = UUID().uuidString
         copy.name = "\(source.name) 副本"
-        applyEdit { state in
+        applyEdit("复制蒙版") { state in
             if let index = state.masks.firstIndex(where: { $0.id == id }) {
                 state.masks.insert(copy, at: index + 1)
             } else {
@@ -606,7 +1032,7 @@ final class EditorModel: ObservableObject {
     /// 删除选中蒙版。
     func deleteSelectedMask() {
         guard let id = selectedMaskId else { return }
-        applyEdit { state in
+        applyEdit("删除蒙版") { state in
             state.masks.removeAll { $0.id == id }
         }
         selectedMaskId = state.masks.first?.id
@@ -617,7 +1043,7 @@ final class EditorModel: ObservableObject {
     func renameSelectedMask(_ name: String) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let id = selectedMaskId else { return }
-        applyEdit { state in
+        applyEdit("重命名蒙版") { state in
             if let index = state.masks.firstIndex(where: { $0.id == id }) {
                 state.masks[index].name = trimmed
             }
@@ -626,7 +1052,7 @@ final class EditorModel: ObservableObject {
 
     /// 显示 / 隐藏某个蒙版（隐藏后不参与渲染与叠加）。
     func toggleMaskVisible(_ id: String) {
-        applyEdit { state in
+        applyEdit("切换蒙版显示") { state in
             if let index = state.masks.firstIndex(where: { $0.id == id }) {
                 state.masks[index].visible.toggle()
             }
@@ -636,7 +1062,7 @@ final class EditorModel: ObservableObject {
     /// 反转选中蒙版。
     func invertSelectedMask() {
         guard let id = selectedMaskId else { return }
-        applyEdit { state in
+        applyEdit("反转蒙版") { state in
             if let index = state.masks.firstIndex(where: { $0.id == id }) {
                 state.masks[index].inverted.toggle()
             }
@@ -665,7 +1091,7 @@ final class EditorModel: ObservableObject {
             fresh.brushFlow = source.brushFlow
             fresh.brushDensity = source.brushDensity
         }
-        applyEdit { state in
+        applyEdit("重置蒙版") { state in
             if let index = state.masks.firstIndex(where: { $0.id == id }) {
                 state.masks[index] = fresh
             }
@@ -680,9 +1106,47 @@ final class EditorModel: ObservableObject {
         else {
             return
         }
-        applyEdit { state in
+        applyEdit("撤销一笔") { state in
             if let index = state.masks.firstIndex(where: { $0.id == id }) {
                 state.masks[index].strokes.removeLast()
+            }
+        }
+    }
+
+    // MARK: - 蒙版设置复制 / 粘贴
+
+    /// 蒙版设置剪贴板（跨蒙版 / 跨照片）。
+    private var maskClipboard: MaskUi?
+
+    /// 是否有可粘贴的蒙版设置。
+    var canPasteMaskSettings: Bool {
+        maskClipboard != nil && selectedMask != nil
+    }
+
+    /// 复制选中蒙版的设置（形状 + 局部调整）。
+    func copySelectedMaskSettings() {
+        guard let mask = selectedMask else { return }
+        maskClipboard = mask
+    }
+
+    /// 粘贴设置到选中蒙版：类型一致时连形状一起套用，否则只套用局部调整。
+    func pasteMaskSettings() {
+        guard let clipboard = maskClipboard, let id = selectedMaskId else { return }
+        let source = state.masks.first { $0.id == id }
+        let sameKind = source?.kind == clipboard.kind
+        applyEdit("粘贴蒙版设置") { state in
+            guard let index = state.masks.firstIndex(where: { $0.id == id }) else { return }
+            let name = state.masks[index].name
+            let savedId = state.masks[index].id
+            if sameKind {
+                var pasted = clipboard
+                pasted.id = savedId
+                pasted.name = name
+                state.masks[index] = pasted
+            } else {
+                state.masks[index].values = clipboard.values
+                state.masks[index].opacity = clipboard.opacity
+                state.masks[index].inverted = clipboard.inverted
             }
         }
     }
@@ -732,6 +1196,7 @@ final class EditorModel: ObservableObject {
     /// 更新选中蒙版的调色参数（滑块）。
     func updateMaskValue(_ key: String, _ newValue: Float) {
         beginEdit()
+        pendingLabel = "蒙版 · \(EditorSpec.sliders.first { $0.key == key }?.label ?? "调整")"
         mutateSelectedMask { $0.values[key] = newValue }
         touchEdit()
     }
@@ -739,8 +1204,9 @@ final class EditorModel: ObservableObject {
     // MARK: - 蒙版画布交互（手势层驱动）
 
     /// 开始拖动蒙版控件：记录快照，拖动期间用快速预览渲染。
-    func beginMaskDrag() {
+    func beginMaskDrag(label: String = "调整蒙版") {
         guard selectedMask != nil else { return }
+        pendingLabel = label
         maskInteracting = true
         beginEdit()
     }
@@ -759,11 +1225,13 @@ final class EditorModel: ObservableObject {
             return
         }
         beginEdit()
+        pendingLabel = brushErase ? "擦除" : "画笔"
         maskInteracting = true
         let mask = state.masks[index]
+        let start = Self.quantized(point)
         state.masks[index].strokes.append(
             BrushStrokeUi(
-                points: [point],
+                points: [start],
                 erase: brushErase,
                 size: mask.brushSize,
                 feather: mask.brushFeather,
@@ -784,6 +1252,7 @@ final class EditorModel: ObservableObject {
         else {
             return
         }
+        let point = Self.quantized(point)
         if let last = stroke.points.last, hypot(last.x - point.x, last.y - point.y) < 0.003 {
             return
         }
@@ -795,8 +1264,16 @@ final class EditorModel: ObservableObject {
 
     /// 抬笔：整笔记一步历史。
     func endBrushStroke() {
-        brushCursor = nil
+        // 抬笔后保留笔刷光标位置（仍显示大小圆），方便接着画。
         finishMaskInteraction()
+    }
+
+    /// 笔画坐标量化到 3 位小数（缩小项目 JSON 体积）。
+    private static func quantized(_ point: CGPoint) -> CGPoint {
+        CGPoint(
+            x: (point.x * 1000).rounded() / 1000,
+            y: (point.y * 1000).rounded() / 1000
+        )
     }
 
     /// 结束蒙版交互：提交历史 + 全分辨率渲染。
@@ -907,6 +1384,39 @@ final class EditorModel: ObservableObject {
         scheduleRender(immediate: true)
     }
 
+    /// 更新沉浸拖动状态（由 `ValueSliderRow` 通过 PreferenceKey 上报）。
+    func setDraggingSlider(_ info: SliderDragInfo?) {
+        let label = info?.label
+        let text = info?.text
+        if draggingSlider != label {
+            draggingSlider = label
+        }
+        if draggingSliderText != text {
+            draggingSliderText = text
+        }
+    }
+
+    /// 沉浸拖动中：除指定标签的滑块外都隐藏。
+    func sliderVisible(_ label: String) -> Bool {
+        draggingSlider == nil || draggingSlider == label
+    }
+
+    /// 切换分类导航（进入曲线前记住来源分类，供曲线「完成」返回）。
+    func setCategory(_ category: EditCategory) {
+        if category == .curves, self.category != .curves {
+            categoryBeforeCurves = self.category
+        }
+        self.category = category
+    }
+
+    /// 曲线面板「完成」：回到进入曲线前的分类。
+    func exitCurves() {
+        if categoryBeforeCurves == .curves {
+            categoryBeforeCurves = .light
+        }
+        category = categoryBeforeCurves
+    }
+
     /// 松开分类导航：恢复预览。
     func endCategoryPreview() {
         guard previewCategory != nil else { return }
@@ -914,32 +1424,55 @@ final class EditorModel: ObservableObject {
         scheduleRender(immediate: true)
     }
 
+    /// 长按蒙版调整页分类：临时把该蒙版这一类的局部参数归零，松手恢复。
+    func beginMaskCategoryPreview(_ category: EditCategory) {
+        guard previewMaskCategory != category else { return }
+        previewMaskCategory = category
+        scheduleRender(immediate: true)
+    }
+
+    func endMaskCategoryPreview() {
+        guard previewMaskCategory != nil else { return }
+        previewMaskCategory = nil
+        scheduleRender(immediate: true)
+    }
+
     /// 渲染 / 预览用状态：长按分类时把该分类参数归零（取默认值 = 无效果）。
     private var renderState: EditState {
-        guard let category = previewCategory else { return state }
+        guard previewCategory != nil || previewMaskCategory != nil else { return state }
         var copy = state
-        switch category {
-        case .light:
-            for spec in EditorSpec.sliders where spec.category == .light {
-                copy.values[spec.key] = spec.defaultValue
+        if let category = previewCategory {
+            switch category {
+            case .light:
+                for spec in EditorSpec.sliders where spec.category == .light {
+                    copy.values[spec.key] = spec.defaultValue
+                }
+            case .color:
+                for spec in EditorSpec.sliders where spec.category == .color {
+                    copy.values[spec.key] = spec.defaultValue
+                }
+                // 颜色分类下还有 HSL / 颜色分级两个子页，一起归零。
+                copy.hsl.reset()
+                copy.grading.reset()
+            case .effects:
+                for spec in EditorSpec.sliders where spec.category == .effects {
+                    copy.values[spec.key] = spec.defaultValue
+                }
+            case .detail:
+                for spec in EditorSpec.sliders where spec.category == .detail {
+                    copy.values[spec.key] = spec.defaultValue
+                }
+            case .curves:
+                copy.curves.reset()
             }
-        case .color:
-            for spec in EditorSpec.sliders where spec.category == .color {
-                copy.values[spec.key] = spec.defaultValue
+        }
+        // 蒙版调整页的长按归零：只动当前蒙版的这一类局部参数。
+        if let category = previewMaskCategory,
+           let id = selectedMaskId,
+           let index = copy.masks.firstIndex(where: { $0.id == id }) {
+            for spec in EditorSpec.sliders where spec.category == category {
+                copy.masks[index].values[spec.key] = spec.defaultValue
             }
-            // 颜色分类下还有 HSL / 颜色分级两个子页，一起归零。
-            copy.hsl.reset()
-            copy.grading.reset()
-        case .effects:
-            for spec in EditorSpec.sliders where spec.category == .effects {
-                copy.values[spec.key] = spec.defaultValue
-            }
-        case .detail:
-            for spec in EditorSpec.sliders where spec.category == .detail {
-                copy.values[spec.key] = spec.defaultValue
-            }
-        case .curves:
-            copy.curves.reset()
         }
         return copy
     }
@@ -966,7 +1499,7 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    private func startRender() {
+    private func startRender(fallback: Bool = false) {
         guard let buffer = baseBuffer else { return }
         if renderBusy {
             renderPending = true
@@ -975,9 +1508,10 @@ final class EditorModel: ObservableObject {
         renderBusy = true
         isRendering = true
         let json = currentJson()
-        // 蒙版拖动 / 涂抹中用低分辨率缓冲：CPU 渲染量降 4 倍，画布更跟手；
-        // 松手提交后自动回到全分辨率预览。
-        let source = maskInteracting ? (fastBuffer ?? buffer) : buffer
+        // 蒙版拖动 / 涂抹、以及沉浸拖动滑块时用低分辨率缓冲：
+        // CPU 渲染量降约 4 倍，手感更跟手；松手提交后自动回到全分辨率预览。
+        let interactive = maskInteracting || draggingSlider != nil || fallback
+        let source = interactive ? (fastBuffer ?? buffer) : buffer
         renderQueue.async { [weak self] in
             let started = CFAbsoluteTimeGetCurrent()
             let result = NativeCore.shared.render(buffer: source, paramsJson: json)
@@ -1002,6 +1536,9 @@ final class EditorModel: ObservableObject {
                     self.message = nil
                     // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
                     self.scheduleMaskAssetsRefresh()
+                } else if !fallback, self.fastBuffer != nil {
+                    // 全分辨率渲染失败：降一档用快速缓冲重试一次，不再直接报错。
+                    self.startRender(fallback: true)
                 } else {
                     self.message = failure ?? "渲染失败"
                 }
@@ -1015,11 +1552,42 @@ final class EditorModel: ObservableObject {
 
     // MARK: - 导出
 
+    /// 导出格式。
+    enum ExportFormat: String, CaseIterable, Identifiable {
+        case jpeg = "JPEG"
+        case png = "PNG"
+        case heic = "HEIC"
+
+        var id: String { rawValue }
+
+        /// UTI（CGImageDestination 用）。
+        var uti: String {
+            switch self {
+            case .jpeg: return "public.jpeg"
+            case .png: return "public.png"
+            case .heic: return "public.heic"
+            }
+        }
+
+        var fileExtension: String {
+            switch self {
+            case .jpeg: return "jpg"
+            case .png: return "png"
+            case .heic: return "heic"
+            }
+        }
+    }
+
     /// 按当前参数渲染高分辨率图片并保存到相册（fdxmp 相簿）。
     func export() {
         guard let asset, !isExporting else { return }
         isExporting = true
+        exportProgress = 0.05
+        exportShareURL = nil
         message = nil
+        let format = EditorLimits.exportFormat
+        let quality = EditorLimits.exportQuality
+        let keepMetadata = EditorLimits.exportKeepMetadata
         requestImage(
             asset: asset,
             maxEdge: EditorLimits.exportMaxEdge,
@@ -1028,10 +1596,17 @@ final class EditorModel: ObservableObject {
             guard let self else { return }
             guard let image else {
                 self.isExporting = false
+                self.exportProgress = nil
                 self.message = "导出失败：无法读取原图"
                 return
             }
+            self.exportProgress = 0.25
             let json = self.currentJson(applyCropRect: true, usePreview: false)
+            // 并行读取原图 EXIF / GPS 等元数据（保留拍摄信息）。
+            var metadata: [String: Any]?
+            if keepMetadata {
+                metadata = Self.loadExportMetadata(asset: asset)
+            }
             self.renderQueue.async { [weak self] in
                 let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.exportMaxEdge)
                 let result = buffer.flatMap {
@@ -1049,18 +1624,111 @@ final class EditorModel: ObservableObject {
                     guard let self else { return }
                     guard let output else {
                         self.isExporting = false
+                        self.exportProgress = nil
                         self.message = failure ?? "导出失败"
                         return
                     }
-                    self.saveToLibrary(output)
+                    self.exportProgress = 0.75
+                    // 编码（JPEG/PNG/HEIC）放到工作线程，避免卡住界面。
+                    self.renderQueue.async { [weak self] in
+                        let fileURL = Self.writeExportFile(
+                            image: output,
+                            format: format,
+                            quality: quality,
+                            metadata: metadata
+                        )
+                        Task { @MainActor in
+                            guard let self else { return }
+                            guard let fileURL else {
+                                self.isExporting = false
+                                self.exportProgress = nil
+                                self.message = "导出失败：无法写入文件"
+                                return
+                            }
+                            self.exportProgress = 0.9
+                            self.saveToLibrary(fileURL: fileURL)
+                        }
+                    }
                 }
             }
         }
     }
 
-    private func saveToLibrary(_ image: UIImage) {
+    /// 读取原图的拍摄元数据（EXIF / TIFF / GPS / IPTC），并清掉会过期的尺寸字段。
+    private static func loadExportMetadata(asset: PHAsset) -> [String: Any]? {
+        let options = PHImageRequestOptions()
+        // 只读本地元数据：避免 iCloud 资源在同步回调里阻塞。
+        options.isNetworkAccessAllowed = false
+        options.version = .current
+        options.isSynchronous = true
+        var data: Data?
+        imageManager.requestImageDataAndOrientation(for: asset, options: options) { result, _, _, _ in
+            data = result
+        }
+        guard
+            let data,
+            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
+        else {
+            return nil
+        }
+        var keep: [String: Any] = [:]
+        for key in [
+            kCGImagePropertyExifDictionary,
+            kCGImagePropertyTIFFDictionary,
+            kCGImagePropertyGPSDictionary,
+            kCGImagePropertyIPTCDictionary,
+        ] {
+            if let value = props[key as String] {
+                keep[key as String] = value
+            }
+        }
+        if var exif = keep[kCGImagePropertyExifDictionary as String] as? [String: Any] {
+            exif.removeValue(forKey: kCGImagePropertyExifPixelXDimension as String)
+            exif.removeValue(forKey: kCGImagePropertyExifPixelYDimension as String)
+            keep[kCGImagePropertyExifDictionary as String] = exif
+        }
+        return keep.isEmpty ? nil : keep
+    }
+
+    /// 按所选格式 / 质量（含 EXIF 与颜色配置）写入临时文件；失败返回 nil。
+    private static func writeExportFile(
+        image: UIImage,
+        format: ExportFormat,
+        quality: Double,
+        metadata: [String: Any]?
+    ) -> URL? {
+        guard let cgImage = image.cgImage else { return nil }
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("fdxmp-export-\(UUID().uuidString).\(format.fileExtension)")
+        guard
+            let destination = CGImageDestinationCreateWithURL(
+                url as CFURL,
+                format.uti as CFString,
+                1,
+                nil
+            )
+        else {
+            return nil
+        }
+        var properties: [CFString: Any] = [:]
+        if format == .jpeg {
+            properties[kCGImageDestinationLossyCompressionQuality] =
+                quality.clamped(to: 0.5...1)
+        }
+        if let metadata {
+            for (key, value) in metadata {
+                properties[key as CFString] = value
+            }
+        }
+        CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
+        guard CGImageDestinationFinalize(destination) else { return nil }
+        return url
+    }
+
+    private func saveToLibrary(fileURL: URL) {
         PHPhotoLibrary.shared().performChanges({
-            let request = PHAssetChangeRequest.creationRequestForAsset(from: image)
+            let request = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: fileURL)
             guard let placeholder = request.placeholderForCreatedAsset else { return }
             if let album = Self.fdxmpAlbum() {
                 PHAssetCollectionChangeRequest(for: album)?.addAssets([placeholder] as NSArray)
@@ -1073,9 +1741,13 @@ final class EditorModel: ObservableObject {
             Task { @MainActor in
                 guard let self else { return }
                 self.isExporting = false
+                self.exportProgress = nil
                 if success {
                     self.message = "已导出到相册「fdxmp」"
                     self.persist()
+                    if EditorLimits.exportShareAfterSave {
+                        self.exportShareURL = fileURL
+                    }
                 } else {
                     self.message = "保存失败：\(error?.localizedDescription ?? "未知错误")"
                 }
@@ -1129,7 +1801,13 @@ final class EditorModel: ObservableObject {
     }
 
     private func pushUndo(_ snapshot: EditState) {
-        undoStack.append(snapshot)
+        pushUndo(snapshot, name: pendingLabel ?? "编辑")
+        pendingLabel = nil
+    }
+
+    /// 记入一步历史（带操作名，供撤销提示与长按历史列表显示）。
+    private func pushUndo(_ snapshot: EditState, name: String) {
+        undoStack.append(HistoryEntry(name: name, state: snapshot))
         if undoStack.count > 40 {
             undoStack.removeFirst()
         }
