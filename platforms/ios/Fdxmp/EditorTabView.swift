@@ -16,6 +16,8 @@ struct EditorTabView: View {
     @State private var baseZoom: CGFloat = 1
     @State private var pan: CGSize = .zero
     @State private var basePan: CGSize = .zero
+    /// 长按看原图后，短时间内忽略单击（避免松手瞬间触发沉浸切换）。
+    @State private var suppressTapUntil = Date.distantPast
 
     var body: some View {
         Group {
@@ -228,24 +230,13 @@ struct EditorTabView: View {
                 toggleZoom()
             }
             .onTapGesture {
+                if Date() < suppressTapUntil { return }
                 guard overlayEnabled else { return }
                 withAnimation(.easeInOut(duration: 0.2)) {
                     immersive.toggle()
                 }
             }
-            .onLongPressGesture(
-                minimumDuration: 1.0,
-                maximumDistance: 24,
-                perform: {
-                    guard overlayEnabled else { return }
-                    model.showOriginal = true
-                },
-                onPressingChanged: { pressing in
-                    if !pressing {
-                        model.showOriginal = false
-                    }
-                }
-            )
+            .simultaneousGesture(holdToPreviewGesture())
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -278,6 +269,27 @@ struct EditorTabView: View {
                 }
             }
         return SimultaneousGesture(magnify, drag)
+    }
+
+    /// 长按 1 秒看原图：长按识别后继续跟踪手指，松手恢复调色效果。
+    ///
+    /// 用"长按 → 串接拖动"的串行手势（而不是 onLongPressGesture 的 pressing 回调），
+    /// 能稳定拿到"按下 1s"与"松手"两个时刻，不会被缩放/拖动手势抢占。
+    private func holdToPreviewGesture() -> some Gesture {
+        LongPressGesture(minimumDuration: 1.0, maximumDistance: 30)
+            .sequenced(before: DragGesture(minimumDistance: 0))
+            .onChanged { value in
+                guard overlayEnabled else { return }
+                if case .second(true, _) = value {
+                    if !model.showOriginal {
+                        model.showOriginal = true
+                    }
+                    suppressTapUntil = Date().addingTimeInterval(0.5)
+                }
+            }
+            .onEnded { _ in
+                model.showOriginal = false
+            }
     }
 
     /// 双击：放大 / 还原。
