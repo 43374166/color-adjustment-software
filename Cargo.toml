@@ -11,7 +11,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -19,7 +19,7 @@ authors = ["fdxmp contributors"]
 
 [workspace.dependencies]
 # 内部 crate
-fdxmp-core = { path = "crates/core", version = "1.0.2" }
+fdxmp-core = { path = "crates/core", version = "1.0.3" }
 
 # 序列化与归档（技术选型：serde + serde_json + zip）
 serde = { version = "1.0.229", features = ["derive"] }

@@ -11,8 +11,8 @@ android {
         applicationId = "com.fdxmp.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "1.0.2"
+        versionCode = 17
+        versionName = "1.0.3"
         ndk {
             // Rust 桥接产物（cargo ndk 生成）
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")

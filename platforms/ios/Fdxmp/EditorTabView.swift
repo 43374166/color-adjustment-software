@@ -270,9 +270,16 @@ struct EditorTabView: View {
         previewArea
     }
 
-    /// 曲线 / 蒙版下隐藏顶部栏与底部工具条，把空间让给编辑区。
+    /// HSL 专注模式：进 HSL 后隐藏所有导航（含底部 tab），只留「完成」退出。
+    private var hslFocused: Bool {
+        model.tool == .edit && model.category == .color && model.colorTab == .hsl
+    }
+
+    /// 曲线 / 蒙版 / HSL 下隐藏顶部栏与底部工具条，把空间让给编辑区。
     private var hidesChrome: Bool {
-        model.tool == .mask || (model.tool == .edit && model.category == .curves)
+        model.tool == .mask
+            || (model.tool == .edit && model.category == .curves)
+            || hslFocused
     }
 
     private var emptyState: some View {
@@ -800,18 +807,30 @@ struct EditorTabView: View {
     /// 布局（自下而上）：工具条（最底）→ 分类导航 → 参数 → 子页标签（最上）。
     private var editPanel: some View {
         VStack(spacing: 0) {
-            if !categoryCollapsed {
+            if hslFocused {
+                // HSL 专注：只有色带选择 + 三个滑块 + 完成。
+                editContent
+                doneRow {
+                    model.colorTab = .base
+                }
+            } else if !categoryCollapsed {
                 editSubTabs
                     .opacity(model.draggingSlider == nil ? 1 : 0)
                 editContent
                 Divider()
                     .overlay(Color.white.opacity(0.08))
                     .opacity(model.draggingSlider == nil ? 1 : 0)
-            }
-            if model.category == .curves {
-                // 曲线：分类导航整排隐形，只留一个「完成」退出。
-                curveDoneRow
+                if model.category == .curves {
+                    // 曲线：分类导航整排隐形，只留一个「完成」退出。
+                    doneRow {
+                        model.exitCurves()
+                    }
                     .opacity(model.draggingSlider == nil ? 1 : 0)
+                } else {
+                    categoryRow
+                        .opacity(model.draggingSlider == nil ? 1 : 0)
+                        .allowsHitTesting(model.draggingSlider == nil)
+                }
             } else {
                 categoryRow
                     .opacity(model.draggingSlider == nil ? 1 : 0)
@@ -820,13 +839,14 @@ struct EditorTabView: View {
         }
     }
 
-    /// 曲线面板的退出按钮（曲线下分类导航整排隐藏）。
-    private var curveDoneRow: some View {
+    /// 专注模式（曲线 / HSL）底部的退出按钮。
+    private func doneRow(_ action: @escaping () -> Void) -> some View {
         HStack {
             Spacer()
             Button("完成") {
+                Haptics.tick()
                 withAnimation(.easeInOut(duration: 0.24)) {
-                    model.exitCurves()
+                    action()
                 }
             }
             .font(.subheadline)
