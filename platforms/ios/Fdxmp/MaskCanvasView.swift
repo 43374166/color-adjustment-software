@@ -218,11 +218,15 @@ struct MaskCanvasGeometry {
 
     /// view 坐标 → 归一化图像坐标（未钳制）。
     func normalized(_ point: CGPoint) -> CGPoint {
-        let local = contentPoint(point)
+        normalized(fromContent: contentPoint(point))
+    }
+
+    /// 内容坐标 → 归一化图像坐标。
+    func normalized(fromContent point: CGPoint) -> CGPoint {
         guard fitted.width > 0, fitted.height > 0 else { return .zero }
         return CGPoint(
-            x: (local.x - fitted.minX) / fitted.width,
-            y: (local.y - fitted.minY) / fitted.height
+            x: (point.x - fitted.minX) / fitted.width,
+            y: (point.y - fitted.minY) / fitted.height
         )
     }
 
@@ -416,7 +420,8 @@ enum MaskHitTester {
             return bestMode
         }
         // 外圈 / 内圈边界附近 → 按局部角度决定缩放哪条半径（拖动边界即缩放）。
-        let normalized = geometry.normalized(point)
+        // 注意：此处的 point 已是内容坐标。
+        let normalized = geometry.normalized(fromContent: point)
         let localAngle = MaskDragSession.localAngle(mask, normalized)
         let axis = abs(cos(localAngle)) >= abs(sin(localAngle)) ? 0 : 1
         let outerBoundary = canvasPoint(
@@ -618,7 +623,12 @@ final class MaskCanvasController {
                 drag = nil
                 return
             }
-            let mode = MaskHitTester.hitTest(mask: mask, at: point, geometry: geometry)
+            // 手柄命中测试在内容坐标（预览图坐标系）里做：缩放 / 平移下位置才对得上。
+            let mode = MaskHitTester.hitTest(
+                mask: mask,
+                at: geometry.contentPoint(point),
+                geometry: geometry
+            )
             guard mode != .none else { return }
             drag = MaskDragSession(
                 mode: mode,

@@ -815,8 +815,14 @@ final class EditorModel: ObservableObject {
         }
         let json = currentJson(applyCropRect: true)
         let size = previewImage?.size ?? originalImage?.size ?? CGSize(width: 4, height: 3)
-        let overlaySize = Self.cappedSize(size, maxEdge: EditorLimits.maskOverlayMaxEdge)
-        let thumbSize = Self.cappedSize(size, maxEdge: EditorLimits.maskThumbnailMaxEdge)
+        let overlaySize = Self.cappedSize(
+            size,
+            maxEdge: CGFloat(EditorLimits.maskOverlayMaxEdge)
+        )
+        let thumbSize = Self.cappedSize(
+            size,
+            maxEdge: CGFloat(EditorLimits.maskThumbnailMaxEdge)
+        )
         let selected = selectedMaskId
         let token = maskAssetToken
         maskAssetQueue.async { [weak self] in
