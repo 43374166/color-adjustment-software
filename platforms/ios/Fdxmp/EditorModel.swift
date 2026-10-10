@@ -572,13 +572,13 @@ final class EditorModel: ObservableObject {
                 else {
                     // 核心拒绝区域渲染（例如带非单位几何的镜头参数）：回退整帧细节帧。
                     Task { @MainActor in
-                        guard let self, self.detailRegionToken == token else { return }
+                        guard self.detailRegionToken == token else { return }
                         self.requestDetailPreview(viewport: viewport, zoom: self.lastDetailZoom)
                     }
                     return
                 }
                 Task { @MainActor in
-                    guard let self, self.detailRegionToken == token else { return }
+                    guard self.detailRegionToken == token else { return }
                     self.detailRegion = DetailRegion(image: rendered, rect: visible)
                 }
             }
@@ -1728,7 +1728,11 @@ final class EditorModel: ObservableObject {
 
     private func saveToLibrary(fileURL: URL) {
         PHPhotoLibrary.shared().performChanges({
-            let request = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: fileURL)
+            guard
+                let request = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: fileURL)
+            else {
+                return
+            }
             guard let placeholder = request.placeholderForCreatedAsset else { return }
             if let album = Self.fdxmpAlbum() {
                 PHAssetCollectionChangeRequest(for: album)?.addAssets([placeholder] as NSArray)
