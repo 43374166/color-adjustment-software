@@ -31,6 +31,8 @@ struct EditorTabView: View {
     @State private var showHistory = false
     /// 分屏对比分割线位置（nil = 关闭对比模式）。
     @State private var compareSplit: CGFloat?
+    /// HSL 色带选择样式：dots（Lightroom 色圆点）/ strip（彩虹色带）。
+    @AppStorage("fdxmp_hsl_style") private var hslStyle = "dots"
     /// 预览区尺寸（用于按视口取放大细节帧分辨率）。
     @State private var previewAreaSize: CGSize = .zero
 
@@ -1029,20 +1031,36 @@ struct EditorTabView: View {
 
     private var hslPanel: some View {
         VStack(spacing: 0) {
-            if model.draggingSlider == nil {
-                // 色相条：彩虹渐变 + 当前色带指示，点 / 拖选择色带。
-                HStack(spacing: 10) {
+            // 色带选择：默认 Lightroom 那种 8 个色圆点（可横滑），
+            // 也可切回"彩虹色带"老式样式（选择记忆在本地）。
+            HStack(spacing: 8) {
+                if hslStyle == "strip" {
                     HslBandStrip(selected: model.hslBand) { kind in
                         model.hslBand = kind
                     }
-                    Text(model.hslBand.rawValue)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .frame(width: 24, alignment: .trailing)
+                } else {
+                    HslBandDots(selected: model.hslBand) { kind in
+                        model.hslBand = kind
+                    }
                 }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
+                Text(model.hslBand.rawValue)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, alignment: .trailing)
+                Button {
+                    Haptics.tick()
+                    hslStyle = hslStyle == "strip" ? "dots" : "strip"
+                } label: {
+                    Image(systemName: hslStyle == "strip" ? "circle.lefthalf.filled" : "circle.grid.3x3")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
             }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
             hslSliders
             Spacer(minLength: 0)
         }
@@ -1385,6 +1403,51 @@ private struct DetailRegionLayer: View {
 }
 
 /// HSL 色相条：彩虹渐变 + 当前色带指示，点 / 拖选择色带。
+private struct HslBandDots: View {
+    let selected: HslBandKind
+    let onSelect: (HslBandKind) -> Void
+
+    var body: some View {
+        GeometryReader { geo in
+            let count = CGFloat(HslBandKind.allCases.count)
+            let width = max(geo.size.width, 1)
+            HStack(spacing: 0) {
+                ForEach(HslBandKind.allCases) { kind in
+                    Circle()
+                        .strokeBorder(tint(kind), lineWidth: 3)
+                        .background(
+                            Circle()
+                                .fill(kind == selected ? tint(kind) : Color.clear)
+                                .frame(width: 8, height: 8)
+                        )
+                        .frame(width: 22, height: 22)
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .frame(width: width, height: 24)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        let index = Int((value.location.x / width) * count)
+                        let clamped = min(max(index, 0), HslBandKind.allCases.count - 1)
+                        let kind = HslBandKind.allCases[clamped]
+                        if kind != selected {
+                            onSelect(kind)
+                            Haptics.tick()
+                        }
+                    }
+            )
+        }
+        .frame(height: 24)
+    }
+
+    private func tint(_ kind: HslBandKind) -> Color {
+        Color(red: kind.tint.r, green: kind.tint.g, blue: kind.tint.b)
+    }
+}
+
+/// HSL 色相条：彩虹渐变 + 当前色带指示，点 / 拖选择色带（老式样式）。
 private struct HslBandStrip: View {
     let selected: HslBandKind
     let onSelect: (HslBandKind) -> Void
