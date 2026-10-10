@@ -209,7 +209,7 @@ enum EditStore {
         recent[assetId] = Date().timeIntervalSince1970
         if recent.count > 50 {
             let keep = recent.sorted { $0.value > $1.value }.prefix(50)
-            recent = Dictionary(uniqueKeysWithValues: keep)
+            recent = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
         }
         UserDefaults.standard.set(recent, forKey: recentKey)
     }
