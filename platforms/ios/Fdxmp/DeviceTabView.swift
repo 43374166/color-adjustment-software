@@ -171,9 +171,10 @@ struct AssetThumbnail: View {
 
     private func load() {
         let options = PHImageRequestOptions()
-        // 缩略图用 fastFormat：RAW 时明显更快，240px 尺寸下画质损失可忽略。
-        options.deliveryMode = .fastFormat
-        options.resizeMode = .fast
+        // 先给一版快图保证不空屏，再补一版高质量图（opportunistic 会回调两次，
+        // 后到的清晰版直接覆盖，缩略图不再糊）。
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .exact
         options.isNetworkAccessAllowed = true
         requestId = model.imageManager.requestImage(
             for: asset,
@@ -638,7 +639,7 @@ struct DeviceTabView: View {
                             .overlay {
                                 AssetThumbnail(
                                     asset: asset,
-                                    targetSize: CGSize(width: 240, height: 240)
+                                    targetSize: CGSize(width: 480, height: 480)
                                 )
                             }
                             .clipShape(RoundedRectangle(cornerRadius: 4))
@@ -674,7 +675,7 @@ struct DeviceTabView: View {
     private var list: some View {
         List(visibleAssets, id: \.localIdentifier) { asset in
             HStack(spacing: 12) {
-                AssetThumbnail(asset: asset, targetSize: CGSize(width: 120, height: 120))
+                AssetThumbnail(asset: asset, targetSize: CGSize(width: 240, height: 240))
                     .frame(width: 56, height: 56)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 VStack(alignment: .leading, spacing: 3) {
