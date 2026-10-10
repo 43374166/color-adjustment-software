@@ -87,6 +87,7 @@ final class EditorModel: ObservableObject {
     private(set) var asset: PHAsset?
 
     private var baseBuffer: RgbaBuffer?
+    private var loadToken = 0
     private var dragSnapshot: EditState?
     private var undoStack: [EditState] = []
     private var redoStack: [EditState] = []
@@ -138,8 +139,22 @@ final class EditorModel: ObservableObject {
         }
         selectedMaskId = state.masks.first?.id
         isLoading = true
-        requestImage(asset: asset, maxEdge: EditorLimits.previewMaxEdge) { [weak self] image in
-            guard let self else { return }
+        loadToken &+= 1
+        let token = loadToken
+        requestImage(
+            asset: asset,
+            maxEdge: EditorLimits.previewMaxEdge,
+            allowFastPreview: true
+        ) { [weak self] image, degraded in
+            guard let self, self.loadToken == token else { return }
+            if degraded {
+                // RAW / 大图：PhotoKit 会先给一张快速代理图，先显示避免长时间空屏。
+                if self.previewImage == nil {
+                    self.previewImage = image
+                    self.isLoading = false
+                }
+                return
+            }
             guard let image else {
                 self.isLoading = false
                 self.message = "无法读取这张照片"
@@ -150,7 +165,7 @@ final class EditorModel: ObservableObject {
                 let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.previewMaxEdge)
                 let original = buffer.flatMap { ImageUtil.image(from: $0) }
                 Task { @MainActor in
-                    guard let self else { return }
+                    guard let self, self.loadToken == token else { return }
                     self.isLoading = false
                     guard let buffer else {
                         self.message = "无法读取这张照片的像素数据"
@@ -530,7 +545,11 @@ final class EditorModel: ObservableObject {
         guard let asset, !isExporting else { return }
         isExporting = true
         message = nil
-        requestImage(asset: asset, maxEdge: EditorLimits.exportMaxEdge) { [weak self] image in
+        requestImage(
+            asset: asset,
+            maxEdge: EditorLimits.exportMaxEdge,
+            allowFastPreview: false
+        ) { [weak self] image, _ in
             guard let self else { return }
             guard let image else {
                 self.isExporting = false
@@ -603,10 +622,11 @@ final class EditorModel: ObservableObject {
     private func requestImage(
         asset: PHAsset,
         maxEdge: Int,
-        completion: @escaping @MainActor (UIImage?) -> Void
+        allowFastPreview: Bool = false,
+        completion: @escaping @MainActor (UIImage?, Bool) -> Void
     ) {
         let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
+        options.deliveryMode = allowFastPreview ? .opportunistic : .highQualityFormat
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         options.version = .current
@@ -617,10 +637,18 @@ final class EditorModel: ObservableObject {
             contentMode: .aspectFit,
             options: options
         ) { image, info in
+            guard let image else {
+                // 正常情况会先回调一张降级图再回调正式图；只有真出错才传 nil。
+                if info?[PHImageErrorKey] != nil {
+                    Task { @MainActor in
+                        completion(nil, false)
+                    }
+                }
+                return
+            }
             let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
-            guard !degraded else { return }
             Task { @MainActor in
-                completion(image)
+                completion(image, degraded)
             }
         }
     }

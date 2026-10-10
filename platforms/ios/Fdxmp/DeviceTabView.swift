@@ -35,6 +35,11 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
     let imageManager = PHCachingImageManager()
 
+    /// 文件名缓存（`PHAssetResource` 查询较慢，网格/搜索会频繁用到）。
+    private var nameCache: [String: String] = [:]
+    /// RAW 判定缓存（同上，避免每次渲染都查资源）。
+    private var rawCache: [String: Bool] = [:]
+
     override init() {
         super.init()
         PHPhotoLibrary.shared().register(self)
@@ -72,7 +77,30 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
         result.enumerateObjects { asset, _, _ in
             list.append(asset)
         }
+        nameCache.removeAll()
+        rawCache.removeAll()
         assets = list
+    }
+
+    /// 原始文件名（带缓存）。
+    func fileName(for asset: PHAsset) -> String {
+        if let cached = nameCache[asset.localIdentifier] {
+            return cached
+        }
+        let name = PHAssetResource.assetResources(for: asset).first?.originalFilename
+            ?? "未命名照片"
+        nameCache[asset.localIdentifier] = name
+        return name
+    }
+
+    /// 是否 RAW（带缓存）。
+    func isRaw(_ asset: PHAsset) -> Bool {
+        if let cached = rawCache[asset.localIdentifier] {
+            return cached
+        }
+        let value = asset.isRaw
+        rawCache[asset.localIdentifier] = value
+        return value
     }
 
     func photoLibraryDidChange(_ changeInstance: PHChange) {
@@ -406,17 +434,20 @@ struct DeviceTabView: View {
     @State private var message: String?
 
     private var visibleAssets: [PHAsset] {
+        let tokens = searchTokens
         var list = model.assets.filter { asset in
-            let matchesQuery = searchText.isEmpty
-                || asset.displayName.localizedCaseInsensitiveContains(searchText)
+            let matchesQuery = tokens.isEmpty
+                || tokens.contains { token in
+                    model.fileName(for: asset).localizedCaseInsensitiveContains(token)
+                }
             let matchesFilter: Bool
             switch filter {
             case .all:
                 matchesFilter = true
             case .raw:
-                matchesFilter = asset.isRaw
+                matchesFilter = model.isRaw(asset)
             case .standard:
-                matchesFilter = !asset.isRaw
+                matchesFilter = !model.isRaw(asset)
             }
             return matchesQuery && matchesFilter
         }
@@ -426,9 +457,20 @@ struct DeviceTabView: View {
         case .oldest:
             list.sort { ($0.creationDate ?? .distantPast) < ($1.creationDate ?? .distantPast) }
         case .name:
-            list.sort { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
+            list.sort {
+                model.fileName(for: $0).localizedStandardCompare(model.fileName(for: $1))
+                    == .orderedAscending
+            }
         }
         return list
+    }
+
+    /// 搜索词：支持逗号（中英文）分隔多个文件名，任意一个命中即显示。
+    private var searchTokens: [String] {
+        searchText
+            .split(whereSeparator: { $0 == "," || $0 == "，" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
     }
 
     var body: some View {
@@ -517,7 +559,7 @@ struct DeviceTabView: View {
             HStack(spacing: 8) {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
-                TextField("搜索文件名", text: $searchText)
+                TextField("搜索文件名（多个用逗号分隔）", text: $searchText)
                     .textFieldStyle(.plain)
                 if !searchText.isEmpty {
                     Button {
@@ -592,10 +634,18 @@ struct DeviceTabView: View {
             ) {
                 ForEach(visibleAssets, id: \.localIdentifier) { asset in
                     ZStack(alignment: .topTrailing) {
-                        AssetThumbnail(asset: asset, targetSize: CGSize(width: 240, height: 240))
-                            .aspectRatio(1, contentMode: .fill)
+                        // 固定 1:1 方格：用 Color 撑出方形再叠加缩略图，
+                        // 否则单元格高度会跟随图片自身比例，网格会参差不齐。
+                        Color(white: 0.10)
+                            .aspectRatio(1, contentMode: .fit)
+                            .overlay {
+                                AssetThumbnail(
+                                    asset: asset,
+                                    targetSize: CGSize(width: 240, height: 240)
+                                )
+                            }
                             .clipShape(RoundedRectangle(cornerRadius: 4))
-                        if asset.isRaw {
+                        if model.isRaw(asset) {
                             Text("RAW")
                                 .font(.system(size: 9, weight: .semibold))
                                 .padding(.horizontal, 4)
@@ -634,10 +684,10 @@ struct DeviceTabView: View {
                     .frame(width: 56, height: 56)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(asset.displayName)
+                    Text(model.fileName(for: asset))
                         .font(.subheadline)
                         .lineLimit(1)
-                    Text("\(asset.createdDescription) · \(asset.pixelDescription)\(asset.isRaw ? " · RAW" : "")")
+                    Text("\(asset.createdDescription) · \(asset.pixelDescription)\(model.isRaw(asset) ? " · RAW" : "")")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                 }
