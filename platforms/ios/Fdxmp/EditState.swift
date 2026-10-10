@@ -281,11 +281,11 @@ func clampedCropRect(_ rect: CGRect) -> CGRect {
 
 // MARK: - 蒙版
 
-/// 蒙版类型（iOS 已接入画笔 / 线性 / 径向）。
+/// 蒙版类型（首期三种：线性渐变 / 径向渐变 / 画笔）。
 enum MaskKindUi: String, CaseIterable, Identifiable {
+    case linear = "线性渐变"
+    case radial = "径向渐变"
     case brush = "画笔"
-    case linear = "线性"
-    case radial = "径向"
 
     var id: String { rawValue }
 
@@ -310,42 +310,150 @@ enum MaskKindUi: String, CaseIterable, Identifiable {
     }
 }
 
-/// 单个蒙版。
+/// 一条画笔笔画：点序列 + 落笔时的参数快照 + 是否擦除。
+///
+/// 参数快照让"改动画笔大小 / 羽毛后只影响后续笔画"，已画好的笔画保持原样；
+/// 点序列是归一化坐标，可二次编辑（不是位图）。
+struct BrushStrokeUi: Equatable {
+    var points: [CGPoint]
+    var erase = false
+    var size: Float = 30
+    var feather: Float = 50
+    var flow: Float = 100
+    var density: Float = 100
+}
+
+/// 单个蒙版的几何 / 笔迹 / 局部调整参数。
 struct MaskUi: Identifiable, Equatable {
     var id: String
     var name: String
     var kind: MaskKindUi
+    /// 可见（隐藏的蒙版不参与渲染与叠加）。
+    var visible = true
     var inverted = false
-    /// 蒙版羽化 0..100。
-    var feather: Float = 50
+    /// 通用羽化 0..100（v0.3 遗留字段；新版三种蒙版各有自己的过渡参数）。
+    var feather: Float = 0
     /// 蒙版不透明度 0..100。
     var opacity: Float = 100
     /// 该蒙版的调色参数（与全局滑块同一套 key，只含 light / color / effects）。
     var values: [String: Float] = EditorSpec.defaultValues()
 
-    // 画笔
-    /// 笔刷大小（长边百分比，2..50）。
-    var brushSize: Float = 12
+    // 画笔（参数用于后续笔画；每条笔画自带快照）
+    /// 笔刷大小（长边百分比，2..100）。
+    var brushSize: Float = 30
     var brushFeather: Float = 50
     var brushFlow: Float = 100
     var brushDensity: Float = 100
-    /// 笔画路径（归一化坐标）。
-    var strokes: [[CGPoint]] = []
+    /// 笔画列表（归一化坐标点序列）。
+    var strokes: [BrushStrokeUi] = []
 
     // 线性渐变
-    var start = CGPoint(x: 0.5, y: 0.2)
-    var end = CGPoint(x: 0.5, y: 0.8)
+    /// 过渡带 100% 一侧的锚点（归一化，边界线过该点、垂直于渐变方向）。
+    var start = CGPoint(x: 0.5, y: 0.3)
+    /// 过渡带 0% 一侧的锚点。
+    var end = CGPoint(x: 0.5, y: 0.7)
 
     // 径向渐变
     var center = CGPoint(x: 0.5, y: 0.5)
-    var radii = CGSize(width: 0.3, height: 0.3)
+    var radii = CGSize(width: 0.4, height: 0.3)
     var rotation: Float = 0
-    /// 内圈缩放 0..98（缺省 75）。
-    var inner: Float = 75
+    /// 径向羽化 0..100（0 = 硬边缘，100 = 从中心就开始过渡）。
+    var radialFeather: Float = 25
 
     /// 该蒙版是否偏离默认参数（有实际效果）。
     var hasAdjustments: Bool {
         values != EditorSpec.defaultValues()
+    }
+}
+
+// MARK: - 线性渐变几何（中心线 / 端点 / 过渡边界）
+
+extension MaskUi {
+    /// 过渡带中心（50% 中心线过该点）。
+    var linearCenter: CGPoint {
+        CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
+    }
+
+    /// 渐变方向单位向量（start → end）。
+    var linearDirection: CGVector {
+        let dx = end.x - start.x
+        let dy = end.y - start.y
+        let length = (dx * dx + dy * dy).squareRoot()
+        guard length > 1e-6 else { return CGVector(dx: 0, dy: 1) }
+        return CGVector(dx: dx / length, dy: dy / length)
+    }
+
+    /// 过渡带宽度（归一化投影长度）。
+    var linearWidth: Double {
+        Double(hypot(end.x - start.x, end.y - start.y))
+    }
+
+    /// 渐变方向角（度，0 = 向右，顺时针为正 —— 与图像 y 轴向下一致）。
+    var linearAngleDegrees: Float {
+        let dir = linearDirection
+        return Float(atan2(dir.dy, dir.dx) * 180 / .pi)
+    }
+
+    /// 显示用的角度（归一化到 0..<180，渐变方向本身对称）。
+    var linearAngleWrapped: Float {
+        var value = linearAngleDegrees.truncatingRemainder(dividingBy: 180)
+        if value < 0 {
+            value += 180
+        }
+        return value
+    }
+
+    /// 显示用的径向旋转角（归一化到 0..<180）。
+    var rotationWrapped: Float {
+        var value = rotation.truncatingRemainder(dividingBy: 180)
+        if value < 0 {
+            value += 180
+        }
+        return value
+    }
+
+    /// 中心线在法线方向上的投影位置（-100..100，0 = 过画面中心）。
+    var linearPositionPercent: Float {
+        let normal = CGVector(dx: -linearDirection.dy, dy: linearDirection.dx)
+        let offset = linearCenter.x * normal.dx + linearCenter.y * normal.dy
+        return Float(offset * 100)
+    }
+
+    /// 设置过渡带宽度（保持中心与方向不变）。
+    func settingLinearWidth(_ width: Double) -> MaskUi {
+        var copy = self
+        let clamped = min(max(width, 0.02), 2)
+        let dir = linearDirection
+        let center = linearCenter
+        let half = CGFloat(clamped / 2)
+        copy.start = CGPoint(x: center.x - dir.dx * half, y: center.y - dir.dy * half)
+        copy.end = CGPoint(x: center.x + dir.dx * half, y: center.y + dir.dy * half)
+        return copy
+    }
+
+    /// 绕中心旋转到指定角度（度）。
+    func settingLinearAngle(_ degrees: Float) -> MaskUi {
+        var copy = self
+        let radians = Float(degrees) * .pi / 180
+        let half = CGFloat(linearWidth / 2)
+        let dir = CGVector(dx: CGFloat(cos(radians)), dy: CGFloat(sin(radians)))
+        let center = linearCenter
+        copy.start = CGPoint(x: center.x - dir.dx * half, y: center.y - dir.dy * half)
+        copy.end = CGPoint(x: center.x + dir.dx * half, y: center.y + dir.dy * half)
+        return copy
+    }
+
+    /// 平移中心线，使法线投影位置为 `percent`（-100..100）。
+    func settingLinearPosition(_ percent: Float) -> MaskUi {
+        var copy = self
+        let normal = CGVector(dx: -linearDirection.dy, dy: linearDirection.dx)
+        let current = Float(
+            (linearCenter.x * normal.dx + linearCenter.y * normal.dy) * 100
+        )
+        let delta = CGFloat((percent - current) / 100)
+        copy.start = CGPoint(x: start.x + normal.dx * delta, y: start.y + normal.dy * delta)
+        copy.end = CGPoint(x: end.x + normal.dx * delta, y: end.y + normal.dy * delta)
+        return copy
     }
 }
 
@@ -474,7 +582,14 @@ enum EditJSON {
                 "density": Double(mask.brushDensity),
                 "auto_mask": false,
                 "strokes": mask.strokes.map { stroke in
-                    stroke.map { [Double($0.x), Double($0.y)] }
+                    [
+                        "points": stroke.points.map { [Double($0.x), Double($0.y)] },
+                        "erase": stroke.erase,
+                        "size": Double(stroke.size),
+                        "feather": Double(stroke.feather),
+                        "flow": Double(stroke.flow),
+                        "density": Double(stroke.density),
+                    ] as [String: Any]
                 },
             ]
         case .linear:
@@ -483,17 +598,20 @@ enum EditJSON {
                 "end": [Double(mask.end.x), Double(mask.end.y)],
             ]
         case .radial:
+            // 羽化 → 内圈缩放（内圈越大过渡越窄；0 = 硬边缘）。
+            let inner = max(0.02, min(0.98, 1 - Double(mask.radialFeather) / 100))
             kindData = [
                 "center": [Double(mask.center.x), Double(mask.center.y)],
                 "radii": [Double(mask.radii.width), Double(mask.radii.height)],
                 "rotation": Double(mask.rotation),
-                "inner": Double(mask.inner / 100),
+                "inner": inner,
             ]
         }
         return [
             "id": mask.id,
             "name": mask.name,
             "kind": ["type": mask.kind.jsonName, "data": kindData],
+            "visible": mask.visible,
             "inverted": mask.inverted,
             "feather": Double(mask.feather),
             "opacity": Double(mask.opacity),
@@ -660,29 +778,19 @@ enum EditJSON {
                 kind: kind
             )
             mask.inverted = (item["inverted"] as? NSNumber)?.boolValue ?? false
-            mask.feather = (item["feather"] as? NSNumber)?.floatValue ?? 50
+            mask.visible = (item["visible"] as? NSNumber)?.boolValue ?? true
+            mask.feather = (item["feather"] as? NSNumber)?.floatValue ?? 0
             mask.opacity = (item["opacity"] as? NSNumber)?.floatValue ?? 100
             if let adjustments = item["adjustments"] as? [String: Any] {
                 mask.values = parseAdjustments(adjustments)
             }
             switch kind {
             case .brush:
-                mask.brushSize = (data["size"] as? NSNumber)?.floatValue ?? 12
+                mask.brushSize = (data["size"] as? NSNumber)?.floatValue ?? 30
                 mask.brushFeather = (data["feather"] as? NSNumber)?.floatValue ?? 50
                 mask.brushFlow = (data["flow"] as? NSNumber)?.floatValue ?? 100
                 mask.brushDensity = (data["density"] as? NSNumber)?.floatValue ?? 100
-                if let strokes = data["strokes"] as? [[[NSNumber]]] {
-                    mask.strokes = strokes.map { stroke in
-                        stroke.compactMap { pair in
-                            pair.count >= 2
-                                ? CGPoint(
-                                    x: CGFloat(pair[0].floatValue),
-                                    y: CGFloat(pair[1].floatValue)
-                                )
-                                : nil
-                        }
-                    }
-                }
+                mask.strokes = parseBrushStrokes(data["strokes"], mask: mask)
             case .linear:
                 if let start = data["start"] as? [NSNumber], start.count >= 2 {
                     mask.start = CGPoint(
@@ -708,9 +816,52 @@ enum EditJSON {
                 }
                 mask.rotation = (data["rotation"] as? NSNumber)?.floatValue ?? 0
                 let inner = (data["inner"] as? NSNumber)?.floatValue ?? 0.75
-                mask.inner = inner <= 1 ? inner * 100 : inner
+                // 兼容两种写法：0..1 分数（Rust / 新版）或 0..100 百分比（旧版）。
+                let innerFraction = inner <= 1 ? inner : inner / 100
+                mask.radialFeather = max(0, min(100, (1 - innerFraction) * 100))
             }
             return mask
+        }
+    }
+
+    /// 解析画笔笔画：v0.4 对象格式（点 + 参数快照 + 擦除）与 v0.3 纯点数组格式。
+    private static func parseBrushStrokes(_ value: Any?, mask: MaskUi) -> [BrushStrokeUi] {
+        guard let list = value as? [Any] else { return [] }
+        return list.compactMap { item -> BrushStrokeUi? in
+            if let object = item as? [String: Any] {
+                guard let rawPoints = object["points"] as? [[NSNumber]] else { return nil }
+                let points = rawPoints.compactMap { pair -> CGPoint? in
+                    pair.count >= 2
+                        ? CGPoint(x: CGFloat(pair[0].floatValue), y: CGFloat(pair[1].floatValue))
+                        : nil
+                }
+                guard !points.isEmpty else { return nil }
+                return BrushStrokeUi(
+                    points: points,
+                    erase: (object["erase"] as? NSNumber)?.boolValue ?? false,
+                    size: (object["size"] as? NSNumber)?.floatValue ?? mask.brushSize,
+                    feather: (object["feather"] as? NSNumber)?.floatValue ?? mask.brushFeather,
+                    flow: (object["flow"] as? NSNumber)?.floatValue ?? mask.brushFlow,
+                    density: (object["density"] as? NSNumber)?.floatValue ?? mask.brushDensity
+                )
+            }
+            // v0.3：纯点数组。
+            if let legacy = item as? [[NSNumber]] {
+                let points = legacy.compactMap { pair -> CGPoint? in
+                    pair.count >= 2
+                        ? CGPoint(x: CGFloat(pair[0].floatValue), y: CGFloat(pair[1].floatValue))
+                        : nil
+                }
+                guard !points.isEmpty else { return nil }
+                return BrushStrokeUi(
+                    points: points,
+                    size: mask.brushSize,
+                    feather: mask.brushFeather,
+                    flow: mask.brushFlow,
+                    density: mask.brushDensity
+                )
+            }
+            return nil
         }
     }
 

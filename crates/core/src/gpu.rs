@@ -89,7 +89,7 @@ impl PreviewSession {
     pub fn new(rgba: &[u8], width: u32, height: u32) -> Result<Self> {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let context = GpuContext::new_blocking()?;
-            let mut pipeline = ColorPipeline::new(&context.device);
+            let pipeline = ColorPipeline::new(&context.device);
             let image = pipeline.upload(&context.device, &context.queue, rgba, width, height)?;
             Ok(Self {
                 context,

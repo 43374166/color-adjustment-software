@@ -84,6 +84,7 @@ cargo check -p fdxmp-core --features full    # gpu + raw + heif
 - [API 概览](docs/API.md)
 - [构建说明](docs/BUILD.md)
 - [需求规格（冻结版）](docs/SPEC.md)
+- [局部蒙版模块（v0.4.0）](docs/MASK_MODULE.md)
 - [阶段 0 报告](docs/STAGE0_REPORT.md)
 - [项目总报告 PROJECT_REPORT](PROJECT_REPORT.md)
 

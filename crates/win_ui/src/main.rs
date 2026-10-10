@@ -4444,7 +4444,9 @@ impl FdxmpApp {
                     let mut params = self.engine.params().clone();
                     if let Some(mask) = params.masks.get_mut(mask_index) {
                         if let fdxmp_core::params::MaskKind::Brush(brush) = &mut mask.kind {
-                            brush.strokes.push(Vec::new());
+                            brush
+                                .strokes
+                                .push(fdxmp_core::params::BrushStroke::new(Vec::new()));
                         }
                     }
                     self.engine.set_params_live(params);
@@ -4457,8 +4459,10 @@ impl FdxmpApp {
                             if let Some(mask) = params.masks.get_mut(mask_index) {
                                 if let fdxmp_core::params::MaskKind::Brush(brush) = &mut mask.kind {
                                     match brush.strokes.last_mut() {
-                                        Some(points) => points.push(uv),
-                                        None => brush.strokes.push(vec![uv]),
+                                        Some(stroke) => stroke.points.push(uv),
+                                        None => brush
+                                            .strokes
+                                            .push(fdxmp_core::params::BrushStroke::new(vec![uv])),
                                     }
                                 }
                             }

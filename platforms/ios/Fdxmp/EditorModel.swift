@@ -42,6 +42,12 @@ enum MaskPanelTab: String, CaseIterable, Identifiable {
 enum EditorLimits {
     /// 预览最长边（越大越清晰、渲染越慢）。
     static let previewMaxEdge = 1440
+    /// 蒙版拖动 / 涂抹时的快速预览最长边（低分辨率缓冲，手感更跟手）。
+    static let fastPreviewMaxEdge = 720
+    /// 蒙版叠加层最长边（与预览一致：共用同一份蒙版栅格缓存，避免重复计算）。
+    static let maskOverlayMaxEdge = 1440
+    /// 蒙版列表缩略图最长边。
+    static let maskThumbnailMaxEdge = 128
     /// 导出最长边。
     /// 导出最长边（可在「我的」页切换 2048 / 4096）。
     static var exportMaxEdge: Int {
@@ -93,10 +99,24 @@ final class EditorModel: ObservableObject {
     @Published var hslBand: HslBandKind = .red
     @Published var selectedMaskId: String?
     @Published var maskTab: MaskPanelTab = .shape
+    /// 是否叠加显示当前蒙版（红色半透明覆盖）。
+    @Published var maskOverlayVisible = true
+    /// 画笔擦除模式（橡皮擦）。
+    @Published var brushErase = false
+    /// 当前蒙版叠加层（id → 红色半透明预乘 RGBA 图像）。
+    @Published private(set) var maskOverlays: [String: UIImage] = [:]
+    /// 蒙版列表缩略图（id → 图像）。
+    @Published private(set) var maskThumbnails: [String: UIImage] = [:]
+    /// 画笔光标（归一化坐标；手指在画布上时非空）。
+    @Published var brushCursor: CGPoint?
 
     private(set) var asset: PHAsset?
 
     private var baseBuffer: RgbaBuffer?
+    /// 拖动蒙版控件 / 涂抹时的低分辨率缓冲（长边 720，预览更跟手）。
+    private var fastBuffer: RgbaBuffer?
+    /// 蒙版交互进行中（用快速缓冲渲染，结束时回落到全分辨率）。
+    private(set) var maskInteracting = false
     private var loadToken = 0
     private var detailToken = 0
     private var detailInFlight = false
@@ -106,6 +126,9 @@ final class EditorModel: ObservableObject {
     private var renderBusy = false
     private var renderPending = false
     private let renderQueue = DispatchQueue(label: "fdxmp.ios.render", qos: .userInitiated)
+    private let maskAssetQueue = DispatchQueue(label: "fdxmp.ios.mask-assets", qos: .userInitiated)
+    private var maskAssetToken = 0
+    private var maskAssetScheduled = false
     private static let imageManager = PHCachingImageManager()
 
     // MARK: - 只读派生值
@@ -137,6 +160,13 @@ final class EditorModel: ObservableObject {
         originalImage = nil
         histogram = nil
         baseBuffer = nil
+        fastBuffer = nil
+        maskOverlays = [:]
+        maskThumbnails = [:]
+        maskInteracting = false
+        brushCursor = nil
+        brushErase = false
+        maskOverlayVisible = true
         undoStack.removeAll()
         redoStack.removeAll()
         publishHistory()
@@ -190,6 +220,10 @@ final class EditorModel: ObservableObject {
                         return
                     }
                     self.baseBuffer = buffer
+                    self.fastBuffer = ImageUtil.downscaled(
+                        buffer: buffer,
+                        maxEdge: EditorLimits.fastPreviewMaxEdge
+                    )
                     self.originalImage = original
                     // 先显示原图占位，首帧渲染完成后替换为调色结果。
                     self.previewImage = original
@@ -267,6 +301,9 @@ final class EditorModel: ObservableObject {
             if category == .detail {
                 category = .light
             }
+            scheduleMaskAssetsRefresh(immediate: true)
+        } else {
+            brushCursor = nil
         }
         scheduleRender(immediate: true)
     }
@@ -363,6 +400,9 @@ final class EditorModel: ObservableObject {
             state = EditState()
         }
         selectedMaskId = nil
+        brushErase = false
+        brushCursor = nil
+        maskInteracting = false
         presetName = "原片"
     }
 
@@ -507,6 +547,7 @@ final class EditorModel: ObservableObject {
 
     // MARK: - 蒙版
 
+    /// 新建蒙版（线性 / 径向 / 画笔），并选中它。
     func addMask(_ kind: MaskKindUi) {
         let count = state.masks.filter { $0.kind == kind }.count + 1
         var mask = MaskUi(
@@ -514,26 +555,143 @@ final class EditorModel: ObservableObject {
             name: "\(kind.rawValue) \(count)",
             kind: kind
         )
+        switch kind {
+        case .linear:
+            // 落在画面中部：过渡带从 32% 到 62%（拖端点 / 调参数再细调）。
+            mask.start = CGPoint(x: 0.5, y: 0.32)
+            mask.end = CGPoint(x: 0.5, y: 0.62)
+        case .radial:
+            mask.center = CGPoint(x: 0.5, y: 0.5)
+            mask.radii = CGSize(width: 0.42, height: 0.3)
+            mask.rotation = 0
+            mask.radialFeather = 30
+        case .brush:
+            mask.brushSize = 30
+            mask.brushFeather = 50
+            mask.brushFlow = 100
+            mask.brushDensity = 100
+        }
         mask.values = EditorSpec.defaultValues()
         applyEdit { state in
             state.masks.append(mask)
         }
         selectedMaskId = mask.id
+        maskTab = .shape
+        brushErase = false
     }
 
+    /// 复制选中蒙版（插在原蒙版之后）。
+    func duplicateSelectedMask() {
+        guard let id = selectedMaskId, let source = state.masks.first(where: { $0.id == id })
+        else {
+            return
+        }
+        var copy = source
+        copy.id = UUID().uuidString
+        copy.name = "\(source.name) 副本"
+        applyEdit { state in
+            if let index = state.masks.firstIndex(where: { $0.id == id }) {
+                state.masks.insert(copy, at: index + 1)
+            } else {
+                state.masks.append(copy)
+            }
+        }
+        selectedMaskId = copy.id
+    }
+
+    /// 删除选中蒙版。
     func deleteSelectedMask() {
         guard let id = selectedMaskId else { return }
         applyEdit { state in
             state.masks.removeAll { $0.id == id }
         }
         selectedMaskId = state.masks.first?.id
+        brushErase = false
+    }
+
+    /// 重命名选中蒙版。
+    func renameSelectedMask(_ name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, let id = selectedMaskId else { return }
+        applyEdit { state in
+            if let index = state.masks.firstIndex(where: { $0.id == id }) {
+                state.masks[index].name = trimmed
+            }
+        }
+    }
+
+    /// 显示 / 隐藏某个蒙版（隐藏后不参与渲染与叠加）。
+    func toggleMaskVisible(_ id: String) {
+        applyEdit { state in
+            if let index = state.masks.firstIndex(where: { $0.id == id }) {
+                state.masks[index].visible.toggle()
+            }
+        }
+    }
+
+    /// 反转选中蒙版。
+    func invertSelectedMask() {
+        guard let id = selectedMaskId else { return }
+        applyEdit { state in
+            if let index = state.masks.firstIndex(where: { $0.id == id }) {
+                state.masks[index].inverted.toggle()
+            }
+        }
+    }
+
+    /// 重置选中蒙版：清空笔迹、几何回默认、局部调整归零（保留名称与可见性）。
+    func resetSelectedMask() {
+        guard let id = selectedMaskId,
+              let source = state.masks.first(where: { $0.id == id })
+        else {
+            return
+        }
+        var fresh = MaskUi(id: source.id, name: source.name, kind: source.kind)
+        fresh.visible = source.visible
+        switch source.kind {
+        case .linear:
+            fresh.start = CGPoint(x: 0.5, y: 0.32)
+            fresh.end = CGPoint(x: 0.5, y: 0.62)
+        case .radial:
+            fresh.center = CGPoint(x: 0.5, y: 0.5)
+            fresh.radii = CGSize(width: 0.42, height: 0.3)
+        case .brush:
+            fresh.brushSize = source.brushSize
+            fresh.brushFeather = source.brushFeather
+            fresh.brushFlow = source.brushFlow
+            fresh.brushDensity = source.brushDensity
+        }
+        applyEdit { state in
+            if let index = state.masks.firstIndex(where: { $0.id == id }) {
+                state.masks[index] = fresh
+            }
+        }
+    }
+
+    /// 撤销画笔的最后一笔（不改动其它参数）。
+    func undoLastStroke() {
+        guard let id = selectedMaskId,
+              let mask = state.masks.first(where: { $0.id == id }),
+              !mask.strokes.isEmpty
+        else {
+            return
+        }
+        applyEdit { state in
+            if let index = state.masks.firstIndex(where: { $0.id == id }) {
+                state.masks[index].strokes.removeLast()
+            }
+        }
     }
 
     func selectMask(_ id: String) {
+        guard selectedMaskId != id else { return }
         selectedMaskId = id
+        brushErase = false
+        brushCursor = nil
+        scheduleMaskAssetsRefresh(immediate: true)
     }
 
-    /// 修改选中蒙版（拖动中不触发渲染，只更新叠加显示）。
+    /// 直接修改选中蒙版（面板拖动 / 画布拖动中调用：静默，不落历史）。
     func mutateSelectedMask(_ transform: (inout MaskUi) -> Void) {
         guard let id = selectedMaskId, let index = state.masks.firstIndex(where: { $0.id == id })
         else {
@@ -542,11 +700,169 @@ final class EditorModel: ObservableObject {
         transform(&state.masks[index])
     }
 
+    /// 画布拖动中的实时更新：快速预览渲染 + 叠加层节流刷新。
+    func updateSelectedMask(_ transform: (inout MaskUi) -> Void) {
+        mutateSelectedMask(transform)
+        touchMaskLiveEdit()
+    }
+
     /// 更新选中蒙版的调色参数（滑块）。
     func updateMaskValue(_ key: String, _ newValue: Float) {
         beginEdit()
         mutateSelectedMask { $0.values[key] = newValue }
         touchEdit()
+    }
+
+    // MARK: - 蒙版画布交互（手势层驱动）
+
+    /// 开始拖动蒙版控件：记录快照，拖动期间用快速预览渲染。
+    func beginMaskDrag() {
+        guard selectedMask != nil else { return }
+        maskInteracting = true
+        beginEdit()
+    }
+
+    /// 结束拖动（整次拖动记一步历史）。
+    func endMaskDrag() {
+        finishMaskInteraction()
+    }
+
+    /// 落笔：生成一条笔画（参数取当前笔刷设置快照）。
+    func beginBrushStroke(at point: CGPoint) {
+        guard let id = selectedMaskId,
+              let index = state.masks.firstIndex(where: { $0.id == id }),
+              state.masks[index].kind == .brush
+        else {
+            return
+        }
+        beginEdit()
+        maskInteracting = true
+        let mask = state.masks[index]
+        state.masks[index].strokes.append(
+            BrushStrokeUi(
+                points: [point],
+                erase: brushErase,
+                size: mask.brushSize,
+                feather: mask.brushFeather,
+                flow: mask.brushFlow,
+                density: mask.brushDensity
+            )
+        )
+        brushCursor = point
+        touchMaskLiveEdit()
+    }
+
+    /// 涂抹中：追加点（距离阈值抽稀）。
+    func extendBrushStroke(to point: CGPoint) {
+        guard let id = selectedMaskId,
+              let index = state.masks.firstIndex(where: { $0.id == id }),
+              state.masks[index].kind == .brush,
+              var stroke = state.masks[index].strokes.last
+        else {
+            return
+        }
+        if let last = stroke.points.last, hypot(last.x - point.x, last.y - point.y) < 0.003 {
+            return
+        }
+        stroke.points.append(point)
+        state.masks[index].strokes[state.masks[index].strokes.count - 1] = stroke
+        brushCursor = point
+        touchMaskLiveEdit()
+    }
+
+    /// 抬笔：整笔记一步历史。
+    func endBrushStroke() {
+        brushCursor = nil
+        finishMaskInteraction()
+    }
+
+    /// 结束蒙版交互：提交历史 + 全分辨率渲染。
+    private func finishMaskInteraction() {
+        maskInteracting = false
+        commitEdit()
+    }
+
+    /// 拖动中的实时更新（快速渲染 + 叠加层节流刷新）。
+    private func touchMaskLiveEdit() {
+        scheduleRender()
+        scheduleMaskAssetsRefresh()
+    }
+
+    // MARK: - 蒙版叠加层 / 缩略图
+
+    /// 请求刷新蒙版叠加层与缩略图（节流；`immediate` = 提交后立即）。
+    private func scheduleMaskAssetsRefresh(immediate: Bool = false) {
+        maskAssetToken &+= 1
+        guard !maskAssetScheduled else { return }
+        maskAssetScheduled = true
+        let delay: Double = immediate ? 0 : 0.12
+        maskAssetQueue.asyncAfter(deadline: .now() + delay) { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.maskAssetScheduled = false
+                self.generateMaskAssets()
+            }
+        }
+    }
+
+    /// 生成叠加层（选中蒙版，按预览尺寸）与缩略图（全部蒙版）—— 后台线程。
+    private func generateMaskAssets() {
+        let masks = state.masks
+        guard !masks.isEmpty else {
+            maskOverlays = [:]
+            maskThumbnails = [:]
+            return
+        }
+        let json = currentJson(applyCropRect: true)
+        let size = previewImage?.size ?? originalImage?.size ?? CGSize(width: 4, height: 3)
+        let overlaySize = Self.cappedSize(size, maxEdge: EditorLimits.maskOverlayMaxEdge)
+        let thumbSize = Self.cappedSize(size, maxEdge: EditorLimits.maskThumbnailMaxEdge)
+        let selected = selectedMaskId
+        let token = maskAssetToken
+        maskAssetQueue.async { [weak self] in
+            var overlays: [String: UIImage] = [:]
+            var thumbnails: [String: UIImage] = [:]
+            for mask in masks {
+                let target = mask.id == selected ? overlaySize : thumbSize
+                guard
+                    let result = NativeCore.shared.maskOverlay(
+                        paramsJson: json,
+                        maskId: mask.id,
+                        width: Int(target.width),
+                        height: Int(target.height)
+                    ),
+                    let image = ImageUtil.image(
+                        from: RgbaBuffer(
+                            pixels: result.pixels,
+                            width: result.width,
+                            height: result.height
+                        )
+                    )
+                else {
+                    continue
+                }
+                if mask.id == selected {
+                    overlays[mask.id] = image
+                }
+                thumbnails[mask.id] = image
+            }
+            Task { @MainActor in
+                guard let self, self.maskAssetToken == token else { return }
+                self.maskOverlays = overlays
+                self.maskThumbnails = thumbnails
+            }
+        }
+    }
+
+    /// 等比缩到最长边（不放大）。
+    private static func cappedSize(_ size: CGSize, maxEdge: CGFloat) -> CGSize {
+        let longEdge = max(size.width, size.height)
+        guard longEdge > maxEdge, longEdge > 0 else { return size }
+        let scale = maxEdge / longEdge
+        return CGSize(
+            width: max(1, (size.width * scale).rounded()),
+            height: max(1, (size.height * scale).rounded())
+        )
     }
 
     // MARK: - 渲染
@@ -579,9 +895,12 @@ final class EditorModel: ObservableObject {
         renderBusy = true
         isRendering = true
         let json = currentJson()
+        // 蒙版拖动 / 涂抹中用低分辨率缓冲：CPU 渲染量降 4 倍，画布更跟手；
+        // 松手提交后自动回到全分辨率预览。
+        let source = maskInteracting ? (fastBuffer ?? buffer) : buffer
         renderQueue.async { [weak self] in
             let started = CFAbsoluteTimeGetCurrent()
-            let result = NativeCore.shared.render(buffer: buffer, paramsJson: json)
+            let result = NativeCore.shared.render(buffer: source, paramsJson: json)
             let millis = (CFAbsoluteTimeGetCurrent() - started) * 1000
             let failure = result == nil ? NativeCore.shared.lastError() : nil
             let histogram = result.flatMap {
@@ -601,6 +920,8 @@ final class EditorModel: ObservableObject {
                     self.histogram = histogram
                     self.renderMillis = millis
                     self.message = nil
+                    // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
+                    self.scheduleMaskAssetsRefresh()
                 } else {
                     self.message = failure ?? "渲染失败"
                 }

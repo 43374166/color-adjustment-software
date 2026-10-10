@@ -57,6 +57,35 @@ final class NativeCore {
                 )
             }
         }
+        return decodePayload(pointer: pointer, outLen: outLen)
+    }
+
+    /// 生成单个蒙版的叠加层（红色半透明，预乘 RGBA8），供画布叠加与列表缩略图使用。
+    ///
+    /// 阻塞调用，必须在工作线程执行；失败返回 nil（原因见 `lastError()`）。
+    func maskOverlay(paramsJson: String, maskId: String, width: Int, height: Int) -> RenderResult? {
+        guard width > 0, height > 0 else { return nil }
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = maskId.withCString { mask in
+            paramsJson.withCString { params in
+                fdxmp_mask_overlay_rgba(
+                    params,
+                    mask,
+                    UInt32(width),
+                    UInt32(height),
+                    &outWidth,
+                    &outHeight,
+                    &outLen
+                )
+            }
+        }
+        return decodePayload(pointer: pointer, outLen: outLen)
+    }
+
+    /// 解析 C ABI 返回的「8 字节大端宽高 + RGBA8 像素」缓冲区。
+    private func decodePayload(pointer: UnsafeMutablePointer<UInt8>?, outLen: Int) -> RenderResult? {
         guard let pointer, outLen >= 8 else { return nil }
         defer { fdxmp_bytes_free(pointer, outLen) }
 

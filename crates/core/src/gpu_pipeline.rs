@@ -979,6 +979,10 @@ impl ColorPipeline {
         // 逐蒙版：用该蒙版的参数重跑管线，按权重混入当前图像（A/B ping-pong）。
         let mut current_is_a = true;
         for (index, mask) in params.masks.iter().enumerate() {
+            // 隐藏的蒙版不参与合成。
+            if !mask.visible {
+                continue;
+            }
             let (mask_view, mask_hash) =
                 match self.ensure_mask_texture(device, queue, index, mask, image) {
                     Ok(value) => value,

@@ -628,11 +628,112 @@ pub enum PeoplePart {
     Clothes,
 }
 
+/// 一条画笔笔画：点序列 + 落笔时的笔刷参数 + 擦除标记。
+///
+/// - 点序列保存的是**归一化坐标**（相对原图），可二次编辑，不保存位图；
+/// - 参数为落笔时的快照（`None` 表示沿用蒙版当前设置），改动面板参数
+///   只影响后续笔画，已画好的笔画保持原样（与 Lightroom 一致）；
+/// - 反序列化兼容 v0.3 的旧格式（纯点数组 `[[x, y], ...]` → 普通笔画）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(from = "BrushStrokeRepr")]
+pub struct BrushStroke {
+    /// 笔画路径（归一化坐标；单点 = 点按一下）。
+    pub points: Vec<[f32; 2]>,
+    /// 擦除笔画：从已有蒙版中减掉（反向混合）。
+    pub erase: bool,
+    /// 落笔时的大小（长边百分比，2..=100）。
+    pub size: Option<f32>,
+    /// 落笔时的羽化，0..=100。
+    pub feather: Option<f32>,
+    /// 落笔时的流动，0..=100。
+    pub flow: Option<f32>,
+    /// 落笔时的密度，0..=100。
+    pub density: Option<f32>,
+}
+
+impl BrushStroke {
+    /// 普通笔画（沿用蒙版当前笔刷设置）。
+    pub fn new(points: Vec<[f32; 2]>) -> Self {
+        Self {
+            points,
+            erase: false,
+            size: None,
+            feather: None,
+            flow: None,
+            density: None,
+        }
+    }
+
+    /// 擦除笔画。
+    pub fn erase(points: Vec<[f32; 2]>) -> Self {
+        Self {
+            erase: true,
+            ..Self::new(points)
+        }
+    }
+
+    /// 是否没有点。
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+}
+
+/// 笔画的反序列化中间表示（对象格式或 v0.3 的点数组格式）。
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BrushStrokeRepr {
+    /// 对象格式（v0.4+）。
+    Object {
+        /// 点序列。
+        points: Vec<[f32; 2]>,
+        /// 擦除标记。
+        #[serde(default)]
+        erase: bool,
+        /// 大小快照。
+        #[serde(default)]
+        size: Option<f32>,
+        /// 羽化快照。
+        #[serde(default)]
+        feather: Option<f32>,
+        /// 流动快照。
+        #[serde(default)]
+        flow: Option<f32>,
+        /// 密度快照。
+        #[serde(default)]
+        density: Option<f32>,
+    },
+    /// 旧格式：只存点序列。
+    Legacy(Vec<[f32; 2]>),
+}
+
+impl From<BrushStrokeRepr> for BrushStroke {
+    fn from(repr: BrushStrokeRepr) -> Self {
+        match repr {
+            BrushStrokeRepr::Object {
+                points,
+                erase,
+                size,
+                feather,
+                flow,
+                density,
+            } => Self {
+                points,
+                erase,
+                size,
+                feather,
+                flow,
+                density,
+            },
+            BrushStrokeRepr::Legacy(points) => Self::new(points),
+        }
+    }
+}
+
 /// 画笔设置。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct BrushSettings {
-    /// 大小（长边的百分比，2..=50）。
+    /// 大小（长边的百分比，2..=100）。
     pub size: f32,
     /// 羽化，0..=100。
     pub feather: f32,
@@ -642,8 +743,8 @@ pub struct BrushSettings {
     pub density: f32,
     /// 自动蒙版。
     pub auto_mask: bool,
-    /// 笔画路径（归一化坐标，每段一条折线）。
-    pub strokes: Vec<Vec<[f32; 2]>>,
+    /// 笔画列表（每笔自带点序列与参数快照，支持擦除）。
+    pub strokes: Vec<BrushStroke>,
 }
 
 /// 蒙版类型。
@@ -741,6 +842,8 @@ pub struct MaskParams {
     pub name: String,
     /// 蒙版类型。
     pub kind: MaskKind,
+    /// 是否可见（隐藏的蒙版不参与渲染；旧项目缺省为可见）。
+    pub visible: bool,
     /// 反向。
     pub inverted: bool,
     /// 羽化，0..=100。
@@ -759,6 +862,7 @@ impl Default for MaskParams {
             id: String::new(),
             name: String::new(),
             kind: MaskKind::AiSubject,
+            visible: true,
             inverted: false,
             feather: 0.0,
             opacity: 100.0,

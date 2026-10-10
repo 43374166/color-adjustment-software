@@ -222,14 +222,14 @@ fn sample_bilinear(source: &RgbaImage, x: f32, y: f32) -> image::Rgba<u8> {
     let fy = y - y0 as f32;
 
     let mut channels = [0u8; 4];
-    for channel in 0..4 {
+    for (channel, value) in channels.iter_mut().enumerate() {
         let p00 = source.get_pixel(x0, y0).0[channel] as f32;
         let p10 = source.get_pixel(x1, y0).0[channel] as f32;
         let p01 = source.get_pixel(x0, y1).0[channel] as f32;
         let p11 = source.get_pixel(x1, y1).0[channel] as f32;
         let top = p00 + (p10 - p00) * fx;
         let bottom = p01 + (p11 - p01) * fx;
-        channels[channel] = (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8;
+        *value = (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8;
     }
     image::Rgba(channels)
 }
@@ -314,13 +314,13 @@ pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImag
 
 /// 按蒙版对图像做局部调整（在全局调色之后、几何裁剪之前）。
 pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
-    if params.masks.is_empty() {
+    if params.masks.iter().all(|mask| !mask.visible) {
         return;
     }
-    // 蒙版栅格按降采样分辨率生成：画笔距离场 / 羽化模糊的开销随像素数下降，
-    // 权重本身是平滑的，双线性采样后观感一致。
-    const MASK_MAX_EDGE: u32 = 512;
-    let (mask_width, mask_height) = scaled_dims(image.width(), image.height(), MASK_MAX_EDGE);
+    // 蒙版栅格按降采样分辨率生成：预览取长边一半（快），导出随分辨率提高
+    // （2048 上限），权重本身是平滑的，双线性采样后观感一致。
+    let edge = mask_raster_edge(image.width().max(image.height()));
+    let (mask_width, mask_height) = scaled_dims(image.width(), image.height(), edge);
     let mask_image = if mask_width != image.width() || mask_height != image.height() {
         image::imageops::resize(
             image,
@@ -335,6 +335,9 @@ pub fn apply_masks(image: &mut RgbaImage, params: &EditParams) {
         .masks
         .iter()
         .filter_map(|mask| {
+            if !mask.visible {
+                return None;
+            }
             let raster = cached_mask(mask, &mask_image, mask_image.width(), mask_image.height())?;
             Some(MaskContext {
                 raster,
@@ -419,6 +422,96 @@ fn scaled_dims(width: u32, height: u32, max_edge: u32) -> (u32, u32) {
         ((width as f32 * scale).round() as u32).max(1),
         ((height as f32 * scale).round() as u32).max(1),
     )
+}
+
+/// 蒙版栅格分辨率：取长边一半（预览等场景足以平滑双线性采样），
+/// 但下限 512、上限 2048 —— 导出高分辨率图时蒙版细节仍足够精细。
+fn mask_raster_edge(long_edge: u32) -> u32 {
+    (long_edge / 2).clamp(512, 2048)
+}
+
+/// 蒙版叠加层：尺寸 + 预乘 RGBA8 像素。
+pub struct MaskOverlayRgba {
+    /// 栅格宽度。
+    pub width: u32,
+    /// 栅格高度。
+    pub height: u32,
+    /// 预乘 RGBA8（行优先，可直接交给平台层贴图）。
+    pub rgba: Vec<u8>,
+}
+
+/// 生成单个蒙版的叠加层（半透明彩色覆盖，预乘 RGBA8）。
+///
+/// `width` / `height` 是叠加目标（预览画布 / 列表缩略图）尺寸；内部按
+/// [`mask_raster_edge`] 降采样，与 [`apply_masks`] 共用同一份栅格缓存。
+/// 只支持几何型蒙版（画笔 / 线性 / 径向），其余类型（颜色范围 / 亮度范围 /
+/// AI 蒙版）返回全透明叠加（其覆盖范围在 UI 上用其它方式示意）。
+pub fn render_mask_overlay_rgba(
+    params_json: &str,
+    mask_id: &str,
+    width: u32,
+    height: u32,
+) -> Result<MaskOverlayRgba> {
+    let params: EditParams = serde_json::from_str(params_json)?;
+    if width == 0 || height == 0 {
+        return Err(FdxmpError::InvalidArgument(
+            "叠加层尺寸必须大于 0".to_string(),
+        ));
+    }
+    let mask = params
+        .masks
+        .iter()
+        .find(|mask| mask.id == mask_id)
+        .ok_or_else(|| FdxmpError::InvalidArgument(format!("找不到蒙版：{mask_id}")))?;
+    let edge = mask_raster_edge(width.max(height));
+    let (raster_width, raster_height) = scaled_dims(width, height, edge);
+    let transparent = || MaskOverlayRgba {
+        width: raster_width,
+        height: raster_height,
+        rgba: vec![0u8; (raster_width as usize) * (raster_height as usize) * 4],
+    };
+    let geometric = matches!(
+        mask.kind,
+        crate::params::MaskKind::Brush(_)
+            | crate::params::MaskKind::LinearGradient { .. }
+            | crate::params::MaskKind::RadialGradient { .. }
+    );
+    if !geometric || !mask.visible {
+        return Ok(transparent());
+    }
+    // 几何型蒙版不需要参考图（1×1 占位即可）。
+    let reference = image::RgbaImage::new(1, 1);
+    let Some(raster) = cached_mask(mask, &reference, raster_width, raster_height) else {
+        return Ok(transparent());
+    };
+    let color = overlay_rgb(mask.overlay);
+    /// 叠加层最大不透明度（Lightroom 风格：选中区域半透明覆盖）。
+    const OVERLAY_ALPHA: f32 = 0.45;
+    let mut rgba = Vec::with_capacity(raster.weights.len() * 4);
+    for weight in &raster.weights {
+        let alpha = weight.clamp(0.0, 1.0) * OVERLAY_ALPHA;
+        rgba.push((color[0] * alpha * 255.0).round() as u8);
+        rgba.push((color[1] * alpha * 255.0).round() as u8);
+        rgba.push((color[2] * alpha * 255.0).round() as u8);
+        rgba.push((alpha * 255.0).round() as u8);
+    }
+    Ok(MaskOverlayRgba {
+        width: raster_width,
+        height: raster_height,
+        rgba,
+    })
+}
+
+/// 叠加颜色 → RGB（与 `masks::overlay_rgba` 的色相一致）。
+fn overlay_rgb(color: crate::params::OverlayColor) -> [f32; 3] {
+    use crate::params::OverlayColor;
+    match color {
+        OverlayColor::Red => [1.0, 0.0, 0.0],
+        OverlayColor::Green => [0.0, 1.0, 0.0],
+        OverlayColor::Blue => [0.0, 0.0, 1.0],
+        OverlayColor::White => [1.0, 1.0, 1.0],
+        OverlayColor::Black => [0.0, 0.0, 0.0],
+    }
 }
 
 /// 把（可能降采样的）蒙版权重栅格双线性采样到全分辨率坐标。
@@ -1180,8 +1273,10 @@ mod tests {
     #[test]
     fn crop_rect_halves_image() {
         let source = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
-        let mut crop = CropParams::default();
-        crop.rect = [0.0, 0.0, 0.5, 0.5];
+        let crop = CropParams {
+            rect: [0.0, 0.0, 0.5, 0.5],
+            ..CropParams::default()
+        };
         let out = apply_geometry(&source, &crop);
         assert_eq!(out.width(), 4);
         assert_eq!(out.height(), 4);
@@ -1190,8 +1285,10 @@ mod tests {
     #[test]
     fn rotation_keeps_size() {
         let source = RgbaImage::from_pixel(8, 8, Rgba([10, 20, 30, 255]));
-        let mut crop = CropParams::default();
-        crop.rotation_deg = 10.0;
+        let crop = CropParams {
+            rotation_deg: 10.0,
+            ..CropParams::default()
+        };
         let out = apply_geometry(&source, &crop);
         assert_eq!(out.dimensions(), (8, 8));
     }
@@ -1201,8 +1298,10 @@ mod tests {
         let mut source = RgbaImage::new(2, 1);
         source.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
         source.put_pixel(1, 0, Rgba([0, 255, 0, 255]));
-        let mut crop = CropParams::default();
-        crop.flip_horizontal = true;
+        let crop = CropParams {
+            flip_horizontal: true,
+            ..CropParams::default()
+        };
         let out = apply_geometry(&source, &crop);
         assert_eq!(out.get_pixel(0, 0).0, [0, 255, 0, 255]);
     }
@@ -1211,14 +1310,20 @@ mod tests {
     fn linear_mask_brightens_masked_side() {
         let source = RgbaImage::from_pixel(4, 4, Rgba([64, 64, 64, 255]));
         let mut params = EditParams::default();
-        let mut mask = crate::params::MaskParams::default();
-        mask.kind = crate::params::MaskKind::LinearGradient {
-            start: [0.0, 0.0],
-            end: [0.0, 1.0],
+        let mask = crate::params::MaskParams {
+            kind: crate::params::MaskKind::LinearGradient {
+                start: [0.0, 0.0],
+                end: [0.0, 1.0],
+            },
+            adjustments: Box::new(EditParams {
+                light: crate::params::LightParams {
+                    exposure: 1.0,
+                    ..crate::params::LightParams::default()
+                },
+                ..EditParams::default()
+            }),
+            ..crate::params::MaskParams::default()
         };
-        let mut local = EditParams::default();
-        local.light.exposure = 1.0;
-        mask.adjustments = Box::new(local);
         params.masks = vec![mask];
 
         let mut out = render_preview_image(&source, &params);
@@ -1226,6 +1331,51 @@ mod tests {
         let top = out.get_pixel(0, 0).0[0];
         let bottom = out.get_pixel(0, 3).0[0];
         assert!(top > bottom + 10, "top={top} bottom={bottom}");
+    }
+
+    #[test]
+    fn mask_overlay_marks_brush_area_and_honours_hidden() {
+        let mut params = EditParams::default();
+        let mut mask = crate::params::MaskParams {
+            id: "m1".to_string(),
+            kind: crate::params::MaskKind::Brush(crate::params::BrushSettings {
+                size: 40.0,
+                feather: 50.0,
+                flow: 100.0,
+                density: 100.0,
+                auto_mask: false,
+                strokes: vec![crate::params::BrushStroke::new(vec![[0.5, 0.5]])],
+            }),
+            ..crate::params::MaskParams::default()
+        };
+        params.masks = vec![mask.clone()];
+        let json = serde_json::to_string(&params).unwrap();
+
+        let overlay = render_mask_overlay_rgba(&json, "m1", 200, 200).unwrap();
+        assert_eq!((overlay.width, overlay.height), (200, 200));
+        let center = 4 * (100 * overlay.width as usize + 100);
+        let corner = 0usize;
+        assert!(overlay.rgba[center + 3] > 100, "笔画中心应有红色叠加");
+        assert_eq!(overlay.rgba[corner + 3], 0, "角落不应有叠加");
+        assert!(overlay.rgba[center] > 0, "叠加为预乘红色（R 通道非零）");
+
+        // 隐藏蒙版 → 全透明叠加。
+        mask.visible = false;
+        params.masks = vec![mask];
+        let json = serde_json::to_string(&params).unwrap();
+        let hidden = render_mask_overlay_rgba(&json, "m1", 200, 200).unwrap();
+        assert!(hidden.rgba.iter().all(|byte| *byte == 0));
+
+        // 未知 id → 报错。
+        assert!(render_mask_overlay_rgba(&json, "nope", 200, 200).is_err());
+    }
+
+    #[test]
+    fn mask_raster_edge_scales_with_image() {
+        assert_eq!(mask_raster_edge(1440), 720);
+        assert_eq!(mask_raster_edge(200), 512);
+        assert_eq!(mask_raster_edge(4096), 2048);
+        assert_eq!(mask_raster_edge(20000), 2048);
     }
 
     #[test]
@@ -1321,18 +1471,24 @@ mod tests {
             let t = index as f32 / 49.0;
             stroke.push([0.25 + t * 0.5, 0.4 + (t * 6.0).sin() * 0.15]);
         }
-        let mut mask = crate::params::MaskParams::default();
-        mask.kind = crate::params::MaskKind::Brush(crate::params::BrushSettings {
-            size: 30.0,
-            feather: 50.0,
-            flow: 100.0,
-            density: 100.0,
-            auto_mask: false,
-            strokes: vec![stroke],
-        });
-        let mut local = EditParams::default();
-        local.light.exposure = 1.0;
-        mask.adjustments = Box::new(local);
+        let mask = crate::params::MaskParams {
+            kind: crate::params::MaskKind::Brush(crate::params::BrushSettings {
+                size: 30.0,
+                feather: 50.0,
+                flow: 100.0,
+                density: 100.0,
+                auto_mask: false,
+                strokes: vec![crate::params::BrushStroke::new(stroke)],
+            }),
+            adjustments: Box::new(EditParams {
+                light: crate::params::LightParams {
+                    exposure: 1.0,
+                    ..crate::params::LightParams::default()
+                },
+                ..EditParams::default()
+            }),
+            ..crate::params::MaskParams::default()
+        };
         params.masks = vec![mask];
 
         let color_start = Instant::now();

@@ -81,6 +81,21 @@ uint8_t *fdxmp_render_memory_rgba(const uint8_t *rgba,
                                   uint32_t *out_height,
                                   size_t *out_len);
 
+/* ---- 蒙版叠加层（移动端蒙版编辑器 / 蒙版列表缩略图）----
+ *
+ * 输入：EditParams JSON + 蒙版 id + 目标宽高（预览画布或缩略图尺寸）；
+ * 输出：8 字节大端宽高 + 预乘 RGBA8 像素（红色半透明覆盖），
+ * 必须用 fdxmp_bytes_free(ptr, len) 释放。失败返回 NULL。
+ * 只支持几何型蒙版（画笔 / 线性 / 径向）；隐藏的蒙版返回全透明叠加。
+ */
+uint8_t *fdxmp_mask_overlay_rgba(const char *params_json,
+                                 const char *mask_id,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 uint32_t *out_width,
+                                 uint32_t *out_height,
+                                 size_t *out_len);
+
 /* ---- 缓存 ---- */
 
 uint64_t fdxmp_cache_total_size(const char *cache_root);

@@ -1,331 +1,267 @@
-import CoreGraphics
 import SwiftUI
 
-/// 蒙版叠加层：显示当前蒙版（画笔笔画 / 线性渐变 / 径向渐变）并接收手势。
-struct MaskOverlayView: View {
-    @ObservedObject var model: EditorModel
-    /// 预览图像尺寸（未裁切）。
-    let imageSize: CGSize
-
-    @State private var dragStart: CGPoint?
-
-    var body: some View {
-        GeometryReader { geo in
-            let fitted = fittedRect(imageSize: imageSize, in: geo.size)
-            Canvas { context, _ in
-                guard let mask = model.selectedMask else { return }
-                switch mask.kind {
-                case .brush:
-                    drawBrush(&context, mask: mask, fitted: fitted)
-                case .linear:
-                    drawLinear(&context, mask: mask, fitted: fitted)
-                case .radial:
-                    drawRadial(&context, mask: mask, fitted: fitted)
-                }
-            }
-            .contentShape(Rectangle())
-            .gesture(gesture(fitted: fitted))
-        }
-    }
-
-    // MARK: - 手势
-
-    private func gesture(fitted: CGRect) -> some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                guard let mask = model.selectedMask else { return }
-                if dragStart == nil {
-                    dragStart = value.startLocation
-                    model.beginEdit()
-                    let start = normalized(value.startLocation, fitted: fitted)
-                    model.mutateSelectedMask { current in
-                        switch current.kind {
-                        case .brush:
-                            current.strokes.append([start])
-                        case .linear:
-                            current.start = start
-                            current.end = start
-                        case .radial:
-                            current.center = start
-                            current.radii = CGSize(width: 0.05, height: 0.05)
-                        }
-                    }
-                }
-                let point = normalized(value.location, fitted: fitted)
-                switch mask.kind {
-                case .brush:
-                    model.mutateSelectedMask { current in
-                        guard !current.strokes.isEmpty else { return }
-                        let lastIndex = current.strokes.count - 1
-                        if let last = current.strokes[lastIndex].last,
-                           hypot(last.x - point.x, last.y - point.y) < 0.004
-                        {
-                            return
-                        }
-                        current.strokes[lastIndex].append(point)
-                    }
-                case .linear:
-                    model.mutateSelectedMask { $0.end = point }
-                case .radial:
-                    model.mutateSelectedMask { current in
-                        let dx = abs(point.x - current.center.x)
-                        let dy = abs(point.y - current.center.y)
-                        current.radii = CGSize(
-                            width: max(dx, 0.05),
-                            height: max(dy, 0.05)
-                        )
-                    }
-                }
-            }
-            .onEnded { _ in
-                guard dragStart != nil else { return }
-                dragStart = nil
-                model.commitEdit()
-            }
-    }
-
-    private func normalized(_ point: CGPoint, fitted: CGRect) -> CGPoint {
-        guard fitted.width > 0, fitted.height > 0 else { return .zero }
-        return CGPoint(
-            x: ((point.x - fitted.minX) / fitted.width).clamped(to: 0...1),
-            y: ((point.y - fitted.minY) / fitted.height).clamped(to: 0...1)
-        )
-    }
-
-    // MARK: - 绘制
-
-    private func drawBrush(
-        _ context: inout GraphicsContext,
-        mask: MaskUi,
-        fitted: CGRect
-    ) {
-        let lineWidth = max(
-            CGFloat(mask.brushSize) / 100 * max(fitted.width, fitted.height),
-            6
-        )
-        for stroke in mask.strokes where stroke.count > 0 {
-            var path = Path()
-            for (index, point) in stroke.enumerated() {
-                let position = CGPoint(
-                    x: fitted.minX + point.x * fitted.width,
-                    y: fitted.minY + point.y * fitted.height
-                )
-                if index == 0 {
-                    path.move(to: position)
-                } else {
-                    path.addLine(to: position)
-                }
-            }
-            if stroke.count == 1, let point = stroke.first {
-                let position = CGPoint(
-                    x: fitted.minX + point.x * fitted.width,
-                    y: fitted.minY + point.y * fitted.height
-                )
-                context.fill(
-                    Path(
-                        ellipseIn: CGRect(
-                            x: position.x - lineWidth / 2,
-                            y: position.y - lineWidth / 2,
-                            width: lineWidth,
-                            height: lineWidth
-                        )
-                    ),
-                    with: .color(maskColor(mask).opacity(0.4))
-                )
-            } else {
-                context.stroke(
-                    path,
-                    with: .color(maskColor(mask).opacity(0.4)),
-                    style: StrokeStyle(lineWidth: lineWidth, lineCap: .round, lineJoin: .round)
-                )
-            }
-        }
-    }
-
-    private func drawLinear(
-        _ context: inout GraphicsContext,
-        mask: MaskUi,
-        fitted: CGRect
-    ) {
-        let start = CGPoint(
-            x: fitted.minX + mask.start.x * fitted.width,
-            y: fitted.minY + mask.start.y * fitted.height
-        )
-        let end = CGPoint(
-            x: fitted.minX + mask.end.x * fitted.width,
-            y: fitted.minY + mask.end.y * fitted.height
-        )
-        var path = Path()
-        path.move(to: start)
-        path.addLine(to: end)
-        context.stroke(
-            path,
-            with: .color(maskColor(mask)),
-            style: StrokeStyle(lineWidth: 2, dash: [6, 4])
-        )
-        // 两端垂直于渐变方向的界线
-        let dx = end.x - start.x
-        let dy = end.y - start.y
-        let length = max(hypot(dx, dy), 1)
-        let normal = CGPoint(x: -dy / length, y: dx / length)
-        let span = max(fitted.width, fitted.height)
-        for center in [start, end] {
-            var line = Path()
-            line.move(
-                to: CGPoint(x: center.x - normal.x * span, y: center.y - normal.y * span)
-            )
-            line.addLine(
-                to: CGPoint(x: center.x + normal.x * span, y: center.y + normal.y * span)
-            )
-            context.stroke(line, with: .color(maskColor(mask).opacity(0.7)), lineWidth: 1)
-        }
-        for center in [start, end] {
-            context.fill(
-                Path(
-                    ellipseIn: CGRect(
-                        x: center.x - 6, y: center.y - 6, width: 12, height: 12
-                    )
-                ),
-                with: .color(maskColor(mask))
-            )
-        }
-    }
-
-    private func drawRadial(
-        _ context: inout GraphicsContext,
-        mask: MaskUi,
-        fitted: CGRect
-    ) {
-        let center = CGPoint(
-            x: fitted.minX + mask.center.x * fitted.width,
-            y: fitted.minY + mask.center.y * fitted.height
-        )
-        let radiusX = mask.radii.width * fitted.width
-        let radiusY = mask.radii.height * fitted.height
-        let rect = CGRect(
-            x: center.x - radiusX,
-            y: center.y - radiusY,
-            width: radiusX * 2,
-            height: radiusY * 2
-        )
-        context.stroke(
-            Path(ellipseIn: rect),
-            with: .color(maskColor(mask)),
-            style: StrokeStyle(lineWidth: 2, dash: [6, 4])
-        )
-        let inner = CGFloat(max(min(mask.inner / 100, 0.98), 0))
-        if inner > 0.01 {
-            let innerRect = rect.insetBy(
-                dx: rect.width / 2 * (1 - inner),
-                dy: rect.height / 2 * (1 - inner)
-            )
-            context.stroke(
-                Path(ellipseIn: innerRect),
-                with: .color(maskColor(mask).opacity(0.5)),
-                style: StrokeStyle(lineWidth: 1, dash: [4, 4])
-            )
-        }
-        context.fill(
-            Path(ellipseIn: CGRect(x: center.x - 5, y: center.y - 5, width: 10, height: 10)),
-            with: .color(maskColor(mask))
-        )
-    }
-
-    private func maskColor(_ mask: MaskUi) -> Color {
-        mask.inverted
-            ? Color(red: 0.35, green: 0.7, blue: 1.0)
-            : Color(red: 1.0, green: 0.3, blue: 0.3)
-    }
-}
-
-/// 蒙版面板：蒙版列表 + 形状参数 + 该蒙版的调色参数。
+/// 蒙版面板：新建（线性 / 径向 / 画笔）+ 列表（缩略图 / 显示隐藏 / 复制 / 重命名 / 删除）
+/// + 通用操作（反转 / 重置 / 显示叠加）+ 形状参数 + 该蒙版的局部调整。
 struct MaskPanelView: View {
     @ObservedObject var model: EditorModel
+    @State private var renameTargetId: String?
+    @State private var renameText = ""
 
     var body: some View {
         VStack(spacing: 0) {
+            headerRow
             chipRow
+            actionRow
             subtabRow
-            if let mask = model.selectedMask {
-                switch model.maskTab {
-                case .shape:
-                    shapeControls(mask)
-                case .adjust:
-                    adjustControls
-                }
-            } else {
-                Spacer()
-                Text("点右上角「+」新建蒙版")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                Spacer()
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+            content
+        }
+        .alert("重命名蒙版", isPresented: renameAlertBinding) {
+            TextField("名称", text: $renameText)
+            Button("取消", role: .cancel) {
+                renameTargetId = nil
+            }
+            Button("确定") {
+                model.renameSelectedMask(renameText)
+                renameTargetId = nil
             }
         }
     }
 
-    // MARK: - 蒙版列表
+    private var renameAlertBinding: Binding<Bool> {
+        Binding(
+            get: { renameTargetId != nil },
+            set: { if !$0 { renameTargetId = nil } }
+        )
+    }
 
-    private var chipRow: some View {
-        HStack(spacing: 8) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 8) {
-                    ForEach(model.state.masks) { mask in
-                        Button {
-                            model.selectMask(mask.id)
-                        } label: {
-                            HStack(spacing: 5) {
-                                Image(systemName: mask.kind.icon)
-                                    .font(.caption2)
-                                Text(mask.name)
-                                    .font(.caption2)
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule().fill(
-                                    model.selectedMaskId == mask.id
-                                        ? Color.accentColor.opacity(0.35)
-                                        : Color.white.opacity(0.08)
-                                )
-                            )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.leading, 14)
+    // MARK: - 顶部：标题 + 完成
+
+    private var headerRow: some View {
+        HStack {
+            Text("蒙版")
+                .font(.subheadline.weight(.semibold))
+            if let mask = model.selectedMask {
+                Text(mask.name)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            Menu {
-                ForEach(MaskKindUi.allCases) { kind in
-                    Button {
-                        model.addMask(kind)
-                    } label: {
-                        Label(kind.rawValue, systemImage: kind.icon)
-                    }
-                }
-            } label: {
-                Image(systemName: "plus")
-                    .font(.footnote.weight(.semibold))
-                    .padding(8)
-                    .background(Circle().fill(Color.white.opacity(0.1)))
-            }
-            Button {
-                model.deleteSelectedMask()
-            } label: {
-                Image(systemName: "trash")
-                    .font(.footnote)
-                    .padding(8)
-                    .background(Circle().fill(Color.white.opacity(0.1)))
-            }
-            .disabled(model.selectedMask == nil)
+            Spacer()
             Button("完成") {
                 model.selectTool(.edit)
             }
             .font(.caption)
             .foregroundStyle(Color.accentColor)
-            .padding(.trailing, 12)
         }
-        .padding(.top, 8)
+        .padding(.horizontal, 16)
+        .padding(.top, 10)
     }
+
+    // MARK: - 蒙版列表（横向卡片：缩略图 + 名称 + 显示 / 隐藏）
+
+    private var chipRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 10) {
+                ForEach(model.state.masks) { mask in
+                    maskCard(mask)
+                }
+                addCard
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+        }
+    }
+
+    private func maskCard(_ mask: MaskUi) -> some View {
+        let selected = model.selectedMaskId == mask.id
+        return VStack(spacing: 3) {
+            ZStack(alignment: .topTrailing) {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.black.opacity(0.5))
+                    .frame(width: 54, height: 54)
+                    .overlay(
+                        Group {
+                            if let thumbnail = model.maskThumbnails[mask.id] {
+                                Image(uiImage: thumbnail)
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(width: 54, height: 54)
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                            } else {
+                                Image(systemName: mask.kind.icon)
+                                    .font(.system(size: 18))
+                                    .foregroundStyle(.white.opacity(0.5))
+                            }
+                        }
+                    )
+                    .opacity(mask.visible ? 1 : 0.4)
+                Button {
+                    model.toggleMaskVisible(mask.id)
+                } label: {
+                    Image(systemName: mask.visible ? "eye" : "eye.slash")
+                        .font(.system(size: 9, weight: .semibold))
+                        .padding(3)
+                        .background(Circle().fill(Color.black.opacity(0.65)))
+                        .foregroundStyle(mask.visible ? Color.white : Color.white.opacity(0.55))
+                }
+                .buttonStyle(.plain)
+                .offset(x: 4, y: -4)
+            }
+            Text(mask.name)
+                .font(.system(size: 9))
+                .lineLimit(1)
+                .frame(width: 58)
+                .foregroundStyle(selected ? Color.white : Color.white.opacity(0.65))
+        }
+        .padding(4)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(
+                    selected
+                        ? Color.accentColor.opacity(0.3)
+                        : Color.white.opacity(0.06)
+                )
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10)
+                .stroke(selected ? Color.accentColor : Color.white.opacity(0.08))
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 10))
+        .onTapGesture {
+            model.selectMask(mask.id)
+        }
+        .contextMenu {
+            Button {
+                renameText = mask.name
+                renameTargetId = mask.id
+            } label: {
+                Label("重命名", systemImage: "pencil")
+            }
+            Button {
+                model.selectMask(mask.id)
+                model.duplicateSelectedMask()
+            } label: {
+                Label("复制", systemImage: "plus.square.on.square")
+            }
+            Button(role: .destructive) {
+                model.selectMask(mask.id)
+                model.deleteSelectedMask()
+            } label: {
+                Label("删除", systemImage: "trash")
+            }
+        }
+    }
+
+    private var addCard: some View {
+        Menu {
+            ForEach(MaskKindUi.allCases) { kind in
+                Button {
+                    model.addMask(kind)
+                } label: {
+                    Label(kind.rawValue, systemImage: kind.icon)
+                }
+            }
+        } label: {
+            VStack(spacing: 3) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.white.opacity(0.08))
+                        .frame(width: 54, height: 54)
+                    Image(systemName: "plus")
+                        .font(.system(size: 18))
+                        .foregroundStyle(Color.accentColor)
+                }
+                Text("新建")
+                    .font(.system(size: 9))
+                    .foregroundStyle(.secondary)
+            }
+            .padding(4)
+        }
+    }
+
+    // MARK: - 通用操作
+
+    private var actionRow: some View {
+        HStack(spacing: 0) {
+            actionButton(
+                "反转",
+                icon: "circle.lefthalf.filled",
+                enabled: model.selectedMask != nil,
+                active: model.selectedMask?.inverted ?? false
+            ) {
+                model.invertSelectedMask()
+            }
+            actionButton(
+                "重置",
+                icon: "arrow.counterclockwise",
+                enabled: model.selectedMask != nil
+            ) {
+                model.resetSelectedMask()
+            }
+            actionButton(
+                "叠加",
+                icon: "square.on.square",
+                active: model.maskOverlayVisible
+            ) {
+                model.maskOverlayVisible.toggle()
+            }
+            actionButton(
+                "复制",
+                icon: "plus.square.on.square",
+                enabled: model.selectedMask != nil
+            ) {
+                model.duplicateSelectedMask()
+            }
+            actionButton(
+                "重命名",
+                icon: "pencil",
+                enabled: model.selectedMask != nil
+            ) {
+                if let mask = model.selectedMask {
+                    renameText = mask.name
+                    renameTargetId = mask.id
+                }
+            }
+            actionButton(
+                "删除",
+                icon: "trash",
+                enabled: model.selectedMask != nil
+            ) {
+                model.deleteSelectedMask()
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.bottom, 4)
+    }
+
+    private func actionButton(
+        _ title: String,
+        icon: String,
+        enabled: Bool = true,
+        active: Bool = false,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            VStack(spacing: 2) {
+                Image(systemName: icon)
+                    .font(.system(size: 15))
+                Text(title)
+                    .font(.system(size: 9))
+            }
+            .frame(maxWidth: .infinity)
+            .foregroundStyle(
+                enabled
+                    ? (active ? Color.accentColor : Color.white.opacity(0.85))
+                    : Color.white.opacity(0.3)
+            )
+        }
+        .buttonStyle(.plain)
+        .disabled(!enabled)
+    }
+
+    // MARK: - 子页：蒙版（形状）/ 调整（局部调色）
 
     private var subtabRow: some View {
         HStack(spacing: 18) {
@@ -349,138 +285,262 @@ struct MaskPanelView: View {
             Spacer()
         }
         .padding(.horizontal, 16)
-        .padding(.top, 8)
+        .padding(.top, 4)
+        .padding(.bottom, 4)
     }
 
-    // MARK: - 形状参数
-
     @ViewBuilder
-    private func shapeControls(_ mask: MaskUi) -> some View {
-        ScrollView {
-            VStack(spacing: 0) {
-                switch mask.kind {
-                case .brush:
-                    sliderRow(
-                        label: "大小",
-                        value: mask.brushSize,
-                        range: 2...50,
-                        neutral: 12,
-                        step: 1,
-                        keyPath: \.brushSize
-                    )
-                    sliderRow(
-                        label: "笔刷羽化",
-                        value: mask.brushFeather,
-                        range: 0...100,
-                        neutral: 50,
-                        step: 5,
-                        keyPath: \.brushFeather
-                    )
-                    sliderRow(
-                        label: "流动",
-                        value: mask.brushFlow,
-                        range: 0...100,
-                        neutral: 100,
-                        step: 5,
-                        keyPath: \.brushFlow
-                    )
-                    sliderRow(
-                        label: "密度",
-                        value: mask.brushDensity,
-                        range: 0...100,
-                        neutral: 100,
-                        step: 5,
-                        keyPath: \.brushDensity
-                    )
-                case .linear:
-                    Text("在照片上拖动设置渐变方向，线条位置即渐变过渡。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 6)
-                case .radial:
-                    Text("在照片上从中心向外拖动调整范围。")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.horizontal, 18)
-                        .padding(.vertical, 6)
-                    sliderRow(
-                        label: "内圈",
-                        value: mask.inner,
-                        range: 0...98,
-                        neutral: 75,
-                        step: 5,
-                        keyPath: \.inner
-                    )
-                    sliderRow(
-                        label: "旋转",
-                        value: mask.rotation,
-                        range: 0...360,
-                        neutral: 0,
-                        step: 15,
-                        keyPath: \.rotation
-                    )
-                }
-                sliderRow(
-                    label: "蒙版羽化",
-                    value: mask.feather,
-                    range: 0...100,
-                    neutral: 50,
-                    step: 5,
-                    keyPath: \.feather
-                )
-                sliderRow(
-                    label: "不透明度",
-                    value: mask.opacity,
-                    range: 0...100,
-                    neutral: 100,
-                    step: 5,
-                    keyPath: \.opacity
-                )
-                HStack {
-                    Toggle("反转蒙版", isOn: Binding(
-                        get: { model.selectedMask?.inverted ?? false },
-                        set: { newValue in
-                            model.applyEdit { state in
-                                guard let id = model.selectedMaskId,
-                                      let index = state.masks.firstIndex(where: { $0.id == id })
-                                else {
-                                    return
-                                }
-                                state.masks[index].inverted = newValue
-                            }
-                        }
-                    ))
+    private var content: some View {
+        if let mask = model.selectedMask {
+            switch model.maskTab {
+            case .shape:
+                shapeControls(mask)
+            case .adjust:
+                adjustControls
+            }
+        } else {
+            VStack(spacing: 8) {
+                Spacer()
+                Text("点「＋ 新建」添加蒙版：线性渐变 / 径向渐变 / 画笔")
                     .font(.caption)
-                    if mask.kind == .brush {
-                        Spacer()
-                        Button("清除笔画") {
-                            model.applyEdit { state in
-                                guard let id = model.selectedMaskId,
-                                      let index = state.masks.firstIndex(where: { $0.id == id })
-                                else {
-                                    return
-                                }
-                                state.masks[index].strokes.removeAll()
-                            }
-                        }
-                        .font(.caption)
-                    }
-                }
-                .padding(.horizontal, 18)
-                .padding(.vertical, 6)
+                    .foregroundStyle(.secondary)
+                Spacer()
             }
         }
     }
 
-    /// 蒙版形状参数滑块（写入选中蒙版）。
-    private func sliderRow(
-        label: String,
+    // MARK: - 形状参数
+
+    private func shapeControls(_ mask: MaskUi) -> some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                switch mask.kind {
+                case .linear:
+                    linearControls(mask)
+                case .radial:
+                    radialControls(mask)
+                case .brush:
+                    brushControls(mask)
+                }
+            }
+            .padding(.vertical, 4)
+        }
+    }
+
+    @ViewBuilder
+    private func linearControls(_ mask: MaskUi) -> some View {
+        hintText("拖动中心线平移 · 拖端点旋转 · 拖黄色手柄或下面的滑块改过渡范围")
+        maskSlider(
+            "位置",
+            value: mask.linearPositionPercent,
+            range: -100...100,
+            neutral: 0,
+            step: 2
+        ) { mask, value in
+            mask.settingLinearPosition(value)
+        }
+        maskSlider(
+            "角度",
+            value: mask.linearAngleWrapped,
+            range: 0...180,
+            neutral: 90,
+            step: 1
+        ) { mask, value in
+            mask.settingLinearAngle(value)
+        }
+        maskSlider(
+            "过渡",
+            value: Float(mask.linearWidth * 100),
+            range: 2...200,
+            neutral: 30,
+            step: 2
+        ) { mask, value in
+            mask.settingLinearWidth(Double(value) / 100)
+        }
+        opacitySlider(mask)
+    }
+
+    @ViewBuilder
+    private func radialControls(_ mask: MaskUi) -> some View {
+        hintText("拖中心移动 · 拖白点缩放 · 拖蓝点旋转 · 拖黄点或滑块调羽化")
+        maskSlider(
+            "位置 X",
+            value: Float(mask.center.x * 100),
+            range: 0...100,
+            neutral: 50,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.center.x = CGFloat(value / 100)
+            return copy
+        }
+        maskSlider(
+            "位置 Y",
+            value: Float(mask.center.y * 100),
+            range: 0...100,
+            neutral: 50,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.center.y = CGFloat(value / 100)
+            return copy
+        }
+        maskSlider(
+            "半径 X",
+            value: Float(mask.radii.width * 100),
+            range: 4...150,
+            neutral: 42,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.radii.width = CGFloat(value / 100)
+            return copy
+        }
+        maskSlider(
+            "半径 Y",
+            value: Float(mask.radii.height * 100),
+            range: 4...150,
+            neutral: 30,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.radii.height = CGFloat(value / 100)
+            return copy
+        }
+        maskSlider(
+            "旋转",
+            value: mask.rotationWrapped,
+            range: 0...180,
+            neutral: 0,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.rotation = value
+            return copy
+        }
+        maskSlider(
+            "羽化",
+            value: mask.radialFeather,
+            range: 0...100,
+            neutral: 30,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.radialFeather = value
+            return copy
+        }
+        opacitySlider(mask)
+    }
+
+    @ViewBuilder
+    private func brushControls(_ mask: MaskUi) -> some View {
+        hintText("在画面上单指涂抹添加蒙版；双指缩放 / 平移画布")
+        Picker(
+            "",
+            selection: Binding(
+                get: { model.brushErase },
+                set: { model.brushErase = $0 }
+            )
+        ) {
+            Text("画笔").tag(false)
+            Text("擦除").tag(true)
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 4)
+        maskSlider(
+            "大小",
+            value: mask.brushSize,
+            range: 2...100,
+            neutral: 30,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.brushSize = value
+            return copy
+        }
+        maskSlider(
+            "羽化",
+            value: mask.brushFeather,
+            range: 0...100,
+            neutral: 50,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.brushFeather = value
+            return copy
+        }
+        maskSlider(
+            "流动",
+            value: mask.brushFlow,
+            range: 0...100,
+            neutral: 100,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.brushFlow = value
+            return copy
+        }
+        maskSlider(
+            "密度",
+            value: mask.brushDensity,
+            range: 0...100,
+            neutral: 100,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.brushDensity = value
+            return copy
+        }
+        opacitySlider(mask)
+        HStack(spacing: 14) {
+            Text("参数只影响之后的笔画；已画的笔画保留落笔设置。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("撤销一笔") {
+                model.undoLastStroke()
+            }
+            .font(.caption)
+            .foregroundStyle(Color.accentColor)
+            .disabled(mask.strokes.isEmpty)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+    }
+
+    private func opacitySlider(_ mask: MaskUi) -> some View {
+        maskSlider(
+            "不透明度",
+            value: mask.opacity,
+            range: 0...100,
+            neutral: 100,
+            step: 1
+        ) { mask, value in
+            var copy = mask
+            copy.opacity = value
+            return copy
+        }
+    }
+
+    private func hintText(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 2)
+    }
+
+    /// 蒙版形状参数滑块（拖动中实时渲染，松手记一步历史）。
+    private func maskSlider(
+        _ label: String,
         value: Float,
         range: ClosedRange<Float>,
         neutral: Float,
         step: Float,
-        keyPath: WritableKeyPath<MaskUi, Float>
+        decimals: Int = 0,
+        apply: @escaping (MaskUi, Float) -> MaskUi
     ) -> some View {
         ValueSliderRow(
             label: label,
@@ -488,17 +548,16 @@ struct MaskPanelView: View {
             range: range,
             neutral: neutral,
             step: step,
-            decimals: 0,
+            decimals: decimals,
             onBegin: { model.beginEdit() },
             onChange: { newValue in
-                model.mutateSelectedMask { $0[keyPath: keyPath] = newValue }
-                model.touchEdit()
+                model.updateSelectedMask { $0 = apply($0, newValue) }
             },
             onCommit: { model.commitEdit() }
         )
     }
 
-    // MARK: - 该蒙版的调色参数
+    // MARK: - 该蒙版的局部调整
 
     private var adjustControls: some View {
         VStack(spacing: 0) {
@@ -513,7 +572,9 @@ struct MaskPanelView: View {
                             range: spec.range,
                             neutral: spec.defaultValue,
                             step: step(for: spec),
-                            decimals: 0,
+                            decimals: spec.key == "exposure"
+                                ? 2
+                                : (spec.range.upperBound - spec.range.lowerBound <= 3 ? 1 : 0),
                             onBegin: { model.beginEdit() },
                             onChange: { model.updateMaskValue(spec.key, $0) },
                             onCommit: { model.commitEdit() }
@@ -567,9 +628,9 @@ struct MaskPanelView: View {
                     .buttonStyle(.plain)
                 }
             }
+            .padding(.horizontal, 12)
+            .padding(.top, 6)
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 8)
     }
 
     private func step(for spec: SliderSpec) -> Float {

@@ -7,7 +7,9 @@
 use rayon::prelude::*;
 
 use crate::error::{FdxmpError, Result};
-pub use crate::params::{BrushSettings, MaskKind, MaskParams, OverlayColor, PeoplePart};
+pub use crate::params::{
+    BrushSettings, BrushStroke, MaskKind, MaskParams, OverlayColor, PeoplePart,
+};
 
 /// 蒙版栅格缓存键（只含影响栅格的字段 + 尺寸）。
 ///
@@ -16,8 +18,14 @@ pub use crate::params::{BrushSettings, MaskKind, MaskParams, OverlayColor, Peopl
 /// 蒙版栅格重建（旧实现把整个 `MaskParams` 序列化进哈希，每次拖动都要重算
 /// 画笔距离场 + 羽化模糊）。
 pub fn mask_key(mask: &MaskParams, width: u32, height: u32) -> u64 {
-    let json = serde_json::to_string(&(&mask.kind, mask.inverted, mask.feather, mask.opacity))
-        .unwrap_or_default();
+    let json = serde_json::to_string(&(
+        &mask.kind,
+        mask.visible,
+        mask.inverted,
+        mask.feather,
+        mask.opacity,
+    ))
+    .unwrap_or_default();
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in json
         .as_bytes()
@@ -78,6 +86,10 @@ pub fn generate_mask(
     width: u32,
     height: u32,
 ) -> Result<MaskRaster> {
+    // 隐藏的蒙版不产生任何覆盖（也不做距离场 / 模糊计算）。
+    if !mask.visible {
+        return Ok(MaskRaster::zeros(width, height));
+    }
     let mut raster = match &mask.kind {
         MaskKind::Brush(settings) => brush_mask(settings, width, height),
         MaskKind::LinearGradient { start, end } => linear_mask(*start, *end, width, height),
@@ -154,7 +166,10 @@ pub fn generate_mask(
     Ok(raster)
 }
 
-/// 线性渐变：起点权重 1 → 终点 0。
+/// 线性渐变：起点一侧权重 1 → 终点一侧 0，中间 smoothstep 平滑过渡。
+///
+/// `start` / `end` 是过渡带的两条边界线锚点（垂直于渐变方向的两条线
+/// 分别过这两点）；50% 中心线过 `(start + end) / 2`。
 pub fn linear_mask(start: [f32; 2], end: [f32; 2], width: u32, height: u32) -> MaskRaster {
     let mut raster = MaskRaster::zeros(width, height);
     let dir = [end[0] - start[0], end[1] - start[1]];
@@ -168,7 +183,7 @@ pub fn linear_mask(start: [f32; 2], end: [f32; 2], width: u32, height: u32) -> M
             for (x, weight) in row.iter_mut().enumerate() {
                 let px = (x as f32 + 0.5) / width as f32;
                 let t = ((px - start[0]) * dir[0] + (py - start[1]) * dir[1]) / length_squared;
-                *weight = 1.0 - t.clamp(0.0, 1.0);
+                *weight = 1.0 - smoothstep(0.0, 1.0, t);
             }
         });
     raster
@@ -275,128 +290,158 @@ pub fn luminance_range_mask(
     raster
 }
 
-/// 画笔：沿笔画路径以圆形笔刷覆盖（含羽化 / 流动 / 密度）。
+/// 画笔：沿笔画路径做**径向渐变 stamp 累积**（大小 / 羽化 / 流动 / 密度 + 擦除）。
+///
+/// 渲染模型与 Lightroom 一致：
+/// - 每条笔画按落笔时的参数快照（缺省沿用蒙版当前设置）沿折线按间距盖章；
+/// - 同一笔画内 stamp 重叠按"流动"累积：`a += (1 - a) · coverage · flow`；
+/// - 单次落笔的覆盖上限由"密度"约束；
+/// - 擦除笔画反向混合：`a *= 1 - coverage · flow`；
+/// - 只对 stamp 包围盒逐行并行盖章，长笔画先按 stamp 间距抽稀。
 pub fn brush_mask(settings: &BrushSettings, width: u32, height: u32) -> MaskRaster {
     let mut raster = MaskRaster::zeros(width, height);
-    if settings.strokes.is_empty() {
+    if settings.strokes.is_empty() || width == 0 || height == 0 {
         return raster;
     }
     let long_edge = width.max(height) as f32;
-    let radius = (settings.size / 100.0).clamp(0.002, 0.5) * long_edge * 0.5;
-    let feather = (settings.feather / 100.0).clamp(0.0, 1.0);
-    let density = (settings.density / 100.0).clamp(0.0, 1.0);
-    let inner = radius * (1.0 - feather).clamp(0.0, 1.0);
-
     for stroke in &settings.strokes {
         if stroke.is_empty() {
             continue;
         }
-        // 点过多时抽稀：距离场开销 ≈ 像素数 × 段数，超长笔画必须限幅。
-        let stroke = &simplify_stroke(stroke);
-        // 只用笔画包围盒 + 半径范围内的像素参与计算
-        let mut min_x = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut min_y = f32::MAX;
-        let mut max_y = f32::MIN;
-        for point in stroke {
-            min_x = min_x.min(point[0]);
-            max_x = max_x.max(point[0]);
-            min_y = min_y.min(point[1]);
-            max_y = max_y.max(point[1]);
-        }
-        let pad = radius / long_edge * 2.0 + 0.02;
-        let x0 = (((min_x - pad) * width as f32).floor().max(0.0)) as u32;
-        let x1 = (((max_x + pad) * width as f32)
-            .ceil()
-            .min(width as f32 - 1.0)) as u32;
-        let y0 = (((min_y - pad) * height as f32).floor().max(0.0)) as u32;
-        let y1 = (((max_y + pad) * height as f32)
-            .ceil()
-            .min(height as f32 - 1.0)) as u32;
-        if x1 < x0 || y1 < y0 {
+        let size = stroke.size.unwrap_or(settings.size);
+        let feather = stroke.feather.unwrap_or(settings.feather);
+        let flow = stroke.flow.unwrap_or(settings.flow);
+        let density = stroke.density.unwrap_or(settings.density);
+        let radius = (size / 100.0).clamp(0.002, 0.5) * long_edge * 0.5;
+        let flow_norm = (flow / 100.0).clamp(0.0, 1.0);
+        let density_norm = (density / 100.0).clamp(0.0, 1.0);
+        if radius <= 0.0 || flow_norm <= 0.0 || density_norm <= 0.0 {
             continue;
         }
-        let row_start = y0 as usize;
-        let row_end = (y1 + 1) as usize;
-        let column_start = x0 as usize;
-        let column_end = (x1 + 1) as usize;
-        let width_usize = width as usize;
-
-        raster.weights[row_start * width_usize..row_end * width_usize]
-            .par_chunks_mut(width_usize)
-            .enumerate()
-            .for_each(|(row_index, row)| {
-                let y = row_start + row_index;
-                let py = (y as f32 + 0.5) / height as f32;
-                for (x, cell) in row
-                    .iter_mut()
-                    .enumerate()
-                    .take(column_end)
-                    .skip(column_start)
-                {
-                    let px = (x as f32 + 0.5) / width as f32;
-                    let distance = distance_to_polyline(&[px, py], stroke);
-                    let coverage = if distance <= inner {
-                        1.0
-                    } else if distance >= radius {
-                        0.0
-                    } else {
-                        1.0 - (distance - inner) / (radius - inner).max(1e-3)
-                    };
-                    if coverage > cell.max(0.0) {
-                        *cell = coverage * density;
-                    }
-                }
-            });
+        let inner = radius * (1.0 - (feather / 100.0).clamp(0.0, 1.0));
+        for stamp in stroke_stamps(&stroke.points, width, height, radius) {
+            stamp_brush(
+                &mut raster,
+                stamp[0],
+                stamp[1],
+                radius,
+                inner,
+                flow_norm,
+                density_norm,
+                stroke.erase,
+            );
+        }
     }
     raster
 }
 
-/// 笔画点抽稀（超过 128 点时等间隔采样，保留末点）。
-fn simplify_stroke(stroke: &[[f32; 2]]) -> Vec<[f32; 2]> {
-    const MAX_POINTS: usize = 128;
-    if stroke.len() <= MAX_POINTS {
-        return stroke.to_vec();
+/// 把折线按 stamp 间距展开成像素坐标的落笔点（首点必落，末段不足间距则丢弃）。
+fn stroke_stamps(points: &[[f32; 2]], width: u32, height: u32, radius: f32) -> Vec<[f32; 2]> {
+    /// 单条笔画的 stamp 上限（防御性限幅，避免病态输入卡死）。
+    const MAX_STAMPS: usize = 8192;
+    let to_pixel = |point: &[f32; 2]| {
+        [
+            point[0].clamp(0.0, 1.0) * width as f32,
+            point[1].clamp(0.0, 1.0) * height as f32,
+        ]
+    };
+    let spacing = (radius * 0.25).max(1.0);
+    let mut stamps = Vec::new();
+    let first = to_pixel(&points[0]);
+    stamps.push(first);
+    let mut since = 0.0f32;
+    for pair in points.windows(2) {
+        let a = to_pixel(&pair[0]);
+        let b = to_pixel(&pair[1]);
+        let dx = b[0] - a[0];
+        let dy = b[1] - a[1];
+        let length = (dx * dx + dy * dy).sqrt();
+        if length <= 1e-6 {
+            continue;
+        }
+        let dir = [dx / length, dy / length];
+        let mut travelled = 0.0f32;
+        while since + (length - travelled) >= spacing {
+            travelled += spacing - since;
+            stamps.push([a[0] + dir[0] * travelled, a[1] + dir[1] * travelled]);
+            since = 0.0;
+            if stamps.len() >= MAX_STAMPS {
+                return stamps;
+            }
+        }
+        since += length - travelled;
     }
-    let step = (stroke.len() as f32 / MAX_POINTS as f32).ceil() as usize;
-    let mut out: Vec<[f32; 2]> = stroke.iter().step_by(step.max(1)).copied().collect();
-    if let Some(last) = stroke.last() {
-        if out.last() != Some(last) {
-            out.push(*last);
+    stamps
+}
+
+/// 单个 stamp：在包围盒内按羽化径向渐变累积（或擦除）权重。
+#[allow(clippy::too_many_arguments)]
+fn stamp_brush(
+    raster: &mut MaskRaster,
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    inner: f32,
+    flow: f32,
+    density: f32,
+    erase: bool,
+) {
+    let width = raster.width;
+    let height = raster.height;
+    if width == 0 || height == 0 {
+        return;
+    }
+    let x0 = (cx - radius).floor().max(0.0) as u32;
+    let y0 = (cy - radius).floor().max(0.0) as u32;
+    let x1 = (cx + radius).ceil().min(width as f32 - 1.0).max(0.0) as u32;
+    let y1 = (cy + radius).ceil().min(height as f32 - 1.0).max(0.0) as u32;
+    if x1 < x0 || y1 < y0 {
+        return;
+    }
+    let row_start = y0 as usize;
+    let row_end = (y1 + 1) as usize;
+    let column_start = x0 as usize;
+    let column_end = (x1 + 1) as usize;
+    let width_usize = width as usize;
+    let area = (column_end - column_start) * (row_end - row_start);
+    let splat = |row: &mut [f32], row_index: usize| {
+        let y = row_start + row_index;
+        let dy = (y as f32 + 0.5) - cy;
+        for (x, cell) in row
+            .iter_mut()
+            .enumerate()
+            .take(column_end)
+            .skip(column_start)
+        {
+            let dx = (x as f32 + 0.5) - cx;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance >= radius {
+                continue;
+            }
+            let falloff = if distance <= inner {
+                1.0
+            } else {
+                1.0 - smoothstep(inner, radius, distance)
+            };
+            let coverage = falloff * flow;
+            if erase {
+                *cell *= 1.0 - coverage;
+            } else {
+                *cell = (*cell + (1.0 - *cell) * coverage).min(density);
+            }
+        }
+    };
+    let region = &mut raster.weights[row_start * width_usize..row_end * width_usize];
+    if area >= 4096 {
+        region
+            .par_chunks_mut(width_usize)
+            .enumerate()
+            .for_each(|(row_index, row)| splat(row, row_index));
+    } else {
+        for (row_index, row) in region.chunks_mut(width_usize).enumerate() {
+            splat(row, row_index);
         }
     }
-    out
-}
-
-fn distance_to_polyline(point: &[f32; 2], stroke: &[[f32; 2]]) -> f32 {
-    if stroke.len() == 1 {
-        let dx = point[0] - stroke[0][0];
-        let dy = point[1] - stroke[0][1];
-        return (dx * dx + dy * dy).sqrt();
-    }
-    let mut best = f32::MAX;
-    for pair in stroke.windows(2) {
-        best = best.min(distance_to_segment(point, &pair[0], &pair[1]));
-    }
-    best
-}
-
-fn distance_to_segment(point: &[f32; 2], start: &[f32; 2], end: &[f32; 2]) -> f32 {
-    let dx = end[0] - start[0];
-    let dy = end[1] - start[1];
-    let length_squared = dx * dx + dy * dy;
-    if length_squared <= 1e-9 {
-        let px = point[0] - start[0];
-        let py = point[1] - start[1];
-        return (px * px + py * py).sqrt();
-    }
-    let t = (((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / length_squared)
-        .clamp(0.0, 1.0);
-    let cx = start[0] + t * dx;
-    let cy = start[1] + t * dy;
-    let px = point[0] - cx;
-    let py = point[1] - cy;
-    (px * px + py * py).sqrt()
 }
 
 fn box_blur(raster: &mut MaskRaster, radius: usize) {
@@ -543,11 +588,146 @@ mod tests {
             flow: 100.0,
             density: 100.0,
             auto_mask: false,
-            strokes: vec![vec![[0.2, 0.5], [0.8, 0.5]]],
+            strokes: vec![BrushStroke::new(vec![[0.2, 0.5], [0.8, 0.5]])],
         };
         let raster = brush_mask(&settings, 100, 100);
         assert!(raster.get(50, 50) > 0.9, "笔画中心应被选中");
         assert!(raster.get(50, 10) < 0.05, "远离笔画不应被选中");
+    }
+
+    #[test]
+    fn brush_erase_stroke_subtracts_coverage() {
+        let mut settings = BrushSettings {
+            size: 20.0,
+            feather: 100.0,
+            flow: 100.0,
+            density: 100.0,
+            auto_mask: false,
+            strokes: vec![BrushStroke::new(vec![[0.2, 0.5], [0.8, 0.5]])],
+        };
+        let painted = brush_mask(&settings, 100, 100);
+        assert!(painted.get(50, 50) > 0.9);
+
+        // 擦除笔画（从右往左擦回）应把中间擦掉，端点保留。
+        settings
+            .strokes
+            .push(BrushStroke::erase(vec![[0.9, 0.5], [0.5, 0.5]]));
+        let erased = brush_mask(&settings, 100, 100);
+        assert!(erased.get(85, 50) < 0.1, "擦除笔画起点应完全擦掉");
+        assert!(
+            erased.get(50, 50) < painted.get(50, 50) * 0.5,
+            "擦除后中心覆盖应显著下降：{} vs {}",
+            erased.get(50, 50),
+            painted.get(50, 50)
+        );
+        assert!(
+            erased.get(30, 50) > 0.5,
+            "未经过的笔画段应保留覆盖：{}",
+            erased.get(30, 50)
+        );
+    }
+
+    #[test]
+    fn brush_flow_and_density_limit_coverage() {
+        let stroke = BrushStroke::new(vec![[0.5, 0.5]]);
+        // 密度 60、流动 50：单点落笔上限不超过密度。
+        let settings = BrushSettings {
+            size: 40.0,
+            feather: 0.0,
+            flow: 50.0,
+            density: 60.0,
+            auto_mask: false,
+            strokes: vec![stroke.clone()],
+        };
+        let raster = brush_mask(&settings, 200, 200);
+        let center = raster.get(100, 100);
+        assert!(
+            center > 0.25 && center <= 0.6 + 1e-3,
+            "密度应封顶：{center}"
+        );
+
+        // 流动 100、密度 100：一笔应接近全选。
+        let full = BrushSettings {
+            size: 40.0,
+            feather: 0.0,
+            flow: 100.0,
+            density: 100.0,
+            auto_mask: false,
+            strokes: vec![stroke],
+        };
+        assert!(brush_mask(&full, 200, 200).get(100, 100) > 0.95);
+    }
+
+    #[test]
+    fn brush_stroke_parameter_snapshot_wins_over_mask_settings() {
+        let mut stroke = BrushStroke::new(vec![[0.5, 0.5]]);
+        stroke.density = Some(20.0);
+        let settings = BrushSettings {
+            size: 40.0,
+            feather: 0.0,
+            flow: 100.0,
+            density: 100.0,
+            auto_mask: false,
+            strokes: vec![stroke],
+        };
+        let raster = brush_mask(&settings, 200, 200);
+        assert!(raster.get(100, 100) <= 0.2 + 1e-3, "落笔参数快照应优先生效");
+    }
+
+    #[test]
+    fn brush_strokes_parse_legacy_and_object_formats() {
+        // v0.3 旧格式：纯点数组。
+        let legacy = r#"{"size":30.0,"feather":50.0,"flow":100.0,"density":100.0,"auto_mask":false,"strokes":[[[0.1,0.2],[0.3,0.4]]]}"#;
+        let settings: BrushSettings = serde_json::from_str(legacy).expect("旧格式应能解析");
+        assert_eq!(settings.strokes.len(), 1);
+        assert_eq!(settings.strokes[0].points.len(), 2);
+        assert!(!settings.strokes[0].erase);
+
+        // v0.4 对象格式：笔画自带参数与擦除标记。
+        let modern = r#"{"size":30.0,"strokes":[{"points":[[0.1,0.2]],"erase":true,"size":12.0,"feather":40.0,"flow":80.0,"density":90.0}]}"#;
+        let settings: BrushSettings = serde_json::from_str(modern).expect("对象格式应能解析");
+        assert!(settings.strokes[0].erase);
+        assert_eq!(settings.strokes[0].size, Some(12.0));
+
+        // 序列化回去仍是对象格式。
+        let json = serde_json::to_string(&settings).expect("应能序列化");
+        assert!(json.contains("\"erase\":true"), "{json}");
+    }
+
+    #[test]
+    fn invisible_mask_is_empty() {
+        let image = gray_image(16, 16, 128);
+        let mut params = mask(MaskKind::LuminanceRange {
+            min: 0.3,
+            max: 0.7,
+            smoothness: 20.0,
+        });
+        params.visible = false;
+        let raster = generate_mask(&params, &image, 16, 16).unwrap();
+        assert!(raster.mean() < 1e-6, "隐藏的蒙版不应有任何覆盖");
+
+        params.visible = true;
+        assert!(generate_mask(&params, &image, 16, 16).unwrap().mean() > 0.9);
+    }
+
+    #[test]
+    fn linear_transition_is_smoothstep() {
+        let raster = linear_mask([0.0, 0.5], [1.0, 0.5], 101, 16);
+        // 边界处为 100% / 0%，中心线为 50%。
+        assert!(raster.get(0, 8) > 0.99, "起点边界应接近 1");
+        assert!(raster.get(100, 8) < 0.01, "终点边界应接近 0");
+        let middle = raster.get(50, 8);
+        assert!(
+            (middle - 0.5).abs() < 0.02,
+            "中心线（50% 过渡线）应接近 0.5：{middle}"
+        );
+        // smoothstep 在靠近两端时切线为 0（比线性坡道更平），中段更陡：
+        // 25% 处应高于线性坡道的 0.75。
+        let quarter = raster.get(25, 8);
+        assert!(
+            (quarter - 0.841).abs() < 0.02,
+            "过渡应是 smoothstep（25% 处 ≈0.841）而非线性 0.75：{quarter}"
+        );
     }
 
     #[test]

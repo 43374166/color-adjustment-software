@@ -1,5 +1,14 @@
 # fdxmp PROJECT_REPORT
 
+> 更新（2026-10-10）：**0.4.0 局部蒙版模块**。iOS 端蒙版编辑器按 Lightroom Mobile
+> 交互重做（线性渐变 / 径向渐变 / 画笔三种）：画布控件（中心线 / 端点 / 过渡边界 /
+> 椭圆 / 旋转与羽化手柄）、画笔涂抹与擦除、一笔撤销、蒙版列表（缩略图 / 显示隐藏 /
+> 复制 / 重命名 / 删除）、真实 alpha 的红色叠加（新增 FFI `fdxmp_mask_overlay_rgba`）。
+> 核心侧：蒙版 `visible` 字段、画笔笔画模型（点序列 + 落笔参数快照 + 擦除，
+> 兼容 v0.3 点数组）、stamp 累积渲染（flow / density 生效）、线性 smoothstep、
+> 蒙版栅格自适应分辨率（预览快、导出细）。详见
+> [`docs/MASK_MODULE.md`](docs/MASK_MODULE.md)。
+
 > 更新（2026-10-06）：色彩管线经过多轮修复（P0 三连、线性 f16 工作空间、色相 / 色调
 > 分区重写、输入 / 导出色彩管理闭环、白平衡色适应 + 颜色分级重做），
 > 最新行为、性能与未修台账以 [`docs/COLOR_FIX_LOG.md`](docs/COLOR_FIX_LOG.md) 为准；

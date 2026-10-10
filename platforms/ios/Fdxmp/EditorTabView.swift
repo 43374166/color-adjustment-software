@@ -18,6 +18,8 @@ struct EditorTabView: View {
     @State private var basePan: CGSize = .zero
     /// 长按看原图后，短时间内忽略单击（避免松手瞬间触发沉浸切换）。
     @State private var suppressTapUntil = Date.distantPast
+    /// 蒙版画布交互控制器（拖动 / 涂抹 / 双指手势）。
+    @State private var maskController = MaskCanvasController()
 
     var body: some View {
         Group {
@@ -38,6 +40,7 @@ struct EditorTabView: View {
         .onChange(of: model.tool) { _ in
             resetZoom()
             model.clearDetailPreview()
+            maskController.reset()
         }
         .onChange(of: zoom) { value in
             // 放大时拉取高分辨率帧（原像素细节），缩回 1x 释放。
@@ -180,65 +183,104 @@ struct EditorTabView: View {
 
     private var previewArea: some View {
         GeometryReader { geo in
-            ZStack {
-                Color.black
-                if let image = shownImage {
-                    Image(uiImage: image)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(width: geo.size.width, height: geo.size.height)
-                        .scaleEffect(zoom)
-                        .offset(pan)
-                } else if model.isLoading {
-                    VStack(spacing: 10) {
-                        ProgressView()
-                            .tint(.white)
-                        Text("正在加载照片")
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-                if model.tool == .crop {
-                    CropOverlayView(model: model, imageSize: previewImageSize)
-                }
+            Group {
                 if model.tool == .mask {
-                    MaskOverlayView(model: model, imageSize: previewImageSize)
-                }
-                if !immersive {
-                    VStack {
-                        HStack {
-                            if model.isRendering {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .tint(.white)
-                            }
-                            Spacer()
-                            if model.tool != .crop && model.tool != .mask {
-                                HistogramOverlay(data: model.histogram)
-                                    .frame(width: 132, height: 76)
+                    // 蒙版模式：触摸全部交给 MaskTouchLayer（单指操作蒙版，双指缩放 / 平移）。
+                    previewBody(geo: geo)
+                } else {
+                    previewBody(geo: geo)
+                        .contentShape(Rectangle())
+                        .gesture(previewGesture())
+                        .onTapGesture(count: 2) {
+                            toggleZoom()
+                        }
+                        .onTapGesture {
+                            if Date() < suppressTapUntil { return }
+                            guard overlayEnabled else { return }
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                immersive.toggle()
                             }
                         }
-                        Spacer()
-                    }
-                    .padding(10)
+                        .simultaneousGesture(holdToPreviewGesture())
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
-            .contentShape(Rectangle())
-            .gesture(previewGesture())
-            .onTapGesture(count: 2) {
-                toggleZoom()
-            }
-            .onTapGesture {
-                if Date() < suppressTapUntil { return }
-                guard overlayEnabled else { return }
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    immersive.toggle()
-                }
-            }
-            .simultaneousGesture(holdToPreviewGesture())
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    @ViewBuilder
+    private func previewBody(geo: GeometryProxy) -> some View {
+        ZStack {
+            Color.black
+            if let image = shownImage {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .scaleEffect(zoom)
+                    .offset(pan)
+            } else if model.isLoading {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .tint(.white)
+                    Text("正在加载照片")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            if model.tool == .crop {
+                CropOverlayView(model: model, imageSize: previewImageSize)
+            }
+            if model.tool == .mask {
+                MaskOverlayLayer(
+                    model: model,
+                    imageSize: previewImageSize,
+                    viewSize: geo.size,
+                    zoom: zoom,
+                    pan: pan
+                )
+                MaskTouchLayer { event in
+                    handleMaskTouch(event, viewSize: geo.size)
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+            }
+            if !immersive {
+                VStack {
+                    HStack {
+                        if model.isRendering {
+                            ProgressView()
+                                .controlSize(.small)
+                                .tint(.white)
+                        }
+                        Spacer()
+                        if model.tool != .crop && model.tool != .mask {
+                            HistogramOverlay(data: model.histogram)
+                                .frame(width: 132, height: 76)
+                        }
+                    }
+                    Spacer()
+                }
+                .padding(10)
+            }
+        }
+    }
+
+    /// 蒙版触摸事件 → 蒙版控件 / 画布操作。
+    private func handleMaskTouch(_ event: MaskTouchEvent, viewSize: CGSize) {
+        let geometry = MaskCanvasGeometry(
+            imageSize: previewImageSize,
+            viewSize: viewSize,
+            zoom: zoom,
+            pan: pan
+        )
+        maskController.handle(
+            event,
+            geometry: geometry,
+            model: model,
+            zoom: $zoom,
+            pan: $pan
+        )
     }
 
     /// 预览手势：双指缩放 + （放大后）单指平移。
@@ -322,7 +364,7 @@ struct EditorTabView: View {
         case .presets: return 210
         case .edit: return model.category == .curves ? 360 : 300
         case .crop: return 210
-        case .mask: return 320
+        case .mask: return 380
         }
     }
 

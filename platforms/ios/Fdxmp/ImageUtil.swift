@@ -85,6 +85,44 @@ enum ImageUtil {
         return UIImage(cgImage: cgImage)
     }
 
+    /// 盒式降采样像素缓冲（蒙版拖动 / 涂抹时的低分辨率预览用，纯 CPU 搬运）。
+    static func downscaled(buffer: RgbaBuffer, maxEdge: Int) -> RgbaBuffer? {
+        let longEdge = max(buffer.width, buffer.height)
+        guard longEdge > maxEdge, buffer.width > 0, buffer.height > 0, maxEdge > 0 else {
+            return nil
+        }
+        let scale = Double(maxEdge) / Double(longEdge)
+        let width = max(1, Int((Double(buffer.width) * scale).rounded()))
+        let height = max(1, Int((Double(buffer.height) * scale).rounded()))
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        for y in 0..<height {
+            let y0 = y * buffer.height / height
+            let y1 = max(y0 + 1, (y + 1) * buffer.height / height)
+            for x in 0..<width {
+                let x0 = x * buffer.width / width
+                let x1 = max(x0 + 1, (x + 1) * buffer.width / width)
+                var sums = [Int](repeating: 0, count: 4)
+                var count = 0
+                for sourceY in y0..<min(y1, buffer.height) {
+                    let rowBase = sourceY * buffer.width
+                    for sourceX in x0..<min(x1, buffer.width) {
+                        let index = (rowBase + sourceX) * 4
+                        for channel in 0..<4 {
+                            sums[channel] += Int(buffer.pixels[index + channel])
+                        }
+                        count += 1
+                    }
+                }
+                guard count > 0 else { continue }
+                let target = (y * width + x) * 4
+                for channel in 0..<4 {
+                    pixels[target + channel] = UInt8(sums[channel] / count)
+                }
+            }
+        }
+        return RgbaBuffer(pixels: pixels, width: width, height: height)
+    }
+
     /// 按最长边缩放并规范化方向（绘制一次同时完成方向校正与缩放）。
     private static func redraw(_ image: UIImage, maxEdge: Int) -> UIImage {
         let pixelWidth = image.size.width * image.scale

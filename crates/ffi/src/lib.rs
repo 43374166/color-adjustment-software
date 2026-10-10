@@ -554,6 +554,68 @@ pub unsafe extern "C" fn fdxmp_render_memory_rgba(
     })
 }
 
+/// 生成单个蒙版的叠加层（红色半透明，预乘 RGBA8），返回缓冲区
+/// （调用方用 `fdxmp_bytes_free(ptr, len)` 释放）；失败返回 NULL。
+///
+/// 缓冲区前 8 字节为大端 `width` / `height`，其后为预乘 RGBA8 像素，
+/// 可直接贴到预览图上（移动端蒙版编辑器的红色覆盖层 / 蒙版列表缩略图）。
+/// 只支持几何型蒙版（画笔 / 线性 / 径向）；隐藏的蒙版返回全透明叠加。
+///
+/// # Safety
+///
+/// `params_json`、`mask_id` 必须为合法 C 字符串；`out_width`、`out_height`、
+/// `out_len` 必须为非空可写指针，且未被释放。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_mask_overlay_rgba(
+    params_json: *const c_char,
+    mask_id: *const c_char,
+    width: u32,
+    height: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let mask_id = match cstr_to_str(mask_id, "mask_id") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        match fdxmp_core::preview::render_mask_overlay_rgba(params_json, mask_id, width, height) {
+            Ok(overlay) => {
+                let mut payload = Vec::with_capacity(8 + overlay.rgba.len());
+                payload.extend_from_slice(&overlay.width.to_be_bytes());
+                payload.extend_from_slice(&overlay.height.to_be_bytes());
+                payload.extend_from_slice(&overlay.rgba);
+                *out_width = overlay.width;
+                *out_height = overlay.height;
+                let mut boxed = payload.into_boxed_slice();
+                *out_len = boxed.len();
+                let pointer = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                pointer
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 缓存总大小（字节）；失败返回 [`FDXMP_U64_ERR`]。
 ///
 /// # Safety
@@ -703,6 +765,54 @@ mod tests {
                 payload[8]
             );
             fdxmp_bytes_free(pointer, out_len);
+        }
+    }
+
+    #[test]
+    fn mask_overlay_through_ffi() {
+        // SAFETY: 参数 C 字符串与输出指针均为本测试构造的合法内存。
+        unsafe {
+            let params = CString::new(
+                r#"{"version":1,"masks":[{"id":"m1","name":"画笔 1","visible":true,"inverted":false,"feather":0,"opacity":100,"overlay":"red","kind":{"type":"brush","data":{"size":40.0,"feather":50.0,"flow":100.0,"density":100.0,"auto_mask":false,"strokes":[{"points":[[0.5,0.5]],"erase":false}]}}}]}"#,
+            )
+            .unwrap();
+            let mask_id = CString::new("m1").unwrap();
+            let mut out_width = 0u32;
+            let mut out_height = 0u32;
+            let mut out_len = 0usize;
+            let pointer = fdxmp_mask_overlay_rgba(
+                params.as_ptr(),
+                mask_id.as_ptr(),
+                64,
+                64,
+                &mut out_width,
+                &mut out_height,
+                &mut out_len,
+            );
+            assert!(!pointer.is_null());
+            assert_eq!((out_width, out_height), (64, 64));
+            assert_eq!(out_len, 8 + 64 * 64 * 4);
+            let payload = std::slice::from_raw_parts(pointer, out_len);
+            let center = 8 + 4 * (32 * 64 + 32);
+            assert!(payload[center + 3] > 100, "笔画中心应有叠加 alpha");
+            assert!(payload[8 + 3] < 10, "角落应无叠加");
+            fdxmp_bytes_free(pointer, out_len);
+
+            // 未知 id：返回 NULL 并写入错误信息。
+            let missing = CString::new("nope").unwrap();
+            let pointer = fdxmp_mask_overlay_rgba(
+                params.as_ptr(),
+                missing.as_ptr(),
+                64,
+                64,
+                &mut out_width,
+                &mut out_height,
+                &mut out_len,
+            );
+            assert!(pointer.is_null());
+            let message = fdxmp_last_error_message();
+            assert!(!message.is_null());
+            fdxmp_string_free(message);
         }
     }
 
