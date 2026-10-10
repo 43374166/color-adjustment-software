@@ -20,6 +20,10 @@ struct EditorTabView: View {
     @State private var suppressTapUntil = Date.distantPast
     /// 蒙版画布交互控制器（拖动 / 涂抹 / 双指手势）。
     @State private var maskController = MaskCanvasController()
+    /// 分类参数面板是否收起（点同一个分类两次 = 收起 / 再展开）。
+    @State private var categoryCollapsed = false
+    /// 长按分类预览后，短时间内忽略这次点击（避免顺带切换 / 收起）。
+    @State private var suppressCategoryTapUntil = Date.distantPast
 
     var body: some View {
         Group {
@@ -41,6 +45,8 @@ struct EditorTabView: View {
             resetZoom()
             model.clearDetailPreview()
             maskController.reset()
+            categoryCollapsed = false
+            model.endCategoryPreview()
         }
         .onChange(of: zoom) { value in
             // 放大时拉取高分辨率帧（原像素细节），缩回 1x 释放。
@@ -77,7 +83,7 @@ struct EditorTabView: View {
 
     private var editor: some View {
         VStack(spacing: 0) {
-            if !immersive {
+            if !immersive && !hidesChrome {
                 topBar
             }
             previewArea
@@ -85,6 +91,13 @@ struct EditorTabView: View {
                 panel
             }
         }
+        .animation(.easeInOut(duration: 0.24), value: panelHeight)
+        .animation(.easeInOut(duration: 0.24), value: hidesChrome)
+    }
+
+    /// 曲线 / 蒙版下隐藏顶部栏与底部工具条，把空间让给编辑区。
+    private var hidesChrome: Bool {
+        model.tool == .mask || (model.tool == .edit && model.category == .curves)
     }
 
     private var emptyState: some View {
@@ -313,12 +326,12 @@ struct EditorTabView: View {
         return SimultaneousGesture(magnify, drag)
     }
 
-    /// 长按 1 秒看原图：长按识别后继续跟踪手指，松手恢复调色效果。
+    /// 长按 0.5 秒看原图：长按识别后继续跟踪手指，松手恢复调色效果。
     ///
     /// 用"长按 → 串接拖动"的串行手势（而不是 onLongPressGesture 的 pressing 回调），
-    /// 能稳定拿到"按下 1s"与"松手"两个时刻，不会被缩放/拖动手势抢占。
+    /// 能稳定拿到"按下 0.5s"与"松手"两个时刻，不会被缩放/拖动手势抢占。
     private func holdToPreviewGesture() -> some Gesture {
-        LongPressGesture(minimumDuration: 1.0, maximumDistance: 30)
+        LongPressGesture(minimumDuration: 0.5, maximumDistance: 30)
             .sequenced(before: DragGesture(minimumDistance: 0))
             .onChanged { value in
                 guard overlayEnabled else { return }
@@ -362,9 +375,14 @@ struct EditorTabView: View {
     private var panelHeight: CGFloat {
         switch model.tool {
         case .presets: return 210
-        case .edit: return model.category == .curves ? 360 : 300
+        // 曲线 / 蒙版下工具条与顶部栏隐藏，面板整体更高（编辑区更大）。
+        case .edit:
+            if categoryCollapsed {
+                return 64
+            }
+            return model.category == .curves ? 440 : 300
         case .crop: return 210
-        case .mask: return 380
+        case .mask: return 425
         }
     }
 
@@ -385,8 +403,10 @@ struct EditorTabView: View {
                 }
             }
             .frame(height: panelHeight)
-            // 主工具条固定在最底部（Lightroom / Android 布局）。
-            toolBar
+            // 主工具条固定在最底部（Lightroom / Android 布局）；曲线 / 蒙版下隐藏。
+            if !hidesChrome {
+                toolBar
+            }
         }
         .background(Color(white: 0.11))
     }
@@ -458,45 +478,57 @@ struct EditorTabView: View {
 
     // MARK: - 编辑面板（亮度 / 颜色 / 效果 / 细节）
 
+    /// 布局（自下而上）：工具条（最底）→ 分类导航 → 参数 → 子页标签（最上）。
     private var editPanel: some View {
         VStack(spacing: 0) {
-            categoryRow
-            if model.category == .curves {
-                CurvePanelView(model: model)
-            } else if model.category == .color {
-                subTabRow(
-                    ColorTab.allCases.map(\.rawValue),
-                    selected: ColorTab.allCases.firstIndex(of: model.colorTab) ?? 0
-                ) { index in
-                    model.colorTab = ColorTab.allCases[index]
-                }
-                switch model.colorTab {
-                case .base:
-                    sliderList
-                case .hsl:
-                    hslPanel
-                case .grading:
-                    gradingPanel
-                }
-            } else {
-                if model.category == .effects {
-                    subTabRow(
-                        EffectTab.allCases.map(\.rawValue),
-                        selected: EffectTab.allCases.firstIndex(of: model.effectTab) ?? 0
-                    ) { index in
-                        model.effectTab = EffectTab.allCases[index]
-                    }
-                }
-                if model.category == .detail {
-                    subTabRow(
-                        DetailTab.allCases.map(\.rawValue),
-                        selected: DetailTab.allCases.firstIndex(of: model.detailTab) ?? 0
-                    ) { index in
-                        model.detailTab = DetailTab.allCases[index]
-                    }
-                }
-                sliderList
+            if !categoryCollapsed {
+                editSubTabs
+                editContent
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
             }
+            categoryRow
+        }
+    }
+
+    /// 最上面的子页标签（可切换）：颜色/HSL/分级、效果/晕影/颗粒、锐化/降噪。
+    @ViewBuilder
+    private var editSubTabs: some View {
+        if model.category == .color {
+            subTabRow(
+                ColorTab.allCases.map(\.rawValue),
+                selected: ColorTab.allCases.firstIndex(of: model.colorTab) ?? 0
+            ) { index in
+                model.colorTab = ColorTab.allCases[index]
+            }
+        } else if model.category == .effects {
+            subTabRow(
+                EffectTab.allCases.map(\.rawValue),
+                selected: EffectTab.allCases.firstIndex(of: model.effectTab) ?? 0
+            ) { index in
+                model.effectTab = EffectTab.allCases[index]
+            }
+        } else if model.category == .detail {
+            subTabRow(
+                DetailTab.allCases.map(\.rawValue),
+                selected: DetailTab.allCases.firstIndex(of: model.detailTab) ?? 0
+            ) { index in
+                model.detailTab = DetailTab.allCases[index]
+            }
+        }
+    }
+
+    /// 参数区（滑块 / HSL / 分级 / 曲线）。
+    @ViewBuilder
+    private var editContent: some View {
+        if model.category == .curves {
+            CurvePanelView(model: model)
+        } else if model.category == .color, model.colorTab == .hsl {
+            hslPanel
+        } else if model.category == .color, model.colorTab == .grading {
+            gradingPanel
+        } else {
+            sliderList
         }
     }
 
@@ -524,7 +556,8 @@ struct EditorTabView: View {
             HStack(spacing: 12) {
                 ForEach(EditCategory.allCases) { category in
                     Button {
-                        model.category = category
+                        guard Date() >= suppressCategoryTapUntil else { return }
+                        toggleCategory(category)
                     } label: {
                         VStack(spacing: 5) {
                             Image(systemName: category.icon)
@@ -549,11 +582,40 @@ struct EditorTabView: View {
                         )
                     }
                     .buttonStyle(.plain)
+                    .simultaneousGesture(categoryHoldGesture(category))
                 }
             }
         }
         .padding(.horizontal, 12)
-        .padding(.top, 8)
+        .padding(.vertical, 6)
+    }
+
+    /// 点分类：从下往上展开参数；再点同一个分类收起。
+    private func toggleCategory(_ category: EditCategory) {
+        withAnimation(.easeInOut(duration: 0.24)) {
+            if model.category == category {
+                categoryCollapsed.toggle()
+            } else {
+                model.category = category
+                categoryCollapsed = false
+            }
+        }
+    }
+
+    /// 长按分类（0.5s）：临时把该分类的参数归零，松手恢复——
+    /// 和「长按照片看原图」一样用来单独对比这个分类的调色变化。
+    private func categoryHoldGesture(_ category: EditCategory) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.5, maximumDistance: 40)
+            .sequenced(before: DragGesture(minimumDistance: 0))
+            .onChanged { value in
+                if case .second(true, _) = value {
+                    model.beginCategoryPreview(category)
+                    suppressCategoryTapUntil = Date().addingTimeInterval(0.4)
+                }
+            }
+            .onEnded { _ in
+                model.endCategoryPreview()
+            }
     }
 
     private func subTabRow(

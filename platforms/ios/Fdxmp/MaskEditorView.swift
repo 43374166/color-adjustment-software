@@ -9,13 +9,12 @@ struct MaskPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            headerRow
-            chipRow
-            actionRow
             subtabRow
+            content
             Divider()
                 .overlay(Color.white.opacity(0.08))
-            content
+            actionRow
+            listRow
         }
         .alert("重命名蒙版", isPresented: renameAlertBinding) {
             TextField("名称", text: $renameText)
@@ -36,41 +35,26 @@ struct MaskPanelView: View {
         )
     }
 
-    // MARK: - 顶部：标题 + 完成
+    // MARK: - 最下：蒙版列表（缩略图 + 显示 / 隐藏）+ 新建 + 完成
 
-    private var headerRow: some View {
-        HStack {
-            Text("蒙版")
-                .font(.subheadline.weight(.semibold))
-            if let mask = model.selectedMask {
-                Text(mask.name)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+    private var listRow: some View {
+        HStack(spacing: 4) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(model.state.masks) { mask in
+                        maskCard(mask)
+                    }
+                    addCard
+                }
+                .padding(.leading, 14)
+                .padding(.vertical, 6)
             }
-            Spacer()
             Button("完成") {
                 model.selectTool(.edit)
             }
             .font(.caption)
             .foregroundStyle(Color.accentColor)
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
-    }
-
-    // MARK: - 蒙版列表（横向卡片：缩略图 + 名称 + 显示 / 隐藏）
-
-    private var chipRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 10) {
-                ForEach(model.state.masks) { mask in
-                    maskCard(mask)
-                }
-                addCard
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            .padding(.horizontal, 12)
         }
     }
 
@@ -267,7 +251,7 @@ struct MaskPanelView: View {
         HStack(spacing: 18) {
             ForEach(MaskPanelTab.allCases) { tab in
                 Button {
-                    model.maskTab = tab
+                    model.setMaskTab(tab)
                 } label: {
                     VStack(spacing: 3) {
                         Text(tab.rawValue)
@@ -283,9 +267,15 @@ struct MaskPanelView: View {
                 .buttonStyle(.plain)
             }
             Spacer()
+            if let mask = model.selectedMask {
+                Text(mask.name)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
         }
         .padding(.horizontal, 16)
-        .padding(.top, 4)
+        .padding(.top, 10)
         .padding(.bottom, 4)
     }
 
@@ -561,7 +551,6 @@ struct MaskPanelView: View {
 
     private var adjustControls: some View {
         VStack(spacing: 0) {
-            categoryRow
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(maskSliders) { spec in
@@ -583,6 +572,9 @@ struct MaskPanelView: View {
                 }
                 .padding(.vertical, 6)
             }
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+            categoryRow
         }
     }
 
@@ -629,7 +621,7 @@ struct MaskPanelView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.top, 6)
+            .padding(.vertical, 6)
         }
     }
 

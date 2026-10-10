@@ -98,7 +98,7 @@ final class EditorModel: ObservableObject {
     @Published var gradingZone: GradingZoneKind = .highlights
     @Published var hslBand: HslBandKind = .red
     @Published var selectedMaskId: String?
-    @Published var maskTab: MaskPanelTab = .shape
+    @Published private(set) var maskTab: MaskPanelTab = .shape
     /// 是否叠加显示当前蒙版（红色半透明覆盖）。
     @Published var maskOverlayVisible = true
     /// 画笔擦除模式（橡皮擦）。
@@ -109,6 +109,8 @@ final class EditorModel: ObservableObject {
     @Published private(set) var maskThumbnails: [String: UIImage] = [:]
     /// 画笔光标（归一化坐标；手指在画布上时非空）。
     @Published var brushCursor: CGPoint?
+    /// 长按分类导航时临时归零预览的分类（松手恢复；不写历史、不落盘）。
+    @Published private(set) var previewCategory: EditCategory?
 
     private(set) var asset: PHAsset?
 
@@ -129,6 +131,8 @@ final class EditorModel: ObservableObject {
     private let maskAssetQueue = DispatchQueue(label: "fdxmp.ios.mask-assets", qos: .userInitiated)
     private var maskAssetToken = 0
     private var maskAssetScheduled = false
+    /// 进入「调整」子页前的叠加显示状态（用于回来时恢复）。
+    private var maskOverlayRestore = true
     private static let imageManager = PHCachingImageManager()
 
     // MARK: - 只读派生值
@@ -576,7 +580,7 @@ final class EditorModel: ObservableObject {
             state.masks.append(mask)
         }
         selectedMaskId = mask.id
-        maskTab = .shape
+        setMaskTab(.shape)
         brushErase = false
     }
 
@@ -689,6 +693,25 @@ final class EditorModel: ObservableObject {
         brushErase = false
         brushCursor = nil
         scheduleMaskAssetsRefresh(immediate: true)
+    }
+
+    /// 切换蒙版面板子页。
+    ///
+    /// 进入「调整」时自动收起红色叠加（调色时只看效果，不被蒙版挡住），
+    /// 回到「蒙版」（形状）子页时恢复原来的叠加显示状态。
+    func setMaskTab(_ tab: MaskPanelTab) {
+        guard maskTab != tab else { return }
+        if tab == .adjust {
+            maskOverlayRestore = maskOverlayVisible
+            maskOverlayVisible = false
+        } else if maskTab == .adjust {
+            maskOverlayVisible = maskOverlayRestore
+            if maskOverlayVisible {
+                // 收起期间可能错过了大图叠加的生成，这里补一次。
+                scheduleMaskAssetsRefresh(immediate: true)
+            }
+        }
+        maskTab = tab
     }
 
     /// 直接修改选中蒙版（面板拖动 / 画布拖动中调用：静默，不落历史）。
@@ -824,12 +847,16 @@ final class EditorModel: ObservableObject {
             maxEdge: CGFloat(EditorLimits.maskThumbnailMaxEdge)
         )
         let selected = selectedMaskId
+        let wantOverlay = maskOverlayVisible
         let token = maskAssetToken
         maskAssetQueue.async { [weak self] in
             var overlays: [String: UIImage] = [:]
             var thumbnails: [String: UIImage] = [:]
             for mask in masks {
-                let target = mask.id == selected ? overlaySize : thumbSize
+                // 叠加层收起时不用生成大图（只留缩略图）。
+                let isSelected = mask.id == selected
+                let wantBig = isSelected && wantOverlay
+                let target = wantBig ? overlaySize : thumbSize
                 guard
                     let result = NativeCore.shared.maskOverlay(
                         paramsJson: json,
@@ -847,7 +874,7 @@ final class EditorModel: ObservableObject {
                 else {
                     continue
                 }
-                if mask.id == selected {
+                if wantBig {
                     overlays[mask.id] = image
                 }
                 thumbnails[mask.id] = image
@@ -873,10 +900,57 @@ final class EditorModel: ObservableObject {
 
     // MARK: - 渲染
 
+    /// 长按分类导航：临时把该分类参数归零（与「长按照片看原图」同款对比手感）。
+    func beginCategoryPreview(_ category: EditCategory) {
+        guard previewCategory != category else { return }
+        previewCategory = category
+        scheduleRender(immediate: true)
+    }
+
+    /// 松开分类导航：恢复预览。
+    func endCategoryPreview() {
+        guard previewCategory != nil else { return }
+        previewCategory = nil
+        scheduleRender(immediate: true)
+    }
+
+    /// 渲染 / 预览用状态：长按分类时把该分类参数归零（取默认值 = 无效果）。
+    private var renderState: EditState {
+        guard let category = previewCategory else { return state }
+        var copy = state
+        switch category {
+        case .light:
+            for spec in EditorSpec.sliders where spec.category == .light {
+                copy.values[spec.key] = spec.defaultValue
+            }
+        case .color:
+            for spec in EditorSpec.sliders where spec.category == .color {
+                copy.values[spec.key] = spec.defaultValue
+            }
+            // 颜色分类下还有 HSL / 颜色分级两个子页，一起归零。
+            copy.hsl.reset()
+            copy.grading.reset()
+        case .effects:
+            for spec in EditorSpec.sliders where spec.category == .effects {
+                copy.values[spec.key] = spec.defaultValue
+            }
+        case .detail:
+            for spec in EditorSpec.sliders where spec.category == .detail {
+                copy.values[spec.key] = spec.defaultValue
+            }
+        case .curves:
+            copy.curves.reset()
+        }
+        return copy
+    }
+
     /// 当前参数 JSON（裁切工具中使用未裁切预览）。
-    private func currentJson(applyCropRect: Bool? = nil) -> String {
+    ///
+    /// `usePreview` = true 时长按分类的临时归零会生效（仅用于渲染预览；
+    /// 保存 / 导出固定传 false，避免把预览状态写进去）。
+    private func currentJson(applyCropRect: Bool? = nil, usePreview: Bool = true) -> String {
         EditJSON.build(
-            state: state,
+            state: usePreview ? renderState : state,
             applyCropRect: applyCropRect ?? (tool != .crop)
         )
     }
@@ -957,7 +1031,7 @@ final class EditorModel: ObservableObject {
                 self.message = "导出失败：无法读取原图"
                 return
             }
-            let json = self.currentJson(applyCropRect: true)
+            let json = self.currentJson(applyCropRect: true, usePreview: false)
             self.renderQueue.async { [weak self] in
                 let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.exportMaxEdge)
                 let result = buffer.flatMap {
@@ -1072,7 +1146,7 @@ final class EditorModel: ObservableObject {
         guard let asset else { return }
         EditStore.save(
             assetId: asset.localIdentifier,
-            json: currentJson(applyCropRect: true)
+            json: currentJson(applyCropRect: true, usePreview: false)
         )
     }
 }
