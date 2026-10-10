@@ -189,7 +189,11 @@ pub fn linear_mask(start: [f32; 2], end: [f32; 2], width: u32, height: u32) -> M
     raster
 }
 
-/// 径向渐变：中心 1 → 边缘 0（椭圆 + 旋转，边缘平滑）。
+/// 径向渐变：内圈 1 → 外圈 0（椭圆 + 旋转，边缘 smoothstep 过渡）。
+///
+/// 旋转在**像素等比空间**里做（`radii` 仍是 `[x, y]` 相对宽高的归一化半径）：
+/// 屏幕上看到的就是标准旋转椭圆，而不是归一化空间旋转后被非等比缩放斜切过的形状。
+/// `inner` 是内圈相对外圈的缩放（0.98 = 硬边缘，越小过渡越宽）。
 pub fn radial_mask(
     center: [f32; 2],
     radii: [f32; 2],
@@ -200,20 +204,23 @@ pub fn radial_mask(
 ) -> MaskRaster {
     let mut raster = MaskRaster::zeros(width, height);
     let (sin, cos) = rotation.to_radians().sin_cos();
-    let rx = radii[0].max(1e-3);
-    let ry = radii[1].max(1e-3);
+    // 像素空间的半轴与中心。
+    let ax = (radii[0].max(1e-3) * width as f32).max(1e-3);
+    let ay = (radii[1].max(1e-3) * height as f32).max(1e-3);
+    let cx = center[0] * width as f32;
+    let cy = center[1] * height as f32;
     let inner_scale = inner.unwrap_or(0.75).clamp(0.0, 0.98);
     raster
         .weights
         .par_chunks_mut(width as usize)
         .enumerate()
         .for_each(|(y, row)| {
-            let py = (y as f32 + 0.5) / height as f32 - center[1];
+            let py = (y as f32 + 0.5) - cy;
             for (x, weight) in row.iter_mut().enumerate() {
-                let px = (x as f32 + 0.5) / width as f32 - center[0];
+                let px = (x as f32 + 0.5) - cx;
                 let local_x = px * cos + py * sin;
                 let local_y = -px * sin + py * cos;
-                let distance = ((local_x / rx).powi(2) + (local_y / ry).powi(2)).sqrt();
+                let distance = ((local_x / ax).powi(2) + (local_y / ay).powi(2)).sqrt();
                 *weight = 1.0 - smoothstep(inner_scale, 1.0, distance);
             }
         });
@@ -555,6 +562,38 @@ mod tests {
         let raster = radial_mask([0.5, 0.5], [0.25, 0.25], 0.0, None, 64, 64);
         assert!(raster.get(32, 32) > 0.95, "中心应为 1");
         assert!(raster.get(0, 0) < 0.05, "角落应为 0");
+    }
+
+    #[test]
+    fn radial_rotation_is_aspect_correct() {
+        // 200×100：rx=0.25（像素半轴 50px）、ry=0.1（10px），旋转 90° 后长轴变成竖直。
+        let raster = radial_mask([0.5, 0.5], [0.25, 0.1], 90.0, Some(0.9), 200, 100);
+        // 中心上方 40px 在长轴（50px）以内 → 选中；正右方 20px 超过短轴（10px）→ 未选中。
+        assert!(
+            raster.get(100, 10) > 0.9,
+            "旋转 90° 后竖直方向仍在椭圆内：{}",
+            raster.get(100, 10)
+        );
+        assert!(
+            raster.get(120, 50) < 0.1,
+            "旋转 90° 后水平方向超出短轴：{}",
+            raster.get(120, 50)
+        );
+        // 未旋转时相反：水平 40px 在长轴内，竖直 20px 超出短轴。
+        let unrotated = radial_mask([0.5, 0.5], [0.25, 0.1], 0.0, Some(0.9), 200, 100);
+        assert!(unrotated.get(140, 50) > 0.9);
+        assert!(unrotated.get(100, 30) < 0.1);
+    }
+
+    #[test]
+    fn radial_feather_transitions_between_inner_and_outer() {
+        // inner=0.5：内圈（半径一半处）为 1，外圈为 0，中间平滑过渡。
+        let raster = radial_mask([0.5, 0.5], [0.4, 0.4], 0.0, Some(0.5), 100, 100);
+        assert!(raster.get(50, 50) > 0.99, "中心应完全选中");
+        assert!(raster.get(50, 30) > 0.9, "内圈以内应接近 1"); // 半径 20/40 = 0.5
+        assert!(raster.get(50, 10) < 0.1, "外圈附近应接近 0"); // 半径 40/40 = 1.0
+        let mid = raster.get(50, 20); // 半径 30/40 = 0.75，内圈与外圈之间
+        assert!(mid > 0.1 && mid < 0.9, "内外圈之间应平滑过渡：{mid}");
     }
 
     #[test]

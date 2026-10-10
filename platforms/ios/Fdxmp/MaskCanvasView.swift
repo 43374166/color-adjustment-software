@@ -261,8 +261,8 @@ enum MaskDragMode: Equatable {
     case linearMove
     /// 拖动端点旋转。
     case linearRotate
-    /// 拖动过渡 / 羽化手柄改变带宽度。
-    case linearFeather
+    /// 拖动某条过渡边界（0 = 100% 一侧，1 = 0% 一侧）——只移动被抓住的那条线。
+    case linearFeather(Int)
     /// 移动椭圆中心。
     case radialMove
     /// 旋转椭圆。
@@ -286,17 +286,51 @@ enum MaskHitTester {
     /// 椭圆四向手柄角度。
     static let cardinalAngles: [CGFloat] = [0, .pi / 2, .pi, -.pi / 2]
 
-    /// 椭圆参数点（归一化坐标）：中心 + R(rotation)·(rx·s·cos t, ry·s·sin t)。
-    static func radialPoint(_ mask: MaskUi, angle: CGFloat, scale: CGFloat) -> CGPoint {
+    /// 椭圆参数点（**内容坐标**）：中心 + R(rotation)·(ax·s·cos t, ay·s·sin t)。
+    ///
+    /// 旋转在像素等比空间里做（与核心 `radial_mask` 一致）：屏幕上是标准旋转椭圆。
+    static func radialPoint(
+        _ mask: MaskUi,
+        angle: CGFloat,
+        scale: CGFloat,
+        fitted: CGRect
+    ) -> CGPoint {
         let radians = CGFloat(mask.rotation) * .pi / 180
-        let localX = mask.radii.width * scale * cos(angle)
-        let localY = mask.radii.height * scale * sin(angle)
+        let localX = mask.radii.width * scale * fitted.width * cos(angle)
+        let localY = mask.radii.height * scale * fitted.height * sin(angle)
         let cosR = cos(radians)
         let sinR = sin(radians)
+        let center = canvasPoint(mask.center, fitted: fitted)
         return CGPoint(
-            x: mask.center.x + localX * cosR - localY * sinR,
-            y: mask.center.y + localX * sinR + localY * cosR
+            x: center.x + localX * cosR - localY * sinR,
+            y: center.y + localX * sinR + localY * cosR
         )
+    }
+
+    /// 椭圆半轴（内容点）。
+    static func radialAxes(_ mask: MaskUi, fitted: CGRect) -> CGVector {
+        CGVector(
+            dx: max(mask.radii.width * fitted.width, 1e-4),
+            dy: max(mask.radii.height * fitted.height, 1e-4)
+        )
+    }
+
+    /// 点相对椭圆中心的局部向量（内容点，已去掉旋转）。
+    static func inverseRotate(_ mask: MaskUi, point: CGPoint, fitted: CGRect) -> CGVector {
+        let radians = CGFloat(mask.rotation) * .pi / 180
+        let cosR = cos(radians)
+        let sinR = sin(radians)
+        let center = canvasPoint(mask.center, fitted: fitted)
+        let dx = point.x - center.x
+        let dy = point.y - center.y
+        return CGVector(dx: dx * cosR + dy * sinR, dy: -dx * sinR + dy * cosR)
+    }
+
+    /// 椭圆参数角（内容坐标；用于旋转手柄跟手与边界判定）。
+    static func localAngle(_ mask: MaskUi, point: CGPoint, fitted: CGRect) -> CGFloat {
+        let local = inverseRotate(mask, point: point, fitted: fitted)
+        let axes = radialAxes(mask, fitted: fitted)
+        return atan2(local.dy / axes.dy, local.dx / axes.dx)
     }
 
     /// 内圈缩放（1 = 外圈，0.02 = 几乎全过渡）。
@@ -321,15 +355,17 @@ enum MaskHitTester {
         guard fitted.width > 0, fitted.height > 0 else { return .none }
         let center = canvasPoint(mask.linearCenter, fitted: fitted)
         let halfSpan = min(fitted.width, fitted.height) * linearPinHalfSpanRatio
-        let dir = canvasVector(mask.linearDirection, fitted: fitted)
-        let length = max(hypot(dir.dx, dir.dy), 1e-6)
-        let normal = CGVector(dx: -dir.dy / length, dy: dir.dx / length)
+        // 中心线 / 过渡边界的共同方向 = 归一化空间垂线在内容空间的像。
+        let dir = mask.linearDirection
+        let across = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)
+        let acrossLength = max(hypot(across.dx, across.dy), 1e-6)
+        let normal = CGVector(dx: across.dx / acrossLength, dy: across.dy / acrossLength)
         // 中心线端点（旋转手柄）。
         let pins = [
             CGPoint(x: center.x - normal.dx * halfSpan, y: center.y - normal.dy * halfSpan),
             CGPoint(x: center.x + normal.dx * halfSpan, y: center.y + normal.dy * halfSpan),
         ]
-        // 距离最近的手柄优先（旋转端点 vs 边界上的羽化手柄可能靠得很近）。
+        // 距离最近的手柄优先（旋转端点 vs 边界上的过渡手柄可能靠得很近）。
         var bestMode = MaskDragMode.none
         var bestDistance = gripRadius
         for pin in pins {
@@ -339,32 +375,34 @@ enum MaskHitTester {
                 bestMode = .linearRotate
             }
         }
-        for anchor in [mask.start, mask.end] {
+        for (index, anchor) in [mask.start, mask.end].enumerated() {
             let grip = canvasPoint(anchor, fitted: fitted)
             let distance = hypot(grip.x - point.x, grip.y - point.y)
             if distance < bestDistance {
                 bestDistance = distance
-                bestMode = .linearFeather
+                bestMode = .linearFeather(index)
             }
         }
         if bestMode != .none {
             return bestMode
         }
-        // 中心线 / 边界线距离（都沿渐变方向度量）。
-        let offset = CGVector(dx: point.x - center.x, dy: point.y - center.y)
-        let centerDistance = abs(offset.dx * normal.dx + offset.dy * normal.dy)
-        let gradient = CGVector(dx: dir.dx / length, dy: dir.dy / length)
-        let anchorA = canvasPoint(mask.start, fitted: fitted)
-        let anchorB = canvasPoint(mask.end, fitted: fitted)
-        let distanceA = abs((point.x - anchorA.x) * gradient.dx + (point.y - anchorA.y) * gradient.dy)
-        let distanceB = abs((point.x - anchorB.x) * gradient.dx + (point.y - anchorB.y) * gradient.dy)
-        let boundaryDistance = min(distanceA, distanceB)
-        // 靠近某条过渡边界（比中心线更近）→ 调整过渡范围。
+        // 到三条线的距离用**归一化空间的投影参数 t** 度量（与核心 / 绘制完全一致，
+        // 不能直接拿内容空间的垂距，否则非正方形图片上会差一条斜线）。
+        let normalized = geometry.normalized(fromContent: point)
+        let t = MaskDragSession.parameter(mask, normalized)
+        let bandPixels = hypot(
+            (mask.end.x - mask.start.x) * fitted.width,
+            (mask.end.y - mask.start.y) * fitted.height
+        )
+        let centerDistance = abs(t - 0.5) * bandPixels
+        let boundaryDistance = min(abs(t), abs(t - 1)) * bandPixels
+        // 靠近某条过渡边界（比中心线更近）→ 只移动那条边界。
         if boundaryDistance + 4 < centerDistance, boundaryDistance < 26 {
-            return .linearFeather
+            return .linearFeather(t < 0.5 ? 0 : 1)
         }
         // 中心线附近 → 平移。
-        let along = abs(offset.dx * normal.dy - offset.dy * normal.dx)
+        let offset = CGVector(dx: point.x - center.x, dy: point.y - center.y)
+        let along = abs(offset.dx * normal.dx + offset.dy * normal.dy)
         if centerDistance < lineDistance, along < halfSpan + 40 {
             return .linearMove
         }
@@ -385,7 +423,7 @@ enum MaskHitTester {
         var bestMode = MaskDragMode.none
         var bestDistance = gripRadius
         // 旋转手柄（外圈顶部再外置一段）。
-        let top = canvasPoint(radialPoint(mask, angle: -.pi / 2, scale: 1), fitted: fitted)
+        let top = radialPoint(mask, angle: -.pi / 2, scale: 1, fitted: fitted)
         let directionX = top.x - center.x
         let directionY = top.y - center.y
         let directionLength = max(hypot(directionX, directionY), 1e-6)
@@ -400,16 +438,13 @@ enum MaskHitTester {
         }
         // 外圈 / 内圈四向手柄。
         for (index, angle) in cardinalAngles.enumerated() {
-            let grip = canvasPoint(radialPoint(mask, angle: angle, scale: 1), fitted: fitted)
+            let grip = radialPoint(mask, angle: angle, scale: 1, fitted: fitted)
             let distance = hypot(grip.x - point.x, grip.y - point.y)
             if distance < bestDistance {
                 bestDistance = distance
                 bestMode = .radialRadius(index % 2)
             }
-            let innerGrip = canvasPoint(
-                radialPoint(mask, angle: angle, scale: scale),
-                fitted: fitted
-            )
+            let innerGrip = radialPoint(mask, angle: angle, scale: scale, fitted: fitted)
             let innerDistance = hypot(innerGrip.x - point.x, innerGrip.y - point.y)
             if innerDistance < bestDistance {
                 bestDistance = innerDistance
@@ -421,20 +456,13 @@ enum MaskHitTester {
         }
         // 外圈 / 内圈边界附近 → 按局部角度决定缩放哪条半径（拖动边界即缩放）。
         // 注意：此处的 point 已是内容坐标。
-        let normalized = geometry.normalized(fromContent: point)
-        let localAngle = MaskDragSession.localAngle(mask, normalized)
+        let localAngle = localAngle(mask, point: point, fitted: fitted)
         let axis = abs(cos(localAngle)) >= abs(sin(localAngle)) ? 0 : 1
-        let outerBoundary = canvasPoint(
-            radialPoint(mask, angle: localAngle, scale: 1),
-            fitted: fitted
-        )
+        let outerBoundary = radialPoint(mask, angle: localAngle, scale: 1, fitted: fitted)
         if hypot(outerBoundary.x - point.x, outerBoundary.y - point.y) < 26 {
             return .radialRadius(axis)
         }
-        let innerBoundary = canvasPoint(
-            radialPoint(mask, angle: localAngle, scale: scale),
-            fitted: fitted
-        )
+        let innerBoundary = radialPoint(mask, angle: localAngle, scale: scale, fitted: fitted)
         if hypot(innerBoundary.x - point.x, innerBoundary.y - point.y) < 22 {
             return .radialFeather(axis)
         }
@@ -451,10 +479,16 @@ struct MaskDragSession {
     let snapshot: MaskUi
     /// 起手点（归一化图像坐标）。
     let startPoint: CGPoint
+    /// 起手点（内容坐标，椭圆类几何用）。
+    let startContent: CGPoint
     let geometry: MaskCanvasGeometry
 
-    /// 按当前触点计算更新后的蒙版；无变化返回 nil。
-    func updated(to point: CGPoint) -> MaskUi? {
+    /// 外圈往外拖时内圈跟随比例（0 = 内圈不动，1 = 等比缩放）。
+    static let outerFollow: CGFloat = 0.35
+
+    /// 按当前触点（内容坐标）计算更新后的蒙版；无变化返回 nil。
+    func updated(to content: CGPoint) -> MaskUi? {
+        let point = geometry.normalized(fromContent: content)
         switch mode {
         case .none:
             return nil
@@ -468,51 +502,88 @@ struct MaskDragSession {
             let center = snapshot.linearCenter
             let centerContent = geometry.contentPoint(normalized: center)
             let fromContent = geometry.contentPoint(normalized: startPoint)
-            let toContent = geometry.contentPoint(normalized: point)
-            let delta = Self.angleDelta(from: fromContent, to: toContent, around: centerContent)
+            let delta = Self.angleDelta(from: fromContent, to: content, around: centerContent)
             return Self.rotatedLinear(snapshot, byContentRadians: delta, fitted: geometry.fitted)
-        case .linearFeather:
-            let normal = Self.unitNormal(snapshot)
-            let offset = (point.x - snapshot.linearCenter.x) * normal.dx
-                + (point.y - snapshot.linearCenter.y) * normal.dy
-            let offsetStart = (startPoint.x - snapshot.linearCenter.x) * normal.dx
-                + (startPoint.y - snapshot.linearCenter.y) * normal.dy
-            let width = snapshot.linearWidth + 2 * Double(offset - offsetStart)
-            return snapshot.settingLinearWidth(width)
+        case .linearFeather(let index):
+            // 只沿渐变方向移动被抓住的那条边界线（另一条保持不动）。
+            let dir = snapshot.linearDirection
+            let projected = Double(
+                (point.x - startPoint.x) * dir.dx + (point.y - startPoint.y) * dir.dy
+            )
+            var copy = snapshot
+            if index == 0 {
+                let limited = min(projected, snapshot.linearWidth - 0.02)
+                copy.start = CGPoint(
+                    x: snapshot.start.x + dir.dx * CGFloat(limited),
+                    y: snapshot.start.y + dir.dy * CGFloat(limited)
+                )
+            } else {
+                let limited = max(projected, -(snapshot.linearWidth - 0.02))
+                copy.end = CGPoint(
+                    x: snapshot.end.x + dir.dx * CGFloat(limited),
+                    y: snapshot.end.y + dir.dy * CGFloat(limited)
+                )
+            }
+            return copy
         case .radialMove:
             let delta = CGPoint(x: point.x - startPoint.x, y: point.y - startPoint.y)
             var copy = snapshot
             copy.center = Self.clamped(snapshot.center, delta: delta)
             return copy
         case .radialRotate:
-            let from = Self.localAngle(snapshot, startPoint)
-            let to = Self.localAngle(snapshot, point)
+            let from = MaskHitTester.localAngle(snapshot, point: startContent, fitted: geometry.fitted)
+            let to = MaskHitTester.localAngle(snapshot, point: content, fitted: geometry.fitted)
             let delta = Self.normalizedRadians(to - from)
             var copy = snapshot
             copy.rotation += Float(delta * 180 / .pi)
             return copy
         case .radialRadius(let axis):
-            let local = Self.inverseRotate(snapshot, point: point)
+            // 外圈选手柄：改该轴半径；内圈跟着走一点（羽化不会被拉成一条缝）。
+            let fitted = geometry.fitted
+            let local = MaskHitTester.inverseRotate(snapshot, point: content, fitted: fitted)
             var copy = snapshot
+            let innerScale = MaskHitTester.innerScale(snapshot)
             if axis == 0 {
-                copy.radii.width = min(max(abs(local.dx), 0.04), 1.5)
+                let radius0 = snapshot.radii.width
+                let radius1 = min(max(abs(local.dx) / max(fitted.width, 1e-4), 0.04), 1.5)
+                copy.radii.width = radius1
+                let inner0 = radius0 * innerScale
+                let scale = (inner0 + Self.outerFollow * (radius1 - radius0)) / max(radius1, 1e-4)
+                copy.radialFeather = Float((1 - min(max(scale, 0.02), 0.98)) * 100)
             } else {
-                copy.radii.height = min(max(abs(local.dy), 0.04), 1.5)
+                let radius0 = snapshot.radii.height
+                let radius1 = min(max(abs(local.dy) / max(fitted.height, 1e-4), 0.04), 1.5)
+                copy.radii.height = radius1
+                let inner0 = radius0 * innerScale
+                let scale = (inner0 + Self.outerFollow * (radius1 - radius0)) / max(radius1, 1e-4)
+                copy.radialFeather = Float((1 - min(max(scale, 0.02), 0.98)) * 100)
             }
             return copy
         case .radialFeather(let axis):
-            let local = Self.inverseRotate(snapshot, point: point)
+            // 内圈选手柄：直接拖内圈，羽化 = 内圈到外圈的距离。
+            let fitted = geometry.fitted
+            let local = MaskHitTester.inverseRotate(snapshot, point: content, fitted: fitted)
+            let axes = MaskHitTester.radialAxes(snapshot, fitted: fitted)
             let scale: CGFloat
             if axis == 0 {
-                scale = abs(local.dx) / max(snapshot.radii.width, 1e-4)
+                scale = abs(local.dx) / axes.dx
             } else {
-                scale = abs(local.dy) / max(snapshot.radii.height, 1e-4)
+                scale = abs(local.dy) / axes.dy
             }
             var copy = snapshot
             let clampedScale = min(max(scale, 0.02), 0.98)
             copy.radialFeather = Float((1 - clampedScale) * 100)
             return copy
         }
+    }
+
+    /// 归一化点的渐变投影参数：0 = 100% 边界（start），1 = 0% 边界（end）。
+    static func parameter(_ mask: MaskUi, _ normalized: CGPoint) -> CGFloat {
+        let dir = mask.linearDirection
+        let width = max(mask.linearWidth, 1e-6)
+        let dx = normalized.x - mask.start.x
+        let dy = normalized.y - mask.start.y
+        return (dx * dir.dx + dy * dir.dy) / CGFloat(width)
     }
 
     // MARK: 工具函数
@@ -524,12 +595,6 @@ struct MaskDragSession {
         )
     }
 
-    /// 渐变方向在归一化空间的单位法线（指向 0% 一侧）。
-    static func unitNormal(_ mask: MaskUi) -> CGVector {
-        let dir = mask.linearDirection
-        return CGVector(dx: -dir.dy, dy: dir.dx)
-    }
-
     /// 内容空间里，两条向量之间的有符号夹角。
     static func angleDelta(from: CGPoint, to: CGPoint, around center: CGPoint) -> CGFloat {
         let a = CGVector(dx: from.x - center.x, dy: from.y - center.y)
@@ -537,48 +602,36 @@ struct MaskDragSession {
         return atan2(a.dx * b.dy - a.dy * b.dx, a.dx * b.dx + a.dy * b.dy)
     }
 
-    /// 旋转线性渐变：在内容空间旋转，再换算回归一化方向（手柄跟手）。
-    static func rotatedLinear(_ mask: MaskUi, byContentRadians radians: CGFloat, fitted: CGRect) -> MaskUi {
+    /// 旋转线性渐变：把手柄方向（归一化垂线的像）按手指转角旋转，再反解渐变方向——
+    /// 端点跟着手指走，三条线与实际过渡方向始终一致。
+    static func rotatedLinear(
+        _ mask: MaskUi,
+        byContentRadians radians: CGFloat,
+        fitted: CGRect
+    ) -> MaskUi {
         let dir = mask.linearDirection
-        var contentDir = CGVector(dx: dir.dx * fitted.width, dy: dir.dy * fitted.height)
-        let length = hypot(contentDir.dx, contentDir.dy)
-        guard length > 1e-6 else { return mask }
-        contentDir = CGVector(dx: contentDir.dx / length, dy: contentDir.dy / length)
+        var handle = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)
+        let handleLength = hypot(handle.dx, handle.dy)
+        guard handleLength > 1e-6 else { return mask }
+        handle = CGVector(dx: handle.dx / handleLength, dy: handle.dy / handleLength)
         let cosR = cos(radians)
         let sinR = sin(radians)
         let rotated = CGVector(
-            dx: contentDir.dx * cosR - contentDir.dy * sinR,
-            dy: contentDir.dx * sinR + contentDir.dy * cosR
+            dx: handle.dx * cosR - handle.dy * sinR,
+            dy: handle.dx * sinR + handle.dy * cosR
         )
-        var normalized = CGVector(dx: rotated.dx / fitted.width, dy: rotated.dy / fitted.height)
-        let normLength = hypot(normalized.dx, normalized.dy)
-        guard normLength > 1e-9 else { return mask }
-        normalized = CGVector(dx: normalized.dx / normLength, dy: normalized.dy / normLength)
+        // 反解：n = 归一化空间的垂线 → d = (n.y, -n.x)。
+        var normal = CGVector(dx: rotated.dx / fitted.width, dy: rotated.dy / fitted.height)
+        let normalLength = hypot(normal.dx, normal.dy)
+        guard normalLength > 1e-9 else { return mask }
+        normal = CGVector(dx: normal.dx / normalLength, dy: normal.dy / normalLength)
+        let newDir = CGVector(dx: normal.dy, dy: -normal.dx)
         var copy = mask
         let half = CGFloat(mask.linearWidth / 2)
         let center = mask.linearCenter
-        copy.start = CGPoint(x: center.x - normalized.dx * half, y: center.y - normalized.dy * half)
-        copy.end = CGPoint(x: center.x + normalized.dx * half, y: center.y + normalized.dy * half)
+        copy.start = CGPoint(x: center.x - newDir.dx * half, y: center.y - newDir.dy * half)
+        copy.end = CGPoint(x: center.x + newDir.dx * half, y: center.y + newDir.dy * half)
         return copy
-    }
-
-    /// 椭圆局部参数角（用于旋转手柄跟手）。
-    static func localAngle(_ mask: MaskUi, _ point: CGPoint) -> CGFloat {
-        let local = inverseRotate(mask, point: point)
-        return atan2(
-            local.dy / max(mask.radii.height, 1e-4),
-            local.dx / max(mask.radii.width, 1e-4)
-        )
-    }
-
-    /// 去掉椭圆旋转后的局部向量（与核心 radial_mask 同一套公式）。
-    static func inverseRotate(_ mask: MaskUi, point: CGPoint) -> CGVector {
-        let radians = CGFloat(mask.rotation) * .pi / 180
-        let cosR = cos(radians)
-        let sinR = sin(radians)
-        let dx = point.x - mask.center.x
-        let dy = point.y - mask.center.y
-        return CGVector(dx: dx * cosR + dy * sinR, dy: -dx * sinR + dy * cosR)
     }
 
     static func normalizedRadians(_ radians: CGFloat) -> CGFloat {
@@ -615,7 +668,8 @@ final class MaskCanvasController {
         switch event {
         case .singleBegan(let point):
             guard let mask = model.selectedMask else { return }
-            let normalized = clampedNormalized(geometry.normalized(point))
+            let content = geometry.contentPoint(point)
+            let normalized = clampedNormalized(geometry.normalized(fromContent: content))
             if mask.kind == .brush {
                 model.brushCursor = normalized
                 model.beginBrushStroke(at: normalized)
@@ -626,7 +680,7 @@ final class MaskCanvasController {
             // 手柄命中测试在内容坐标（预览图坐标系）里做：缩放 / 平移下位置才对得上。
             let mode = MaskHitTester.hitTest(
                 mask: mask,
-                at: geometry.contentPoint(point),
+                at: content,
                 geometry: geometry
             )
             guard mode != .none else { return }
@@ -634,19 +688,22 @@ final class MaskCanvasController {
                 mode: mode,
                 snapshot: mask,
                 startPoint: normalized,
+                startContent: content,
                 geometry: geometry
             )
             dragging = true
             model.beginMaskDrag()
         case .singleMoved(let point):
             if brushing {
-                let normalized = clampedNormalized(geometry.normalized(point))
+                let normalized = clampedNormalized(
+                    geometry.normalized(fromContent: geometry.contentPoint(point))
+                )
                 model.brushCursor = normalized
                 model.extendBrushStroke(to: normalized)
                 return
             }
             guard let session = drag, dragging,
-                  let updated = session.updated(to: clampedNormalized(geometry.normalized(point)))
+                  let updated = session.updated(to: geometry.contentPoint(point))
             else {
                 return
             }
@@ -664,10 +721,9 @@ final class MaskCanvasController {
             if newZoom <= 1.01 {
                 pan.wrappedValue = .zero
             }
-        case .twoFingerRotate(let radians, let centroid):
+        case .twoFingerRotate(let radians, _):
             rotateSelectedMask(
                 byViewRadians: radians,
-                centroid: centroid,
                 geometry: geometry,
                 model: model
             )
@@ -703,7 +759,6 @@ final class MaskCanvasController {
 
     private func rotateSelectedMask(
         byViewRadians radians: CGFloat,
-        centroid: CGPoint,
         geometry: MaskCanvasGeometry,
         model: EditorModel
     ) {
@@ -712,40 +767,27 @@ final class MaskCanvasController {
         else {
             return
         }
-        // view 空间的旋转角 → 归一化空间的等效角度（各向异性缩放会改变角度）。
-        let centerContent = geometry.contentPoint(normalized: mask.kind == .linear ? mask.linearCenter : mask.center)
-        let centroidContent = geometry.contentPoint(centroid)
-        let cosR = cos(radians)
-        let sinR = sin(radians)
-        let vx = centroidContent.x - centerContent.x
-        let vy = centroidContent.y - centerContent.y
-        let rotated = CGPoint(x: vx * cosR - vy * sinR, y: vx * sinR + vy * cosR)
-        let fitted = geometry.fitted
-        guard fitted.width > 0, fitted.height > 0 else { return }
-        let a = CGVector(dx: vx / fitted.width, dy: vy / fitted.height)
-        let b = CGVector(dx: rotated.x / fitted.width, dy: rotated.y / fitted.height)
-        // 归一化空间里的等效旋转角。
-        let delta = MaskDragSession.normalizedRadians(
-            atan2(b.dy, b.dx) - atan2(a.dy, a.dx)
-        )
+        // 椭圆 / 渐变的旋转现在都定义在像素等比空间，view 空间的转角可以直接用。
         if !rotationActive {
             rotationActive = true
             rotationAccumulated = 0
             rotationApplied = 0
             model.beginMaskDrag()
         }
-        rotationAccumulated += Double(MaskDragSession.normalizedRadians(delta))
+        rotationAccumulated += Double(radians)
         let step = rotationAccumulated - rotationApplied
         rotationApplied = rotationAccumulated
         guard abs(step) > 1e-5 else { return }
         model.updateSelectedMask { current in
             switch current.kind {
             case .linear:
-                let angle = Double(current.linearAngleDegrees) * .pi / 180 + step
-                let degrees = Float(angle * 180 / .pi)
-                let rotatedMask = current.settingLinearAngle(degrees)
-                current.start = rotatedMask.start
-                current.end = rotatedMask.end
+                let rotated = MaskDragSession.rotatedLinear(
+                    current,
+                    byContentRadians: CGFloat(step),
+                    fitted: geometry.fitted
+                )
+                current.start = rotated.start
+                current.end = rotated.end
             case .radial:
                 current.rotation += Float(step * 180 / .pi)
             case .brush:
@@ -811,9 +853,12 @@ struct MaskOverlayLayer: View {
 
     private func drawLinear(_ context: inout GraphicsContext, mask: MaskUi, fitted: CGRect) {
         let center = canvasPoint(mask.linearCenter, fitted: fitted)
-        let dir = canvasVector(mask.linearDirection, fitted: fitted)
-        let length = max(hypot(dir.dx, dir.dy), 1e-6)
-        let normal = CGVector(dx: -dir.dy / length, dy: dir.dx / length)
+        // 三条线的方向 = 归一化空间垂线在内容空间的像（核心按归一化投影算 alpha，
+        // 直接取内容空间垂线在非正方形图片上会与实际渐变方向差一条斜线）。
+        let dir = mask.linearDirection
+        let across = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)
+        let acrossLength = max(hypot(across.dx, across.dy), 1e-6)
+        let normal = CGVector(dx: across.dx / acrossLength, dy: across.dy / acrossLength)
         let span = max(fitted.width, fitted.height) * 1.2
         // 过渡边界（100% / 0% 两条线）。
         for anchor in [mask.start, mask.end] {
@@ -852,18 +897,16 @@ struct MaskOverlayLayer: View {
         let innerScale = MaskHitTester.innerScale(mask)
         let outer = radialPath(mask, scale: 1, fitted: fitted)
         let inner = radialPath(mask, scale: innerScale, fitted: fitted)
-        context.stroke(outer, with: .color(.white.opacity(0.9)), lineWidth: 2)
+        // 内圈（100% 边界）实线、外圈（0% 边界）虚线：中间是平滑过渡带。
         context.stroke(
-            inner,
-            with: .color(.white.opacity(0.5)),
+            outer,
+            with: .color(.white.opacity(0.55)),
             style: StrokeStyle(lineWidth: 1.5, dash: [6, 5])
         )
+        context.stroke(inner, with: .color(.white.opacity(0.95)), lineWidth: 2)
         let center = canvasPoint(mask.center, fitted: fitted)
         // 旋转手柄（外圈顶部往外一小段）。
-        let top = canvasPoint(
-            MaskHitTester.radialPoint(mask, angle: -.pi / 2, scale: 1),
-            fitted: fitted
-        )
+        let top = MaskHitTester.radialPoint(mask, angle: -.pi / 2, scale: 1, fitted: fitted)
         let directionX = top.x - center.x
         let directionY = top.y - center.y
         let directionLength = max(hypot(directionX, directionY), 1e-6)
@@ -878,13 +921,12 @@ struct MaskOverlayLayer: View {
         drawGrip(&context, at: rotatePoint, color: Color(red: 0.36, green: 0.68, blue: 1.0), radius: 8)
         // 外圈 / 内圈四向手柄。
         for angle in MaskHitTester.cardinalAngles {
-            let outerGrip = canvasPoint(
-                MaskHitTester.radialPoint(mask, angle: angle, scale: 1),
-                fitted: fitted
-            )
+            let outerGrip = MaskHitTester.radialPoint(mask, angle: angle, scale: 1, fitted: fitted)
             drawGrip(&context, at: outerGrip, color: .white, radius: 7)
-            let innerGrip = canvasPoint(
-                MaskHitTester.radialPoint(mask, angle: angle, scale: innerScale),
+            let innerGrip = MaskHitTester.radialPoint(
+                mask,
+                angle: angle,
+                scale: innerScale,
                 fitted: fitted
             )
             drawGrip(
@@ -917,8 +959,10 @@ struct MaskOverlayLayer: View {
         let segments = 72
         for index in 0...segments {
             let angle = CGFloat(index) / CGFloat(segments) * 2 * .pi
-            let point = canvasPoint(
-                MaskHitTester.radialPoint(mask, angle: angle, scale: scale),
+            let point = MaskHitTester.radialPoint(
+                mask,
+                angle: angle,
+                scale: scale,
                 fitted: fitted
             )
             if index == 0 {

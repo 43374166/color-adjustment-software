@@ -329,7 +329,7 @@ struct MaskPanelView: View {
 
     @ViewBuilder
     private func linearControls(_ mask: MaskUi) -> some View {
-        hintText("拖动中心线平移 · 拖端点旋转 · 拖黄色手柄或下面的滑块改过渡范围")
+        hintText("拖中心线平移 · 拖端点旋转 · 拖黄色手柄只移动那条过渡边界（两条线独立）")
         maskSlider(
             "位置",
             value: mask.linearPositionPercent,
@@ -362,7 +362,7 @@ struct MaskPanelView: View {
 
     @ViewBuilder
     private func radialControls(_ mask: MaskUi) -> some View {
-        hintText("拖中心移动 · 拖白点缩放 · 拖蓝点旋转 · 拖黄点或滑块调羽化")
+        hintText("拖白点缩放外圈（内圈跟着走一点）· 拖黄点直接调内圈羽化 · 拖蓝点旋转")
         maskSlider(
             "位置 X",
             value: Float(mask.center.x * 100),
