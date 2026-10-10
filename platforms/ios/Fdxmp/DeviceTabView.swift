@@ -171,7 +171,8 @@ struct AssetThumbnail: View {
 
     private func load() {
         let options = PHImageRequestOptions()
-        options.deliveryMode = .opportunistic
+        // 缩略图用 fastFormat：RAW 时明显更快，240px 尺寸下画质损失可忽略。
+        options.deliveryMode = .fastFormat
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         requestId = model.imageManager.requestImage(

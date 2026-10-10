@@ -146,20 +146,16 @@ struct CenteredSlider: View {
                         }
                         // 移动距离过大（纵向滚动）时不当作点击。
                         guard maxDistance < 8 else { return }
-                        // 轻点：双击复位，单击按圆点位置 ±step。
+                        // 轻点：单击不变；双击归零（默认值）。
                         let now = Date()
                         let doubleTap = now.timeIntervalSince(lastTapTime) < 0.32
                         lastTapTime = now
                         if doubleTap {
                             onChange(neutral.clamped(to: range))
+                            onCommit()
                         } else {
-                            let delta: Float = gesture.startLocation.x >= thumbX ? step : -step
-                            let next = (value + delta).clamped(to: range)
-                            if next != value {
-                                onChange(next)
-                            }
+                            // 单击不改变数值（拖动才是主要交互方式）。
                         }
-                        onCommit()
                     }
             )
         }

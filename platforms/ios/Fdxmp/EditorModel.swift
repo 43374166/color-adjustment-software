@@ -141,18 +141,24 @@ final class EditorModel: ObservableObject {
         isLoading = true
         loadToken &+= 1
         let token = loadToken
+        let maxEdge = EditorLimits.previewMaxEdge
+
+        // 1) 快速首图：RAW / 大图先出一张低质量图，避免几秒空屏。
+        requestImage(asset: asset, maxEdge: maxEdge, mode: .fastFormat) { [weak self] image, _ in
+            guard let self, self.loadToken == token, self.baseBuffer == nil else { return }
+            guard let image else { return }
+            self.previewImage = image
+            self.isLoading = false
+        }
+
+        // 2) 正式图：转成像素缓冲后走 Rust 渲染。
         requestImage(
             asset: asset,
-            maxEdge: EditorLimits.previewMaxEdge,
-            allowFastPreview: true
+            maxEdge: maxEdge,
+            mode: .highQualityFormat
         ) { [weak self] image, degraded in
             guard let self, self.loadToken == token else { return }
             if degraded {
-                // RAW / 大图：PhotoKit 会先给一张快速代理图，先显示避免长时间空屏。
-                if self.previewImage == nil {
-                    self.previewImage = image
-                    self.isLoading = false
-                }
                 return
             }
             guard let image else {
@@ -162,7 +168,7 @@ final class EditorModel: ObservableObject {
             }
             // 像素转换（方向校正 + 缩放 + 色彩空间）放到渲染线程，避免卡主线程。
             self.renderQueue.async { [weak self] in
-                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.previewMaxEdge)
+                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: maxEdge)
                 let original = buffer.flatMap { ImageUtil.image(from: $0) }
                 Task { @MainActor in
                     guard let self, self.loadToken == token else { return }
@@ -548,7 +554,7 @@ final class EditorModel: ObservableObject {
         requestImage(
             asset: asset,
             maxEdge: EditorLimits.exportMaxEdge,
-            allowFastPreview: false
+            mode: .highQualityFormat
         ) { [weak self] image, _ in
             guard let self else { return }
             guard let image else {
@@ -622,11 +628,11 @@ final class EditorModel: ObservableObject {
     private func requestImage(
         asset: PHAsset,
         maxEdge: Int,
-        allowFastPreview: Bool = false,
+        mode: PHImageRequestOptionsDeliveryMode = .highQualityFormat,
         completion: @escaping @MainActor (UIImage?, Bool) -> Void
     ) {
         let options = PHImageRequestOptions()
-        options.deliveryMode = allowFastPreview ? .opportunistic : .highQualityFormat
+        options.deliveryMode = mode
         options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         options.version = .current

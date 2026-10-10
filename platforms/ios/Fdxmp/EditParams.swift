@@ -191,16 +191,45 @@ extension Comparable {
 
 /// 编辑记录存储：按照片（PHAsset localIdentifier）保存 EditParams JSON。
 enum EditStore {
-    private static let key = "fdxmp_ios_edit_records"
+    private static let recordsKey = "fdxmp_ios_edit_records"
+    private static let recentKey = "fdxmp_ios_recent_edits"
 
     static func json(assetId: String) -> String? {
-        let records = UserDefaults.standard.dictionary(forKey: key) as? [String: String]
+        let records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String]
         return records?[assetId]
     }
 
     static func save(assetId: String, json: String) {
-        var records = UserDefaults.standard.dictionary(forKey: key) as? [String: String] ?? [:]
+        var records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String] ?? [:]
         records[assetId] = json
-        UserDefaults.standard.set(records, forKey: key)
+        UserDefaults.standard.set(records, forKey: recordsKey)
+
+        // 记录"最近编辑"顺序，供编辑页的"最近编辑"列表恢复上次进度。
+        var recent = UserDefaults.standard.dictionary(forKey: recentKey) as? [String: Double] ?? [:]
+        recent[assetId] = Date().timeIntervalSince1970
+        if recent.count > 50 {
+            let keep = recent.sorted { $0.value > $1.value }.prefix(50)
+            recent = Dictionary(uniqueKeysWithValues: keep)
+        }
+        UserDefaults.standard.set(recent, forKey: recentKey)
+    }
+
+    /// 最近编辑过的照片（按时间倒序）。
+    static func recentEdits(limit: Int = 30) -> [(assetId: String, date: Date)] {
+        let recent = UserDefaults.standard.dictionary(forKey: recentKey) as? [String: Double] ?? [:]
+        return recent
+            .sorted { $0.value > $1.value }
+            .prefix(limit)
+            .map { (assetId: $0.key, date: Date(timeIntervalSince1970: $0.value)) }
+    }
+
+    /// 删除一条编辑记录。
+    static func remove(assetId: String) {
+        var records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String] ?? [:]
+        records.removeValue(forKey: assetId)
+        UserDefaults.standard.set(records, forKey: recordsKey)
+        var recent = UserDefaults.standard.dictionary(forKey: recentKey) as? [String: Double] ?? [:]
+        recent.removeValue(forKey: assetId)
+        UserDefaults.standard.set(recent, forKey: recentKey)
     }
 }

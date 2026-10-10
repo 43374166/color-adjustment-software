@@ -7,8 +7,15 @@ import SwiftUI
 /// 长按图片看原图；滑块松手记一步历史；导出按当前参数渲染并保存到相册。
 struct EditorTabView: View {
     let asset: PHAsset?
+    /// 返回回调（退出编辑会话，回到来源页面）。
+    var onClose: () -> Void = {}
 
     @StateObject private var model = EditorModel()
+    @State private var immersive = false
+    @State private var zoom: CGFloat = 1
+    @State private var baseZoom: CGFloat = 1
+    @State private var pan: CGSize = .zero
+    @State private var basePan: CGSize = .zero
 
     var body: some View {
         Group {
@@ -21,7 +28,12 @@ struct EditorTabView: View {
         .background(Color(white: 0.08))
         .onAppear(perform: loadIfNeeded)
         .onChange(of: asset?.localIdentifier) { _ in
+            resetZoom()
+            immersive = false
             loadIfNeeded()
+        }
+        .onChange(of: model.tool) { _ in
+            resetZoom()
         }
         .overlay(alignment: .bottom) {
             if let message = model.message {
@@ -48,9 +60,13 @@ struct EditorTabView: View {
 
     private var editor: some View {
         VStack(spacing: 0) {
-            topBar
+            if !immersive {
+                topBar
+            }
             previewArea
-            panel
+            if !immersive {
+                panel
+            }
         }
     }
 
@@ -73,6 +89,11 @@ struct EditorTabView: View {
 
     private var topBar: some View {
         HStack(spacing: 14) {
+            Button {
+                onClose()
+            } label: {
+                Image(systemName: "chevron.backward")
+            }
             VStack(alignment: .leading, spacing: 1) {
                 Text(model.assetName)
                     .font(.footnote)
@@ -141,9 +162,16 @@ struct EditorTabView: View {
                         .resizable()
                         .scaledToFit()
                         .frame(width: geo.size.width, height: geo.size.height)
+                        .scaleEffect(zoom)
+                        .offset(pan)
                 } else if model.isLoading {
-                    ProgressView()
-                        .tint(.white)
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .tint(.white)
+                        Text("正在加载照片")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
                 }
                 if model.tool == .crop {
                     CropOverlayView(model: model, imageSize: previewImageSize)
@@ -151,36 +179,105 @@ struct EditorTabView: View {
                 if model.tool == .mask {
                     MaskOverlayView(model: model, imageSize: previewImageSize)
                 }
-                VStack {
-                    HStack {
-                        if model.isRendering {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(.white)
+                if !immersive {
+                    VStack {
+                        HStack {
+                            if model.isRendering {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(.white)
+                            }
+                            Spacer()
+                            if model.tool != .crop && model.tool != .mask {
+                                HistogramOverlay(data: model.histogram)
+                                    .frame(width: 132, height: 76)
+                            }
                         }
                         Spacer()
-                        if model.tool != .crop && model.tool != .mask {
-                            HistogramOverlay(data: model.histogram)
-                                .frame(width: 132, height: 76)
-                        }
                     }
-                    Spacer()
+                    .padding(10)
                 }
-                .padding(10)
             }
             .frame(width: geo.size.width, height: geo.size.height)
             .contentShape(Rectangle())
+            .gesture(previewGesture())
+            .onTapGesture(count: 2) {
+                toggleZoom()
+            }
+            .onTapGesture {
+                guard overlayEnabled else { return }
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    immersive.toggle()
+                }
+            }
             .onLongPressGesture(
-                minimumDuration: 0.15,
-                maximumDistance: 30,
-                perform: {},
-                onPressingChanged: { pressing in
+                minimumDuration: 1.0,
+                maximumDistance: 24,
+                perform: {
                     guard overlayEnabled else { return }
-                    model.showOriginal = pressing
+                    model.showOriginal = true
+                },
+                onPressingChanged: { pressing in
+                    if !pressing {
+                        model.showOriginal = false
+                    }
                 }
             )
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// 预览手势：双指缩放 + （放大后）单指平移。
+    private func previewGesture() -> some Gesture {
+        let magnify = MagnificationGesture()
+            .onChanged { value in
+                guard overlayEnabled else { return }
+                zoom = (baseZoom * value).clamped(to: 1...6)
+            }
+            .onEnded { _ in
+                guard overlayEnabled else { return }
+                baseZoom = zoom
+                if zoom <= 1.01 {
+                    resetZoom()
+                }
+            }
+        let drag = DragGesture(minimumDistance: 12)
+            .onChanged { value in
+                guard overlayEnabled, zoom > 1 else { return }
+                pan = CGSize(
+                    width: basePan.width + value.translation.width,
+                    height: basePan.height + value.translation.height
+                )
+            }
+            .onEnded { _ in
+                if zoom > 1 {
+                    basePan = pan
+                }
+            }
+        return SimultaneousGesture(magnify, drag)
+    }
+
+    /// 双击：放大 / 还原。
+    private func toggleZoom() {
+        guard overlayEnabled else { return }
+        withAnimation(.easeInOut(duration: 0.22)) {
+            if zoom > 1.01 {
+                zoom = 1
+                baseZoom = 1
+                pan = .zero
+                basePan = .zero
+            } else {
+                zoom = 2.5
+                baseZoom = 2.5
+            }
+        }
+    }
+
+    private func resetZoom() {
+        zoom = 1
+        baseZoom = 1
+        pan = .zero
+        basePan = .zero
     }
 
     // MARK: - 底部面板
@@ -422,7 +519,7 @@ struct EditorTabView: View {
 
     private func step(for spec: SliderSpec) -> Float {
         if spec.key == "exposure" {
-            return 1
+            return 0.1
         }
         if spec.range.upperBound - spec.range.lowerBound <= 3 {
             return 0.05

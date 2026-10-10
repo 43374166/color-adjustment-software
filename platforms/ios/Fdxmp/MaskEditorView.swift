@@ -568,7 +568,7 @@ struct MaskPanelView: View {
 
     private func step(for spec: SliderSpec) -> Float {
         if spec.key == "exposure" {
-            return 1
+            return 0.1
         }
         if spec.range.upperBound - spec.range.lowerBound <= 3 {
             return 0.05

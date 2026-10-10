@@ -25,19 +25,37 @@ struct ContentView: View {
 
     @State private var selection: Tab = .device
     @State private var editAsset: PHAsset?
+    /// 进入编辑会话的来源（关闭时回到哪里）。
+    @State private var editOrigin: Tab = .device
 
     var body: some View {
         TabView(selection: $selection) {
             DeviceTabView { asset in
                 editAsset = asset
+                editOrigin = .device
                 selection = .edit
             }
             .tabItem { Label(Tab.device.rawValue, systemImage: Tab.device.icon) }
             .tag(Tab.device)
 
-            EditorTabView(asset: editAsset)
-                .tabItem { Label(Tab.edit.rawValue, systemImage: Tab.edit.icon) }
-                .tag(Tab.edit)
+            Group {
+                if let asset = editAsset {
+                    // 编辑会话全屏：隐藏底部三大 Tab，只保留编辑器自身的四个工具。
+                    EditorTabView(asset: asset) {
+                        editAsset = nil
+                        selection = editOrigin
+                    }
+                    .toolbar(.hidden, for: .tabBar)
+                } else {
+                    RecentlyEditedView { asset in
+                        editAsset = asset
+                        editOrigin = .edit
+                    }
+                    .toolbar(.visible, for: .tabBar)
+                }
+            }
+            .tabItem { Label(Tab.edit.rawValue, systemImage: Tab.edit.icon) }
+            .tag(Tab.edit)
 
             placeholder(
                 title: "我的",
