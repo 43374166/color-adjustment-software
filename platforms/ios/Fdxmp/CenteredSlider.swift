@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 /// 通用数值滑块行（标签 + 数值 + 中性点滑块），用于 HSL / 分级 / 参数曲线等面板。
@@ -69,6 +70,7 @@ struct CenteredSlider: View {
     @State private var didDrag = false
     @State private var maxDistance: CGFloat = 0
     @State private var lastTapTime = Date.distantPast
+    @State private var pendingStep: DispatchWorkItem?
 
     var body: some View {
         GeometryReader { geo in
@@ -120,6 +122,9 @@ struct CenteredSlider: View {
                             gestureActive = true
                             didDrag = false
                             maxDistance = 0
+                            // 新的触摸取消上一次待执行的单击步进。
+                            pendingStep?.cancel()
+                            pendingStep = nil
                             onBegin()
                         }
                         maxDistance = max(
@@ -146,20 +151,45 @@ struct CenteredSlider: View {
                         }
                         // 移动距离过大（纵向滚动）时不当作点击。
                         guard maxDistance < 8 else { return }
-                        // 轻点：单击不变；双击归零（默认值）。
+                        // 轻点：
+                        // - 双击（且落在圆点附近）→ 归零（默认值）；
+                        // - 单击 → 延迟 0.3s 执行 ±step（若期间出现第二击则取消，
+                        //   保证双击归零时不会先留下一次步进）。
                         let now = Date()
-                        let doubleTap = now.timeIntervalSince(lastTapTime) < 0.32
-                        lastTapTime = now
-                        if doubleTap {
-                            onChange(neutral.clamped(to: range))
-                            onCommit()
+                        let isDoubleTap = now.timeIntervalSince(lastTapTime) < 0.30
+                        let onThumb = abs(gesture.startLocation.x - thumbX) <= 30
+                        if isDoubleTap {
+                            lastTapTime = .distantPast
+                            pendingStep?.cancel()
+                            pendingStep = nil
+                            if onThumb {
+                                onChange(neutral.clamped(to: range))
+                                onCommit()
+                            } else {
+                                applyStep(from: gesture.startLocation.x, thumbX: thumbX)
+                            }
                         } else {
-                            // 单击不改变数值（拖动才是主要交互方式）。
+                            lastTapTime = now
+                            let work = DispatchWorkItem {
+                                applyStep(from: gesture.startLocation.x, thumbX: thumbX)
+                            }
+                            pendingStep = work
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30, execute: work)
                         }
                     }
             )
         }
         .frame(height: 42)
+    }
+
+    /// 单击步进：圆点左侧 -step，右侧 +step。
+    private func applyStep(from x: CGFloat, thumbX: CGFloat) {
+        let delta: Float = x >= thumbX ? step : -step
+        let next = (value + delta).clamped(to: range)
+        if next != value {
+            onChange(next)
+            onCommit()
+        }
     }
 
     private func position(for target: Float, width: CGFloat, span: Float) -> CGFloat {

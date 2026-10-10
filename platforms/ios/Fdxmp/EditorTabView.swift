@@ -30,10 +30,22 @@ struct EditorTabView: View {
         .onChange(of: asset?.localIdentifier) { _ in
             resetZoom()
             immersive = false
+            model.clearDetailPreview()
             loadIfNeeded()
         }
         .onChange(of: model.tool) { _ in
             resetZoom()
+            model.clearDetailPreview()
+        }
+        .onChange(of: zoom) { value in
+            // 放大时拉取高分辨率帧（原像素细节），缩回 1x 释放。
+            if value > 1.01 {
+                if model.detailImage == nil {
+                    model.requestDetailPreview()
+                }
+            } else {
+                model.clearDetailPreview()
+            }
         }
         .overlay(alignment: .bottom) {
             if let message = model.message {
@@ -149,6 +161,17 @@ struct EditorTabView: View {
         model.previewImage?.size ?? model.originalImage?.size ?? CGSize(width: 4, height: 3)
     }
 
+    /// 当前显示的图像：原图对比 > 放大细节帧 > 普通预览。
+    private var shownImage: UIImage? {
+        if model.showOriginal {
+            return model.originalImage ?? model.previewImage
+        }
+        if zoom > 1.01, let detail = model.detailImage {
+            return detail
+        }
+        return model.previewImage
+    }
+
     private var overlayEnabled: Bool {
         model.tool != .crop && model.tool != .mask
     }
@@ -157,7 +180,7 @@ struct EditorTabView: View {
         GeometryReader { geo in
             ZStack {
                 Color.black
-                if let image = model.displayImage {
+                if let image = shownImage {
                     Image(uiImage: image)
                         .resizable()
                         .scaledToFit()
@@ -293,7 +316,6 @@ struct EditorTabView: View {
 
     private var panel: some View {
         VStack(spacing: 0) {
-            toolBar
             Divider()
                 .overlay(Color.white.opacity(0.08))
             Group {
@@ -309,6 +331,8 @@ struct EditorTabView: View {
                 }
             }
             .frame(height: panelHeight)
+            // 主工具条固定在最底部（Lightroom / Android 布局）。
+            toolBar
         }
         .background(Color(white: 0.11))
     }
@@ -442,33 +466,39 @@ struct EditorTabView: View {
     }
 
     private var categoryRow: some View {
-        HStack(spacing: 18) {
-            ForEach(EditCategory.allCases) { category in
-                Button {
-                    model.category = category
-                } label: {
-                    VStack(spacing: 3) {
-                        Text(category.rawValue)
-                            .font(.caption)
-                            .foregroundStyle(
-                                model.category == category
-                                    ? Color.white
-                                    : Color.white.opacity(0.55)
-                            )
-                        Rectangle()
-                            .fill(
-                                model.category == category
-                                    ? Color.accentColor
-                                    : Color.clear
-                            )
-                            .frame(width: 26, height: 2)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach(EditCategory.allCases) { category in
+                    Button {
+                        model.category = category
+                    } label: {
+                        VStack(spacing: 5) {
+                            Image(systemName: category.icon)
+                                .font(.system(size: 16))
+                            Text(category.rawValue)
+                                .font(.caption2)
+                        }
+                        .frame(width: 58)
+                        .padding(.vertical, 7)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(
+                                    model.category == category
+                                        ? Color.white.opacity(0.14)
+                                        : Color.clear
+                                )
+                        )
+                        .foregroundStyle(
+                            model.category == category
+                                ? Color.white
+                                : Color.white.opacity(0.6)
+                        )
                     }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
-            Spacer()
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 12)
         .padding(.top, 8)
     }
 

@@ -44,6 +44,8 @@ enum EditorLimits {
     static let previewMaxEdge = 1440
     /// 导出最长边。
     static let exportMaxEdge = 4096
+    /// 放大查看（原像素细节）用的最长边。
+    static let detailMaxEdge = 4096
 }
 
 /// 编辑界面状态机：照片加载 → 防抖渲染 → 直方图 / 撤销重做 / 导出。
@@ -58,6 +60,8 @@ final class EditorModel: ObservableObject {
     @Published private(set) var originalImage: UIImage?
     @Published var showOriginal = false
     @Published private(set) var histogram: HistogramData?
+    /// 放大查看时的高分辨率帧（仅缩放 > 1 时显示）。
+    @Published private(set) var detailImage: UIImage?
     @Published private(set) var isLoading = false
     @Published private(set) var isRendering = false
     @Published private(set) var isExporting = false
@@ -88,6 +92,8 @@ final class EditorModel: ObservableObject {
 
     private var baseBuffer: RgbaBuffer?
     private var loadToken = 0
+    private var detailToken = 0
+    private var detailInFlight = false
     private var dragSnapshot: EditState?
     private var undoStack: [EditState] = []
     private var redoStack: [EditState] = []
@@ -191,6 +197,58 @@ final class EditorModel: ObservableObject {
         message = nil
     }
 
+    // MARK: - 放大细节（原像素）
+
+    /// 请求一张高分辨率帧：双指 / 双击放大时用，保证放大后看到的是原始像素而不是放大后的代理图。
+    func requestDetailPreview() {
+        guard let asset, !detailInFlight else { return }
+        detailInFlight = true
+        detailToken &+= 1
+        let token = detailToken
+        let json = currentJson(applyCropRect: true)
+        requestImage(
+            asset: asset,
+            maxEdge: EditorLimits.detailMaxEdge,
+            mode: .highQualityFormat
+        ) { [weak self] image, degraded in
+            guard let self, self.detailToken == token, !degraded else { return }
+            guard let image else {
+                self.detailInFlight = false
+                return
+            }
+            self.renderQueue.async { [weak self] in
+                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.detailMaxEdge)
+                let result = buffer.flatMap {
+                    NativeCore.shared.render(buffer: $0, paramsJson: json)
+                }
+                let output = result.flatMap {
+                    ImageUtil.image(
+                        from: RgbaBuffer(pixels: $0.pixels, width: $0.width, height: $0.height)
+                    )
+                }
+                Task { @MainActor in
+                    guard let self, self.detailToken == token else { return }
+                    self.detailInFlight = false
+                    self.detailImage = output
+                }
+            }
+        }
+    }
+
+    /// 缩回 1x 时释放高分辨率帧，省内存。
+    func clearDetailPreview() {
+        detailToken &+= 1
+        detailInFlight = false
+        detailImage = nil
+    }
+
+    /// 编辑提交后刷新（放大状态下保持像素级清晰）。
+    private func refreshDetailIfNeeded() {
+        if detailImage != nil, !detailInFlight {
+            requestDetailPreview()
+        }
+    }
+
     /// 切换工具（裁切时预览显示未裁切原图，其余工具显示裁切结果）。
     func selectTool(_ newTool: EditorTool) {
         guard tool != newTool else { return }
@@ -230,6 +288,7 @@ final class EditorModel: ObservableObject {
         presetName = "自定义"
         persist()
         scheduleRender(immediate: true)
+        refreshDetailIfNeeded()
     }
 
     /// 一次性参数修改（点按类操作）：自动记一步历史。
@@ -241,6 +300,7 @@ final class EditorModel: ObservableObject {
         presetName = "自定义"
         persist()
         scheduleRender(immediate: true)
+        refreshDetailIfNeeded()
     }
 
     func undo() {
@@ -251,6 +311,7 @@ final class EditorModel: ObservableObject {
         presetName = "自定义"
         persist()
         scheduleRender(immediate: true)
+        refreshDetailIfNeeded()
     }
 
     func redo() {
@@ -261,6 +322,7 @@ final class EditorModel: ObservableObject {
         presetName = "自定义"
         persist()
         scheduleRender(immediate: true)
+        refreshDetailIfNeeded()
     }
 
     // MARK: - 基础滑块

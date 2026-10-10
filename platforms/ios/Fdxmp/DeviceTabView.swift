@@ -514,9 +514,6 @@ struct DeviceTabView: View {
     private var gallery: some View {
         VStack(spacing: 0) {
             toolbar
-            if selectionMode {
-                selectionBar
-            }
             if model.assets.isEmpty {
                 emptyState
             } else if gridMode {
@@ -524,7 +521,6 @@ struct DeviceTabView: View {
             } else {
                 list
             }
-            bottomBar
         }
         .fullScreenCover(item: Binding(
             get: { previewId.map(PreviewTarget.init) },
@@ -668,9 +664,6 @@ struct DeviceTabView: View {
                     .onTapGesture {
                         handleTap(asset)
                     }
-                    .onLongPressGesture {
-                        enterSelection(asset)
-                    }
                 }
             }
             .padding(2)
@@ -703,9 +696,6 @@ struct DeviceTabView: View {
             .contentShape(Rectangle())
             .onTapGesture {
                 handleTap(asset)
-            }
-            .onLongPressGesture {
-                enterSelection(asset)
             }
         }
         .listStyle(.plain)

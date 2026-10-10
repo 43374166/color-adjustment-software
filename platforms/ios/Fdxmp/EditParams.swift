@@ -9,6 +9,17 @@ enum EditCategory: String, CaseIterable, Identifiable {
     case curves = "曲线"
 
     var id: String { rawValue }
+
+    /// 图标（Lightroom 风格：图标 + 文字）。
+    var icon: String {
+        switch self {
+        case .light: return "sun.max"
+        case .color: return "drop"
+        case .effects: return "camera.filters"
+        case .detail: return "triangle"
+        case .curves: return "point.topleft.down.curvedto.point.bottomright.up"
+        }
+    }
 }
 
 /// 效果面板子页。

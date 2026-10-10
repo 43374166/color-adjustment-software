@@ -536,33 +536,39 @@ struct MaskPanelView: View {
     }
 
     private var categoryRow: some View {
-        HStack(spacing: 18) {
-            ForEach([EditCategory.light, .color, .effects]) { category in
-                Button {
-                    model.category = category
-                } label: {
-                    VStack(spacing: 3) {
-                        Text(category.rawValue)
-                            .font(.caption)
-                            .foregroundStyle(
-                                model.category == category
-                                    ? Color.white
-                                    : Color.white.opacity(0.55)
-                            )
-                        Rectangle()
-                            .fill(
-                                model.category == category
-                                    ? Color.accentColor
-                                    : Color.clear
-                            )
-                            .frame(width: 26, height: 2)
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach([EditCategory.light, .color, .effects]) { category in
+                    Button {
+                        model.category = category
+                    } label: {
+                        VStack(spacing: 5) {
+                            Image(systemName: category.icon)
+                                .font(.system(size: 15))
+                            Text(category.rawValue)
+                                .font(.caption2)
+                        }
+                        .frame(width: 56)
+                        .padding(.vertical, 6)
+                        .background(
+                            RoundedRectangle(cornerRadius: 10)
+                                .fill(
+                                    model.category == category
+                                        ? Color.white.opacity(0.14)
+                                        : Color.clear
+                                )
+                        )
+                        .foregroundStyle(
+                            model.category == category
+                                ? Color.white
+                                : Color.white.opacity(0.6)
+                        )
                     }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
-            Spacer()
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 12)
         .padding(.top, 8)
     }
 
