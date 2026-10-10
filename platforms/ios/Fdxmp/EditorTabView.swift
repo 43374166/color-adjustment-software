@@ -27,6 +27,8 @@ struct EditorTabView: View {
     @State private var suppressCategoryTapUntil = Date.distantPast
     /// 长按撤销键后，短时间内忽略这次点击（避免顺带撤销一步）。
     @State private var suppressUndoTapUntil = Date.distantPast
+    /// 长按照片前是否已处于沉浸模式（松手后按原样恢复）。
+    @State private var immersiveBeforeHold = false
     /// 历史列表弹层。
     @State private var showHistory = false
     /// 分屏对比分割线位置（nil = 关闭对比模式）。
@@ -620,13 +622,21 @@ struct EditorTabView: View {
                 if case .second(true, _) = value {
                     if !model.showOriginal {
                         Haptics.medium()
+                        // 长按看原图时把 UI 一并隐藏（沉浸查看），松手恢复。
+                        immersiveBeforeHold = immersive
                         model.showOriginal = true
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            immersive = true
+                        }
                     }
                     suppressTapUntil = Date().addingTimeInterval(0.5)
                 }
             }
             .onEnded { _ in
                 model.showOriginal = false
+                withAnimation(.easeInOut(duration: 0.18)) {
+                    immersive = immersiveBeforeHold
+                }
             }
     }
 
