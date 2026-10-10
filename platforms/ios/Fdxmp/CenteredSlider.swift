@@ -56,7 +56,8 @@ struct ValueSliderRow: View {
             )
             .padding(.horizontal, 18)
         }
-        .padding(.vertical, 3)
+        // 两行滑块之间收紧一点（少占画面）。
+        .padding(.vertical, 1)
         // 上报拖动状态 + 实时数值：面板隐藏其它 UI，画面顶部显示大号数值。
         .preference(
             key: SliderDragPreferenceKey.self,
@@ -103,6 +104,8 @@ struct CenteredSlider: View {
     @State private var fineMode = false
     @State private var fineAnchorX: CGFloat?
     @State private var fineAnchorValue: Float = 0
+    /// 本次触摸被判定为"纵向滚动面板"（不再调值，修误触）。
+    @State private var scrollLocked = false
 
     var body: some View {
         GeometryReader { geo in
@@ -134,12 +137,16 @@ struct CenteredSlider: View {
                 }
                 // 圆点
                 Circle()
-                    .fill(Color(white: 0.06))
+                    .fill(Color(white: 0.08))
                     .frame(width: 26, height: 26)
                     .overlay(
+                        // 外圈白色、内点浅蓝（和 Lightroom 的圆点一致）。
+                        Circle().strokeBorder(Color.white.opacity(0.92), lineWidth: 2.5)
+                    )
+                    .overlay(
                         Circle()
-                            .fill(Color.accentColor)
-                            .frame(width: 19, height: 19)
+                            .fill(Color.accentColor.opacity(0.55))
+                            .frame(width: 15, height: 15)
                     )
                     .offset(x: thumbX - 13, y: 8)
             }
@@ -154,6 +161,7 @@ struct CenteredSlider: View {
                             gestureActive = true
                             didDrag = false
                             maxDistance = 0
+                            scrollLocked = false
                             // 新的触摸取消上一次待执行的单击步进。
                             pendingStep?.cancel()
                             pendingStep = nil
@@ -163,6 +171,18 @@ struct CenteredSlider: View {
                             maxDistance,
                             hypot(gesture.translation.width, gesture.translation.height)
                         )
+                        // 纵向为主的滑动是"翻面板找参数"，不能顺带把参数改了。
+                        if !scrollLocked, abs(gesture.translation.height) > 8,
+                           abs(gesture.translation.height) > abs(gesture.translation.width)
+                        {
+                            scrollLocked = true
+                            if didDrag {
+                                didDrag = false
+                                onDraggingChange?(false)
+                                onCommit()
+                            }
+                        }
+                        guard !scrollLocked else { return }
                         // 长按后进入微调：只按相对位移慢慢走。
                         if fineMode {
                             if fineAnchorX == nil {
@@ -203,6 +223,10 @@ struct CenteredSlider: View {
                     .onEnded { gesture in
                         guard gestureActive else { return }
                         gestureActive = false
+                        if scrollLocked {
+                            scrollLocked = false
+                            return
+                        }
                         if fineMode {
                             fineMode = false
                             fineAnchorX = nil

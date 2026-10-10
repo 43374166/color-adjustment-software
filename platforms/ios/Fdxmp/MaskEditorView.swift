@@ -11,16 +11,18 @@ struct MaskPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.draggingSlider == nil {
-                subtabRow
-            }
+            subtabRow
+                .opacity(model.draggingSlider == nil ? 1 : 0)
             content
-            if model.draggingSlider == nil {
-                Divider()
-                    .overlay(Color.white.opacity(0.08))
-                actionRow
-                listRow
-            }
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+            actionRow
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+                .allowsHitTesting(model.draggingSlider == nil)
+            listRow
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+                .allowsHitTesting(model.draggingSlider == nil)
         }
         .alert("重命名蒙版", isPresented: renameAlertBinding) {
             TextField("名称", text: $renameText)
@@ -489,21 +491,21 @@ struct MaskPanelView: View {
     @ViewBuilder
     private func brushControls(_ mask: MaskUi) -> some View {
         hintText("在画面上单指涂抹添加蒙版；双指缩放 / 平移画布")
-        if model.draggingSlider == nil {
-            Picker(
-                "",
-                selection: Binding(
-                    get: { model.brushErase },
-                    set: { model.brushErase = $0 }
-                )
-            ) {
-                Text("画笔").tag(false)
-                Text("擦除").tag(true)
-            }
-            .pickerStyle(.segmented)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 4)
+        Picker(
+            "",
+            selection: Binding(
+                get: { model.brushErase },
+                set: { model.brushErase = $0 }
+            )
+        ) {
+            Text("画笔").tag(false)
+            Text("擦除").tag(true)
         }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 4)
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+        .allowsHitTesting(model.draggingSlider == nil)
         maskSlider(
             "大小",
             value: mask.brushSize,
@@ -549,22 +551,22 @@ struct MaskPanelView: View {
             return copy
         }
         opacitySlider(mask)
-        if model.draggingSlider == nil {
-            HStack(spacing: 14) {
-                Text("参数只影响之后的笔画；已画的笔画保留落笔设置。")
-                    .font(.system(size: 10))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button("撤销一笔") {
-                    model.undoLastStroke()
-                }
-                .font(.caption)
-                .foregroundStyle(Color.accentColor)
-                .disabled(mask.strokes.isEmpty)
+        HStack(spacing: 14) {
+            Text("参数只影响之后的笔画；已画的笔画保留落笔设置。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            Spacer()
+            Button("撤销一笔") {
+                model.undoLastStroke()
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 6)
+            .font(.caption)
+            .foregroundStyle(Color.accentColor)
+            .disabled(mask.strokes.isEmpty)
         }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 6)
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+        .allowsHitTesting(model.draggingSlider == nil)
     }
 
     private func opacitySlider(_ mask: MaskUi) -> some View {
@@ -583,15 +585,14 @@ struct MaskPanelView: View {
 
     @ViewBuilder
     private func hintText(_ text: String) -> some View {
-        // 拖动滑块时只留滑块，提示文字也隐藏。
-        if model.draggingSlider == nil {
-            Text(text)
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.horizontal, 18)
-                .padding(.bottom, 2)
-        }
+        // 拖动滑块时只留滑块（提示文字隐去但保留高度，滑块位置不跳）。
+        Text(text)
+            .font(.system(size: 10))
+            .foregroundStyle(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 18)
+            .padding(.bottom, 2)
+            .opacity(model.draggingSlider == nil ? 1 : 0)
     }
 
     /// 蒙版形状参数滑块（拖动中实时渲染，松手记一步历史）。
@@ -648,11 +649,12 @@ struct MaskPanelView: View {
                 }
                 .padding(.vertical, 6)
             }
-            if model.draggingSlider == nil {
-                Divider()
-                    .overlay(Color.white.opacity(0.08))
-                categoryRow
-            }
+            Divider()
+                .overlay(Color.white.opacity(0.08))
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+            categoryRow
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+                .allowsHitTesting(model.draggingSlider == nil)
         }
     }
 

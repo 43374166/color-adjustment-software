@@ -427,6 +427,8 @@ struct EditorTabView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // 放大后的图片不能盖住上面的导航栏：裁在预览区内。
+        .clipped()
     }
 
     @ViewBuilder
@@ -463,7 +465,12 @@ struct EditorTabView: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-                    .frame(width: geo.size.width, height: geo.size.height)
+                    // 靠上对齐：面板浮在下面时，图片内容不会被遮掉太多。
+                    .frame(
+                        width: geo.size.width,
+                        height: geo.size.height,
+                        alignment: .top
+                    )
                     .scaleEffect(zoom)
                     .offset(pan)
             } else if model.isLoading {
@@ -644,10 +651,6 @@ struct EditorTabView: View {
     // MARK: - 底部面板
 
     private var panelHeight: CGFloat {
-        // 拖动滑块时：只留这个滑块（Lightroom 做法）。
-        if model.draggingSlider != nil {
-            return 74
-        }
         switch model.tool {
         case .presets: return 210
         // 曲线 / 蒙版下工具条与顶部栏隐藏，面板整体更高（编辑区更大）。
@@ -655,9 +658,9 @@ struct EditorTabView: View {
             if categoryCollapsed {
                 return 64
             }
-            return model.category == .curves ? 440 : 300
+            return model.category == .curves ? 428 : 288
         case .crop: return 210
-        case .mask: return 425
+        case .mask: return 404
         }
     }
 
@@ -681,16 +684,14 @@ struct EditorTabView: View {
             // 主工具条固定在最底部（Lightroom / Android 布局）；曲线 / 蒙版下隐藏。
             if !hidesChrome && model.draggingSlider == nil {
                 toolBar
+            } else if !hidesChrome {
+                // 沉浸拖动：工具条只隐藏不位移（滑块保持原位）。
+                toolBar.opacity(0)
             }
         }
         .frame(maxWidth: .infinity)
-        // 微微透明的面板：后面露一点照片，方便对比调色效果。
-        .background(
-            ZStack {
-                Rectangle().fill(.ultraThinMaterial)
-                Color(white: 0.07).opacity(0.6)
-            }
-        )
+        // 真透明（不是毛玻璃）：后面露一点照片，方便对比调色效果。
+        .background(Color(white: 0.07).opacity(0.78))
     }
 
     private var toolBar: some View {
@@ -797,22 +798,22 @@ struct EditorTabView: View {
     /// 布局（自下而上）：工具条（最底）→ 分类导航 → 参数 → 子页标签（最上）。
     private var editPanel: some View {
         VStack(spacing: 0) {
-            if model.draggingSlider == nil {
-                if !categoryCollapsed {
-                    editSubTabs
-                    editContent
-                    Divider()
-                        .overlay(Color.white.opacity(0.08))
-                }
-                if model.category == .curves {
-                    // 曲线：分类导航整排隐形，只留一个「完成」退出。
-                    curveDoneRow
-                } else {
-                    categoryRow
-                }
-            } else {
-                // 沉浸：只留正在拖动的那个滑块。
+            if !categoryCollapsed {
+                editSubTabs
+                    .opacity(model.draggingSlider == nil ? 1 : 0)
                 editContent
+                Divider()
+                    .overlay(Color.white.opacity(0.08))
+                    .opacity(model.draggingSlider == nil ? 1 : 0)
+            }
+            if model.category == .curves {
+                // 曲线：分类导航整排隐形，只留一个「完成」退出。
+                curveDoneRow
+                    .opacity(model.draggingSlider == nil ? 1 : 0)
+            } else {
+                categoryRow
+                    .opacity(model.draggingSlider == nil ? 1 : 0)
+                    .allowsHitTesting(model.draggingSlider == nil)
             }
         }
     }
@@ -885,8 +886,10 @@ struct EditorTabView: View {
     private var sliderList: some View {
         ScrollView {
             LazyVStack(spacing: 0) {
-                ForEach(currentSliders.filter { model.sliderVisible($0.label) }) { spec in
+                ForEach(currentSliders) { spec in
                     sliderRow(spec)
+                        .opacity(model.sliderVisible(spec.label) ? 1 : 0)
+                        .allowsHitTesting(model.sliderVisible(spec.label))
                 }
             }
             .padding(.vertical, 8)
