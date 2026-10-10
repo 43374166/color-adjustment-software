@@ -49,14 +49,7 @@ enum EditorLimits {
     static let maskOverlayMaxEdge = 1440
     /// 蒙版列表缩略图最长边。
     static let maskThumbnailMaxEdge = 128
-    /// 导出最长边。
-    /// 导出最长边（可在「我的」页切换 2048 / 4096）。
-    static var exportMaxEdge: Int {
-        let stored = UserDefaults.standard.integer(forKey: exportMaxEdgeKey)
-        return stored > 0 ? stored : 4096
-    }
-    /// 导出尺寸设置键（与「我的」页的 @AppStorage 共用）。
-    static let exportMaxEdgeKey = "fdxmp_export_max_edge"
+    /// 导出按**原图分辨率**渲染（不再限制最长边）。
     /// 导出格式 / 质量 / 保留元数据 / 导出后分享（与「我的」页 @AppStorage 共用）。
     static let exportFormatKey = "fdxmp_export_format"
     static let exportQualityKey = "fdxmp_export_quality"
@@ -1588,9 +1581,16 @@ final class EditorModel: ObservableObject {
         let format = EditorLimits.exportFormat
         let quality = EditorLimits.exportQuality
         let keepMetadata = EditorLimits.exportKeepMetadata
+        // 原图分辨率（不再限制最长边）。
+        let targetEdge = max(asset.pixelWidth, asset.pixelHeight)
+        let crop = state.crop
+        let identityGeometry = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
+            && crop.rotation == 0
+            && !crop.flipHorizontal
+            && !crop.flipVertical
         requestImage(
             asset: asset,
-            maxEdge: EditorLimits.exportMaxEdge,
+            maxEdge: targetEdge,
             mode: .highQualityFormat
         ) { [weak self] image, _ in
             guard let self else { return }
@@ -1608,18 +1608,28 @@ final class EditorModel: ObservableObject {
                 metadata = Self.loadExportMetadata(asset: asset)
             }
             self.renderQueue.async { [weak self] in
-                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.exportMaxEdge)
-                let result = buffer.flatMap {
-                    NativeCore.shared.render(buffer: $0, paramsJson: json)
-                }
-                let failure = result == nil ? NativeCore.shared.lastError() : nil
-                let output = result.flatMap {
-                    ImageUtil.image(
-                        from: RgbaBuffer(
-                            pixels: $0.pixels, width: $0.width, height: $0.height
-                        )
+                guard let self else { return }
+                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: targetEdge)
+                // 大图优先按横向条带分块渲染（每块只跑区域管线，内存峰值明显低于整帧）。
+                let renderedBuffer: RgbaBuffer?
+                if let buffer, let tiled = self.renderTiledExport(
+                    buffer: buffer,
+                    paramsJson: json,
+                    identityGeometry: identityGeometry
+                ) {
+                    renderedBuffer = tiled
+                } else if let buffer,
+                          let result = NativeCore.shared.render(buffer: buffer, paramsJson: json) {
+                    renderedBuffer = RgbaBuffer(
+                        pixels: result.pixels,
+                        width: result.width,
+                        height: result.height
                     )
+                } else {
+                    renderedBuffer = nil
                 }
+                let failure = renderedBuffer == nil ? NativeCore.shared.lastError() : nil
+                let output = renderedBuffer.flatMap { ImageUtil.image(from: $0) }
                 Task { @MainActor in
                     guard let self else { return }
                     guard let output else {
@@ -1652,6 +1662,73 @@ final class EditorModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// 读取原图的拍摄元数据（EXIF / TIFF / GPS / IPTC），并清掉会过期的尺寸字段。
+    /// 大图导出：按横向条带分块调用区域渲染，拼成整张原图分辨率结果。
+    ///
+    /// 返回 nil 表示条件不满足（有裁切 / 旋转，或核心拒绝——例如带非单位几何的镜头参数），
+    /// 调用方回退单次整帧渲染。
+    private func renderTiledExport(
+        buffer: RgbaBuffer,
+        paramsJson: String,
+        identityGeometry: Bool
+    ) -> RgbaBuffer? {
+        guard identityGeometry else { return nil }
+        let width = buffer.width
+        let height = buffer.height
+        guard width > 32, height > 32 else { return nil }
+        // 每条区域约 4MP（含余量），条带越矮内存越省、次数越多。
+        let margin = 12
+        let stripHeight = max(64, min(height, 4_000_000 / max(width, 1)))
+        let stripCount = Int(ceil(Double(height) / Double(stripHeight)))
+        var output = [UInt8](repeating: 0, count: width * height * 4)
+        var y = 0
+        var index = 0
+        while y < height {
+            let h = min(stripHeight, height - y)
+            let regionY = max(0, y - margin)
+            let regionBottom = min(height, y + h + margin)
+            let regionHeight = regionBottom - regionY
+            guard
+                let region = ImageUtil.cropped(
+                    buffer: buffer,
+                    x: 0,
+                    y: regionY,
+                    width: width,
+                    height: regionHeight
+                ),
+                let result = NativeCore.shared.renderRegion(
+                    buffer: region,
+                    originX: 0,
+                    originY: regionY,
+                    visibleX: 0,
+                    visibleY: y,
+                    visibleWidth: width,
+                    visibleHeight: h,
+                    fullWidth: width,
+                    fullHeight: height,
+                    paramsJson: paramsJson
+                ),
+                result.width == width,
+                result.height == h
+            else {
+                return nil
+            }
+            let targetStart = y * width * 4
+            let bytes = h * width * 4
+            output.replaceSubrange(
+                targetStart..<(targetStart + bytes),
+                with: result.pixels[0..<bytes]
+            )
+            index += 1
+            y += h
+            let progress = 0.3 + 0.5 * Double(index) / Double(max(stripCount, 1))
+            Task { @MainActor [weak self] in
+                self?.exportProgress = min(progress, 0.8)
+            }
+        }
+        return RgbaBuffer(pixels: output, width: width, height: height)
     }
 
     /// 读取原图的拍摄元数据（EXIF / TIFF / GPS / IPTC），并清掉会过期的尺寸字段。

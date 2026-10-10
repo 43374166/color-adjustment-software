@@ -3,7 +3,6 @@ import UIKit
 
 /// 「我的」页：编辑记录、内置预设、导出设置、关于。
 struct MeTabView: View {
-    @AppStorage(EditorLimits.exportMaxEdgeKey) private var exportMaxEdge = 4096
     @AppStorage(EditorLimits.exportFormatKey) private var exportFormat = EditorModel.ExportFormat.jpeg.rawValue
     @AppStorage(EditorLimits.exportQualityKey) private var exportQuality = 0.92
     @AppStorage(EditorLimits.exportKeepMetadataKey) private var exportKeepMetadata = true
@@ -157,15 +156,12 @@ struct MeTabView: View {
     private var exportCard: some View {
         card("导出") {
             HStack {
-                Text("导出最长边")
+                Text("导出尺寸")
                     .font(.footnote)
                 Spacer()
-                Picker("导出最长边", selection: $exportMaxEdge) {
-                    Text("2048").tag(2048)
-                    Text("4096").tag(4096)
-                }
-                .pickerStyle(.segmented)
-                .frame(width: 150)
+                Text("原图分辨率")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
             HStack {
                 Text("格式")
