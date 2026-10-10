@@ -40,6 +40,14 @@ enum MaskPanelTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// 渲染尺寸上限（非 actor 隔离，可在后台渲染闭包中安全引用）。
+enum EditorLimits {
+    /// 预览最长边（越大越清晰、渲染越慢）。
+    static let previewMaxEdge = 1440
+    /// 导出最长边。
+    static let exportMaxEdge = 4096
+}
+
 /// 编辑界面状态机：照片加载 → 防抖渲染 → 直方图 / 撤销重做 / 导出。
 ///
 /// 渲染走 Rust CPU 预览（`fdxmp_render_memory_rgba`）：
@@ -79,11 +87,6 @@ final class EditorModel: ObservableObject {
     @Published var maskTab: MaskPanelTab = .shape
 
     private(set) var asset: PHAsset?
-
-    /// 预览最长边（越大越清晰、渲染越慢）。
-    static let previewMaxEdge = 1440
-    /// 导出最长边。
-    static let exportMaxEdge = 4096
 
     private var baseBuffer: RgbaBuffer?
     private var dragSnapshot: EditState?
@@ -138,7 +141,7 @@ final class EditorModel: ObservableObject {
         }
         selectedMaskId = state.masks.first?.id
         isLoading = true
-        requestImage(asset: asset, maxEdge: Self.previewMaxEdge) { [weak self] image in
+        requestImage(asset: asset, maxEdge: EditorLimits.previewMaxEdge) { [weak self] image in
             guard let self else { return }
             guard let image else {
                 self.isLoading = false
@@ -147,7 +150,7 @@ final class EditorModel: ObservableObject {
             }
             // 像素转换（方向校正 + 缩放 + 色彩空间）放到渲染线程，避免卡主线程。
             self.renderQueue.async { [weak self] in
-                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: Self.previewMaxEdge)
+                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.previewMaxEdge)
                 let original = buffer.flatMap { ImageUtil.image(from: $0) }
                 Task { @MainActor in
                     guard let self else { return }
@@ -535,7 +538,7 @@ final class EditorModel: ObservableObject {
         guard let asset, !isExporting else { return }
         isExporting = true
         message = nil
-        requestImage(asset: asset, maxEdge: Self.exportMaxEdge) { [weak self] image in
+        requestImage(asset: asset, maxEdge: EditorLimits.exportMaxEdge) { [weak self] image in
             guard let self else { return }
             guard let image else {
                 self.isExporting = false
@@ -544,7 +547,7 @@ final class EditorModel: ObservableObject {
             }
             let json = self.currentJson(applyCropRect: true)
             self.renderQueue.async { [weak self] in
-                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: Self.exportMaxEdge)
+                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: EditorLimits.exportMaxEdge)
                 let result = buffer.flatMap {
                     NativeCore.shared.render(buffer: $0, paramsJson: json)
                 }

@@ -61,14 +61,17 @@ final class NativeCore {
         defer { fdxmp_bytes_free(pointer, outLen) }
 
         let payload = UnsafeBufferPointer(start: pointer, count: outLen)
-        let width = Int(
-            UInt32(payload[0]) << 24 | UInt32(payload[1]) << 16
-                | UInt32(payload[2]) << 8 | UInt32(payload[3])
-        )
-        let height = Int(
-            UInt32(payload[4]) << 24 | UInt32(payload[5]) << 16
-                | UInt32(payload[6]) << 8 | UInt32(payload[7])
-        )
+        // 显式拆成单字节位移，避免 Release（WMO）下类型检查超时。
+        let widthHigh = UInt32(payload[0]) << 24
+        let widthMid = UInt32(payload[1]) << 16
+        let widthLow = UInt32(payload[2]) << 8
+        let widthRaw = widthHigh | widthMid | widthLow | UInt32(payload[3])
+        let heightHigh = UInt32(payload[4]) << 24
+        let heightMid = UInt32(payload[5]) << 16
+        let heightLow = UInt32(payload[6]) << 8
+        let heightRaw = heightHigh | heightMid | heightLow | UInt32(payload[7])
+        let width = Int(widthRaw)
+        let height = Int(heightRaw)
         guard width > 0, height > 0, outLen >= 8 + width * height * 4 else {
             return nil
         }

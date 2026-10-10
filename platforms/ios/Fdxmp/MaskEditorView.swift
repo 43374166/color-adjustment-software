@@ -213,7 +213,7 @@ struct MaskOverlayView: View {
             with: .color(maskColor(mask)),
             style: StrokeStyle(lineWidth: 2, dash: [6, 4])
         )
-        let inner = max(min(mask.inner / 100, 0.98), 0)
+        let inner = CGFloat(max(min(mask.inner / 100, 0.98), 0))
         if inner > 0.01 {
             let innerRect = rect.insetBy(
                 dx: rect.width / 2 * (1 - inner),
