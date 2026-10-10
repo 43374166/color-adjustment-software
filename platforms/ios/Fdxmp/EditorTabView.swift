@@ -1033,8 +1033,59 @@ struct EditorTabView: View {
                 : (spec.range.upperBound - spec.range.lowerBound <= 3 ? 1 : 0),
             onBegin: { model.beginEdit() },
             onChange: { model.updateValue(spec.key, $0) },
-            onCommit: { model.commitEdit() }
+            onCommit: { model.commitEdit() },
+            trackColors: trackColors(for: spec.key)
         )
+    }
+
+    /// 颜色类滑块的轨道配色（和 Lightroom 一样用颜色区分调节方向，粗细不变）。
+    private func trackColors(for key: String) -> [Color]? {
+        switch key {
+        case "temperature":
+            return [
+                Color(red: 0.30, green: 0.45, blue: 1.0),
+                Color(white: 0.85),
+                Color(red: 1.0, green: 0.82, blue: 0.30),
+            ]
+        case "tint":
+            return [
+                Color(red: 0.30, green: 0.90, blue: 0.45),
+                Color(white: 0.85),
+                Color(red: 0.85, green: 0.30, blue: 0.95),
+            ]
+        case "vibrance":
+            return [
+                Color(white: 0.45),
+                Color(red: 0.25, green: 0.80, blue: 0.55),
+                Color(red: 0.55, green: 0.35, blue: 0.95),
+            ]
+        case "saturation":
+            return [Color(white: 0.5), Color(red: 0.95, green: 0.30, blue: 0.30)]
+        default:
+            return nil
+        }
+    }
+
+    /// HSL 三个滑块的轨道配色（按当前色带的颜色）。
+    private func hslTrackColors(_ channel: String) -> [Color] {
+        let kind = model.hslBand
+        let tint = Color(red: kind.tint.r, green: kind.tint.g, blue: kind.tint.b)
+        switch channel {
+        case "hue":
+            return [
+                Color(red: 1, green: 0, blue: 0),
+                Color(red: 1, green: 1, blue: 0),
+                Color(red: 0, green: 1, blue: 0),
+                Color(red: 0, green: 1, blue: 1),
+                Color(red: 0, green: 0, blue: 1),
+                Color(red: 1, green: 0, blue: 1),
+                Color(red: 1, green: 0, blue: 0),
+            ]
+        case "saturation":
+            return [Color(white: 0.45), tint]
+        default:
+            return [Color(white: 0.1), tint, Color(white: 1.0)]
+        }
     }
 
     private func step(for spec: SliderSpec) -> Float {
@@ -1101,7 +1152,8 @@ struct EditorTabView: View {
                             updated.hue = value
                             model.updateHsl(model.hslBand, updated, commit: false)
                         },
-                        onCommit: { model.commitEdit() }
+                        onCommit: { model.commitEdit() },
+                        trackColors: hslTrackColors("hue")
                     )
                 }
                 if model.sliderVisible("饱和度") {
@@ -1115,7 +1167,8 @@ struct EditorTabView: View {
                             updated.saturation = value
                             model.updateHsl(model.hslBand, updated, commit: false)
                         },
-                        onCommit: { model.commitEdit() }
+                        onCommit: { model.commitEdit() },
+                        trackColors: hslTrackColors("saturation")
                     )
                 }
                 if model.sliderVisible("明亮度") {
@@ -1129,7 +1182,8 @@ struct EditorTabView: View {
                             updated.luminance = value
                             model.updateHsl(model.hslBand, updated, commit: false)
                         },
-                        onCommit: { model.commitEdit() }
+                        onCommit: { model.commitEdit() },
+                        trackColors: hslTrackColors("luminance")
                     )
                 }
             }

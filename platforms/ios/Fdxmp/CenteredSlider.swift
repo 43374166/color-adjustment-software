@@ -32,6 +32,8 @@ struct ValueSliderRow: View {
     let onCommit: () -> Void
     /// 是否正在横向拖动（点击步进不算）。
     @State private var dragging = false
+    /// 轨道渐变配色（如色温蓝→黄、色调绿→洋红）；nil = 纯色轨道。
+    var trackColors: [Color]? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -52,7 +54,8 @@ struct ValueSliderRow: View {
                 onBegin: onBegin,
                 onChange: onChange,
                 onCommit: onCommit,
-                onDraggingChange: { dragging = $0 }
+                onDraggingChange: { dragging = $0 },
+                trackColors: trackColors
             )
             .padding(.horizontal, 18)
         }
@@ -94,6 +97,8 @@ struct CenteredSlider: View {
     let onCommit: () -> Void
     /// 横向拖动（>8pt）开始 / 结束回调；点击步进不触发。
     var onDraggingChange: ((Bool) -> Void)? = nil
+    /// 轨道渐变配色（色温 / 色调 / 饱和度 / 色相等）；nil = 纯色轨道。
+    var trackColors: [Color]? = nil
 
     @State private var gestureActive = false
     @State private var didDrag = false
@@ -119,10 +124,25 @@ struct CenteredSlider: View {
             )
             ZStack(alignment: .topLeading) {
                 // 轨道
-                Capsule()
-                    .fill(Color(white: 0.24))
-                    .frame(width: width, height: 5)
-                    .offset(y: 18.5)
+                if let trackColors, trackColors.count >= 2 {
+                    // 带颜色区分的轨道（色温 / 色调 / 饱和度 / 色相…）。
+                    Capsule()
+                        .fill(
+                            LinearGradient(
+                                colors: trackColors,
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .frame(width: width, height: 5)
+                        .offset(y: 18.5)
+                        .opacity(0.9)
+                } else {
+                    Capsule()
+                        .fill(Color(white: 0.24))
+                        .frame(width: width, height: 5)
+                        .offset(y: 18.5)
+                }
                 // 中性点刻度
                 Rectangle()
                     .fill(Color.white.opacity(0.4))
