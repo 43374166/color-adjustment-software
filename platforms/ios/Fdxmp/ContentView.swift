@@ -27,13 +27,13 @@ struct ContentView: View {
     @State private var editAsset: PHAsset?
     /// 进入编辑会话的来源（关闭时回到哪里）。
     @State private var editOrigin: Tab = .device
+    /// 进入编辑会话时的照片队列（编辑器内左右滑动切上一张 / 下一张）。
+    @State private var editQueue: [PHAsset] = []
 
     var body: some View {
         TabView(selection: $selection) {
-            DeviceTabView { asset in
-                editAsset = asset
-                editOrigin = .device
-                selection = .edit
+            DeviceTabView { asset, queue in
+                openEditor(asset: asset, queue: queue, origin: .device)
             }
             .tabItem { Label(Tab.device.rawValue, systemImage: Tab.device.icon) }
             .tag(Tab.device)
@@ -41,15 +41,18 @@ struct ContentView: View {
             Group {
                 if let asset = editAsset {
                     // 编辑会话全屏：隐藏底部三大 Tab，只保留编辑器自身的四个工具。
-                    EditorTabView(asset: asset) {
-                        editAsset = nil
-                        selection = editOrigin
-                    }
+                    EditorTabView(
+                        asset: asset,
+                        onClose: { closeEditor() },
+                        onSwipePrev: { stepEditor(by: -1) },
+                        onSwipeNext: { stepEditor(by: 1) },
+                        canSwipePrev: canStepBackward,
+                        canSwipeNext: canStepForward
+                    )
                     .toolbar(.hidden, for: .tabBar)
                 } else {
-                    RecentlyEditedView { asset in
-                        editAsset = asset
-                        editOrigin = .edit
+                    RecentlyEditedView { asset, queue in
+                        openEditor(asset: asset, queue: queue, origin: .edit)
                     }
                     .toolbar(.visible, for: .tabBar)
                 }
@@ -62,6 +65,45 @@ struct ContentView: View {
                 .tag(Tab.me)
         }
         .preferredColorScheme(.dark)
+    }
+
+    // MARK: - 编辑会话（含左右滑动切图）
+
+    /// 当前编辑照片在队列中的位置。
+    private var editIndex: Int? {
+        guard let editAsset else { return nil }
+        return editQueue.firstIndex { $0.localIdentifier == editAsset.localIdentifier }
+    }
+
+    private var canStepBackward: Bool {
+        guard let index = editIndex else { return false }
+        return index > 0
+    }
+
+    private var canStepForward: Bool {
+        guard let index = editIndex else { return false }
+        return index + 1 < editQueue.count
+    }
+
+    /// 打开编辑会话：带上当前列表（设备页网格 / 列表 / 全屏预览、最近编辑列表）。
+    private func openEditor(asset: PHAsset, queue: [PHAsset], origin: Tab) {
+        editAsset = asset
+        editQueue = queue
+        editOrigin = origin
+        selection = .edit
+    }
+
+    private func closeEditor() {
+        editAsset = nil
+        selection = editOrigin
+    }
+
+    /// 编辑器内滑动切上一张 / 下一张（offset = ±1）。
+    private func stepEditor(by offset: Int) {
+        guard let index = editIndex else { return }
+        let target = index + offset
+        guard editQueue.indices.contains(target) else { return }
+        editAsset = editQueue[target]
     }
 }
 

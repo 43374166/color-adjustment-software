@@ -10,6 +10,11 @@ struct EditorTabView: View {
     let asset: PHAsset?
     /// 返回回调（退出编辑会话，回到来源页面）。
     var onClose: () -> Void = {}
+    /// 未放大时左右滑动切图：上一张 / 下一张（队列与边界由父层提供）。
+    var onSwipePrev: () -> Void = {}
+    var onSwipeNext: () -> Void = {}
+    var canSwipePrev = false
+    var canSwipeNext = false
 
     @StateObject private var model = EditorModel()
     @State private var immersive = false
@@ -29,6 +34,8 @@ struct EditorTabView: View {
     @State private var suppressUndoTapUntil = Date.distantPast
     /// 长按照片前是否已处于沉浸模式（松手后按原样恢复）。
     @State private var immersiveBeforeHold = false
+    /// 最近一次双指缩放的时间（防止捏合手势被误判成左右滑动切图）。
+    @State private var lastPinchAt = Date.distantPast
     /// 历史列表弹层。
     @State private var showHistory = false
     /// 分屏对比分割线位置（nil = 关闭对比模式）。
@@ -575,6 +582,7 @@ struct EditorTabView: View {
         let magnify = MagnificationGesture()
             .onChanged { value in
                 guard overlayEnabled else { return }
+                lastPinchAt = Date()
                 zoom = (baseZoom * value).clamped(to: 1...6)
             }
             .onEnded { _ in
@@ -596,12 +604,33 @@ struct EditorTabView: View {
                     height: basePan.height + value.translation.height
                 )
             }
-            .onEnded { _ in
+            .onEnded { value in
                 if zoom > 1 {
                     basePan = pan
+                    return
                 }
+                // 未放大时：左右滑动切上一张 / 下一张照片。
+                guard overlayEnabled, compareSplit == nil else { return }
+                handleSwipeToSwitch(value.translation)
             }
         return SimultaneousGesture(magnify, drag)
+    }
+
+    /// 未放大时的左右滑动切图：横向位移要足够大且明显占主导；
+    /// 刚做过双指缩放的短时间内不判定（捏合松手瞬间的收拢不算滑动）。
+    private func handleSwipeToSwitch(_ translation: CGSize) {
+        let horizontal = translation.width
+        guard abs(horizontal) >= 64, abs(horizontal) >= abs(translation.height) * 1.6 else { return }
+        guard Date().timeIntervalSince(lastPinchAt) > 0.35 else { return }
+        if horizontal > 0 {
+            guard canSwipePrev else { return }
+            Haptics.light()
+            onSwipePrev()
+        } else {
+            guard canSwipeNext else { return }
+            Haptics.light()
+            onSwipeNext()
+        }
     }
 
     /// 长按 0.5 秒看原图：长按识别后继续跟踪手指，松手恢复调色效果。

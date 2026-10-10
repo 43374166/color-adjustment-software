@@ -421,7 +421,8 @@ struct CameraPicker: UIViewControllerRepresentable {
 // MARK: - 设备 Tab
 
 struct DeviceTabView: View {
-    let onOpenEditor: (PHAsset) -> Void
+    /// 打开编辑页：照片 + 当前可见列表（编辑页内可左右滑动切上一张 / 下一张）。
+    let onOpenEditor: (PHAsset, [PHAsset]) -> Void
 
     @StateObject private var model = PhotoLibraryModel()
     @State private var searchText = ""
@@ -529,7 +530,7 @@ struct DeviceTabView: View {
         )) { target in
             PhotoPreviewView(assets: visibleAssets, startId: target.id) { asset in
                 previewId = nil
-                onOpenEditor(asset)
+                onOpenEditor(asset, visibleAssets)
             }
             .environmentObject(model)
         }
@@ -758,8 +759,8 @@ struct DeviceTabView: View {
         if selectionMode {
             toggleSelection(asset)
         } else {
-            // 与 Android 一致：点缩略图直接进入编辑页。
-            onOpenEditor(asset)
+            // 与 Android 一致：点缩略图直接进入编辑页（连同当前列表，编辑页可左右滑动切图）。
+            onOpenEditor(asset, visibleAssets)
         }
     }
 

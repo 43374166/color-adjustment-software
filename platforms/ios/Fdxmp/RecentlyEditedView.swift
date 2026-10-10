@@ -3,7 +3,8 @@ import SwiftUI
 
 /// 编辑 Tab 的首页：最近编辑过的照片（用于"下次进来还记得"）。
 struct RecentlyEditedView: View {
-    let onOpen: (PHAsset) -> Void
+    /// 打开编辑页：照片 + 整个最近编辑列表（编辑页内可左右滑动切上一张 / 下一张）。
+    let onOpen: (PHAsset, [PHAsset]) -> Void
 
     @State private var entries: [RecentEntry] = []
 
@@ -50,7 +51,7 @@ struct RecentlyEditedView: View {
             LazyVStack(spacing: 8) {
                 ForEach(entries) { entry in
                     Button {
-                        onOpen(entry.asset)
+                        onOpen(entry.asset, entries.map(\.asset))
                     } label: {
                         row(entry)
                     }
