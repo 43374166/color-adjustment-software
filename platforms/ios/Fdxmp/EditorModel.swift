@@ -43,7 +43,13 @@ enum EditorLimits {
     /// 预览最长边（越大越清晰、渲染越慢）。
     static let previewMaxEdge = 1440
     /// 导出最长边。
-    static let exportMaxEdge = 4096
+    /// 导出最长边（可在「我的」页切换 2048 / 4096）。
+    static var exportMaxEdge: Int {
+        let stored = UserDefaults.standard.integer(forKey: exportMaxEdgeKey)
+        return stored > 0 ? stored : 4096
+    }
+    /// 导出尺寸设置键（与「我的」页的 @AppStorage 共用）。
+    static let exportMaxEdgeKey = "fdxmp_export_max_edge"
     /// 放大查看（原像素细节）用的最长边。
     static let detailMaxEdge = 4096
 }

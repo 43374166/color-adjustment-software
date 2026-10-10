@@ -57,26 +57,11 @@ struct ContentView: View {
             .tabItem { Label(Tab.edit.rawValue, systemImage: Tab.edit.icon) }
             .tag(Tab.edit)
 
-            placeholder(
-                title: "我的",
-                detail: "账号 / 缓存管理 / 预设管理 / 主题 / 关于（后续阶段接入）"
-            )
-            .tabItem { Label(Tab.me.rawValue, systemImage: Tab.me.icon) }
-            .tag(Tab.me)
+            MeTabView()
+                .tabItem { Label(Tab.me.rawValue, systemImage: Tab.me.icon) }
+                .tag(Tab.me)
         }
         .preferredColorScheme(.dark)
-    }
-
-    private func placeholder(title: String, detail: String) -> some View {
-        VStack(spacing: 12) {
-            Text("fdxmp · \(title)")
-                .font(.headline)
-            Text(detail)
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .padding(24)
     }
 }
 

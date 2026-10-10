@@ -243,4 +243,21 @@ enum EditStore {
         recent.removeValue(forKey: assetId)
         UserDefaults.standard.set(recent, forKey: recentKey)
     }
+
+    /// 已编辑照片数量。
+    static func count() -> Int {
+        let records = UserDefaults.standard.dictionary(forKey: recordsKey) as? [String: String] ?? [:]
+        return records.count
+    }
+
+    /// 最近一次编辑时间。
+    static func lastEditedAt() -> Date? {
+        recentEdits(limit: 1).first?.date
+    }
+
+    /// 清空全部编辑记录。
+    static func clearAll() {
+        UserDefaults.standard.removeObject(forKey: recordsKey)
+        UserDefaults.standard.removeObject(forKey: recentKey)
+    }
 }
