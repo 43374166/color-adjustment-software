@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $dist = Join-Path $root "dist/windows"
-$version = "1.0.4"
+$version = "1.0.5"
 $cargoToml = Get-Content (Join-Path $root "Cargo.toml") -Raw
 if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $version = $Matches[1] }
 

@@ -1585,6 +1585,9 @@ private struct GradingWheel: View {
     let onEnd: () -> Void
 
     @State private var dragging = false
+    /// 拖动的是内圈（只调色相）还是外点（色相 + 饱和度）。
+    @State private var innerMode = false
+    @State private var lastTapTime = Date.distantPast
 
     var body: some View {
         GeometryReader { geo in
@@ -1597,6 +1600,12 @@ private struct GradingWheel: View {
             let dot = CGPoint(
                 x: center.x + cos(angle) * radius * saturation,
                 y: center.y + sin(angle) * radius * saturation
+            )
+            // 内圈小圆：固定在 0.34R 上，只表示 / 调整色相。
+            let innerRadius = radius * 0.34
+            let innerDot = CGPoint(
+                x: center.x + cos(angle) * innerRadius,
+                y: center.y + sin(angle) * innerRadius
             )
             ZStack {
                 Circle()
@@ -1628,6 +1637,13 @@ private struct GradingWheel: View {
                     )
                 Circle()
                     .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
+                // 内圈小圆（只调色相）：外圈白色、内点浅蓝。
+                Circle()
+                    .fill(Color.accentColor.opacity(0.55))
+                    .overlay(Circle().strokeBorder(Color.white, lineWidth: 2))
+                    .frame(width: 16, height: 16)
+                    .position(innerDot)
+                // 外点（色相 + 饱和度）。
                 Circle()
                     .fill(Color.white)
                     .overlay(Circle().stroke(Color.black.opacity(0.4), lineWidth: 1))
@@ -1641,26 +1657,49 @@ private struct GradingWheel: View {
                     .onChanged { value in
                         if !dragging {
                             dragging = true
+                            // 起手靠近内圈 → 只调色相；否则色相 + 饱和度。
+                            let distance = hypot(
+                                value.startLocation.x - innerDot.x,
+                                value.startLocation.y - innerDot.y
+                            )
+                            innerMode = distance < 30
                             onBegin()
                             Haptics.prepare()
                         }
                         let dx = value.location.x - center.x
                         let dy = value.location.y - center.y
-                        let distance = min((dx * dx + dy * dy).squareRoot(), radius)
                         var hue = atan2(dy, dx) * 180 / .pi
                         if hue < 0 {
                             hue += 360
                         }
                         var updated = zone
                         updated.hue = Float(hue.truncatingRemainder(dividingBy: 360))
-                        updated.saturation = Float(distance / radius * 100)
+                        if !innerMode {
+                            let distance = min((dx * dx + dy * dy).squareRoot(), radius)
+                            updated.saturation = Float(distance / radius * 100)
+                        }
                         onChange(updated)
                     }
-                    .onEnded { _ in
-                        if dragging {
-                            dragging = false
-                            onEnd()
+                    .onEnded { value in
+                        guard dragging else { return }
+                        dragging = false
+                        // 双击色轮：色相 + 饱和度归零（亮度不动）。
+                        let isTap = hypot(value.translation.width, value.translation.height) < 8
+                        if isTap {
+                            let now = Date()
+                            if now.timeIntervalSince(lastTapTime) < 0.32 {
+                                lastTapTime = .distantPast
+                                Haptics.light()
+                                var reset = zone
+                                reset.hue = 0
+                                reset.saturation = 0
+                                onChange(reset)
+                                onEnd()
+                                return
+                            }
+                            lastTapTime = now
                         }
+                        onEnd()
                     }
             )
         }
