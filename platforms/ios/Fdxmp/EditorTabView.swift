@@ -410,6 +410,9 @@ struct EditorTabView: View {
                 if model.tool == .mask {
                     // 蒙版模式：触摸全部交给 MaskTouchLayer（单指操作蒙版，双指缩放 / 平移）。
                     previewBody(geo: geo)
+                } else if model.tool == .edit && model.category == .curves {
+                    // 曲线：图片上的曲线编辑区自己收手势，避免误触沉浸 / 看原图。
+                    previewBody(geo: geo)
                 } else {
                     previewBody(geo: geo)
                         .contentShape(Rectangle())
@@ -521,6 +524,10 @@ struct EditorTabView: View {
                     handleMaskTouch(event, viewSize: geo.size)
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
+            }
+            // 曲线：正方形透明编辑区直接叠在图片上（无背景板）。
+            if model.tool == .edit && model.category == .curves {
+                CurveOverlay(model: model, viewSize: geo.size)
             }
             // 拖动滑块时隐藏所有 UI（只留滑块 + 画面）。
             if !immersive && model.draggingSlider == nil {
@@ -1448,6 +1455,32 @@ private struct ShareSheet: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
+}
+
+/// 区域高清帧层：把 1:1 区域图按归一化矩形对齐贴到预览上（与预览同一套缩放 / 平移）。
+private struct CurveOverlay: View {
+    @ObservedObject var model: EditorModel
+    let viewSize: CGSize
+
+    var body: some View {
+        let side = min(viewSize.width, viewSize.height) * 0.84
+        CurveEditorCanvas(
+            points: model.curvePoints(model.curveChannel),
+            channel: model.curveChannel,
+            parametric: model.state.curves.parametric,
+            onChange: { points, commit in
+                model.updateCurve(model.curveChannel, points, commit: commit)
+            },
+            onParametricChange: { values, commit in
+                model.updateParametric(values, commit: commit)
+            },
+            transparent: true
+        )
+        .frame(width: side, height: side)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .allowsHitTesting(model.draggingSlider == nil)
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+    }
 }
 
 /// 区域高清帧层：把 1:1 区域图按归一化矩形对齐贴到预览上（与预览同一套缩放 / 平移）。

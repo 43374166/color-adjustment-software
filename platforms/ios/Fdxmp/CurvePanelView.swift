@@ -8,27 +8,11 @@ struct CurvePanelView: View {
         VStack(spacing: 0) {
             if model.draggingSlider == nil {
                 header
-                CurveEditorCanvas(
-                    points: model.curvePoints(model.curveChannel),
-                    channel: model.curveChannel,
-                    parametric: model.state.curves.parametric,
-                    onChange: { points, commit in
-                        model.updateCurve(model.curveChannel, points, commit: commit)
-                    },
-                    onParametricChange: { values, commit in
-                        model.updateParametric(values, commit: commit)
-                    }
-                )
-                .frame(height: model.curveChannel == .parametric ? 150 : 186)
-                .padding(.horizontal, 16)
-                .padding(.top, 4)
-                if model.curveChannel != .parametric {
-                    Spacer(minLength: 0)
-                    Text("点空白加点 · 点控制点删除 · 拖动调整")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .padding(.bottom, 4)
-                }
+                Spacer(minLength: 0)
+                Text("在画面上直接调曲线：触摸即加点并拖动，双击控制点删除")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.bottom, 6)
             }
             if model.curveChannel == .parametric {
                 // 参数曲线滑块（拖动中只留正在拖的那一个）。
@@ -205,8 +189,11 @@ struct CurveEditorCanvas: View {
     let parametric: ParametricValues
     let onChange: ([CurvePoint], Bool) -> Void
     let onParametricChange: (ParametricValues, Bool) -> Void
+    /// 透明模式（叠在图片上直接调，无背景板）。
+    var transparent = false
 
     @State private var draggingIndex = -1
+    @State private var lastTapTime = Date.distantPast
 
     private var isParametric: Bool { channel == .parametric }
 
@@ -220,8 +207,8 @@ struct CurveEditorCanvas: View {
                     drawPoints(&context, size: canvasSize)
                 }
             }
-            .background(Color.black.opacity(0.35))
-            .clipShape(RoundedRectangle(cornerRadius: 10))
+            .background(Color.black.opacity(transparent ? 0.0 : 0.35))
+            .clipShape(RoundedRectangle(cornerRadius: transparent ? 0 : 10))
             .contentShape(Rectangle())
             .gesture(curveGesture(size: size))
         }
@@ -232,7 +219,24 @@ struct CurveEditorCanvas: View {
             .onChanged { gesture in
                 guard !isParametric else { return }
                 if draggingIndex < 0 {
-                    draggingIndex = nearestIndex(to: gesture.startLocation, in: size)
+                    // 触摸即生效：点到控制点就拖它，点到空白处就在该位置生成一个点再拖。
+                    let hit = nearestIndex(to: gesture.startLocation, in: size)
+                    if hit >= 0 {
+                        draggingIndex = hit
+                    } else {
+                        Haptics.light()
+                        let x = Float(
+                            (gesture.startLocation.x / max(size.width, 1)).clamped(to: 0.02...0.98)
+                        )
+                        let y = Float(
+                            (1 - gesture.startLocation.y / max(size.height, 1)).clamped(to: 0...1)
+                        )
+                        var updated = (points + [CurvePoint(x: x, y: y)]).sorted { $0.x < $1.x }
+                        draggingIndex = updated.firstIndex { $0.x == x && $0.y == y } ?? 0
+                        onChange(updated, false)
+                        Haptics.prepare()
+                        return
+                    }
                     Haptics.prepare()
                 }
                 let index = draggingIndex
@@ -255,25 +259,23 @@ struct CurveEditorCanvas: View {
             }
             .onEnded { gesture in
                 guard !isParametric else { return }
-                let isTap = abs(gesture.translation.width) < 8
-                    && abs(gesture.translation.height) < 8
-                if isTap {
-                    let index = nearestIndex(to: gesture.startLocation, in: size)
-                    if index > 0, index < points.count - 1 {
+                let index = draggingIndex
+                let isTap = hypot(gesture.translation.width, gesture.translation.height) < 8
+                // 双击控制点：删除（代替原来的"点一下删除"，避免和"触摸即加点"打架）。
+                if isTap, index > 0, index < points.count - 1 {
+                    let now = Date()
+                    if now.timeIntervalSince(lastTapTime) < 0.32 {
+                        lastTapTime = .distantPast
                         Haptics.light()
                         var updated = points
                         updated.remove(at: index)
                         onChange(updated, true)
-                    } else if index < 0 {
-                        Haptics.light()
-                        let x = Float((gesture.startLocation.x / size.width).clamped(to: 0.02...0.98))
-                        let y = Float((1 - gesture.startLocation.y / size.height).clamped(to: 0...1))
-                        let updated = (points + [CurvePoint(x: x, y: y)]).sorted { $0.x < $1.x }
-                        onChange(updated, true)
+                        draggingIndex = -1
+                        return
                     }
-                } else {
-                    onChange(points, true)
+                    lastTapTime = now
                 }
+                onChange(points, true)
                 draggingIndex = -1
             }
     }
