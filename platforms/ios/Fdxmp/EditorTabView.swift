@@ -87,6 +87,7 @@ struct EditorTabView: View {
             model.endCategoryPreview()
             compareSplit = nil
             model.clearBeforeImage()
+            model.setComparePreviewActive(false)
             if model.tool == .mask {
                 Haptics.prepare()
             }
@@ -377,6 +378,9 @@ struct EditorTabView: View {
                     compareSplit = nil
                     model.clearBeforeImage()
                 }
+                // 进入 / 退出对比都要刷新一帧（对比模式下零拷贝上屏暂停，需要回读画面）。
+                model.setComparePreviewActive(compareSplit != nil)
+                model.refreshPreview()
             } label: {
                 Image(systemName: "rectangle.split.2x1")
                     .foregroundStyle(
@@ -410,7 +414,11 @@ struct EditorTabView: View {
     // MARK: - 预览
 
     private var previewImageSize: CGSize {
-        model.previewImage?.size ?? model.originalImage?.size ?? CGSize(width: 4, height: 3)
+        // 零拷贝上屏时 previewImage 可能是旧帧，布局几何以最近一帧输出尺寸为准。
+        model.previewOutputSize
+            ?? model.previewImage?.size
+            ?? model.originalImage?.size
+            ?? CGSize(width: 4, height: 3)
     }
 
     /// 当前显示的图像：原图对比 > 放大细节帧 > 普通预览。
@@ -496,19 +504,34 @@ struct EditorTabView: View {
                             .foregroundStyle(.white)
                     )
                     .position(x: geo.size.width * split, y: geo.size.height / 2)
-            } else if let image = shownImage {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    // 和 fittedRect / 叠加层几何一致：竖图被高度撑满；
-                    // 横图 / 方图整体偏上（顶距 = 剩余空间的 1/3）。
-                    .frame(
-                        width: geo.size.width,
-                        height: geo.size.height
-                    )
-                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
-                    .scaleEffect(zoom)
-                    .offset(pan)
+            } else if shownImage != nil || model.zeroCopyActive {
+                // 预览画面：Metal 图层常驻（零拷贝上屏用，未激活时透明不挡 Image），
+                // 回读画面盖在上面（零拷贝生效 / 看原图 / 对比模式下隐藏）。
+                let fitted = fittedRect(imageSize: previewImageSize, in: geo.size)
+                let metalActive = model.zeroCopyActive && !model.showOriginal && compareSplit == nil
+                ZStack {
+                    MetalPreviewView { pointer, token in
+                        model.attachPreviewLayer(pointer, token: token)
+                    }
+                    .frame(width: fitted.width, height: fitted.height)
+                    .position(x: fitted.midX, y: fitted.midY)
+                    .opacity(metalActive ? 1 : 0)
+                    if !metalActive, let image = shownImage {
+                        Image(uiImage: image)
+                            .resizable()
+                            .scaledToFit()
+                            // 和 fittedRect / 叠加层几何一致：竖图被高度撑满；
+                            // 横图 / 方图整体偏上（顶距 = 剩余空间的 1/3）。
+                            .frame(
+                                width: geo.size.width,
+                                height: geo.size.height
+                            )
+                            .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
+                    }
+                }
+                .frame(width: geo.size.width, height: geo.size.height)
+                .scaleEffect(zoom)
+                .offset(pan)
             } else if model.isLoading {
                 VStack(spacing: 10) {
                     ProgressView()

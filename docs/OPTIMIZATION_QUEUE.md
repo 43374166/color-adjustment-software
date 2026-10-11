@@ -70,6 +70,14 @@
       （「裁剪 + 蒙版」组合）时自动回退 CPU；首帧先 CPU 快速出图、GPU 就绪后接管重渲染；
       打包脚本 + CI 加 `--features gpu`，Xcode 工程补 Metal / QuartzCore 等系统框架；
       导出 / 细节帧 / 蒙版叠加仍走 CPU（参考实现，保证输出和以前逐像素一致）
+- [x] 1.3.0 GPU 第二档：零拷贝上屏 + GPU 直方图 + 共享设备
+      - 共享 GPU 设备：核心 `PreviewSession::new_with_context` + FFI 全局设备（多次建会话不再重复初始化）；
+      - 零拷贝上屏：FFI `fdxmp_gpu_preview_attach_layer / present`（wgpu Surface 挂 CAMetalLayer，
+        显示纹理整帧拷贝后 present，不读回像素）；Swift 侧 MetalPreviewView（常驻、不接手势）
+        与 Image 同布局同变换；对比 / 看原图 / 失败时自动回退回读路径；
+      - GPU 直方图：`histogram.wgsl` compute 通道（4×256 桶，与 Swift 侧同公式），
+        上屏帧的直方图也实时更新（不用再为直方图读回整帧）；
+      - 首帧 CPU 快速出图 → GPU 会话就绪 → 挂层 → 零拷贝接管（视图零变化）
 
 ## 待做
 

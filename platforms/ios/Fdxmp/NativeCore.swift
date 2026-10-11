@@ -202,4 +202,47 @@ final class GpuPreviewSession {
         }
         return NativeCore.shared.decodePayload(pointer: pointer, outLen: outLen)
     }
+
+    /// 零拷贝上屏：把 CAMetalLayer 挂到会话上（失败返回 false，继续走回读路径）。
+    func attachLayer(_ layer: UnsafeMutableRawPointer) -> Bool {
+        guard let handle else { return false }
+        return fdxmp_gpu_preview_attach_layer(handle, layer) == 0
+    }
+
+    /// 渲染一帧并直接上屏（不读回像素）；返回输出尺寸，失败返回 nil（回退回读路径）。
+    func present(paramsJson: String) -> (width: Int, height: Int)? {
+        guard let handle else { return nil }
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        let code = paramsJson.withCString { params in
+            fdxmp_gpu_preview_present(handle, params, &outWidth, &outHeight)
+        }
+        guard code == 0, outWidth > 0, outHeight > 0 else { return nil }
+        return (Int(outWidth), Int(outHeight))
+    }
+
+    /// GPU 直方图（4×256：R / G / B / 亮度；基于最近一帧显示纹理）。
+    func histogram() -> HistogramData? {
+        guard let handle else { return nil }
+        var outLen = 0
+        let pointer = fdxmp_gpu_preview_histogram(handle, &outLen)
+        guard let pointer, outLen >= 4096 else { return nil }
+        defer { fdxmp_bytes_free(pointer, outLen) }
+        let payload = UnsafeBufferPointer(start: pointer, count: outLen)
+        var bins = [Int](repeating: 0, count: 1024)
+        for index in 0..<1024 {
+            let offset = index * 4
+            let value = UInt32(payload[offset])
+                | (UInt32(payload[offset + 1]) << 8)
+                | (UInt32(payload[offset + 2]) << 16)
+                | (UInt32(payload[offset + 3]) << 24)
+            bins[index] = Int(value)
+        }
+        return HistogramData(
+            red: Array(bins[0..<256]),
+            green: Array(bins[256..<512]),
+            blue: Array(bins[512..<768]),
+            luma: Array(bins[768..<1024])
+        )
+    }
 }

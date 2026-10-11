@@ -15,7 +15,7 @@ Maven 依赖走阿里云镜像（`settings.gradle.kts`）。
 powershell -File packaging\android\build.ps1        # ✅ 已实测：debug APK 16 MB（三 ABI）
 ```
 
-产物：`dist/android/fdxmp-1.2.0-debug.apk`（debug 可直接安装到手机；
+产物：`dist/android/fdxmp-1.3.0-debug.apk`（debug 可直接安装到手机；
 `-Release` 生成未签名 release APK，需要 keystore 才能上架）。
 
 已实测（2026-10-03）：Rust 桥接 arm64-v8a / armeabi-v7a / x86_64 全部编译，

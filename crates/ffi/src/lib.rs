@@ -766,6 +766,21 @@ pub struct GpuPreviewHandle {
     session: fdxmp_core::gpu::PreviewSession,
 }
 
+/// 共享 GPU 设备：App 生命周期内只初始化一次，多次建会话不再重复初始化设备。
+#[cfg(feature = "gpu")]
+fn shared_gpu_context() -> std::result::Result<&'static fdxmp_core::gpu::GpuContext, String> {
+    static SHARED: OnceLock<std::result::Result<&'static fdxmp_core::gpu::GpuContext, String>> =
+        OnceLock::new();
+    match SHARED.get_or_init(|| {
+        fdxmp_core::gpu::GpuContext::new_blocking()
+            .map(|context| &*Box::leak(Box::new(context)))
+            .map_err(|err| err.to_string())
+    }) {
+        Ok(context) => Ok(context),
+        Err(message) => Err(message.clone()),
+    }
+}
+
 /// 未启用 `gpu` feature 时的占位句柄（所有调用失败返回 NULL）。
 #[cfg(not(feature = "gpu"))]
 pub struct GpuPreviewHandle {
@@ -814,7 +829,14 @@ pub unsafe extern "C" fn fdxmp_gpu_preview_create(
         };
         // SAFETY: 调用方保证缓冲区至少 `width * height * 4` 字节。
         let buffer = std::slice::from_raw_parts(rgba, expected);
-        match fdxmp_core::gpu::PreviewSession::new(buffer, width, height) {
+        let context = match shared_gpu_context() {
+            Ok(context) => context,
+            Err(message) => {
+                set_last_error(format!("GPU 初始化失败：{message}"));
+                return ptr::null_mut();
+            }
+        };
+        match fdxmp_core::gpu::PreviewSession::new_with_context(context, buffer, width, height) {
             Ok(session) => Box::into_raw(Box::new(GpuPreviewHandle { session })),
             Err(err) => {
                 set_last_error(err.to_string());
@@ -963,6 +985,168 @@ pub unsafe extern "C" fn fdxmp_gpu_preview_destroy(handle: *mut GpuPreviewHandle
 #[cfg(not(feature = "gpu"))]
 #[no_mangle]
 pub unsafe extern "C" fn fdxmp_gpu_preview_destroy(_handle: *mut GpuPreviewHandle) {}
+
+/// 把 CAMetalLayer 挂到会话上（零拷贝上屏；iOS / macOS）。成功返回 0，失败返回 -1。
+///
+/// # Safety
+///
+/// `handle` 必须是 `fdxmp_gpu_preview_create` 返回的指针；`layer` 必须是存活的
+/// `CAMetalLayer` 指针，且在会话使用期间一直有效。
+#[cfg(all(feature = "gpu", target_vendor = "apple"))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_attach_layer(
+    handle: *mut GpuPreviewHandle,
+    layer: *mut c_void,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        if handle.is_null() || layer.is_null() {
+            set_last_error("handle / layer 不能为空指针");
+            return FDXMP_ERR;
+        }
+        // SAFETY: 调用方保证 handle 由 create 返回且未被 destroy。
+        match (*handle).session.attach_layer(layer) {
+            Ok(()) => FDXMP_OK,
+            Err(err) => {
+                set_last_error(err.to_string());
+                FDXMP_ERR
+            }
+        }
+    })
+}
+
+/// 当前平台 / 构建不支持零拷贝上屏（返回 -1）。
+///
+/// # Safety
+///
+/// 同正式实现（此版本不会读取任何指针）。
+#[cfg(not(all(feature = "gpu", target_vendor = "apple")))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_attach_layer(
+    _handle: *mut GpuPreviewHandle,
+    _layer: *mut c_void,
+) -> i32 {
+    set_last_error("当前平台 / 构建不支持零拷贝上屏");
+    FDXMP_ERR
+}
+
+/// 渲染一帧并直接上屏（不读回像素；输出尺寸写入 out_width / out_height）。
+/// 成功返回 0，失败返回 -1（调用方回退回读路径）。
+///
+/// # Safety
+///
+/// `handle` 必须是 `fdxmp_gpu_preview_create` 返回的指针；`params_json` 为合法 C 字符串；
+/// `out_width`、`out_height` 为非空可写指针。
+#[cfg(all(feature = "gpu", target_vendor = "apple"))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_present(
+    handle: *mut GpuPreviewHandle,
+    params_json: *const c_char,
+    out_width: *mut u32,
+    out_height: *mut u32,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        if handle.is_null() || out_width.is_null() || out_height.is_null() {
+            set_last_error("handle / out_width / out_height 不能为空指针");
+            return FDXMP_ERR;
+        }
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let params: fdxmp_core::params::EditParams = match serde_json::from_str(params_json) {
+            Ok(value) => value,
+            Err(err) => {
+                set_last_error(format!("参数 JSON 解析失败：{err}"));
+                return FDXMP_ERR;
+            }
+        };
+        // SAFETY: 调用方保证 handle 由 create 返回且未被 destroy。
+        match (*handle).session.present(&params) {
+            Ok((width, height)) => {
+                *out_width = width;
+                *out_height = height;
+                FDXMP_OK
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                FDXMP_ERR
+            }
+        }
+    })
+}
+
+/// 当前平台 / 构建不支持零拷贝上屏（返回 -1）。
+///
+/// # Safety
+///
+/// 同正式实现（此版本不会读取任何指针）。
+#[cfg(not(all(feature = "gpu", target_vendor = "apple")))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_present(
+    _handle: *mut GpuPreviewHandle,
+    _params_json: *const c_char,
+    _out_width: *mut u32,
+    _out_height: *mut u32,
+) -> i32 {
+    set_last_error("当前平台 / 构建不支持零拷贝上屏");
+    FDXMP_ERR
+}
+
+/// GPU 直方图：返回 4×256 个小端 u32（R / G / B / 亮度，共 4096 字节），
+/// 须用 `fdxmp_bytes_free` 释放；失败返回 NULL。
+///
+/// # Safety
+///
+/// `handle` 必须是 `fdxmp_gpu_preview_create` 返回的指针；`out_len` 为非空可写指针。
+#[cfg(feature = "gpu")]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_histogram(
+    handle: *mut GpuPreviewHandle,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if handle.is_null() || out_len.is_null() {
+            set_last_error("handle / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        // SAFETY: 调用方保证 handle 由 create 返回且未被 destroy。
+        match (*handle).session.histogram() {
+            Ok(bins) => {
+                let mut payload = Vec::with_capacity(bins.len() * 4);
+                for value in bins.iter() {
+                    payload.extend_from_slice(&value.to_le_bytes());
+                }
+                let mut boxed = payload.into_boxed_slice();
+                *out_len = boxed.len();
+                let pointer = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                pointer
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// 未启用 `gpu` feature 的占位实现（返回 NULL）。
+///
+/// # Safety
+///
+/// 同正式实现（此版本不会读取任何指针）。
+#[cfg(not(feature = "gpu"))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_histogram(
+    _handle: *mut GpuPreviewHandle,
+    _out_len: *mut usize,
+) -> *mut u8 {
+    set_last_error("未启用 gpu feature");
+    ptr::null_mut()
+}
 
 #[cfg(test)]
 mod tests {

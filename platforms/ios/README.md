@@ -10,9 +10,11 @@ iOS 端采用「系统解码 + Rust 调色」：
 1. PhotoKit 解码照片（HEIC / JPEG / RAW 都由系统负责）；
 2. Swift 侧把图像转成行优先 RGBA8；
 3. Rust 核心应用 EditParams（调色 / 细节 / 效果 / 镜头 / 几何 / 蒙版）：
-   预览优先走 GPU（`fdxmp_gpu_preview_*`，wgpu → Metal），创建失败或单帧不适合
-   （如「裁剪 + 蒙版」组合）时自动回退 CPU（`fdxmp_render_memory_rgba`）；
-4. 渲染结果转回 UIImage 显示，直方图在 Swift 侧统计。
+   预览优先走 GPU（`fdxmp_gpu_preview_*`，wgpu → Metal）：把 CAMetalLayer 挂到会话上后
+   **零拷贝上屏**（显示纹理直接 present，不回读像素），直方图也由 GPU 统计；
+   创建失败或单帧不适合（如「裁剪 + 蒙版」组合）时自动回退 CPU
+   （`fdxmp_render_memory_rgba`，回读的 UIImage 路径仍然保留）；
+4. 回读路径（对比模式 / 看原图 / GPU 不可用）把渲染结果转成 UIImage 显示，直方图在 Swift 侧统计。
 
 因此 iOS 构建只启用核心 `gpu` feature（不带 `raw` / `heif`）；
 wgpu 走系统 Metal，链接 Metal / QuartzCore 等系统框架，云打包不需要任何第三方原生库。

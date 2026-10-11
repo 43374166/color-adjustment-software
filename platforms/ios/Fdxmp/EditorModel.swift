@@ -161,6 +161,16 @@ final class EditorModel: ObservableObject {
     private var gpuSession: GpuPreviewSession?
     /// GPU 会话代际（换图 / 重建后旧回调作废）。
     private var gpuSessionToken = 0
+    /// 零拷贝上屏：预览图层指针（由 MetalPreviewView 提供；nil = 无图层）。
+    private var previewLayerPointer: UnsafeMutableRawPointer?
+    /// 当前图层的实例 token（用来忽略旧图层销毁回调）。
+    private var previewLayerToken: UUID?
+    /// 零拷贝上屏是否生效（视图据此显示 Metal 图层或 UIImage）。
+    @Published private(set) var zeroCopyActive = false
+    /// 最近一帧的输出尺寸（零拷贝时 previewImage 可能是旧帧，布局几何以它为准）。
+    @Published private(set) var previewOutputSize: CGSize?
+    /// 视图侧要求暂停零拷贝上屏（对比模式等；由视图在切换时设置）。
+    private var comparePreviewActive = false
     /// 拖动蒙版控件 / 涂抹时的低分辨率缓冲（长边 720，预览更跟手）。
     private var fastBuffer: RgbaBuffer?
     /// 蒙版交互进行中（用快速缓冲渲染，结束时回落到全分辨率）。
@@ -230,6 +240,7 @@ final class EditorModel: ObservableObject {
         baseBuffer = nil
         fastBuffer = nil
         clearGpuSession()
+        previewOutputSize = nil
         maskOverlays = [:]
         maskThumbnails = [:]
         maskInteracting = false
@@ -314,6 +325,7 @@ final class EditorModel: ObservableObject {
     private func clearGpuSession() {
         gpuSessionToken &+= 1
         gpuSession = nil
+        zeroCopyActive = false
     }
 
     /// 为预览缓冲在后台创建 GPU 会话；失败（模拟器 / 老设备 / 驱动不足）静默留在 CPU 路径。
@@ -326,11 +338,49 @@ final class EditorModel: ObservableObject {
                 guard let self, self.gpuSessionToken == token else { return }
                 self.gpuSession = session
                 if session != nil {
-                    // 会话就绪：立刻用 GPU 重渲染一帧，显示效果与后续交互保持一致。
-                    self.scheduleRender(immediate: true)
+                    // 会话就绪：若预览图层在场就顺手挂上（零拷贝），然后重渲染一帧。
+                    self.tryAttachPreviewLayer()
                 }
             }
         }
+    }
+
+    /// MetalPreviewView 报告预览图层（pointer = 新图层，nil = 该实例销毁）。
+    func attachPreviewLayer(_ pointer: UnsafeMutableRawPointer?, token: UUID) {
+        if let pointer {
+            previewLayerToken = token
+            previewLayerPointer = pointer
+            tryAttachPreviewLayer()
+        } else {
+            guard previewLayerToken == token else { return }
+            previewLayerToken = nil
+            previewLayerPointer = nil
+            zeroCopyActive = false
+        }
+    }
+
+    /// 把当前预览图层挂到 GPU 会话上（成功 = 打开零拷贝；失败 / 无图层 = 留在回读路径）。
+    private func tryAttachPreviewLayer() {
+        guard let session = gpuSession, let pointer = previewLayerPointer else { return }
+        renderQueue.async { [weak self] in
+            let attached = session.attachLayer(pointer)
+            Task { @MainActor in
+                guard let self, self.gpuSession === session else { return }
+                self.zeroCopyActive = attached
+                // 无论是否上屏，都重渲染一帧：零拷贝时出首帧，回读时刷新显示。
+                self.scheduleRender(immediate: true)
+            }
+        }
+    }
+
+    /// 立即重渲染一帧预览（进入 / 退出对比模式等需要刷新回读画面时调用）。
+    func refreshPreview() {
+        scheduleRender(immediate: true)
+    }
+
+    /// 对比模式开关（视图切换分屏对比时调用；暂停零拷贝上屏，改用回读画面）。
+    func setComparePreviewActive(_ active: Bool) {
+        comparePreviewActive = active
     }
 
     func clearMessage() {
@@ -1653,8 +1703,33 @@ final class EditorModel: ObservableObject {
         let interactive = maskInteracting || draggingSlider != nil || fallback
         let source = interactive ? (fastBuffer ?? buffer) : buffer
         let gpu = gpuSession
+        // 零拷贝上屏：GPU 会话 + 图层就绪 + 非对比 / 非看原图时直接把画面推给 CAMetalLayer。
+        let zeroCopy = gpu != nil && zeroCopyActive && !comparePreviewActive && !showOriginal
         renderQueue.async { [weak self] in
             let started = CFAbsoluteTimeGetCurrent()
+            if zeroCopy, let gpu, let size = gpu.present(paramsJson: json) {
+                // 上屏路径：不读回像素，直方图也由 GPU 统计（4×256 桶）。
+                let histogram = gpu.histogram()
+                let millis = (CFAbsoluteTimeGetCurrent() - started) * 1000
+                Task { @MainActor in
+                    guard let self else { return }
+                    self.renderBusy = false
+                    self.isRendering = false
+                    self.previewOutputSize = CGSize(width: size.width, height: size.height)
+                    if let histogram {
+                        self.histogram = histogram
+                    }
+                    self.renderMillis = millis
+                    self.message = nil
+                    // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
+                    self.scheduleMaskAssetsRefresh()
+                    if self.renderPending {
+                        self.renderPending = false
+                        self.startRender()
+                    }
+                }
+                return
+            }
             // GPU 优先（同一帧内失败 / 不适合时自动回退 CPU）。
             var result = gpu?.render(paramsJson: json)
             if result == nil {
@@ -1662,6 +1737,7 @@ final class EditorModel: ObservableObject {
             }
             let millis = (CFAbsoluteTimeGetCurrent() - started) * 1000
             let failure = result == nil ? NativeCore.shared.lastError() : nil
+            let outputSize = result.map { CGSize(width: $0.width, height: $0.height) }
             let histogram = result.flatMap {
                 HistogramData(pixels: $0.pixels, width: $0.width, height: $0.height)
             }
@@ -1677,6 +1753,7 @@ final class EditorModel: ObservableObject {
                 if let image, let histogram {
                     self.previewImage = image
                     self.histogram = histogram
+                    self.previewOutputSize = outputSize
                     self.renderMillis = millis
                     self.message = nil
                     // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。

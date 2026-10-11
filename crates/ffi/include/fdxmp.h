@@ -141,6 +141,21 @@ uint8_t *fdxmp_gpu_preview_render(void *handle,
 /* 后端名称（char* 用 fdxmp_string_free 释放）；失败返回 NULL。 */
 char *fdxmp_gpu_preview_backend(void *handle);
 
+/* 零拷贝上屏（iOS / macOS）：把 CAMetalLayer 挂到会话上；成功 0，失败 -1。
+ * layer 必须是存活的 CAMetalLayer 指针，且在会话使用期间一直有效。 */
+int32_t fdxmp_gpu_preview_attach_layer(void *handle, void *layer);
+
+/* 渲染一帧并直接上屏（不读回像素）；输出尺寸写入 out_width / out_height。
+ * 成功 0，失败 -1（调用方回退回读路径）。 */
+int32_t fdxmp_gpu_preview_present(void *handle,
+                                  const char *params_json,
+                                  uint32_t *out_width,
+                                  uint32_t *out_height);
+
+/* GPU 直方图：4×256 个小端 u32（R / G / B / 亮度，共 4096 字节）；
+ * 缓冲区用 fdxmp_bytes_free 释放；失败返回 NULL。 */
+uint8_t *fdxmp_gpu_preview_histogram(void *handle, size_t *out_len);
+
 /* 释放会话（handle 可为 NULL）。 */
 void fdxmp_gpu_preview_destroy(void *handle);
 

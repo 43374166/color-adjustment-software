@@ -1858,6 +1858,11 @@ impl ColorPipeline {
         self.target.as_ref().map(|target| &target.display_view)
     }
 
+    /// 当前渲染目标的显示纹理（零拷贝上屏 / 直方图用；未渲染时为 None）。
+    pub fn display_texture(&self) -> Option<&wgpu::Texture> {
+        self.target.as_ref().map(|target| &target.display_texture)
+    }
+
     /// 渲染目标代数：源图 / 尺寸 / 几何状态变化时递增（用于刷新 egui 纹理注册）。
     pub fn target_generation(&self) -> u64 {
         self.target
@@ -2053,6 +2058,150 @@ impl ColorPipeline {
         drop(mapped);
         buffer.unmap();
         Ok(rgba)
+    }
+}
+
+/// 直方图桶数（R / G / B / 亮度各 256）。
+pub const HISTOGRAM_BINS: usize = 1024;
+
+/// 显示纹理直方图：compute pass 统计 + 回读 4KB（4×256 小端 u32）。
+pub struct HistogramPass {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    bins: wgpu::Buffer,
+    staging: wgpu::Buffer,
+}
+
+impl HistogramPass {
+    /// 创建直方图通道（管线 + 计数缓冲 + 回读缓冲）。
+    pub fn new(device: &wgpu::Device) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fdxmp-histogram"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/histogram.wgsl").into()),
+        });
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fdxmp-histogram-layout"),
+            entries: &[
+                texture_entry(0),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fdxmp-histogram-pipeline-layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fdxmp-histogram-pipeline"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_histogram"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let size = (HISTOGRAM_BINS * 4) as u64;
+        let bins = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fdxmp-histogram-bins"),
+            size,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("fdxmp-histogram-staging"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        Self {
+            pipeline,
+            layout,
+            bins,
+            staging,
+        }
+    }
+
+    /// 统计一帧显示纹理的直方图（需先渲染出显示纹理）。
+    pub fn compute(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: &wgpu::TextureView,
+        width: u32,
+        height: u32,
+    ) -> Result<[u32; HISTOGRAM_BINS]> {
+        if width == 0 || height == 0 {
+            return Err(FdxmpError::Gpu("直方图尺寸为 0".to_string()));
+        }
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fdxmp-histogram-bind"),
+            layout: &self.layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(source),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.bins.as_entire_binding(),
+                },
+            ],
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("fdxmp-histogram-encoder"),
+        });
+        encoder.clear_buffer(&self.bins, 0, None);
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("fdxmp-histogram-pass"),
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(width.div_ceil(8), height.div_ceil(8), 1);
+        }
+        encoder.copy_buffer_to_buffer(&self.bins, 0, &self.staging, 0, (HISTOGRAM_BINS * 4) as u64);
+        queue.submit(Some(encoder.finish()));
+
+        let slice = self.staging.slice(..);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        let _ = device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        receiver
+            .recv()
+            .map_err(|err| FdxmpError::Gpu(format!("直方图等待失败：{err}")))?
+            .map_err(|err| FdxmpError::Gpu(format!("直方图映射失败：{err}")))?;
+        let mapped = slice
+            .get_mapped_range()
+            .map_err(|err| FdxmpError::Gpu(format!("直方图映射失败：{err}")))?;
+        let mut out = [0u32; HISTOGRAM_BINS];
+        for (index, slot) in out.iter_mut().enumerate() {
+            let offset = index * 4;
+            *slot = u32::from_le_bytes([
+                mapped[offset],
+                mapped[offset + 1],
+                mapped[offset + 2],
+                mapped[offset + 3],
+            ]);
+        }
+        drop(mapped);
+        self.staging.unmap();
+        Ok(out)
     }
 }
 
