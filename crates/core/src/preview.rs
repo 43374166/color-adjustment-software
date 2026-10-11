@@ -13,7 +13,7 @@ use rayon::prelude::*;
 use crate::error::{FdxmpError, Result};
 use crate::params::{
     eval_curve, ColorGradingParams, CropParams, CurveParams, DetailParams, EditParams, HslParams,
-    LensParams, ParametricCurve, ToneCurve,
+    LensParams, LightParams, ParametricCurve, ToneCurve,
 };
 
 /// CPU 预览渲染结果：尺寸 + RGBA8 像素（行优先）。
@@ -824,39 +824,8 @@ fn adjust_pixel(mut rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [
     let light = &params.light;
     let color = &params.color;
 
-    // 分区色调：用平滑权重整体加减，保持通道比例。
-    let luma = luminance(rgb);
-    let highlights = light.highlights / 100.0;
-    if highlights != 0.0 {
-        let weight = smoothstep(0.5, 1.0, luma);
-        for channel in &mut rgb {
-            *channel += highlights * weight * 0.35;
-        }
-    }
-    let shadows = light.shadows / 100.0;
-    if shadows != 0.0 {
-        let weight = 1.0 - smoothstep(0.0, 0.5, luma);
-        for channel in &mut rgb {
-            *channel += shadows * weight * 0.35;
-        }
-    }
-    let whites = light.whites / 100.0;
-    if whites != 0.0 {
-        let weight = luma * luma;
-        for channel in &mut rgb {
-            *channel += whites * weight * 0.30;
-        }
-    }
-    let blacks = light.blacks / 100.0;
-    if blacks != 0.0 {
-        let weight = (1.0 - luma) * (1.0 - luma);
-        for channel in &mut rgb {
-            *channel += blacks * weight * 0.30;
-        }
-    }
-    for channel in &mut rgb {
-        *channel = channel.clamp(0.0, 1.0);
-    }
+    // 分区色调（高光 / 阴影 / 白色 / 黑色）：显示空间分区位移，与着色器同公式。
+    rgb = apply_tone_zones(rgb, light);
 
     // 曲线：参数曲线 → RGB → 单通道。
     rgb = curves.apply(rgb);
@@ -927,6 +896,53 @@ fn apply_effects(
 
 fn luminance(rgb: [f32; 3]) -> f32 {
     0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
+}
+
+/// 分区色调（显示空间 sRGB，与着色器 `pipeline_base` 同公式）：
+///
+/// - 高光 / 阴影：按显示亮度的平滑分区权重，做「向白 / 黑渐进」的有界位移
+///   （端点锚定、不裁切，暗部不会被压死）；
+/// - 白色 / 黑色：白点 / 黑点位移，只动顶部 / 底部（中灰不受影响），
+///   允许端点轻微裁切——这是"白点 / 黑点"的语义；
+/// - 四条第曲线互不挤压、各自单调。
+fn apply_tone_zones(rgb: [f32; 3], light: &LightParams) -> [f32; 3] {
+    let h = (light.highlights / 100.0).clamp(-1.0, 1.0);
+    let sh = (light.shadows / 100.0).clamp(-1.0, 1.0);
+    let wv = (light.whites / 100.0).clamp(-1.0, 1.0);
+    let bl = (light.blacks / 100.0).clamp(-1.0, 1.0);
+    if h == 0.0 && sh == 0.0 && wv == 0.0 && bl == 0.0 {
+        return rgb;
+    }
+    let luma = luminance(rgb);
+    // 分区权重（显示亮度）：高光只动上部、阴影只动下部、白 / 黑只动端点。
+    let w_hi = smoothstep(0.45, 0.85, luma);
+    let w_sh = 1.0 - smoothstep(0.15, 0.55, luma);
+    let w_wh = smoothstep(0.60, 0.95, luma);
+    let w_bl = 1.0 - smoothstep(0.05, 0.40, luma);
+    let mut out = [0.0f32; 3];
+    for (index, channel) in rgb.iter().enumerate() {
+        let s = *channel;
+        let mut value = s;
+        if h > 0.0 {
+            // 向白渐进：白场不动，越亮位移越小。
+            value += h * w_hi * (1.0 - s).max(0.0) * 0.45;
+        } else if h < 0.0 {
+            // 向中灰回收：纯白略微保留（顶部 0.85 以上渐收，保证单调）。
+            let shape = (s - 0.5).max(0.0) * (1.0 - 0.55 * smoothstep(0.85, 1.0, s));
+            value += h * w_hi * shape * 0.45;
+        }
+        if sh > 0.0 {
+            // 向中灰提亮：越暗提得越多，到 0.55 为止。
+            value += sh * w_sh * (0.55 - s).max(0.0) * 0.40;
+        } else if sh < 0.0 {
+            // 向黑渐进：越暗压得越多，不会越界。
+            value += sh * w_sh * s * 0.35;
+        }
+        // 白点 / 黑点：端点位移（±100 → ±0.10）。
+        value += (wv * w_wh + bl * w_bl) * 0.10;
+        out[index] = value.clamp(0.0, 1.0);
+    }
+    out
 }
 
 /// HSL 八色带中心（色相圈 0..1）。
@@ -1840,6 +1856,136 @@ mod tests {
         // 色差为 0（单位变换）保持原样。
         let identity = apply_lens(&source, &LensParams::default());
         assert_eq!(identity.get_pixel(3, 8).0, before);
+    }
+
+    #[test]
+    fn tone_zones_anchor_endpoints() {
+        // 高光 / 阴影端点锚定（不裁切）；白点 / 黑点按语义允许端点位移。
+        let light = LightParams {
+            highlights: 100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([1.0, 1.0, 1.0], &light);
+        assert!((out[0] - 1.0).abs() < 1e-4, "高光 +100 不应裁白：{out:?}");
+
+        let light = LightParams {
+            highlights: -100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([0.0, 0.0, 0.0], &light);
+        assert!(out[0].abs() < 1e-5, "高光 -100 不应抬黑：{out:?}");
+
+        let light = LightParams {
+            whites: -100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([1.0, 1.0, 1.0], &light);
+        assert!((out[0] - 0.9).abs() < 0.02, "白色 -100 应回收白点：{out:?}");
+
+        let light = LightParams {
+            blacks: -100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([0.02, 0.02, 0.02], &light);
+        assert!(out[0] < 0.02, "黑色 -100 应下压黑点：{out:?}");
+    }
+
+    #[test]
+    fn tone_zones_do_not_bleed_into_midtones() {
+        let mid = [0.5, 0.5, 0.5];
+        for light in [
+            LightParams {
+                highlights: 100.0,
+                ..Default::default()
+            },
+            LightParams {
+                shadows: 100.0,
+                ..Default::default()
+            },
+            LightParams {
+                whites: 100.0,
+                ..Default::default()
+            },
+            LightParams {
+                blacks: -100.0,
+                ..Default::default()
+            },
+        ] {
+            let out = apply_tone_zones(mid, &light);
+            assert!(
+                (out[0] - 0.5).abs() < 0.02,
+                "中灰不应被分区控制波及：{light:?} → {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tone_zones_lightroom_strength() {
+        // 目标（对齐 Lightroom 手感）：阴影 +100 ≈ 0.30；高光 +100 ≈ 0.85；
+        // 高光 -100 ≈ 0.75；白色 -100（纯白）≈ 0.90。
+        let light = LightParams {
+            shadows: 100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([0.13, 0.13, 0.13], &light);
+        assert!((out[0] - 0.30).abs() < 0.04, "阴影 +100 ≈0.30：{out:?}");
+
+        let light = LightParams {
+            highlights: 100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([0.75, 0.75, 0.75], &light);
+        assert!((out[0] - 0.845).abs() < 0.03, "高光 +100 ≈0.85：{out:?}");
+
+        let light = LightParams {
+            highlights: -100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([0.90, 0.90, 0.90], &light);
+        assert!((out[0] - 0.75).abs() < 0.05, "高光 -100 ≈0.75：{out:?}");
+    }
+
+    #[test]
+    fn tone_zones_are_monotonic() {
+        let controls = [
+            LightParams {
+                highlights: 100.0,
+                ..Default::default()
+            },
+            LightParams {
+                highlights: -100.0,
+                ..Default::default()
+            },
+            LightParams {
+                shadows: 100.0,
+                ..Default::default()
+            },
+            LightParams {
+                shadows: -100.0,
+                ..Default::default()
+            },
+            LightParams {
+                whites: 100.0,
+                ..Default::default()
+            },
+            LightParams {
+                blacks: -100.0,
+                ..Default::default()
+            },
+        ];
+        for light in controls {
+            let mut previous = -1.0f32;
+            for step in 0..=100 {
+                let s = step as f32 / 100.0;
+                let out = apply_tone_zones([s, s, s], &light);
+                assert!(
+                    out[0] >= previous - 1e-5,
+                    "分区曲线应单调：{light:?} 在 {s} 处下降（{previous} → {}）",
+                    out[0]
+                );
+                previous = out[0];
+            }
+        }
     }
 
     /// 性能排查（默认忽略）：`cargo test --release -p fdxmp-core --lib -- --ignored --nocapture bench_pipeline`

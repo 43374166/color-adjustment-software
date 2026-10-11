@@ -128,11 +128,6 @@ fn hsv_to_rgb(hsv: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(v, p1, q);
 }
 
-/// 平滑分区权重：`value` 在 `center` 处为 1，距 center 达 `radius` 时衰减为 0。
-fn zone_weight(value: f32, center: f32, radius: f32) -> f32 {
-    return 1.0 - smoothstep(0.0, max(radius, 1e-4), abs(value - center));
-}
-
 /// 颜色分级单区累加：目标色按亮度归一后按权重 / 饱和度累积，同时累积本区亮度增益。
 fn add_grade_zone(
     hue_degrees: f32,
@@ -214,34 +209,7 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
     // 2) 曝光
     c = c * pow(2.0, p(0));
 
-    // 3) 高光 / 阴影 / 白色 / 黑色
-    //    - 分区在显示参考（sRGB 亮度）空间判定，四条曲线互不挤压
-    //      （旧实现在中灰处 shadow≈0.70、black≈0.66，滑块互相污染）；
-    //    - 高光 / 阴影是增益；白色 / 黑色是端点偏移
-    //      （乘性增益对 0 无效，抬不起黑场、压不下白场）。
-    let zone_lum = luminance(linear_to_srgb(c));
-    let highlight_weight = zone_weight(zone_lum, 0.75, 0.35);
-    let shadow_weight = zone_weight(zone_lum, 0.25, 0.35);
-    let white_weight = zone_weight(zone_lum, 1.0, 0.30);
-    let black_weight = zone_weight(zone_lum, 0.0, 0.30);
-
-    let tone_gain = 1.0
-        + p(2) / 100.0 * highlight_weight * 0.8
-        + p(3) / 100.0 * shadow_weight * 0.8;
-    c = max(c * tone_gain, vec3<f32>(0.0));
-
-    let endpoint_offset =
-        (p(4) / 100.0 * white_weight + p(5) / 100.0 * black_weight) * 0.08;
-    if (abs(endpoint_offset) > 0.0001) {
-        // 端点偏移在显示编码域生效（感知均匀），>1 的高光余量单独保留。
-        let base = min(c, vec3<f32>(1.0));
-        let overflow = max(c - vec3<f32>(1.0), vec3<f32>(0.0));
-        let display = linear_to_srgb(base);
-        let shifted = max(display + vec3<f32>(endpoint_offset), vec3<f32>(0.0));
-        c = srgb_to_linear(shifted) + overflow;
-    }
-
-    // 4) 对比度：Lightroom 式显示空间 S 曲线——端点锚定（0 → 0、1 → 1，
+    // 3) 对比度：Lightroom 式显示空间 S 曲线——端点锚定（0 → 0、1 → 1，
     //    不压死暗部、不裁白），中段斜率随强度增加（+100 → 中段 ≈ 1.4×）；
     //    超出 1 的高光余量原样保留。与 CPU `pipeline::apply_reference` 同公式。
     let contrast_amount = clamp(p(1) / 100.0, -1.0, 1.0) * 0.8;
@@ -251,6 +219,40 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
         let contrast_smooth = contrast_s * contrast_s * (vec3<f32>(3.0) - 2.0 * contrast_s);
         let contrast_curved = contrast_s + vec3<f32>(contrast_amount) * (contrast_smooth - contrast_s);
         c = srgb_to_linear(contrast_curved) + contrast_headroom;
+    }
+
+    // 4) 高光 / 阴影 / 白色 / 黑色：显示空间分区色调（Lightroom 式）——
+    //    分区权重用显示亮度；高光 / 阴影是「向白 / 黑渐进」的有界位移（端点锚定），
+    //    白色 / 黑色是白点 / 黑点位移（只动端点，中灰不受影响）。
+    //    与 CPU `preview::apply_tone_zones` 同公式。
+    let tone_amount = abs(p(2)) + abs(p(3)) + abs(p(4)) + abs(p(5));
+    if (tone_amount > 0.0001) {
+        let tone_headroom = max(c - vec3<f32>(1.0), vec3<f32>(0.0));
+        let tone_s = linear_to_srgb(c);
+        let tone_lum = luminance(tone_s);
+        let h = clamp(p(2) / 100.0, -1.0, 1.0);
+        let sh = clamp(p(3) / 100.0, -1.0, 1.0);
+        let wv = clamp(p(4) / 100.0, -1.0, 1.0);
+        let bl = clamp(p(5) / 100.0, -1.0, 1.0);
+        let w_hi = smoothstep(0.45, 0.85, tone_lum);
+        let w_sh = 1.0 - smoothstep(0.15, 0.55, tone_lum);
+        let w_wh = smoothstep(0.60, 0.95, tone_lum);
+        let w_bl = 1.0 - smoothstep(0.05, 0.40, tone_lum);
+        let h_pos = max(h, 0.0);
+        let h_neg = max(-h, 0.0);
+        let sh_pos = max(sh, 0.0);
+        let sh_neg = max(-sh, 0.0);
+        let hi_shape_pos = max(vec3<f32>(1.0) - tone_s, vec3<f32>(0.0));
+        let hi_shape_neg = max(tone_s - vec3<f32>(0.5), vec3<f32>(0.0))
+            * (vec3<f32>(1.0) - 0.55 * smoothstep(vec3<f32>(0.85), vec3<f32>(1.0), tone_s));
+        let sh_shape_pos = max(vec3<f32>(0.55) - tone_s, vec3<f32>(0.0));
+        let tone_delta = vec3<f32>(h_pos * w_hi * 0.45) * hi_shape_pos
+            - vec3<f32>(h_neg * w_hi * 0.45) * hi_shape_neg
+            + vec3<f32>(sh_pos * w_sh * 0.40) * sh_shape_pos
+            - vec3<f32>(sh_neg * w_sh * 0.35) * tone_s
+            + vec3<f32>((wv * w_wh + bl * w_bl) * 0.10);
+        let tone_shifted = clamp(tone_s + tone_delta, vec3<f32>(0.0), vec3<f32>(1.0));
+        c = srgb_to_linear(tone_shifted) + tone_headroom;
     }
 
     // 5) 参数曲线（分界同样是显示参考空间：默认 0.65 / 0.35 即 sRGB 亮度分界）

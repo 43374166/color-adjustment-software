@@ -13,8 +13,8 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "1.3.1"
-    CURRENT_PROJECT_VERSION: "37"
+    MARKETING_VERSION: "1.3.2"
+    CURRENT_PROJECT_VERSION: "38"
     SWIFT_VERSION: "5.0"
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 
@@ -44,6 +44,7 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.fdxmp.app
         INFOPLIST_FILE: Fdxmp/Info.plist
         TARGETED_DEVICE_FAMILY: "1,2"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_OBJC_BRIDGING_HEADER: Fdxmp/Fdxmp-Bridging-Header.h
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/../../crates/ffi/include
