@@ -157,6 +157,10 @@ final class EditorModel: ObservableObject {
     private(set) var asset: PHAsset?
 
     private var baseBuffer: RgbaBuffer?
+    /// GPU 预览会话（nil = GPU 不可用 / 未就绪，预览自动走 CPU）。
+    private var gpuSession: GpuPreviewSession?
+    /// GPU 会话代际（换图 / 重建后旧回调作废）。
+    private var gpuSessionToken = 0
     /// 拖动蒙版控件 / 涂抹时的低分辨率缓冲（长边 720，预览更跟手）。
     private var fastBuffer: RgbaBuffer?
     /// 蒙版交互进行中（用快速缓冲渲染，结束时回落到全分辨率）。
@@ -225,6 +229,7 @@ final class EditorModel: ObservableObject {
         histogram = nil
         baseBuffer = nil
         fastBuffer = nil
+        clearGpuSession()
         maskOverlays = [:]
         maskThumbnails = [:]
         maskInteracting = false
@@ -297,6 +302,31 @@ final class EditorModel: ObservableObject {
                     self.originalImage = original
                     // 先显示原图占位，首帧渲染完成后替换为调色结果。
                     self.previewImage = original
+                    self.scheduleRender(immediate: true)
+                    // 首帧先走 CPU 保证立刻出图；GPU 会话在后台创建，就绪后接管预览渲染。
+                    self.createGpuSession(for: buffer)
+                }
+            }
+        }
+    }
+
+    /// 丢弃当前 GPU 会话（换图 / 重置时调用；在用的会话由渲染闭包强引用，安全等到自然结束）。
+    private func clearGpuSession() {
+        gpuSessionToken &+= 1
+        gpuSession = nil
+    }
+
+    /// 为预览缓冲在后台创建 GPU 会话；失败（模拟器 / 老设备 / 驱动不足）静默留在 CPU 路径。
+    private func createGpuSession(for buffer: RgbaBuffer) {
+        clearGpuSession()
+        let token = gpuSessionToken
+        renderQueue.async { [weak self] in
+            let session = GpuPreviewSession(buffer: buffer)
+            Task { @MainActor in
+                guard let self, self.gpuSessionToken == token else { return }
+                self.gpuSession = session
+                if session != nil {
+                    // 会话就绪：立刻用 GPU 重渲染一帧，显示效果与后续交互保持一致。
                     self.scheduleRender(immediate: true)
                 }
             }
@@ -1622,9 +1652,14 @@ final class EditorModel: ObservableObject {
         // CPU 渲染量降约 4 倍，手感更跟手；松手提交后自动回到全分辨率预览。
         let interactive = maskInteracting || draggingSlider != nil || fallback
         let source = interactive ? (fastBuffer ?? buffer) : buffer
+        let gpu = gpuSession
         renderQueue.async { [weak self] in
             let started = CFAbsoluteTimeGetCurrent()
-            let result = NativeCore.shared.render(buffer: source, paramsJson: json)
+            // GPU 优先（同一帧内失败 / 不适合时自动回退 CPU）。
+            var result = gpu?.render(paramsJson: json)
+            if result == nil {
+                result = NativeCore.shared.render(buffer: source, paramsJson: json)
+            }
             let millis = (CFAbsoluteTimeGetCurrent() - started) * 1000
             let failure = result == nil ? NativeCore.shared.lastError() : nil
             let histogram = result.flatMap {

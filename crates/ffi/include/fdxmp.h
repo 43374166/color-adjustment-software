@@ -119,6 +119,31 @@ uint8_t *fdxmp_mask_overlay_rgba(const char *params_json,
                                  uint32_t *out_height,
                                  size_t *out_len);
 
+/* ---- GPU 预览会话（Metal / DX12 / Vulkan；iOS 以 `--features gpu` 构建启用）----
+ *
+ * 移动端实时预览：源图只上传一次，参数变化时重渲染并回读 RGBA8。
+ * 创建失败（无 GPU / 驱动不足 / 未启用 feature）返回 NULL，调用方回退 CPU 预览；
+ * 「裁剪 + 蒙版」组合在 GPU 下坐标不一致，render 也返回 NULL
+ * （错误信息见 fdxmp_last_error_message），同样由调用方回退 CPU。
+ * 句柄用 fdxmp_gpu_preview_destroy 释放；返回缓冲区用 fdxmp_bytes_free 释放。
+ */
+
+/* 创建会话；`rgba` 为行优先 RGBA8（至少 width × height × 4 字节）。失败返回 NULL。 */
+void *fdxmp_gpu_preview_create(const uint8_t *rgba, uint32_t width, uint32_t height);
+
+/* 用参数 JSON 渲染一帧；返回格式同 fdxmp_render_memory_rgba（8 字节大端宽高 + RGBA8）。 */
+uint8_t *fdxmp_gpu_preview_render(void *handle,
+                                  const char *params_json,
+                                  uint32_t *out_width,
+                                  uint32_t *out_height,
+                                  size_t *out_len);
+
+/* 后端名称（char* 用 fdxmp_string_free 释放）；失败返回 NULL。 */
+char *fdxmp_gpu_preview_backend(void *handle);
+
+/* 释放会话（handle 可为 NULL）。 */
+void fdxmp_gpu_preview_destroy(void *handle);
+
 /* ---- 缓存 ---- */
 
 uint64_t fdxmp_cache_total_size(const char *cache_root);

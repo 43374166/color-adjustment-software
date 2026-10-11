@@ -128,7 +128,7 @@ final class NativeCore {
     }
 
     /// 解析 C ABI 返回的「8 字节大端宽高 + RGBA8 像素」缓冲区。
-    private func decodePayload(pointer: UnsafeMutablePointer<UInt8>?, outLen: Int) -> RenderResult? {
+    func decodePayload(pointer: UnsafeMutablePointer<UInt8>?, outLen: Int) -> RenderResult? {
         guard let pointer, outLen >= 8 else { return nil }
         defer { fdxmp_bytes_free(pointer, outLen) }
 
@@ -152,5 +152,54 @@ final class NativeCore {
             width: width,
             height: height
         )
+    }
+}
+
+/// GPU 预览会话（Metal；核心 `gpu` feature）。
+///
+/// 源图只上传一次，参数变化时重渲染并回读；创建失败（模拟器 / 老设备 /
+/// 驱动不足 / 未启用 feature）返回 nil，调用方自动回退 CPU 预览。
+/// 只在 `EditorModel.renderQueue` 这类工作线程「创建 → 渲染 → 释放」串行使用。
+final class GpuPreviewSession {
+    private var handle: UnsafeMutableRawPointer?
+
+    init?(buffer: RgbaBuffer) {
+        let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in
+            fdxmp_gpu_preview_create(
+                pixels.baseAddress,
+                UInt32(buffer.width),
+                UInt32(buffer.height)
+            )
+        }
+        guard let pointer else { return nil }
+        handle = pointer
+    }
+
+    deinit {
+        if let handle {
+            fdxmp_gpu_preview_destroy(handle)
+        }
+    }
+
+    /// GPU 后端名称（"metal" / "dx12" / "vulkan"…；失败返回 nil）。
+    var backend: String? {
+        guard let handle, let raw = fdxmp_gpu_preview_backend(handle) else { return nil }
+        defer { fdxmp_string_free(raw) }
+        return String(cString: raw)
+    }
+
+    /// 按参数 JSON 渲染一帧。
+    ///
+    /// 返回 nil 表示本帧不适合 GPU（如「裁剪 + 蒙版」组合）或渲染失败，
+    /// 调用方应回退 CPU 渲染；失败原因见 `NativeCore.shared.lastError()`。
+    func render(paramsJson: String) -> NativeCore.RenderResult? {
+        guard let handle else { return nil }
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = paramsJson.withCString { params in
+            fdxmp_gpu_preview_render(handle, params, &outWidth, &outHeight, &outLen)
+        }
+        return NativeCore.shared.decodePayload(pointer: pointer, outLen: outLen)
     }
 }

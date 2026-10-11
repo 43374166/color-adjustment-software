@@ -752,6 +752,218 @@ pub unsafe extern "C" fn fdxmp_cache_clear(cache_root: *const c_char) -> u64 {
     })
 }
 
+/* ---------------- GPU 预览会话（Metal / DX12 / Vulkan；需启用 `gpu` feature） ----------------
+ *
+ * 移动端实时预览：源图只上传一次，参数变化时重渲染并回读 RGBA8。
+ * 创建失败（无 GPU / 驱动不足 / 未启用 feature）返回 NULL，调用方回退 CPU 预览；
+ * 「裁剪 + 蒙版」组合在 GPU 下坐标不一致，`render` 也返回 NULL
+ * （错误信息见 `fdxmp_last_error_message`），同样由调用方回退 CPU。
+ */
+
+/// GPU 预览会话句柄（不透明；用 `fdxmp_gpu_preview_destroy` 释放）。
+#[cfg(feature = "gpu")]
+pub struct GpuPreviewHandle {
+    session: fdxmp_core::gpu::PreviewSession,
+}
+
+/// 未启用 `gpu` feature 时的占位句柄（所有调用失败返回 NULL）。
+#[cfg(not(feature = "gpu"))]
+pub struct GpuPreviewHandle {
+    _private: (),
+}
+
+#[cfg(feature = "gpu")]
+unsafe fn gpu_payload(width: u32, height: u32, rgba: &[u8], out_len: *mut usize) -> *mut u8 {
+    let mut payload = Vec::with_capacity(8 + rgba.len());
+    payload.extend_from_slice(&width.to_be_bytes());
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload.extend_from_slice(rgba);
+    let mut boxed = payload.into_boxed_slice();
+    // SAFETY: 调用方保证 out_len 是非空可写指针。
+    unsafe {
+        *out_len = boxed.len();
+    }
+    let pointer = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    pointer
+}
+
+/// 用 RGBA8 源图创建 GPU 预览会话；失败返回 NULL（调用方回退 CPU）。
+///
+/// # Safety
+///
+/// `rgba` 必须指向至少 `width * height * 4` 字节的可读缓冲区。
+#[cfg(feature = "gpu")]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_create(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+) -> *mut GpuPreviewHandle {
+    guard(ptr::null_mut(), || {
+        if rgba.is_null() || width == 0 || height == 0 {
+            set_last_error("rgba / width / height 不合法");
+            return ptr::null_mut();
+        }
+        let Some(expected) = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            set_last_error("图像尺寸溢出");
+            return ptr::null_mut();
+        };
+        // SAFETY: 调用方保证缓冲区至少 `width * height * 4` 字节。
+        let buffer = std::slice::from_raw_parts(rgba, expected);
+        match fdxmp_core::gpu::PreviewSession::new(buffer, width, height) {
+            Ok(session) => Box::into_raw(Box::new(GpuPreviewHandle { session })),
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// 未启用 `gpu` feature 的占位实现（返回 NULL）。
+///
+/// # Safety
+///
+/// 同正式实现（此版本不会读取任何指针）。
+#[cfg(not(feature = "gpu"))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_create(
+    _rgba: *const u8,
+    _width: u32,
+    _height: u32,
+) -> *mut GpuPreviewHandle {
+    set_last_error("未启用 gpu feature，请使用 CPU 预览");
+    ptr::null_mut()
+}
+
+/// 用参数 JSON 渲染一帧；返回格式同 `fdxmp_render_memory_rgba`
+/// （8 字节大端宽高 + RGBA8，须用 `fdxmp_bytes_free` 释放）；失败返回 NULL。
+///
+/// # Safety
+///
+/// `handle` 必须是 `fdxmp_gpu_preview_create` 返回的指针；`params_json` 为合法 C 字符串；
+/// `out_len` 为非空可写指针。
+#[cfg(feature = "gpu")]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_render(
+    handle: *mut GpuPreviewHandle,
+    params_json: *const c_char,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if handle.is_null() || out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("handle / out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let params: fdxmp_core::params::EditParams = match serde_json::from_str(params_json) {
+            Ok(value) => value,
+            Err(err) => {
+                set_last_error(format!("参数 JSON 解析失败：{err}"));
+                return ptr::null_mut();
+            }
+        };
+        // SAFETY: 调用方保证 handle 由 create 返回且未被 destroy。
+        let session = &mut (*handle).session;
+        match session.render(&params) {
+            Ok((width, height, rgba)) => {
+                *out_width = width;
+                *out_height = height;
+                gpu_payload(width, height, &rgba, out_len)
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// 未启用 `gpu` feature 的占位实现（返回 NULL）。
+///
+/// # Safety
+///
+/// 同正式实现（此版本不会读取任何指针）。
+#[cfg(not(feature = "gpu"))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_render(
+    _handle: *mut GpuPreviewHandle,
+    _params_json: *const c_char,
+    _out_width: *mut u32,
+    _out_height: *mut u32,
+    _out_len: *mut usize,
+) -> *mut u8 {
+    set_last_error("未启用 gpu feature，请使用 CPU 预览");
+    ptr::null_mut()
+}
+
+/// 返回 GPU 后端名称（"metal" / "dx12" / "vulkan"…，须用 `fdxmp_string_free` 释放）；
+/// 失败返回 NULL。
+///
+/// # Safety
+///
+/// `handle` 必须是 `fdxmp_gpu_preview_create` 返回的指针。
+#[cfg(feature = "gpu")]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_backend(handle: *mut GpuPreviewHandle) -> *mut c_char {
+    guard(ptr::null_mut(), || {
+        if handle.is_null() {
+            set_last_error("handle 不能为空指针");
+            return ptr::null_mut();
+        }
+        // SAFETY: 调用方保证 handle 由 create 返回且未被 destroy。
+        into_c_string((*handle).session.backend().to_string())
+    })
+}
+
+/// 未启用 `gpu` feature 的占位实现（返回 NULL）。
+///
+/// # Safety
+///
+/// 同正式实现（此版本不会读取任何指针）。
+#[cfg(not(feature = "gpu"))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_backend(_handle: *mut GpuPreviewHandle) -> *mut c_char {
+    set_last_error("未启用 gpu feature");
+    ptr::null_mut()
+}
+
+/// 释放 GPU 预览会话。
+///
+/// # Safety
+///
+/// `handle` 必须是 `fdxmp_gpu_preview_create` 返回的指针，且只能释放一次。
+#[cfg(feature = "gpu")]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_destroy(handle: *mut GpuPreviewHandle) {
+    if handle.is_null() {
+        return;
+    }
+    // SAFETY: 调用方保证 handle 由 create 返回且未释放过。
+    drop(Box::from_raw(handle));
+}
+
+/// 未启用 `gpu` feature 的占位实现（空操作）。
+///
+/// # Safety
+///
+/// 同正式实现（此版本不会读取任何指针）。
+#[cfg(not(feature = "gpu"))]
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_gpu_preview_destroy(_handle: *mut GpuPreviewHandle) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

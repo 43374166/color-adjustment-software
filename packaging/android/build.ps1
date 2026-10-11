@@ -60,7 +60,7 @@ if (-not $apk) {
 }
 
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
-$target = Join-Path $dist ("fdxmp-1.1.9-{0}.apk" -f $flavor)
+$target = Join-Path $dist ("fdxmp-1.2.0-{0}.apk" -f $flavor)
 Copy-Item $apk.FullName $target -Force
 Write-Host ("Android 打包完成：{0}（{1:N1} MB）" -f $target, ($apk.Length / 1MB)) -ForegroundColor Green
 

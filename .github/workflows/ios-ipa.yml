@@ -34,8 +34,8 @@ jobs:
 
       - name: 构建 Rust 静态库
         run: |
-          cargo rustc -p fdxmp-ffi --release --target aarch64-apple-ios --crate-type staticlib
-          cargo rustc -p fdxmp-ffi --release --target aarch64-apple-ios-sim --crate-type staticlib
+          cargo rustc -p fdxmp-ffi --release --features gpu --target aarch64-apple-ios --crate-type staticlib
+          cargo rustc -p fdxmp-ffi --release --features gpu --target aarch64-apple-ios-sim --crate-type staticlib
 
       - name: 合并 xcframework
         run: |

@@ -13,8 +13,8 @@ options:
 
 settings:
   base:
-    MARKETING_VERSION: "1.1.9"
-    CURRENT_PROJECT_VERSION: "34"
+    MARKETING_VERSION: "1.2.0"
+    CURRENT_PROJECT_VERSION: "35"
     SWIFT_VERSION: "5.0"
     ENABLE_USER_SCRIPT_SANDBOXING: NO
 
@@ -32,6 +32,12 @@ targets:
       - framework: ../../dist/ios/FdxmpCore.xcframework
         embed: false
         codeSign: false
+      # wgpu（Metal 后端）需要的系统框架（静态库不会自动带链接指令）
+      - sdk: Metal.framework
+      - sdk: QuartzCore.framework
+      - sdk: CoreGraphics.framework
+      - sdk: IOSurface.framework
+      - sdk: CoreVideo.framework
     settings:
       base:
         PRODUCT_NAME: Fdxmp
