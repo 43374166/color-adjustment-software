@@ -1,8 +1,11 @@
 import Foundation
 import SwiftUI
 
-/// 蒙版面板：新建（线性 / 径向 / 画笔）+ 列表（缩略图 / 显示隐藏 / 复制 / 重命名 / 删除）
-/// + 通用操作（反转 / 重置 / 显示叠加）+ 形状参数 + 该蒙版的局部调整。
+/// 蒙版面板：新建（线性 / 径向 / 画笔）+ 列表（缩略图 / 显示隐藏）。
+///
+/// 调整页（创建蒙版后才从底部弹起）：该蒙版的局部调色 → 羽化（快捷）→
+/// 子 nav（反转 / 复制 / 重置 / 重命名 / 删除）→ 颜色（显示叠加 / 叠加色）。
+/// 长按蒙版卡片只打开「蒙版设置」：形状参数 + 不透明度 + 复制 / 粘贴设置。
 struct MaskPanelView: View {
     @ObservedObject var model: EditorModel
     @State private var renameTargetId: String?
@@ -35,7 +38,7 @@ struct MaskPanelView: View {
                 renameTargetId = nil
             }
         }
-        // 长按蒙版卡片：蒙版设置（羽化 / 不透明度 / 反转 / 叠加色 / 形状参数 / 复制删除等）。
+        // 长按蒙版卡片：只打开「蒙版设置」（形状参数 / 不透明度 / 复制粘贴设置）。
         .sheet(isPresented: settingsBinding) {
             settingsSheet
         }
@@ -100,71 +103,11 @@ struct MaskPanelView: View {
                 Divider().overlay(Color.white.opacity(0.08))
                 ScrollView {
                     VStack(spacing: 0) {
-                        HStack(spacing: 14) {
-                            Toggle("反转", isOn: Binding(
-                                get: { mask.inverted },
-                                set: { newValue in
-                                    model.applyEdit("反转蒙版") { state in
-                                        guard let index = state.masks.firstIndex(where: { $0.id == mask.id })
-                                        else { return }
-                                        state.masks[index].inverted = newValue
-                                    }
-                                }
-                            ))
-                            .font(.footnote)
-                            .tint(Color.accentColor)
-                            Toggle("显示叠加", isOn: Binding(
-                                get: { model.maskOverlayVisible },
-                                set: { model.maskOverlayVisible = $0 }
-                            ))
-                            .font(.footnote)
-                            .tint(Color.accentColor)
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 6)
-                        // 叠加颜色
-                        HStack(spacing: 14) {
-                            Text("叠加色")
-                                .font(.footnote)
-                            Spacer()
-                            ForEach(MaskOverlayColor.allCases) { overlay in
-                                Button {
-                                    Haptics.tick()
-                                    model.applyEdit("叠加颜色") { state in
-                                        guard let index = state.masks.firstIndex(where: { $0.id == mask.id })
-                                        else { return }
-                                        state.masks[index].overlay = overlay
-                                    }
-                                } label: {
-                                    Circle()
-                                        .fill(overlayTint(overlay))
-                                        .frame(width: 22, height: 22)
-                                        .overlay(
-                                            Circle().stroke(
-                                                mask.overlay == overlay ? Color.white : Color.white.opacity(0.25),
-                                                lineWidth: mask.overlay == overlay ? 2.5 : 1
-                                            )
-                                        )
-                                }
-                                .buttonStyle(.plain)
-                            }
-                        }
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 6)
-                        // 形状参数（按类型）+ 蒙版羽化 / 不透明度
+                        // 形状参数（按类型）
                         shapeControlRows(mask)
+                        // 不透明度（从面板挪进设置里）
                         opacitySlider(mask)
-                        maskSlider(
-                            "蒙版羽化",
-                            value: mask.feather,
-                            range: 0...100,
-                            neutral: 0,
-                            step: 1
-                        ) { target, value in
-                            var copy = target
-                            copy.feather = value
-                            return copy
-                        }
+                        // 复制 / 粘贴设置留在设置里；其余操作都在面板的子 nav 上。
                         HStack(spacing: 13) {
                             actionButton(
                                 "复制设置",
@@ -181,21 +124,6 @@ struct MaskPanelView: View {
                                 Haptics.light()
                                 model.pasteMaskSettings()
                             }
-                            actionButton("重命名", icon: "pencil") {
-                                renameText = mask.name
-                                renameTargetId = mask.id
-                            }
-                            actionButton("复制蒙版", icon: "plus.square.on.square") {
-                                model.duplicateSelectedMask()
-                                settingsMaskId = nil
-                            }
-                            actionButton("重置", icon: "arrow.counterclockwise") {
-                                model.resetSelectedMask()
-                            }
-                            actionButton("删除", icon: "trash") {
-                                model.deleteSelectedMask()
-                                settingsMaskId = nil
-                            }
                         }
                         .padding(.horizontal, 8)
                         .padding(.vertical, 8)
@@ -205,16 +133,6 @@ struct MaskPanelView: View {
                 .scrollDisabled(model.draggingSlider != nil)
             }
             .presentationDetents([.medium, .large])
-            .alert("重命名蒙版", isPresented: renameAlertBinding) {
-                TextField("名称", text: $renameText)
-                Button("取消", role: .cancel) {
-                    renameTargetId = nil
-                }
-                Button("确定") {
-                    model.renameSelectedMask(renameText)
-                    renameTargetId = nil
-                }
-            }
         }
     }
 
@@ -276,11 +194,10 @@ struct MaskPanelView: View {
         .onTapGesture {
             model.selectMask(mask.id)
         }
-        // 长按卡片：打开蒙版设置（羽化 / 不透明度 / 反转 / 形状参数 / 复制删除等）。
+        // 长按卡片：只打开「蒙版设置」（形状参数 / 不透明度 / 复制粘贴设置）。
         .onLongPressGesture(minimumDuration: 0.4) {
             Haptics.light()
             model.selectMask(mask.id)
-            renameText = mask.name
             settingsMaskId = mask.id
         }
     }
@@ -312,91 +229,110 @@ struct MaskPanelView: View {
         }
     }
 
-    // MARK: - 通用操作
+    // MARK: - 羽化（快捷）+ 子 nav + 颜色
 
+    /// 蒙版羽化（快捷滑块；更细的形状参数仍在长按卡片的「蒙版设置」里）。
+    private func quickFeatherRow(_ mask: MaskUi) -> some View {
+        maskSlider(
+            "羽化",
+            value: mask.feather,
+            range: 0...100,
+            neutral: 0,
+            step: 1
+        ) { target, value in
+            var copy = target
+            copy.feather = value
+            return copy
+        }
+    }
+
+    /// 子 nav（放在蒙版列表上面）：反转 / 复制 / 重置 / 重命名 / 删除。
     private var actionRow: some View {
         HStack(spacing: 0) {
             actionButton(
                 "反转",
                 icon: "circle.lefthalf.filled",
-                enabled: model.selectedMask != nil,
                 active: model.selectedMask?.inverted ?? false
             ) {
                 model.invertSelectedMask()
             }
-            actionButton(
-                "重置",
-                icon: "arrow.counterclockwise",
-                enabled: model.selectedMask != nil
-            ) {
-                model.resetSelectedMask()
-            }
-            actionButton(
-                "叠加",
-                icon: "square.on.square",
-                active: model.maskOverlayVisible
-            ) {
-                model.maskOverlayVisible.toggle()
-            }
-            Menu {
-                ForEach(MaskOverlayColor.allCases) { overlay in
-                    Button {
-                        Haptics.tick()
-                        model.applyEdit("叠加颜色") { state in
-                            guard let id = model.selectedMaskId,
-                                  let index = state.masks.firstIndex(where: { $0.id == id })
-                            else { return }
-                            state.masks[index].overlay = overlay
-                        }
-                    } label: {
-                        HStack {
-                            Text(overlay.rawValue)
-                            if model.selectedMask?.overlay == overlay {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            } label: {
-                VStack(spacing: 2) {
-                    Circle()
-                        .fill(overlayTint(model.selectedMask?.overlay ?? .red))
-                        .frame(width: 15, height: 15)
-                        .overlay(Circle().stroke(Color.white.opacity(0.35), lineWidth: 1))
-                    Text("叠加色")
-                        .font(.system(size: 9))
-                }
-                .frame(maxWidth: .infinity)
-                .foregroundStyle(model.selectedMask == nil ? Color.white.opacity(0.3) : Color.white.opacity(0.85))
-            }
-            .disabled(model.selectedMask == nil)
-            actionButton(
-                "复制",
-                icon: "plus.square.on.square",
-                enabled: model.selectedMask != nil
-            ) {
+            actionButton("复制", icon: "plus.square.on.square") {
                 model.duplicateSelectedMask()
             }
-            actionButton(
-                "重命名",
-                icon: "pencil",
-                enabled: model.selectedMask != nil
-            ) {
+            actionButton("重置", icon: "arrow.counterclockwise") {
+                model.resetSelectedMask()
+            }
+            actionButton("重命名", icon: "pencil") {
                 if let mask = model.selectedMask {
                     renameText = mask.name
                     renameTargetId = mask.id
                 }
             }
-            actionButton(
-                "删除",
-                icon: "trash",
-                enabled: model.selectedMask != nil
-            ) {
+            actionButton("删除", icon: "trash") {
                 model.deleteSelectedMask()
             }
         }
         .padding(.horizontal, 8)
+        .padding(.top, 4)
+        .padding(.bottom, 2)
+        // 拖动滑块时：只隐藏不位移（滑块保持原位）。
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+        .allowsHitTesting(model.draggingSlider == nil)
+    }
+
+    /// 颜色（在子 nav 下面）：显示叠加 + 叠加色。
+    private func overlayColorRow(_ mask: MaskUi) -> some View {
+        HStack(spacing: 12) {
+            Button {
+                Haptics.tick()
+                model.maskOverlayVisible.toggle()
+            } label: {
+                VStack(spacing: 2) {
+                    Image(systemName: model.maskOverlayVisible ? "eye" : "eye.slash")
+                        .font(.system(size: 14))
+                    Text("显示叠加")
+                        .font(.system(size: 9))
+                }
+                .foregroundStyle(
+                    model.maskOverlayVisible
+                        ? Color.accentColor
+                        : Color.white.opacity(0.85)
+                )
+            }
+            .buttonStyle(.plain)
+            Spacer(minLength: 0)
+            Text("叠加色")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+            ForEach(MaskOverlayColor.allCases) { overlay in
+                Button {
+                    Haptics.tick()
+                    model.applyEdit("叠加颜色") { state in
+                        guard let index = state.masks.firstIndex(where: { $0.id == mask.id })
+                        else { return }
+                        state.masks[index].overlay = overlay
+                    }
+                } label: {
+                    Circle()
+                        .fill(overlayTint(overlay))
+                        .frame(width: 22, height: 22)
+                        .overlay(
+                            Circle().stroke(
+                                mask.overlay == overlay
+                                    ? Color.white
+                                    : Color.white.opacity(0.25),
+                                lineWidth: mask.overlay == overlay ? 2.5 : 1
+                            )
+                        )
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 6)
         .padding(.bottom, 4)
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+        .allowsHitTesting(model.draggingSlider == nil)
     }
 
     private func actionButton(
@@ -435,68 +371,28 @@ struct MaskPanelView: View {
         }
     }
 
-    // MARK: - 子页：蒙版（形状）/ 调整（局部调色）
-
-    private var subtabRow: some View {
-        HStack(spacing: 18) {
-            ForEach(MaskPanelTab.allCases) { tab in
-                Button {
-                    model.setMaskTab(tab)
-                } label: {
-                    VStack(spacing: 3) {
-                        Text(tab.rawValue)
-                            .font(.caption)
-                            .foregroundStyle(
-                                model.maskTab == tab ? Color.white : Color.white.opacity(0.55)
-                            )
-                        Rectangle()
-                            .fill(model.maskTab == tab ? Color.accentColor : Color.clear)
-                            .frame(width: 26, height: 2)
-                    }
-                }
-                .buttonStyle(.plain)
-            }
-            Spacer()
-            if let mask = model.selectedMask {
-                Text(mask.name)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 10)
-        .padding(.bottom, 4)
-    }
-
     @ViewBuilder
     private var content: some View {
         if let mask = model.selectedMask {
-            // 面板只留调整内容 + 不透明度；形状设置在长按卡片的蒙版设置里。
+            // 调整页（创建蒙版后才从底部弹起）：
+            // 局部调色 → 羽化（快捷）→ 子 nav（反转 / 复制 / 重置 / 重命名 / 删除）→ 颜色（叠加 + 叠加色）。
             VStack(spacing: 0) {
-                opacitySlider(mask)
                 adjustControls
+                quickFeatherRow(mask)
+                actionRow
+                overlayColorRow(mask)
             }
         } else {
-            VStack(spacing: 8) {
-                Spacer()
-                Text("点「＋ 新建」添加蒙版：线性渐变 / 径向渐变 / 画笔")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                Spacer()
-            }
+            // 还没有蒙版：只留一句提示 + 新建行，创建后再弹起调整页。
+            Text("点「＋ 新建」添加蒙版：线性渐变 / 径向渐变 / 画笔")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
         }
     }
 
     // MARK: - 形状参数
-
-    private func shapeControls(_ mask: MaskUi) -> some View {
-        ScrollView {
-            shapeControlRows(mask)
-        }
-        // 拖动滑块中：禁止面板上下滚动（只调值）。
-        .scrollDisabled(model.draggingSlider != nil)
-    }
 
     /// 形状参数行（不含滚动容器；设置弹层里直接嵌这段）。
     private func shapeControlRows(_ mask: MaskUi) -> some View {
@@ -543,7 +439,6 @@ struct MaskPanelView: View {
         ) { mask, value in
             mask.settingLinearWidth(Double(value) / 100)
         }
-        opacitySlider(mask)
     }
 
     @ViewBuilder
@@ -605,7 +500,7 @@ struct MaskPanelView: View {
             return copy
         }
         maskSlider(
-            "羽化",
+            "内圈羽化",
             value: mask.radialFeather,
             range: 0...100,
             neutral: 30,
@@ -615,7 +510,6 @@ struct MaskPanelView: View {
             copy.radialFeather = value
             return copy
         }
-        opacitySlider(mask)
     }
 
     @ViewBuilder
@@ -648,7 +542,7 @@ struct MaskPanelView: View {
             return copy
         }
         maskSlider(
-            "羽化",
+            "笔刷羽化",
             value: mask.brushFeather,
             range: 0...100,
             neutral: 50,
@@ -680,7 +574,6 @@ struct MaskPanelView: View {
             copy.brushDensity = value
             return copy
         }
-        opacitySlider(mask)
         HStack(spacing: 14) {
             Text("参数只影响之后的笔画；已画的笔画保留落笔设置。")
                 .font(.system(size: 10))

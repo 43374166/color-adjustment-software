@@ -787,8 +787,8 @@ struct EditorTabView: View {
             }
             return 288
         case .crop: return 210
-        // 蒙版下工具条与顶部栏隐藏，面板整体更高（编辑区更大）。
-        case .mask: return 404
+        // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
+        case .mask: return model.selectedMask == nil ? 150 : 360
         }
     }
 

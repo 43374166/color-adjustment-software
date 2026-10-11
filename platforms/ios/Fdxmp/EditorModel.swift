@@ -31,14 +31,6 @@ enum ColorTab: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// 蒙版面板的子页。
-enum MaskPanelTab: String, CaseIterable, Identifiable {
-    case shape = "蒙版"
-    case adjust = "调整"
-
-    var id: String { rawValue }
-}
-
 /// 渲染尺寸上限（非 actor 隔离，可在后台渲染闭包中安全引用）。
 enum EditorLimits {
     /// 预览最长边（越大越清晰、渲染越慢）。
@@ -137,7 +129,6 @@ final class EditorModel: ObservableObject {
     @Published var gradingZone: GradingZoneKind = .highlights
     @Published var hslBand: HslBandKind = .red
     @Published var selectedMaskId: String?
-    @Published private(set) var maskTab: MaskPanelTab = .shape
     /// 是否叠加显示当前蒙版（红色半透明覆盖）。
     @Published var maskOverlayVisible = true
     /// 画笔擦除模式（橡皮擦）。
@@ -189,8 +180,6 @@ final class EditorModel: ObservableObject {
     private let maskAssetQueue = DispatchQueue(label: "fdxmp.ios.mask-assets", qos: .userInitiated)
     private var maskAssetToken = 0
     private var maskAssetScheduled = false
-    /// 进入「调整」子页前的叠加显示状态（用于回来时恢复）。
-    private var maskOverlayRestore = true
     /// 进入曲线前的分类（曲线面板「完成」时恢复）。
     private var categoryBeforeCurves: EditCategory = .light
     /// 预设强度的混合快照（应用预设前 / 预设结果）。
@@ -1136,7 +1125,6 @@ final class EditorModel: ObservableObject {
             state.masks.append(mask)
         }
         selectedMaskId = mask.id
-        setMaskTab(.shape)
         brushErase = false
     }
 
@@ -1287,25 +1275,6 @@ final class EditorModel: ObservableObject {
         brushErase = false
         brushCursor = nil
         scheduleMaskAssetsRefresh(immediate: true)
-    }
-
-    /// 切换蒙版面板子页。
-    ///
-    /// 进入「调整」时自动收起红色叠加（调色时只看效果，不被蒙版挡住），
-    /// 回到「蒙版」（形状）子页时恢复原来的叠加显示状态。
-    func setMaskTab(_ tab: MaskPanelTab) {
-        guard maskTab != tab else { return }
-        if tab == .adjust {
-            maskOverlayRestore = maskOverlayVisible
-            maskOverlayVisible = false
-        } else if maskTab == .adjust {
-            maskOverlayVisible = maskOverlayRestore
-            if maskOverlayVisible {
-                // 收起期间可能错过了大图叠加的生成，这里补一次。
-                scheduleMaskAssetsRefresh(immediate: true)
-            }
-        }
-        maskTab = tab
     }
 
     /// 直接修改选中蒙版（面板拖动 / 画布拖动中调用：静默，不落历史）。
