@@ -1630,7 +1630,7 @@ final class EditorModel: ObservableObject {
                 }
                 let failure = renderedBuffer == nil ? NativeCore.shared.lastError() : nil
                 let output = renderedBuffer.flatMap { ImageUtil.image(from: $0) }
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     guard let self else { return }
                     guard let output else {
                         self.isExporting = false
