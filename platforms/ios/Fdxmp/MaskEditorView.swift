@@ -3,9 +3,10 @@ import SwiftUI
 
 /// 蒙版面板：新建（线性 / 径向 / 画笔）+ 列表（缩略图 / 显示隐藏）。
 ///
-/// 调整页（创建蒙版后才从底部弹起）：该蒙版的局部调色 → 羽化（快捷）→
-/// 子 nav（反转 / 复制 / 重置 / 重命名 / 删除）→ 颜色（显示叠加 / 叠加色）。
-/// 长按蒙版卡片只打开「蒙版设置」：形状参数 + 不透明度 + 复制 / 粘贴设置。
+/// 调整页（创建蒙版后才从底部弹起）：该蒙版的局部调色 + 子 nav
+/// （反转 / 复制 / 重置 / 重命名 / 删除，就在蒙版列表上面）。
+/// 长按蒙版卡片打开「蒙版设置」：显示叠加 / 叠加色（默认红色）+ 形状参数 +
+/// 蒙版羽化 + 不透明度 + 复制 / 粘贴设置。
 struct MaskPanelView: View {
     @ObservedObject var model: EditorModel
     @State private var renameTargetId: String?
@@ -38,7 +39,7 @@ struct MaskPanelView: View {
                 renameTargetId = nil
             }
         }
-        // 长按蒙版卡片：只打开「蒙版设置」（形状参数 / 不透明度 / 复制粘贴设置）。
+        // 长按蒙版卡片：打开「蒙版设置」（叠加 + 形状参数 + 羽化 / 不透明度 + 复制粘贴设置）。
         .sheet(isPresented: settingsBinding) {
             settingsSheet
         }
@@ -103,8 +104,68 @@ struct MaskPanelView: View {
                 Divider().overlay(Color.white.opacity(0.08))
                 ScrollView {
                     VStack(spacing: 0) {
+                        // 显示叠加 + 叠加色（默认红色）
+                        HStack(spacing: 14) {
+                            Button {
+                                Haptics.tick()
+                                model.maskOverlayVisible.toggle()
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: model.maskOverlayVisible ? "eye" : "eye.slash")
+                                        .font(.footnote)
+                                    Text("显示叠加")
+                                        .font(.footnote)
+                                }
+                                .foregroundStyle(
+                                    model.maskOverlayVisible
+                                        ? Color.accentColor
+                                        : Color.white.opacity(0.85)
+                                )
+                            }
+                            .buttonStyle(.plain)
+                            Spacer(minLength: 0)
+                            Text("叠加色")
+                                .font(.footnote)
+                            ForEach(MaskOverlayColor.allCases) { overlay in
+                                Button {
+                                    Haptics.tick()
+                                    model.applyEdit("叠加颜色") { state in
+                                        guard let index = state.masks.firstIndex(where: { $0.id == mask.id })
+                                        else { return }
+                                        state.masks[index].overlay = overlay
+                                    }
+                                } label: {
+                                    Circle()
+                                        .fill(overlayTint(overlay))
+                                        .frame(width: 22, height: 22)
+                                        .overlay(
+                                            Circle().stroke(
+                                                mask.overlay == overlay
+                                                    ? Color.white
+                                                    : Color.white.opacity(0.25),
+                                                lineWidth: mask.overlay == overlay ? 2.5 : 1
+                                            )
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 6)
                         // 形状参数（按类型）
                         shapeControlRows(mask)
+                        // 蒙版羽化（整体软边）
+                        maskSlider(
+                            "蒙版羽化",
+                            value: mask.feather,
+                            range: 0...100,
+                            neutral: 0,
+                            step: 1
+                        ) { target, value in
+                            var copy = target
+                            copy.feather = value
+                            return copy
+                        }
                         // 不透明度（从面板挪进设置里）
                         opacitySlider(mask)
                         // 复制 / 粘贴设置留在设置里；其余操作都在面板的子 nav 上。
@@ -229,24 +290,8 @@ struct MaskPanelView: View {
         }
     }
 
-    // MARK: - 羽化（快捷）+ 子 nav + 颜色
+    // MARK: - 子 nav（放在蒙版列表上面）：反转 / 复制 / 重置 / 重命名 / 删除
 
-    /// 蒙版羽化（快捷滑块；更细的形状参数仍在长按卡片的「蒙版设置」里）。
-    private func quickFeatherRow(_ mask: MaskUi) -> some View {
-        maskSlider(
-            "羽化",
-            value: mask.feather,
-            range: 0...100,
-            neutral: 0,
-            step: 1
-        ) { target, value in
-            var copy = target
-            copy.feather = value
-            return copy
-        }
-    }
-
-    /// 子 nav（放在蒙版列表上面）：反转 / 复制 / 重置 / 重命名 / 删除。
     private var actionRow: some View {
         HStack(spacing: 0) {
             actionButton(
@@ -276,61 +321,6 @@ struct MaskPanelView: View {
         .padding(.top, 4)
         .padding(.bottom, 2)
         // 拖动滑块时：只隐藏不位移（滑块保持原位）。
-        .opacity(model.draggingSlider == nil ? 1 : 0)
-        .allowsHitTesting(model.draggingSlider == nil)
-    }
-
-    /// 颜色（在子 nav 下面）：显示叠加 + 叠加色。
-    private func overlayColorRow(_ mask: MaskUi) -> some View {
-        HStack(spacing: 12) {
-            Button {
-                Haptics.tick()
-                model.maskOverlayVisible.toggle()
-            } label: {
-                VStack(spacing: 2) {
-                    Image(systemName: model.maskOverlayVisible ? "eye" : "eye.slash")
-                        .font(.system(size: 14))
-                    Text("显示叠加")
-                        .font(.system(size: 9))
-                }
-                .foregroundStyle(
-                    model.maskOverlayVisible
-                        ? Color.accentColor
-                        : Color.white.opacity(0.85)
-                )
-            }
-            .buttonStyle(.plain)
-            Spacer(minLength: 0)
-            Text("叠加色")
-                .font(.system(size: 10))
-                .foregroundStyle(.secondary)
-            ForEach(MaskOverlayColor.allCases) { overlay in
-                Button {
-                    Haptics.tick()
-                    model.applyEdit("叠加颜色") { state in
-                        guard let index = state.masks.firstIndex(where: { $0.id == mask.id })
-                        else { return }
-                        state.masks[index].overlay = overlay
-                    }
-                } label: {
-                    Circle()
-                        .fill(overlayTint(overlay))
-                        .frame(width: 22, height: 22)
-                        .overlay(
-                            Circle().stroke(
-                                mask.overlay == overlay
-                                    ? Color.white
-                                    : Color.white.opacity(0.25),
-                                lineWidth: mask.overlay == overlay ? 2.5 : 1
-                            )
-                        )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 6)
-        .padding(.bottom, 4)
         .opacity(model.draggingSlider == nil ? 1 : 0)
         .allowsHitTesting(model.draggingSlider == nil)
     }
@@ -375,12 +365,11 @@ struct MaskPanelView: View {
     private var content: some View {
         if let mask = model.selectedMask {
             // 调整页（创建蒙版后才从底部弹起）：
-            // 局部调色 → 羽化（快捷）→ 子 nav（反转 / 复制 / 重置 / 重命名 / 删除）→ 颜色（叠加 + 叠加色）。
+            // 局部调色 → 子 nav（反转 / 复制 / 重置 / 重命名 / 删除）。
+            // 羽化 / 叠加色 / 不透明度这些都在长按卡片的「蒙版设置」里。
             VStack(spacing: 0) {
                 adjustControls
-                quickFeatherRow(mask)
                 actionRow
-                overlayColorRow(mask)
             }
         } else {
             // 还没有蒙版：只留一句提示 + 新建行，创建后再弹起调整页。

@@ -493,11 +493,11 @@ struct EditorTabView: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-                    // 靠上对齐：面板浮在下面时，图片内容不会被遮掉太多。
+                    // 居中显示（和 fittedRect / 叠加层几何一致）：
+                    // 竖图本来就被高度撑满，横图不会被顶到导航栏下面。
                     .frame(
                         width: geo.size.width,
-                        height: geo.size.height,
-                        alignment: .top
+                        height: geo.size.height
                     )
                     .scaleEffect(zoom)
                     .offset(pan)
@@ -788,7 +788,8 @@ struct EditorTabView: View {
             return 288
         case .crop: return 210
         // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
-        case .mask: return model.selectedMask == nil ? 150 : 360
+        // 羽化 / 叠加色挪回长按设置后，面板只剩"调整 + 子 nav"，再压低一档。
+        case .mask: return model.selectedMask == nil ? 150 : 280
         }
     }
 
@@ -1155,13 +1156,23 @@ struct EditorTabView: View {
         let tint = Color(red: kind.tint.r, green: kind.tint.g, blue: kind.tint.b)
         switch channel {
         case "hue":
-            // 色相轨道用当前色带自己的颜色（不是整条彩虹）。
-            return [tint, tint]
+            // 和 Lightroom 一样：左 = 上一个色相、中 = 本色带、右 = 下一个色相
+            // （绿色带 → 左黄、中绿、右青）。
+            return [neighborTint(kind, offset: -1), tint, neighborTint(kind, offset: 1)]
         case "saturation":
             return [Color(white: 0.45), tint]
         default:
             return [Color(white: 0.1), tint, Color(white: 1.0)]
         }
+    }
+
+    /// 环形相邻色带的颜色（用于色相轨道两端）。
+    private func neighborTint(_ kind: HslBandKind, offset: Int) -> Color {
+        let all = HslBandKind.allCases
+        guard let index = all.firstIndex(of: kind) else { return Color.white }
+        let count = all.count
+        let neighbor = all[((index + offset) % count + count) % count]
+        return Color(red: neighbor.tint.r, green: neighbor.tint.g, blue: neighbor.tint.b)
     }
 
     private func step(for spec: SliderSpec) -> Float {
