@@ -119,8 +119,14 @@ final class EditorModel: ObservableObject {
     @Published var state = EditState()
     @Published private(set) var tool: EditorTool = .edit
     @Published private(set) var presetName = "原片"
+    /// 当前应用的预设引用（系统预设 `b:名称` / 用户预设 `u:id`；手动调整后清空）。
+    @Published private(set) var presetRef: String?
     /// 预设强度 0..100（应用预设后可调；0 = 应用前的样子）。
     @Published private(set) var presetStrength: Float = 100
+    /// 用户预设文件夹（父，按创建顺序）。
+    @Published private(set) var presetFolders: [PresetFolder] = []
+    /// 用户预设（子，按创建顺序）。
+    @Published private(set) var userPresets: [UserPreset] = []
 
     // 面板导航
     @Published var category: EditCategory = .light
@@ -154,7 +160,7 @@ final class EditorModel: ObservableObject {
     @Published private(set) var beforeImage: UIImage?
     /// 正在准备对比帧。
     @Published private(set) var isPreparingBefore = false
-    /// 预设缩略图（键 = 预设名，用当前照片的小图渲染）。
+    /// 预设缩略图（键 = 预设引用 `b:` / `u:`，用当前照片的小图渲染）。
     @Published private(set) var presetThumbnails: [String: UIImage] = [:]
 
     private(set) var asset: PHAsset?
@@ -193,6 +199,12 @@ final class EditorModel: ObservableObject {
     /// 正在拖预设强度滑块（此时不要清掉混合上下文）。
     private var suppressPresetStrengthReset = false
     private static let imageManager = PHCachingImageManager()
+
+    init() {
+        let library = PresetLibraryCoding.load()
+        presetFolders = library.folders
+        userPresets = library.presets
+    }
 
     // MARK: - 只读派生值
 
@@ -242,9 +254,11 @@ final class EditorModel: ObservableObject {
         if let json = EditStore.json(assetId: asset.localIdentifier) {
             state = EditJSON.parse(json)
             presetName = "自定义"
+            presetRef = nil
         } else {
             state = EditState()
             presetName = "原片"
+            presetRef = EditorSpec.presets.first?.ref
         }
         selectedMaskId = state.masks.first?.id
         isLoading = true
@@ -334,24 +348,18 @@ final class EditorModel: ObservableObject {
 
     private var presetThumbToken = 0
 
-    /// 用当前照片的小图渲染每个内置预设的效果（进入预设工具时刷新）。
+    /// 用当前照片的小图渲染每个预设的效果（进入预设工具 / 预设库变化时刷新）。
     func refreshPresetThumbnails() {
         guard let buffer = baseBuffer else { return }
         presetThumbToken &+= 1
         let token = presetThumbToken
         let crop = state.crop
-        let presets = EditorSpec.presets
+        let builtins = EditorSpec.presets
+        let users = userPresets
         maskAssetQueue.async { [weak self] in
             let small = ImageUtil.downscaled(buffer: buffer, maxEdge: 200) ?? buffer
             var images: [String: UIImage] = [:]
-            for preset in presets {
-                var thumbState = EditState()
-                thumbState.crop = crop
-                var values = EditorSpec.defaultValues()
-                for (key, value) in preset.params {
-                    values[key] = value
-                }
-                thumbState.values = values
+            func render(_ ref: String, _ thumbState: EditState) {
                 let json = EditJSON.build(state: thumbState, applyCropRect: true)
                 guard
                     let result = NativeCore.shared.render(buffer: small, paramsJson: json),
@@ -363,9 +371,25 @@ final class EditorModel: ObservableObject {
                         )
                     )
                 else {
-                    continue
+                    return
                 }
-                images[preset.name] = image
+                images[ref] = image
+            }
+            for preset in builtins {
+                var thumbState = EditState()
+                thumbState.crop = crop
+                var values = EditorSpec.defaultValues()
+                for (key, value) in preset.params {
+                    values[key] = value
+                }
+                thumbState.values = values
+                render(preset.ref, thumbState)
+            }
+            for preset in users {
+                var thumbState = EditState()
+                thumbState.crop = crop
+                preset.apply(to: &thumbState)
+                render(preset.ref, thumbState)
             }
             Task { @MainActor in
                 guard let self, self.presetThumbToken == token else { return }
@@ -642,6 +666,7 @@ final class EditorModel: ObservableObject {
         draggingSlider = nil
         draggingSliderText = nil
         presetName = "自定义"
+        presetRef = nil
         persist()
         scheduleRender(immediate: true)
         refreshDetailIfNeeded()
@@ -657,6 +682,7 @@ final class EditorModel: ObservableObject {
         pendingLabel = label
         pushUndo(before)
         presetName = "自定义"
+        presetRef = nil
         persist()
         scheduleRender(immediate: true)
         refreshDetailIfNeeded()
@@ -674,6 +700,7 @@ final class EditorModel: ObservableObject {
         presetTarget = nil
         publishHistory()
         presetName = "自定义"
+        presetRef = nil
         message = "已重做：\(entry.name)"
         persist()
         scheduleRender(immediate: true)
@@ -700,6 +727,7 @@ final class EditorModel: ObservableObject {
         presetTarget = nil
         publishHistory()
         presetName = "自定义"
+        presetRef = nil
         if announce {
             message = "已撤销：\(name)"
         }
@@ -734,10 +762,89 @@ final class EditorModel: ObservableObject {
             state.curves.reset()
         }
         presetName = preset.name
+        presetRef = preset.ref
         // 记住应用前后：预设「强度」在两者之间插值。
         presetBase = base
         presetTarget = state
         presetStrength = 100
+    }
+
+    // MARK: 用户预设库（文件夹 + 预设）
+
+    /// 新建预设文件夹。
+    @discardableResult
+    func createPresetFolder(name: String) -> PresetFolder? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let folder = PresetFolder(id: UUID().uuidString, name: trimmed, createdAt: Date())
+        presetFolders.append(folder)
+        persistPresetLibrary()
+        return folder
+    }
+
+    /// 删除文件夹（连同里面的预设）。
+    func deletePresetFolder(_ id: String) {
+        let removed = userPresets.filter { $0.folderId == id }
+        userPresets.removeAll { $0.folderId == id }
+        presetFolders.removeAll { $0.id == id }
+        if let ref = presetRef, removed.contains(where: { $0.ref == ref }) {
+            presetRef = nil
+            presetName = "自定义"
+        }
+        persistPresetLibrary()
+        refreshPresetThumbnails()
+    }
+
+    /// 删除用户预设。
+    func deleteUserPreset(_ id: String) {
+        userPresets.removeAll { $0.id == id }
+        if presetRef == "u:\(id)" {
+            presetRef = nil
+            presetName = "自定义"
+        }
+        persistPresetLibrary()
+        refreshPresetThumbnails()
+    }
+
+    /// 把当前调色存为用户预设（只收集勾选的分组）。
+    @discardableResult
+    func saveUserPreset(
+        name: String,
+        folderId: String,
+        sections: Set<PresetSection>
+    ) -> UserPreset? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              presetFolders.contains(where: { $0.id == folderId }),
+              !sections.isEmpty else { return nil }
+        let preset = UserPreset.make(
+            from: state,
+            name: trimmed,
+            folderId: folderId,
+            sections: sections
+        )
+        userPresets.append(preset)
+        persistPresetLibrary()
+        message = "已保存预设「\(trimmed)」"
+        refreshPresetThumbnails()
+        return preset
+    }
+
+    /// 应用用户预设：只覆盖勾选的分组，其余保持原样；之后可调「强度」。
+    func applyUserPreset(_ preset: UserPreset) {
+        let base = state
+        applyEdit(preset.name) { state in
+            preset.apply(to: &state)
+        }
+        presetName = preset.name
+        presetRef = preset.ref
+        presetBase = base
+        presetTarget = state
+        presetStrength = 100
+    }
+
+    private func persistPresetLibrary() {
+        PresetLibraryCoding.save(folders: presetFolders, presets: userPresets)
     }
 
     /// 有可调强度的预设上下文（应用过预设后为 true）。
@@ -753,7 +860,8 @@ final class EditorModel: ObservableObject {
     }
 
     /// 拖动预设强度：在「应用前」与「预设结果」之间插值。
-    /// 曲线按 50% 分界切换（与核心 `EditParams::blend` 的桌面行为一致）。
+    /// 曲线按 50% 分界切换（与核心 `EditParams::blend` 的桌面行为一致）；
+    /// 预设没包含的分组在前后两份状态里本来就相同，插值等于不变。
     func updatePresetStrength(_ value: Float) {
         guard let base = presetBase, let target = presetTarget else { return }
         presetStrength = value
@@ -764,6 +872,33 @@ final class EditorModel: ObservableObject {
             let to = target.values[spec.key] ?? spec.defaultValue
             updated.values[spec.key] = from + (to - from) * t
         }
+        // HSL / 颜色分级同样插值（用户预设可能包含这两组）。
+        var hsl = updated.hsl
+        for kind in HslBandKind.allCases {
+            let from = base.hsl[kind]
+            let to = target.hsl[kind]
+            hsl[kind] = HslBand(
+                hue: from.hue + (to.hue - from.hue) * t,
+                saturation: from.saturation + (to.saturation - from.saturation) * t,
+                luminance: from.luminance + (to.luminance - from.luminance) * t
+            )
+        }
+        updated.hsl = hsl
+        var grading = updated.grading
+        for kind in GradingZoneKind.allCases {
+            let from = base.grading[kind]
+            let to = target.grading[kind]
+            grading[kind] = GradingZone(
+                hue: from.hue + (to.hue - from.hue) * t,
+                saturation: from.saturation + (to.saturation - from.saturation) * t,
+                luminance: from.luminance + (to.luminance - from.luminance) * t
+            )
+        }
+        grading.blending = base.grading.blending
+            + (target.grading.blending - base.grading.blending) * t
+        grading.balance = base.grading.balance
+            + (target.grading.balance - base.grading.balance) * t
+        updated.grading = grading
         updated.curves = t < 0.5 ? base.curves : target.curves
         state = updated
         touchEdit()
@@ -784,6 +919,7 @@ final class EditorModel: ObservableObject {
         brushCursor = nil
         maskInteracting = false
         presetName = "原片"
+        presetRef = EditorSpec.presets.first?.ref
     }
 
     // MARK: - 曲线
@@ -907,6 +1043,7 @@ final class EditorModel: ObservableObject {
         }
         dragSnapshot = nil
         presetName = "自定义"
+        presetRef = nil
         persist()
         scheduleRender(immediate: true)
     }

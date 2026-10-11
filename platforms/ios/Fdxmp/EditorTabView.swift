@@ -774,7 +774,8 @@ struct EditorTabView: View {
 
     private var panelHeight: CGFloat {
         switch model.tool {
-        case .presets: return 210
+        // 预设树（文件夹 + 预设竖排）比原来的卡片行高一些，给列表多留窗口。
+        case .presets: return 250
         case .edit:
             if categoryCollapsed {
                 return 64
@@ -799,7 +800,7 @@ struct EditorTabView: View {
             Group {
                 switch model.tool {
                 case .presets:
-                    presetPanel
+                    PresetPanelView(model: model)
                 case .crop:
                     cropPanel
                 case .edit:
@@ -847,81 +848,6 @@ struct EditorTabView: View {
             }
         }
         .padding(.vertical, 7)
-    }
-
-    // MARK: - 预设
-
-    private var presetPanel: some View {
-        VStack(spacing: 0) {
-            // 拖动强度滑块时：卡片行只隐藏不位移（滑块保持原位）。
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 10) {
-                    ForEach(EditorSpec.presets) { preset in
-                        Button {
-                            Haptics.light()
-                            model.applyPreset(preset)
-                        } label: {
-                            presetCard(preset)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-                .padding(.horizontal, 14)
-                .padding(.vertical, 12)
-            }
-            .scrollDisabled(model.draggingSlider != nil)
-            .opacity(model.draggingSlider == nil ? 1 : 0)
-            .allowsHitTesting(model.draggingSlider == nil)
-            if model.canAdjustPresetStrength {
-                // Lightroom 式预设强度：0 = 应用前，100 = 预设原样。
-                ValueSliderRow(
-                    label: "强度",
-                    value: model.presetStrength,
-                    range: 0...100,
-                    neutral: 100,
-                    step: 5,
-                    onBegin: { model.beginPresetStrengthEdit() },
-                    onChange: { model.updatePresetStrength($0) },
-                    onCommit: { model.commitPresetStrengthEdit() }
-                )
-                .padding(.horizontal, 4)
-            } else if model.draggingSlider == nil {
-                Spacer(minLength: 0)
-            }
-        }
-    }
-
-    private func presetCard(_ preset: BuiltinPreset) -> some View {
-        let selected = model.presetName == preset.name
-        return VStack(spacing: 4) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(Color.black.opacity(0.4))
-                if let thumbnail = model.presetThumbnails[preset.name] {
-                    Image(uiImage: thumbnail)
-                        .resizable()
-                        .scaledToFill()
-                        .frame(width: 96, height: 62)
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                } else {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(.white)
-                }
-            }
-            .frame(width: 96, height: 62)
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(
-                        selected ? Color.accentColor : Color.white.opacity(0.12),
-                        lineWidth: selected ? 2 : 1
-                    )
-            )
-            Text(preset.name)
-                .font(.caption2)
-                .foregroundStyle(selected ? Color.accentColor : Color.white.opacity(0.8))
-        }
-        .frame(width: 100)
     }
 
     // MARK: - 编辑面板（亮度 / 颜色 / 效果 / 细节）
