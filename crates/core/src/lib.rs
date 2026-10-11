@@ -5,7 +5,9 @@
 //! 本 crate 不依赖任何 UI 框架，四端（Windows / Android / HarmonyOS / iOS）
 //! 通过 `fdxmp-ffi` 暴露的 C ABI 或各平台桥接层调用。
 
-#![forbid(unsafe_code)]
+// 默认拒绝 unsafe；零拷贝上屏（gpu feature 的 apple 目标）需要极少量 FFI/图形 API
+// 裸指针操作，在对应项上单独 `#[allow(unsafe_code)]` 并写明 Safety 注释。
+#![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 #[cfg(feature = "ai")]

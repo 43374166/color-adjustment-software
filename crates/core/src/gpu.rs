@@ -9,6 +9,8 @@
 
 use crate::error::{FdxmpError, Result};
 use crate::geometry::GeometryMode;
+#[cfg(target_vendor = "apple")]
+use crate::gpu_pipeline::PresentPass;
 use crate::gpu_pipeline::{ColorPipeline, HistogramPass, PipelineImage, HISTOGRAM_BINS};
 use crate::params::EditParams;
 
@@ -199,6 +201,7 @@ impl PreviewSession {
     ///
     /// `layer` 必须是存活的 `CAMetalLayer` 指针，且在会话使用期间一直有效。
     #[cfg(target_vendor = "apple")]
+    #[allow(unsafe_code)]
     pub fn attach_layer(&mut self, layer: *mut std::ffi::c_void) -> Result<()> {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let presenter = unsafe { SurfacePresenter::new(&self.instance, &self.adapter, layer) }?;
@@ -223,7 +226,7 @@ impl PreviewSession {
             .unwrap_or((self.width, self.height));
         let texture = self
             .pipeline
-            .display_texture()
+            .output_view()
             .ok_or_else(|| FdxmpError::Gpu("尚未渲染，无法上屏".to_string()))?;
         let presenter = self
             .presenter
@@ -240,6 +243,8 @@ pub struct SurfacePresenter {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
     configured: bool,
+    /// 上屏拷贝通道（显示纹理 → 表面纹理，顺带完成格式转换）。
+    pass: PresentPass,
 }
 
 #[cfg(target_vendor = "apple")]
@@ -247,6 +252,7 @@ impl SurfacePresenter {
     /// # Safety
     ///
     /// `layer` 必须是存活的 `CAMetalLayer` 指针。
+    #[allow(unsafe_code)]
     unsafe fn new(
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
@@ -262,28 +268,30 @@ impl SurfacePresenter {
             .iter()
             .copied()
             .find(|format| *format == wgpu::TextureFormat::Rgba8Unorm)
+            .or_else(|| {
+                // 退而求其次：优先非 sRGB 格式（显示纹理里的值是 sRGB 编码的原样字节，
+                // 写进非 sRGB 表面才是「所见即所存」，和回读 + UIImage 路径一致）。
+                capabilities
+                    .formats
+                    .iter()
+                    .copied()
+                    .find(|format| !format.is_srgb())
+            })
             .or_else(|| capabilities.formats.first().copied())
         else {
             return Err(FdxmpError::Gpu("显示表面没有可用格式".to_string()));
         };
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::COPY_DST,
-            format,
-            width: 1,
-            height: 1,
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            alpha_mode: capabilities
-                .alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-            view_formats: vec![],
-        };
+        let mut config = surface
+            .get_default_config(adapter, 1, 1)
+            .ok_or_else(|| FdxmpError::Gpu("无法获取显示默认配置".to_string()))?;
+        config.format = format;
+        config.present_mode = wgpu::PresentMode::Fifo;
+        let pass = PresentPass::new(device, format);
         Ok(Self {
             surface,
             config,
             configured: false,
+            pass,
         })
     }
 
@@ -302,7 +310,7 @@ impl SurfacePresenter {
         &mut self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        texture: &wgpu::Texture,
+        source: &wgpu::TextureView,
         width: u32,
         height: u32,
     ) -> Result<()> {
@@ -324,30 +332,14 @@ impl SurfacePresenter {
             }
             other => return Err(FdxmpError::Gpu(format!("获取显示帧失败：{other:?}"))),
         };
-        let copy_width = width.min(frame.texture.width());
-        let copy_height = height.min(frame.texture.height());
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("fdxmp-present"),
         });
-        encoder.copy_texture_to_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::TexelCopyTextureInfo {
-                texture: &frame.texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            wgpu::Extent3d {
-                width: copy_width,
-                height: copy_height,
-                depth_or_array_layers: 1,
-            },
-        );
+        // 采样显示纹理 → 写表面纹理（格式转换由 GPU 完成）。
+        let target_view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        self.pass.draw(device, &mut encoder, source, &target_view);
         queue.submit(Some(encoder.finish()));
         queue.present(frame);
         Ok(())
