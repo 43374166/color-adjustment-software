@@ -36,11 +36,9 @@ struct EditorTabView: View {
     @State private var maskController = MaskCanvasController()
     /// 分类参数面板是否收起（点同一个分类两次 = 收起 / 再展开）。
     @State private var categoryCollapsed = false
-    /// 分类导航触摸跟踪状态（轻点 = 展开 / 收起，长按 = 只看这类参数复原）。
-    @State private var categoryTouchActive = false
-    @State private var categoryTouchMoved = false
-    @State private var categoryPreviewActive = false
-    @State private var categoryHoldWork: DispatchWorkItem?
+    /// 长按分类对比：按住期间 + 松手后一小段时间都吞掉这次点击，避免顺带展开 / 收起。
+    @State private var categoryHoldActive = false
+    @State private var categorySuppressTapUntil = Date.distantPast
     /// 长按撤销键后，短时间内忽略这次点击（避免顺带撤销一步）。
     @State private var suppressUndoTapUntil = Date.distantPast
     /// 长按照片前是否已处于沉浸模式（松手后按原样恢复）。
@@ -987,29 +985,40 @@ struct EditorTabView: View {
 
     /// 分类按钮（自己判定触摸）：轻点展开 / 收起，长按只做"这一类参数复原"对比。
     private func categoryButton(_ category: EditCategory) -> some View {
-        VStack(spacing: 5) {
-            Image(systemName: category.icon)
-                .font(.system(size: 16))
-            Text(category.rawValue)
-                .font(.caption2)
+        Button {
+            // 长按对比松手时 Button 也会触发一次点击：这里吞掉，别顺带展开 / 收起。
+            // （两种回调顺序都兜住；即使手势回调缺失，下一次点按也能自救。）
+            if categoryHoldActive || Date() < categorySuppressTapUntil {
+                categoryHoldActive = false
+                return
+            }
+            toggleCategory(category)
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: category.icon)
+                    .font(.system(size: 16))
+                Text(category.rawValue)
+                    .font(.caption2)
+            }
+            .frame(width: 58)
+            .padding(.vertical, 7)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(
+                        model.category == category
+                            ? Color.white.opacity(0.14)
+                            : Color.clear
+                    )
+            )
+            .foregroundStyle(
+                model.category == category
+                    ? Color.white
+                    : Color.white.opacity(0.6)
+            )
+            .contentShape(Rectangle())
         }
-        .frame(width: 58)
-        .padding(.vertical, 7)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(
-                    model.category == category
-                        ? Color.white.opacity(0.14)
-                        : Color.clear
-                )
-        )
-        .foregroundStyle(
-            model.category == category
-                ? Color.white
-                : Color.white.opacity(0.6)
-        )
-        .contentShape(Rectangle())
-        .simultaneousGesture(categoryTouchGesture(category))
+        .buttonStyle(.plain)
+        .simultaneousGesture(categoryHoldGesture(category))
     }
 
     /// 点分类：从下往上展开参数；再点同一个分类收起。
@@ -1025,51 +1034,27 @@ struct EditorTabView: View {
         }
     }
 
-    /// 分类导航的触摸判定（轻点 = 展开 / 收起；长按 0.5s = 只看这类参数复原）。
+    /// 长按分类（0.5s）：临时把该分类参数归零，只看"复原后"的样子，松手恢复。
     ///
-    /// 不再用「Button + 同时长按」：那样长按松手还会顺带触发一次点击（展开 / 收起）。
-    /// 这里自己判定，长按松手只结束对比，不做别的；横向滑动交给外层 ScrollView。
-    private func categoryTouchGesture(_ category: EditCategory) -> some Gesture {
-        DragGesture(minimumDistance: 0)
+    /// 用系统长按识别 + 串接拖动（0.5.0 起一直用的方式，稳定拿到"按住 0.5s"和"松手"）；
+    /// 长按期间禁止点击、松手后短时间内也吞掉那次点击——两种回调顺序都不会顺带展开 / 收起。
+    private func categoryHoldGesture(_ category: EditCategory) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.5, maximumDistance: 40)
+            .sequenced(before: DragGesture(minimumDistance: 0))
             .onChanged { value in
-                if !categoryTouchActive {
-                    categoryTouchActive = true
-                    categoryTouchMoved = false
-                    categoryPreviewActive = false
-                    let work = DispatchWorkItem {
-                        if categoryTouchActive, !categoryTouchMoved, !categoryPreviewActive {
-                            categoryPreviewActive = true
-                            Haptics.medium()
-                            model.beginCategoryPreview(category)
-                        }
-                    }
-                    categoryHoldWork = work
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
-                    return
-                }
-                if !categoryTouchMoved,
-                   hypot(value.translation.width, value.translation.height) > 12 {
-                    categoryTouchMoved = true
-                    categoryHoldWork?.cancel()
-                    categoryHoldWork = nil
+                if case .second(true, _) = value {
+                    guard !categoryHoldActive else { return }
+                    categoryHoldActive = true
+                    Haptics.medium()
+                    model.beginCategoryPreview(category)
                 }
             }
             .onEnded { _ in
-                categoryHoldWork?.cancel()
-                categoryHoldWork = nil
-                let wasActive = categoryTouchActive
-                let moved = categoryTouchMoved
-                let previewing = categoryPreviewActive
-                categoryTouchActive = false
-                categoryTouchMoved = false
-                categoryPreviewActive = false
-                guard wasActive else { return }
-                if previewing {
-                    model.endCategoryPreview()
-                    return
-                }
-                guard !moved else { return }
-                toggleCategory(category)
+                // 轻点（长按没成立）时不做任何事，别把这次正常点按吞掉。
+                guard categoryHoldActive else { return }
+                categoryHoldActive = false
+                categorySuppressTapUntil = Date().addingTimeInterval(0.4)
+                model.endCategoryPreview()
             }
     }
 

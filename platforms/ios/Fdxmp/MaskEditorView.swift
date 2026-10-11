@@ -13,11 +13,9 @@ struct MaskPanelView: View {
     @State private var renameText = ""
     /// 蒙版设置弹层对应的蒙版 id。
     @State private var settingsMaskId: String?
-    /// 分类导航触摸跟踪状态（轻点 = 切换分类，长按 = 只看这类参数复原）。
-    @State private var categoryTouchActive = false
-    @State private var categoryTouchMoved = false
-    @State private var categoryPreviewActive = false
-    @State private var categoryHoldWork: DispatchWorkItem?
+    /// 长按分类对比：按住期间 + 松手后一小段时间都吞掉这次点击，避免顺带切换分类。
+    @State private var categoryHoldActive = false
+    @State private var categorySuppressTapUntil = Date.distantPast
 
     var body: some View {
         VStack(spacing: 0) {
@@ -699,75 +697,62 @@ struct MaskPanelView: View {
 
     /// 分类按钮（自己判定触摸）：轻点切换分类，长按只做"这一类参数复原"对比。
     private func categoryButton(_ category: EditCategory) -> some View {
-        VStack(spacing: 5) {
-            Image(systemName: category.icon)
-                .font(.system(size: 15))
-            Text(category.rawValue)
-                .font(.caption2)
+        Button {
+            // 长按对比松手时 Button 也会触发一次点击：这里吞掉，别顺带切换分类。
+            // （两种回调顺序都兜住；即使手势回调缺失，下一次点按也能自救。）
+            if categoryHoldActive || Date() < categorySuppressTapUntil {
+                categoryHoldActive = false
+                return
+            }
+            Haptics.tick()
+            model.setCategory(category)
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: category.icon)
+                    .font(.system(size: 15))
+                Text(category.rawValue)
+                    .font(.caption2)
+            }
+            .frame(width: 56)
+            .padding(.vertical, 6)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(
+                        model.category == category
+                            ? Color.white.opacity(0.14)
+                            : Color.clear
+                    )
+            )
+            .foregroundStyle(
+                model.category == category
+                    ? Color.white
+                    : Color.white.opacity(0.6)
+            )
+            .contentShape(Rectangle())
         }
-        .frame(width: 56)
-        .padding(.vertical, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 10)
-                .fill(
-                    model.category == category
-                        ? Color.white.opacity(0.14)
-                        : Color.clear
-                )
-        )
-        .foregroundStyle(
-            model.category == category
-                ? Color.white
-                : Color.white.opacity(0.6)
-        )
-        .contentShape(Rectangle())
-        .simultaneousGesture(categoryTouchGesture(category))
+        .buttonStyle(.plain)
+        .simultaneousGesture(categoryHoldGesture(category))
     }
 
-    /// 分类导航的触摸判定（轻点 = 切换分类；长按 0.5s = 只看这类参数复原，松手恢复）。
-    /// 不再用「Button + 同时长按」：长按松手不会顺带触发一次点击。
-    private func categoryTouchGesture(_ category: EditCategory) -> some Gesture {
-        DragGesture(minimumDistance: 0)
+    /// 长按分类（0.5s）：临时把该蒙版这一类的局部参数归零，松手恢复（对比用）。
+    /// 用系统长按识别 + 串接拖动；按住期间和松手后的短暂窗口都吞掉点击。
+    private func categoryHoldGesture(_ category: EditCategory) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.5, maximumDistance: 40)
+            .sequenced(before: DragGesture(minimumDistance: 0))
             .onChanged { value in
-                if !categoryTouchActive {
-                    categoryTouchActive = true
-                    categoryTouchMoved = false
-                    categoryPreviewActive = false
-                    let work = DispatchWorkItem {
-                        if categoryTouchActive, !categoryTouchMoved, !categoryPreviewActive {
-                            categoryPreviewActive = true
-                            Haptics.medium()
-                            model.beginMaskCategoryPreview(category)
-                        }
-                    }
-                    categoryHoldWork = work
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
-                    return
-                }
-                if !categoryTouchMoved,
-                   hypot(value.translation.width, value.translation.height) > 12 {
-                    categoryTouchMoved = true
-                    categoryHoldWork?.cancel()
-                    categoryHoldWork = nil
+                if case .second(true, _) = value {
+                    guard !categoryHoldActive else { return }
+                    categoryHoldActive = true
+                    Haptics.medium()
+                    model.beginMaskCategoryPreview(category)
                 }
             }
             .onEnded { _ in
-                categoryHoldWork?.cancel()
-                categoryHoldWork = nil
-                let wasActive = categoryTouchActive
-                let moved = categoryTouchMoved
-                let previewing = categoryPreviewActive
-                categoryTouchActive = false
-                categoryTouchMoved = false
-                categoryPreviewActive = false
-                guard wasActive else { return }
-                if previewing {
-                    model.endMaskCategoryPreview()
-                    return
-                }
-                guard !moved else { return }
-                Haptics.tick()
-                model.setCategory(category)
+                // 轻点（长按没成立）时不做任何事，别把这次正常点按吞掉。
+                guard categoryHoldActive else { return }
+                categoryHoldActive = false
+                categorySuppressTapUntil = Date().addingTimeInterval(0.4)
+                model.endMaskCategoryPreview()
             }
     }
 
