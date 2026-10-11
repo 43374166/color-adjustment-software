@@ -109,8 +109,9 @@ struct CenteredSlider: View {
     @State private var fineMode = false
     @State private var fineAnchorX: CGFloat?
     @State private var fineAnchorValue: Float = 0
-    /// 本次触摸被判定为"纵向滚动面板"（不再调值，修误触）。
-    @State private var scrollLocked = false
+    /// 本次触摸的方向判定（只在越过阈值时决定一次）：
+    /// 横向 = 调这个滑块，纵向 = 翻面板找参数，两者互不干扰。
+    @State private var dragAxis: Axis?
 
     var body: some View {
         GeometryReader { geo in
@@ -157,7 +158,7 @@ struct CenteredSlider: View {
                 }
                 // 圆点
                 Circle()
-                    .fill(Color(white: 0.08))
+                    .fill(Color.clear)
                     .frame(width: 26, height: 26)
                     .overlay(
                         // 外圈白色、内点浅蓝（和 Lightroom 的圆点一致）。
@@ -181,7 +182,7 @@ struct CenteredSlider: View {
                             gestureActive = true
                             didDrag = false
                             maxDistance = 0
-                            scrollLocked = false
+                            dragAxis = nil
                             // 新的触摸取消上一次待执行的单击步进。
                             pendingStep?.cancel()
                             pendingStep = nil
@@ -191,18 +192,6 @@ struct CenteredSlider: View {
                             maxDistance,
                             hypot(gesture.translation.width, gesture.translation.height)
                         )
-                        // 纵向为主的滑动是"翻面板找参数"，不能顺带把参数改了。
-                        if !scrollLocked, abs(gesture.translation.height) > 8,
-                           abs(gesture.translation.height) > abs(gesture.translation.width)
-                        {
-                            scrollLocked = true
-                            if didDrag {
-                                didDrag = false
-                                onDraggingChange?(false)
-                                onCommit()
-                            }
-                        }
-                        guard !scrollLocked else { return }
                         // 长按后进入微调：只按相对位移慢慢走。
                         if fineMode {
                             if fineAnchorX == nil {
@@ -221,16 +210,20 @@ struct CenteredSlider: View {
                             }
                             return
                         }
-                        if abs(gesture.translation.width) > 8,
-                           abs(gesture.translation.width) > abs(gesture.translation.height)
-                        {
-                            if !didDrag {
-                                onDraggingChange?(true)
-                                Haptics.prepare()
-                            }
-                            didDrag = true
+                        // 方向判定只在越过阈值时做一次：横向 = 调这个滑块，
+                        // 纵向 = 翻面板找参数。中途不再改变判定——滑动不会突然失效，
+                        // 也不会滑到一半顺带把面板滚起来。
+                        if dragAxis == nil, maxDistance > 9 {
+                            dragAxis = abs(gesture.translation.width) > abs(gesture.translation.height)
+                                ? .horizontal
+                                : .vertical
                         }
-                        guard didDrag else { return }
+                        guard dragAxis == .horizontal else { return }
+                        if !didDrag {
+                            didDrag = true
+                            onDraggingChange?(true)
+                            Haptics.prepare()
+                        }
                         let ratio = (gesture.location.x / width).clamped(to: 0...1)
                         let target = range.lowerBound + Float(ratio) * span
                         let clamped = target.clamped(to: range)
@@ -243,10 +236,8 @@ struct CenteredSlider: View {
                     .onEnded { gesture in
                         guard gestureActive else { return }
                         gestureActive = false
-                        if scrollLocked {
-                            scrollLocked = false
-                            return
-                        }
+                        let axis = dragAxis
+                        dragAxis = nil
                         if fineMode {
                             fineMode = false
                             fineAnchorX = nil
@@ -255,6 +246,10 @@ struct CenteredSlider: View {
                                 onDraggingChange?(false)
                                 onCommit()
                             }
+                            return
+                        }
+                        if axis == .vertical {
+                            // 判定为翻面板滚动：本次触摸不调值、不步进。
                             return
                         }
                         if didDrag {

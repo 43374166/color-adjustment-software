@@ -273,8 +273,11 @@ struct EditorTabView: View {
 
     @ViewBuilder
     private var editorColumn: some View {
-        if !immersive && !hidesChrome && model.draggingSlider == nil {
+        if !immersive && !hidesChrome {
+            // 拖动滑块时顶部栏只隐藏不位移：图片位置不跳动（保持从灵动岛下面开始）。
             topBar
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+                .allowsHitTesting(model.draggingSlider == nil)
         }
         previewArea
     }
@@ -708,13 +711,18 @@ struct EditorTabView: View {
     private var panelHeight: CGFloat {
         switch model.tool {
         case .presets: return 210
-        // 曲线 / 蒙版下工具条与顶部栏隐藏，面板整体更高（编辑区更大）。
         case .edit:
             if categoryCollapsed {
                 return 64
             }
-            return model.category == .curves ? 428 : 288
+            if model.category == .curves {
+                // 曲线面板压到最下面：普通通道只需要"标题 + 提示 + 通道 + 完成"，
+                // 给一块矮面板（少挡画面）；参数通道再高一些，给滑块留窗口。
+                return model.curveChannel == .parametric ? 288 : 172
+            }
+            return 288
         case .crop: return 210
+        // 蒙版下工具条与顶部栏隐藏，面板整体更高（编辑区更大）。
         case .mask: return 404
         }
     }
@@ -723,6 +731,7 @@ struct EditorTabView: View {
         VStack(spacing: 0) {
             Divider()
                 .overlay(Color.white.opacity(0.08))
+                .opacity(model.draggingSlider == nil ? 1 : 0)
             Group {
                 switch model.tool {
                 case .presets:
@@ -737,16 +746,17 @@ struct EditorTabView: View {
             }
             .frame(height: panelHeight)
             // 主工具条固定在最底部（Lightroom / Android 布局）；曲线 / 蒙版下隐藏。
-            if !hidesChrome && model.draggingSlider == nil {
-                toolBar
-            } else if !hidesChrome {
+            if !hidesChrome {
                 // 沉浸拖动：工具条只隐藏不位移（滑块保持原位）。
-                toolBar.opacity(0)
+                toolBar
+                    .opacity(model.draggingSlider == nil ? 1 : 0)
+                    .allowsHitTesting(model.draggingSlider == nil)
             }
         }
         .frame(maxWidth: .infinity)
-        // 真透明（不是毛玻璃）：后面露一点照片，方便对比调色效果。
-        .background(Color(white: 0.07).opacity(0.78))
+        // 真透明（不是毛玻璃）：后面露一点照片，方便对比调色效果；
+        // 拖动滑块时连底色一起隐掉，只留滑块和画面（Lightroom 做法）。
+        .background(Color(white: 0.07).opacity(model.draggingSlider == nil ? 0.78 : 0))
     }
 
     private var toolBar: some View {
@@ -779,23 +789,25 @@ struct EditorTabView: View {
 
     private var presetPanel: some View {
         VStack(spacing: 0) {
-            if model.draggingSlider == nil {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 10) {
-                        ForEach(EditorSpec.presets) { preset in
-                            Button {
-                                Haptics.light()
-                                model.applyPreset(preset)
-                            } label: {
-                                presetCard(preset)
-                            }
-                            .buttonStyle(.plain)
+            // 拖动强度滑块时：卡片行只隐藏不位移（滑块保持原位）。
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    ForEach(EditorSpec.presets) { preset in
+                        Button {
+                            Haptics.light()
+                            model.applyPreset(preset)
+                        } label: {
+                            presetCard(preset)
                         }
+                        .buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 12)
                 }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 12)
             }
+            .scrollDisabled(model.draggingSlider != nil)
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
             if model.canAdjustPresetStrength {
                 // Lightroom 式预设强度：0 = 应用前，100 = 预设原样。
                 ValueSliderRow(
@@ -859,9 +871,12 @@ struct EditorTabView: View {
                 doneRow {
                     model.colorTab = .base
                 }
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+                .allowsHitTesting(model.draggingSlider == nil)
             } else if !categoryCollapsed {
                 editSubTabs
                     .opacity(model.draggingSlider == nil ? 1 : 0)
+                    .allowsHitTesting(model.draggingSlider == nil)
                 editContent
                 Divider()
                     .overlay(Color.white.opacity(0.08))
@@ -872,6 +887,7 @@ struct EditorTabView: View {
                         model.exitCurves()
                     }
                     .opacity(model.draggingSlider == nil ? 1 : 0)
+                    .allowsHitTesting(model.draggingSlider == nil)
                 } else {
                     categoryRow
                         .opacity(model.draggingSlider == nil ? 1 : 0)
@@ -962,6 +978,8 @@ struct EditorTabView: View {
             }
             .padding(.vertical, 8)
         }
+        // 拖动滑块中：禁止面板上下滚动（只调值）。
+        .scrollDisabled(model.draggingSlider != nil)
     }
 
     private var categoryRow: some View {
@@ -1118,15 +1136,8 @@ struct EditorTabView: View {
         let tint = Color(red: kind.tint.r, green: kind.tint.g, blue: kind.tint.b)
         switch channel {
         case "hue":
-            return [
-                Color(red: 1, green: 0, blue: 0),
-                Color(red: 1, green: 1, blue: 0),
-                Color(red: 0, green: 1, blue: 0),
-                Color(red: 0, green: 1, blue: 1),
-                Color(red: 0, green: 0, blue: 1),
-                Color(red: 1, green: 0, blue: 1),
-                Color(red: 1, green: 0, blue: 0),
-            ]
+            // 色相轨道用当前色带自己的颜色（不是整条彩虹）。
+            return [tint, tint]
         case "saturation":
             return [Color(white: 0.45), tint]
         default:
@@ -1187,53 +1198,56 @@ struct EditorTabView: View {
         let band = model.state.hsl[model.hslBand]
         return ScrollView {
             VStack(spacing: 0) {
-                if model.sliderVisible("色相") {
-                    ValueSliderRow(
-                        label: "色相",
-                        value: band.hue,
-                        range: -100...100,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.hsl[model.hslBand]
-                            updated.hue = value
-                            model.updateHsl(model.hslBand, updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() },
-                        trackColors: hslTrackColors("hue")
-                    )
-                }
-                if model.sliderVisible("饱和度") {
-                    ValueSliderRow(
-                        label: "饱和度",
-                        value: band.saturation,
-                        range: -100...100,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.hsl[model.hslBand]
-                            updated.saturation = value
-                            model.updateHsl(model.hslBand, updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() },
-                        trackColors: hslTrackColors("saturation")
-                    )
-                }
-                if model.sliderVisible("明亮度") {
-                    ValueSliderRow(
-                        label: "明亮度",
-                        value: band.luminance,
-                        range: -100...100,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.hsl[model.hslBand]
-                            updated.luminance = value
-                            model.updateHsl(model.hslBand, updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() },
-                        trackColors: hslTrackColors("luminance")
-                    )
-                }
+                // 拖动某个滑块时其余只隐藏不位移（滑块保持原位）。
+                ValueSliderRow(
+                    label: "色相",
+                    value: band.hue,
+                    range: -100...100,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.hsl[model.hslBand]
+                        updated.hue = value
+                        model.updateHsl(model.hslBand, updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() },
+                    trackColors: hslTrackColors("hue")
+                )
+                .opacity(model.sliderVisible("色相") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("色相"))
+                ValueSliderRow(
+                    label: "饱和度",
+                    value: band.saturation,
+                    range: -100...100,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.hsl[model.hslBand]
+                        updated.saturation = value
+                        model.updateHsl(model.hslBand, updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() },
+                    trackColors: hslTrackColors("saturation")
+                )
+                .opacity(model.sliderVisible("饱和度") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("饱和度"))
+                ValueSliderRow(
+                    label: "明亮度",
+                    value: band.luminance,
+                    range: -100...100,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.hsl[model.hslBand]
+                        updated.luminance = value
+                        model.updateHsl(model.hslBand, updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() },
+                    trackColors: hslTrackColors("luminance")
+                )
+                .opacity(model.sliderVisible("明亮度") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("明亮度"))
             }
         }
+        // 拖动滑块中：禁止面板上下滚动（只调值）。
+        .scrollDisabled(model.draggingSlider != nil)
     }
 
     // MARK: - 颜色分级
@@ -1241,7 +1255,8 @@ struct EditorTabView: View {
     private var gradingPanel: some View {
         ScrollView {
             VStack(spacing: 0) {
-                if model.draggingSlider == nil {
+                // 拖动滑块时：色轮区只隐藏不位移（滑块保持原位）。
+                Group {
                     subTabRow(
                         GradingZoneKind.allCases.map(\.rawValue),
                         selected: GradingZoneKind.allCases.firstIndex(of: model.gradingZone) ?? 0
@@ -1258,92 +1273,97 @@ struct EditorTabView: View {
                         onEnd: { model.commitEdit() }
                     )
                 }
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+                .allowsHitTesting(model.draggingSlider == nil)
                 gradingZoneSliders
-                if model.sliderVisible("混合") {
-                    ValueSliderRow(
-                        label: "混合",
-                        value: model.state.grading.blending,
-                        range: 0...100,
-                        neutral: 50,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            model.updateGradingMix(
-                                blending: value,
-                                balance: model.state.grading.balance,
-                                commit: false
-                            )
-                        },
-                        onCommit: { model.commitEdit() }
-                    )
-                }
-                if model.sliderVisible("平衡") {
-                    ValueSliderRow(
-                        label: "平衡",
-                        value: model.state.grading.balance,
-                        range: -100...100,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            model.updateGradingMix(
-                                blending: model.state.grading.blending,
-                                balance: value,
-                                commit: false
-                            )
-                        },
-                        onCommit: { model.commitEdit() }
-                    )
-                }
+                ValueSliderRow(
+                    label: "混合",
+                    value: model.state.grading.blending,
+                    range: 0...100,
+                    neutral: 50,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        model.updateGradingMix(
+                            blending: value,
+                            balance: model.state.grading.balance,
+                            commit: false
+                        )
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("混合") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("混合"))
+                ValueSliderRow(
+                    label: "平衡",
+                    value: model.state.grading.balance,
+                    range: -100...100,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        model.updateGradingMix(
+                            blending: model.state.grading.blending,
+                            balance: value,
+                            commit: false
+                        )
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("平衡") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("平衡"))
             }
         }
+        // 拖动滑块中：禁止面板上下滚动（只调值）。
+        .scrollDisabled(model.draggingSlider != nil)
     }
 
     private var gradingZoneSliders: some View {
         let zone = model.state.grading[model.gradingZone]
         return VStack(spacing: 0) {
-            if model.sliderVisible("色相") {
-                ValueSliderRow(
-                    label: "色相",
-                    value: zone.hue,
-                    range: 0...360,
-                    neutral: 0,
-                    step: 15,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.grading[model.gradingZone]
-                        updated.hue = value
-                        model.updateGrading(model.gradingZone, updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
-            }
-            if model.sliderVisible("饱和度") {
-                ValueSliderRow(
-                    label: "饱和度",
-                    value: zone.saturation,
-                    range: 0...100,
-                    neutral: 0,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.grading[model.gradingZone]
-                        updated.saturation = value
-                        model.updateGrading(model.gradingZone, updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
-            }
-            if model.sliderVisible("明亮度") {
-                ValueSliderRow(
-                    label: "明亮度",
-                    value: zone.luminance,
-                    range: -100...100,
-                    onBegin: { model.beginEdit() },
-                    onChange: { value in
-                        var updated = model.state.grading[model.gradingZone]
-                        updated.luminance = value
-                        model.updateGrading(model.gradingZone, updated, commit: false)
-                    },
-                    onCommit: { model.commitEdit() }
-                )
-            }
+            // 拖动某个滑块时其余只隐藏不位移（滑块保持原位）。
+            ValueSliderRow(
+                label: "色相",
+                value: zone.hue,
+                range: 0...360,
+                neutral: 0,
+                step: 15,
+                onBegin: { model.beginEdit() },
+                onChange: { value in
+                    var updated = model.state.grading[model.gradingZone]
+                    updated.hue = value
+                    model.updateGrading(model.gradingZone, updated, commit: false)
+                },
+                onCommit: { model.commitEdit() }
+            )
+            .opacity(model.sliderVisible("色相") ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible("色相"))
+            ValueSliderRow(
+                label: "饱和度",
+                value: zone.saturation,
+                range: 0...100,
+                neutral: 0,
+                onBegin: { model.beginEdit() },
+                onChange: { value in
+                    var updated = model.state.grading[model.gradingZone]
+                    updated.saturation = value
+                    model.updateGrading(model.gradingZone, updated, commit: false)
+                },
+                onCommit: { model.commitEdit() }
+            )
+            .opacity(model.sliderVisible("饱和度") ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible("饱和度"))
+            ValueSliderRow(
+                label: "明亮度",
+                value: zone.luminance,
+                range: -100...100,
+                onBegin: { model.beginEdit() },
+                onChange: { value in
+                    var updated = model.state.grading[model.gradingZone]
+                    updated.luminance = value
+                    model.updateGrading(model.gradingZone, updated, commit: false)
+                },
+                onCommit: { model.commitEdit() }
+            )
+            .opacity(model.sliderVisible("明亮度") ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible("明亮度"))
         }
     }
 
@@ -1351,7 +1371,8 @@ struct EditorTabView: View {
 
     private var cropPanel: some View {
         VStack(spacing: 0) {
-            if model.draggingSlider == nil {
+            // 拖动「拉直」滑块时：上面两行只隐藏不位移（滑块保持原位）。
+            Group {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
                         ForEach(CropAspect.allCases) { aspect in
@@ -1405,6 +1426,9 @@ struct EditorTabView: View {
                     .padding(.bottom, 6)
                 }
             }
+            .scrollDisabled(model.draggingSlider != nil)
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
             ValueSliderRow(
                 label: "拉直",
                 value: model.state.crop.rotation,
@@ -1416,7 +1440,7 @@ struct EditorTabView: View {
                 onChange: { model.updateCropRotation($0, commit: false) },
                 onCommit: { model.commitEdit() }
             )
-            if model.draggingSlider == nil {
+            Group {
                 HStack(spacing: 16) {
                     Button("水平翻转") {
                         model.toggleCropFlip(horizontal: true)
@@ -1437,6 +1461,8 @@ struct EditorTabView: View {
                 .padding(.horizontal, 18)
                 .padding(.vertical, 8)
             }
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
             Spacer(minLength: 0)
         }
     }

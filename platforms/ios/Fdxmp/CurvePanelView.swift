@@ -6,7 +6,8 @@ struct CurvePanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            if model.draggingSlider == nil {
+            // 拖动参数滑块时：标题 / 提示只隐藏不位移（滑块保持原位）。
+            Group {
                 header
                 Spacer(minLength: 0)
                 Text("在画面上直接调曲线：触摸即加点并拖动，双击控制点删除")
@@ -14,13 +15,17 @@ struct CurvePanelView: View {
                     .foregroundStyle(.secondary)
                     .padding(.bottom, 6)
             }
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
             if model.curveChannel == .parametric {
                 // 参数曲线滑块（拖动中只留正在拖的那一个）。
                 parametricSliders
             }
-            if model.draggingSlider == nil {
+            Group {
                 channelRow
             }
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
         }
     }
 
@@ -43,87 +48,92 @@ struct CurvePanelView: View {
         let values = model.state.curves.parametric
         return ScrollView {
             VStack(spacing: 0) {
-                if model.sliderVisible("高光") {
-                    ValueSliderRow(
-                        label: "高光",
-                        value: values.highlights,
-                        range: -100...100,
-                        decimals: 0,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.curves.parametric
-                            updated.highlights = value
-                            model.updateParametric(updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() }
-                    )
-                }
-                if model.sliderVisible("中间调") {
-                    ValueSliderRow(
-                        label: "中间调",
-                        value: values.midtones,
-                        range: -100...100,
-                        decimals: 0,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.curves.parametric
-                            updated.midtones = value
-                            model.updateParametric(updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() }
-                    )
-                }
-                if model.sliderVisible("阴影") {
-                    ValueSliderRow(
-                        label: "阴影",
-                        value: values.shadows,
-                        range: -100...100,
-                        decimals: 0,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.curves.parametric
-                            updated.shadows = value
-                            model.updateParametric(updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() }
-                    )
-                }
-                if model.sliderVisible("高光分界") {
-                    ValueSliderRow(
-                        label: "高光分界",
-                        value: values.highlightsSplit,
-                        range: 0.5...1,
-                        neutral: 0.75,
-                        step: 0.05,
-                        decimals: 2,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.curves.parametric
-                            updated.highlightsSplit = value
-                            model.updateParametric(updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() }
-                    )
-                }
-                if model.sliderVisible("中间调分界") {
-                    ValueSliderRow(
-                        label: "中间调分界",
-                        value: values.midtonesSplit,
-                        range: 0...0.5,
-                        neutral: 0.25,
-                        step: 0.05,
-                        decimals: 2,
-                        onBegin: { model.beginEdit() },
-                        onChange: { value in
-                            var updated = model.state.curves.parametric
-                            updated.midtonesSplit = value
-                            model.updateParametric(updated, commit: false)
-                        },
-                        onCommit: { model.commitEdit() }
-                    )
-                }
+                // 拖动某个滑块时其余只隐藏不位移（滑块保持原位）。
+                ValueSliderRow(
+                    label: "高光",
+                    value: values.highlights,
+                    range: -100...100,
+                    decimals: 0,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.curves.parametric
+                        updated.highlights = value
+                        model.updateParametric(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("高光") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("高光"))
+                ValueSliderRow(
+                    label: "中间调",
+                    value: values.midtones,
+                    range: -100...100,
+                    decimals: 0,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.curves.parametric
+                        updated.midtones = value
+                        model.updateParametric(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("中间调") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("中间调"))
+                ValueSliderRow(
+                    label: "阴影",
+                    value: values.shadows,
+                    range: -100...100,
+                    decimals: 0,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.curves.parametric
+                        updated.shadows = value
+                        model.updateParametric(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("阴影") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("阴影"))
+                ValueSliderRow(
+                    label: "高光分界",
+                    value: values.highlightsSplit,
+                    range: 0.5...1,
+                    neutral: 0.75,
+                    step: 0.05,
+                    decimals: 2,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.curves.parametric
+                        updated.highlightsSplit = value
+                        model.updateParametric(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("高光分界") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("高光分界"))
+                ValueSliderRow(
+                    label: "中间调分界",
+                    value: values.midtonesSplit,
+                    range: 0...0.5,
+                    neutral: 0.25,
+                    step: 0.05,
+                    decimals: 2,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.curves.parametric
+                        updated.midtonesSplit = value
+                        model.updateParametric(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("中间调分界") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("中间调分界"))
             }
         }
+        // 拖动滑块中：禁止面板上下滚动（只调值）。
+        .scrollDisabled(model.draggingSlider != nil)
+        // 参数通道下给滑块一个最小窗口，避免被 Spacer 挤没。
+        .frame(minHeight: 120)
     }
 
     private var channelRow: some View {

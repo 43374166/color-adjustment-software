@@ -197,6 +197,8 @@ struct MaskPanelView: View {
                         .padding(.vertical, 8)
                     }
                 }
+                // 拖动滑块中：禁止弹层上下滚动（只调值）。
+                .scrollDisabled(model.draggingSlider != nil)
             }
             .presentationDetents([.medium, .large])
             .alert("重命名蒙版", isPresented: renameAlertBinding) {
@@ -488,6 +490,8 @@ struct MaskPanelView: View {
         ScrollView {
             shapeControlRows(mask)
         }
+        // 拖动滑块中：禁止面板上下滚动（只调值）。
+        .scrollDisabled(model.draggingSlider != nil)
     }
 
     /// 形状参数行（不含滚动容器；设置弹层里直接嵌这段）。
@@ -728,22 +732,22 @@ struct MaskPanelView: View {
         decimals: Int = 0,
         apply: @escaping (MaskUi, Float) -> MaskUi
     ) -> some View {
-        // 拖动某个滑块时只保留它自己（Lightroom 式沉浸）。
-        if model.sliderVisible(label) {
-            ValueSliderRow(
-                label: label,
-                value: value,
-                range: range,
-                neutral: neutral,
-                step: step,
-                decimals: decimals,
-                onBegin: { model.beginEdit() },
-                onChange: { newValue in
-                    model.updateSelectedMask { $0 = apply($0, newValue) }
-                },
-                onCommit: { model.commitEdit() }
-            )
-        }
+        // 拖动某个滑块时其余只隐藏不位移（Lightroom 式沉浸，滑块保持原位）。
+        ValueSliderRow(
+            label: label,
+            value: value,
+            range: range,
+            neutral: neutral,
+            step: step,
+            decimals: decimals,
+            onBegin: { model.beginEdit() },
+            onChange: { newValue in
+                model.updateSelectedMask { $0 = apply($0, newValue) }
+            },
+            onCommit: { model.commitEdit() }
+        )
+        .opacity(model.sliderVisible(label) ? 1 : 0)
+        .allowsHitTesting(model.sliderVisible(label))
     }
 
     // MARK: - 该蒙版的局部调整
@@ -752,7 +756,8 @@ struct MaskPanelView: View {
         VStack(spacing: 0) {
             ScrollView {
                 LazyVStack(spacing: 0) {
-                    ForEach(maskSliders.filter { model.sliderVisible($0.label) }) { spec in
+                    // 拖动某个滑块时其余只隐藏不位移（滑块保持原位）。
+                    ForEach(maskSliders) { spec in
                         let value = model.selectedMask?.values[spec.key] ?? spec.defaultValue
                         ValueSliderRow(
                             label: spec.label,
@@ -767,10 +772,14 @@ struct MaskPanelView: View {
                             onChange: { model.updateMaskValue(spec.key, $0) },
                             onCommit: { model.commitEdit() }
                         )
+                        .opacity(model.sliderVisible(spec.label) ? 1 : 0)
+                        .allowsHitTesting(model.sliderVisible(spec.label))
                     }
                 }
                 .padding(.vertical, 6)
             }
+            // 拖动滑块中：禁止面板上下滚动（只调值）。
+            .scrollDisabled(model.draggingSlider != nil)
             Divider()
                 .overlay(Color.white.opacity(0.08))
                 .opacity(model.draggingSlider == nil ? 1 : 0)
