@@ -1110,11 +1110,11 @@ struct EditorTabView: View {
                     categoryTouchMoved = false
                     categoryPreviewActive = false
                     let work = DispatchWorkItem {
-                        guard categoryTouchActive, !categoryTouchMoved, !categoryPreviewActive
-                        else { return }
-                        categoryPreviewActive = true
-                        Haptics.medium()
-                        model.beginCategoryPreview(category)
+                        if categoryTouchActive, !categoryTouchMoved, !categoryPreviewActive {
+                            categoryPreviewActive = true
+                            Haptics.medium()
+                            model.beginCategoryPreview(category)
+                        }
                     }
                     categoryHoldWork = work
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
