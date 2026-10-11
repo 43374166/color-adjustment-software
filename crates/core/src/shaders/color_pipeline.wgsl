@@ -241,17 +241,17 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
         c = srgb_to_linear(shifted) + overflow;
     }
 
-    // 4) 对比度
-    // 正半轴线性放大（+100 → 2.5×）；负半轴用 1/(1-1.5a) 平滑压平，
-    // 任意取值都不会反相（旧实现 -100 → -0.5，会把图像黑白颠倒）。
-    let contrast_amount = clamp(p(1) / 100.0, -1.0, 1.0);
-    let contrast = select(
-        1.0 / (1.0 - 1.5 * contrast_amount),
-        1.0 + 1.5 * contrast_amount,
-        contrast_amount >= 0.0
-    );
-    c = (c - vec3<f32>(0.18)) * contrast + vec3<f32>(0.18);
-    c = max(c, vec3<f32>(0.0));
+    // 4) 对比度：Lightroom 式显示空间 S 曲线——端点锚定（0 → 0、1 → 1，
+    //    不压死暗部、不裁白），中段斜率随强度增加（+100 → 中段 ≈ 1.4×）；
+    //    超出 1 的高光余量原样保留。与 CPU `pipeline::apply_reference` 同公式。
+    let contrast_amount = clamp(p(1) / 100.0, -1.0, 1.0) * 0.8;
+    if (abs(contrast_amount) > 0.0001) {
+        let contrast_headroom = max(c - vec3<f32>(1.0), vec3<f32>(0.0));
+        let contrast_s = linear_to_srgb(c);
+        let contrast_smooth = contrast_s * contrast_s * (vec3<f32>(3.0) - 2.0 * contrast_s);
+        let contrast_curved = contrast_s + vec3<f32>(contrast_amount) * (contrast_smooth - contrast_s);
+        c = srgb_to_linear(contrast_curved) + contrast_headroom;
+    }
 
     // 5) 参数曲线（分界同样是显示参考空间：默认 0.65 / 0.35 即 sRGB 亮度分界）
     let param_lum = luminance(linear_to_srgb(c));

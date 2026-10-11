@@ -65,7 +65,7 @@ pub const STAGE_ORDER: [Stage; 15] = [
 /// CPU 参考实现：基础调色段（白平衡 → 曝光 → 对比度），与 GPU 着色器同公式。
 ///
 /// 对应 `shaders/color_pipeline.wgsl::pipeline_base` 的前四步：
-/// Bradford 色适应矩阵、`2^曝光`、`1+1.5a` / `1/(1-1.5a)`（pivot 0.18）。
+/// Bradford 色适应矩阵、`2^曝光`、显示空间锚定端点的对比度 S 曲线。
 /// 色调分区、曲线、HSL、分级等阶段不在本函数范围内。
 ///
 /// 输入输出均为线性 RGB（允许 > 1.0 的高光余量）。
@@ -80,17 +80,41 @@ pub fn apply_reference(mut rgb: [f32; 3], params: &EditParams) -> [f32; 3] {
         *channel *= exposure;
     }
 
-    // 对比度：正半轴线性放大、负半轴平滑压平（任意取值都不反相）
-    let amount = (params.light.contrast / 100.0).clamp(-1.0, 1.0);
-    let factor = if amount >= 0.0 {
-        1.0 + 1.5 * amount
-    } else {
-        1.0 / (1.0 - 1.5 * amount)
-    };
-    for channel in &mut rgb {
-        *channel = ((*channel - 0.18) * factor + 0.18).max(0.0);
+    // 对比度：Lightroom 式显示空间 S 曲线——端点锚定（0 → 0、1 → 1，
+    // 不压死暗部、不裁白），中段斜率随强度增加（±100 → 中段约 ±0.8× 混合，
+    // 即 +100 中段斜率 ≈ 1.4×）；逐通道在 sRGB 空间做，超出 1 的高光余量原样保留。
+    // 与着色器 `pipeline_base` 同公式。
+    let amount = (params.light.contrast / 100.0).clamp(-1.0, 1.0) * 0.8;
+    if amount.abs() > 1e-4 {
+        for channel in &mut rgb {
+            let headroom = (*channel - 1.0).max(0.0);
+            let s = linear_to_srgb(*channel);
+            let smooth = s * s * (3.0 - 2.0 * s);
+            let curved = s + amount * (smooth - s);
+            *channel = srgb_to_linear(curved) + headroom;
+        }
     }
     rgb
+}
+
+/// 线性 → sRGB（0..1；超出 1 的部分由调用方单独保留）。
+fn linear_to_srgb(value: f32) -> f32 {
+    let x = value.clamp(0.0, 1.0);
+    if x <= 0.0031308 {
+        x * 12.92
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// sRGB → 线性。
+fn srgb_to_linear(value: f32) -> f32 {
+    let x = value.clamp(0.0, 1.0);
+    if x <= 0.04045 {
+        x / 12.92
+    } else {
+        ((x + 0.055) / 1.055).powf(2.4)
+    }
 }
 
 #[cfg(test)]
@@ -127,18 +151,52 @@ mod tests {
     }
 
     #[test]
-    fn negative_contrast_matches_shader_and_does_not_invert() {
+    fn contrast_anchors_endpoints() {
+        // Lightroom 式 S 曲线：黑 / 白两端锚定（0 → 0、1 → 1，不裁切），
+        // 与着色器 `pipeline_base` 同公式。
+        for contrast in [-100.0f32, 100.0] {
+            let mut params = EditParams::default();
+            params.light.contrast = contrast;
+            let black = apply_reference([0.0, 0.0, 0.0], &params);
+            let white = apply_reference([1.0, 1.0, 1.0], &params);
+            assert!(black[0].abs() < 1e-5, "黑场应保持 0：{black:?}");
+            assert!((white[0] - 1.0).abs() < 1e-5, "白场应保持 1：{white:?}");
+        }
+    }
+
+    #[test]
+    fn positive_contrast_keeps_shadows_and_highlights_alive() {
+        let mut params = EditParams::default();
+        params.light.contrast = 100.0;
+        // 中灰锚定：sRGB 0.5（线性 ≈ 0.2140）基本不动。
+        let mid = apply_reference([0.2140, 0.2140, 0.2140], &params);
+        assert!((mid[0] - 0.2140).abs() < 1e-3, "中灰应锚定：{mid:?}");
+        // 暗部压暗但**不压死**（旧实现会裁到 0）。
+        let shadow = apply_reference([0.02, 0.02, 0.02], &params);
+        assert!(shadow[0] > 0.004, "暗部不应被压到黑：{shadow:?}");
+        assert!(shadow[0] < 0.02, "暗部应被压暗：{shadow:?}");
+        // 高光提亮但不裁白。
+        let highlight = apply_reference([0.9, 0.9, 0.9], &params);
+        assert!(highlight[0] > 0.9, "高光应被提亮：{highlight:?}");
+        assert!(highlight[0] < 1.0, "高光不应被裁白：{highlight:?}");
+        // 高光余量（> 1）原样保留。
+        let headroom = apply_reference([1.4, 1.4, 1.4], &params);
+        assert!(
+            (headroom[0] - 1.4).abs() < 1e-4,
+            ">1 的高光余量应保持不变：{headroom:?}"
+        );
+    }
+
+    #[test]
+    fn negative_contrast_lifts_shadows_without_inverting() {
         let mut params = EditParams::default();
         params.light.contrast = -100.0;
+        let shadow = apply_reference([0.02, 0.02, 0.02], &params);
         let black = apply_reference([0.0, 0.0, 0.0], &params);
         let white = apply_reference([1.0, 1.0, 1.0], &params);
-        // 系数 1/(1+1.5) = 0.4：黑 → 0.108，白 → 0.508（与着色器一致，且不反相）
-        assert!(
-            (black[0] - 0.108).abs() < 1e-4,
-            "黑场应被压平到中灰附近：{black:?}"
-        );
-        assert!((white[0] - 0.508).abs() < 1e-4, "白场应被压平：{white:?}");
+        assert!(shadow[0] > 0.02, "对比度 -100 应提亮暗部：{shadow:?}");
         assert!(black[0] < white[0], "对比度 -100 不得反相");
+        assert!(shadow[0] < 1.0, "提亮不应越界：{shadow:?}");
     }
 
     #[test]
