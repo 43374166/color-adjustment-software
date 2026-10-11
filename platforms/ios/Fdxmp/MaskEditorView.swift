@@ -691,7 +691,7 @@ struct MaskPanelView: View {
                 }
             }
             .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.vertical, 3)
         }
     }
 
@@ -707,14 +707,14 @@ struct MaskPanelView: View {
             Haptics.tick()
             model.setCategory(category)
         } label: {
-            VStack(spacing: 5) {
+            VStack(spacing: 3) {
                 Image(systemName: category.icon)
-                    .font(.system(size: 15))
+                    .font(.system(size: 13))
                 Text(category.rawValue)
                     .font(.caption2)
             }
-            .frame(width: 56)
-            .padding(.vertical, 6)
+            .frame(width: 54)
+            .padding(.vertical, 3)
             .background(
                 RoundedRectangle(cornerRadius: 10)
                     .fill(

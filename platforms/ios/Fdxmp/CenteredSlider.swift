@@ -143,10 +143,11 @@ struct CenteredSlider: View {
                         .frame(width: width, height: 5)
                         .offset(y: 18.5)
                 }
-                // 进度（从中性点画到当前值）
+                // 进度（从中性点画到当前值）：和 Lightroom 一样用白色，
+                // 不再用主题蓝（颜色类轨道上蓝色会和轨道颜色混在一起）。
                 if abs(thumbX - neutralX) > 0.5 {
                     Capsule()
-                        .fill(Color.accentColor)
+                        .fill(Color.white.opacity(0.88))
                         .frame(width: abs(thumbX - neutralX), height: 5)
                         .offset(x: min(thumbX, neutralX), y: 18.5)
                 }

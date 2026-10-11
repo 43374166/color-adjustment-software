@@ -428,6 +428,13 @@ struct EditorTabView: View {
         model.tool != .crop && model.tool != .mask
     }
 
+    /// 横图 / 方图的上移量：顶距从"剩余空间 1/2（居中）"收到 1/3（与 fittedRect 一致）。
+    /// 竖图（撑满高度）为 0，不受影响。
+    private func fittedLift(imageSize: CGSize, viewSize: CGSize) -> CGFloat {
+        let fitted = fittedRect(imageSize: imageSize, in: viewSize)
+        return max(0, (viewSize.height - fitted.height) / 6)
+    }
+
     private var previewArea: some View {
         GeometryReader { geo in
             Group {
@@ -467,11 +474,13 @@ struct EditorTabView: View {
                     .resizable()
                     .scaledToFit()
                     .frame(width: geo.size.width, height: geo.size.height)
+                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
                 Image(uiImage: edited)
                     .resizable()
                     .scaledToFit()
                     .frame(width: geo.size.width, height: geo.size.height)
                     .mask(CompareSplitShape(fraction: split))
+                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
                 // 分割线 + 手柄。
                 Rectangle()
                     .fill(Color.white.opacity(0.9))
@@ -491,12 +500,13 @@ struct EditorTabView: View {
                 Image(uiImage: image)
                     .resizable()
                     .scaledToFit()
-                    // 居中显示（和 fittedRect / 叠加层几何一致）：
-                    // 竖图本来就被高度撑满，横图不会被顶到导航栏下面。
+                    // 和 fittedRect / 叠加层几何一致：竖图被高度撑满；
+                    // 横图 / 方图整体偏上（顶距 = 剩余空间的 1/3）。
                     .frame(
                         width: geo.size.width,
                         height: geo.size.height
                     )
+                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
                     .scaleEffect(zoom)
                     .offset(pan)
             } else if model.isLoading {
@@ -786,8 +796,8 @@ struct EditorTabView: View {
             return 288
         case .crop: return 210
         // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
-        // 羽化 / 叠加色挪回长按设置后，面板只剩"调整 + 子 nav"，再压低一档。
-        case .mask: return model.selectedMask == nil ? 150 : 280
+        // 分类行压矮后，把高度让给上面的参数（滑块）区。
+        case .mask: return model.selectedMask == nil ? 150 : 300
         }
     }
 
