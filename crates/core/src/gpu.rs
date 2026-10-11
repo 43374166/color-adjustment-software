@@ -204,7 +204,9 @@ impl PreviewSession {
     #[allow(unsafe_code)]
     pub fn attach_layer(&mut self, layer: *mut std::ffi::c_void) -> Result<()> {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let presenter = unsafe { SurfacePresenter::new(&self.instance, &self.adapter, layer) }?;
+            let presenter = unsafe {
+                SurfacePresenter::new(&self.device, &self.instance, &self.adapter, layer)
+            }?;
             self.presenter = Some(presenter);
             Ok(())
         }));
@@ -254,6 +256,7 @@ impl SurfacePresenter {
     /// `layer` 必须是存活的 `CAMetalLayer` 指针。
     #[allow(unsafe_code)]
     unsafe fn new(
+        device: &wgpu::Device,
         instance: &wgpu::Instance,
         adapter: &wgpu::Adapter,
         layer: *mut std::ffi::c_void,
