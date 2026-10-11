@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.fdxmp.app",
     "vendor": "fdxmp",
-    "versionCode": 1000027,
-    "versionName": "1.1.8",
+    "versionCode": 1000028,
+    "versionName": "1.1.9",
     "icon": "$media:layered_image",
     "label": "$string:app_name"
   }

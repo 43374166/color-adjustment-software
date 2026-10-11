@@ -177,12 +177,15 @@ pub fn apply_lens(source: &RgbaImage, lens: &LensParams) -> RgbaImage {
     let profile = if lens.profile_correction { -0.06 } else { 0.0 };
     let k = distortion * 0.25 + profile;
     let vignette = (lens.vignette / 100.0).clamp(-1.0, 1.0);
+    // 横向色差系数（与 GPU 着色器 / `LensModel::chromatic_scale` 一致：±100 → 通道缩放 ±1%）。
+    let ca = (lens.chromatic_aberration / 100.0).clamp(-1.0, 1.0) * 0.01;
     let identity = k.abs() < 1e-4
         && vertical.abs() < 1e-4
         && horizontal.abs() < 1e-4
         && rotate.abs() < 0.01
         && (scale - 1.0).abs() < 1e-4
-        && vignette.abs() < 1e-4;
+        && vignette.abs() < 1e-4
+        && ca.abs() < 1e-5;
     if identity {
         return source.clone();
     }
@@ -212,7 +215,25 @@ pub fn apply_lens(source: &RgbaImage, lens: &LensParams) -> RgbaImage {
             let factor = 1.0 + k * radius_squared;
             let sx = half_w + rx * factor * max_half;
             let sy = half_h + ry * factor * max_half;
-            let mut pixel = sample_bilinear(source, sx, sy);
+            let mut pixel = if ca.abs() > 1e-5 {
+                // 横向色差校正：红 / 蓝各自沿半径做 (1 ± ca) 缩放再采样（与着色器同公式）。
+                let red = sample_channel(
+                    source,
+                    half_w + (sx - half_w) * (1.0 + ca),
+                    half_h + (sy - half_h) * (1.0 + ca),
+                    0,
+                );
+                let green = sample_bilinear(source, sx, sy);
+                let blue = sample_channel(
+                    source,
+                    half_w + (sx - half_w) * (1.0 - ca),
+                    half_h + (sy - half_h) * (1.0 - ca),
+                    2,
+                );
+                image::Rgba([red, green.0[1], blue, green.0[3]])
+            } else {
+                sample_bilinear(source, sx, sy)
+            };
             if vignette.abs() > 1e-4 {
                 let distance = radius_squared.sqrt() / std::f32::consts::SQRT_2;
                 let weight = smoothstep(0.35, 1.0, distance);
@@ -319,6 +340,27 @@ fn sample_bilinear(source: &RgbaImage, x: f32, y: f32) -> image::Rgba<u8> {
         *value = (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8;
     }
     image::Rgba(channels)
+}
+
+/// 单通道双线性采样（镜头横向色差校正用：红 / 蓝各按各自的坐标取）。
+fn sample_channel(source: &RgbaImage, x: f32, y: f32, channel: usize) -> u8 {
+    let max_x = source.width().saturating_sub(1) as f32;
+    let max_y = source.height().saturating_sub(1) as f32;
+    let x = x.clamp(0.0, max_x);
+    let y = y.clamp(0.0, max_y);
+    let x0 = x.floor() as u32;
+    let y0 = y.floor() as u32;
+    let x1 = (x0 + 1).min(source.width().saturating_sub(1));
+    let y1 = (y0 + 1).min(source.height().saturating_sub(1));
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let p00 = source.get_pixel(x0, y0).0[channel] as f32;
+    let p10 = source.get_pixel(x1, y0).0[channel] as f32;
+    let p01 = source.get_pixel(x0, y1).0[channel] as f32;
+    let p11 = source.get_pixel(x1, y1).0[channel] as f32;
+    let top = p00 + (p10 - p00) * fx;
+    let bottom = p01 + (p11 - p01) * fx;
+    (top + (bottom - top) * fy).round().clamp(0.0, 255.0) as u8
 }
 
 fn crop_rect(source: &RgbaImage, rect: [f32; 4]) -> RgbaImage {
@@ -1777,6 +1819,27 @@ mod tests {
         lens.geometry.scale = 1.5;
         let out = apply_lens(&source, &lens);
         assert_ne!(out.get_pixel(0, 0).0, source.get_pixel(0, 0).0);
+    }
+
+    #[test]
+    fn lens_chromatic_aberration_scales_red_and_blue() {
+        let mut source = RgbaImage::new(16, 16);
+        for (x, _y, pixel) in source.enumerate_pixels_mut() {
+            // 横向渐变：红 / 蓝同值，便于检测两通道被分开采样。
+            let value = (x * 16) as u8;
+            *pixel = Rgba([value, 128, value, 255]);
+        }
+        let mut lens = LensParams::default();
+        lens.chromatic_aberration = 100.0;
+        let out = apply_lens(&source, &lens);
+        let before = source.get_pixel(3, 8).0;
+        let after = out.get_pixel(3, 8).0;
+        // 红 / 蓝沿半径各自缩放采样：两个通道不再相等；绿通道不动。
+        assert_ne!(after, before);
+        assert_eq!(after[1], before[1]);
+        // 色差为 0（单位变换）保持原样。
+        let identity = apply_lens(&source, &LensParams::default());
+        assert_eq!(identity.get_pixel(3, 8).0, before);
     }
 
     /// 性能排查（默认忽略）：`cargo test --release -p fdxmp-core --lib -- --ignored --nocapture bench_pipeline`

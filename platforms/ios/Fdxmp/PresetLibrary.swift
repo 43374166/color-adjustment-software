@@ -113,6 +113,7 @@ struct UserPreset: Identifiable, Equatable {
         case .effects: return .effects
         case .detail: return .detail
         case .curves: return .curves
+        case .optics: return nil
         }
     }
 

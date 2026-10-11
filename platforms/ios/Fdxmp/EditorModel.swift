@@ -477,7 +477,9 @@ final class EditorModel: ObservableObject {
             && crop.rotation == 0
             && !crop.flipHorizontal
             && !crop.flipVertical
-        guard identity, let asset else { return false }
+        // 光学（色差 / 配置文件校正）也算几何变换：区域渲染要求单位镜头模型。
+        let lensIdentity = !state.removeChromaticAberration && !state.profileCorrection
+        guard identity, lensIdentity, let asset else { return false }
         // 只对中等像素量走 1:1（全分辨率解码有内存尖峰，超大图仍用整帧细节帧）。
         let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
         return pixels > 0 && pixels <= 24_000_000
@@ -594,8 +596,14 @@ final class EditorModel: ObservableObject {
     /// 编辑提交后刷新（放大状态下保持像素级清晰）。
     private func refreshDetailIfNeeded() {
         if detailRegion != nil {
-            // 区域模式：按上次的可见矩形重渲染一块。
-            performDetailRegionRequest(visible: lastRegionVisible, viewport: lastDetailViewport)
+            if canRenderRegionDetail {
+                // 区域模式：按上次的可见矩形重渲染一块。
+                performDetailRegionRequest(visible: lastRegionVisible, viewport: lastDetailViewport)
+            } else {
+                // 开了镜头校正 / 色差：区域渲染不可用，回落到整帧细节帧。
+                clearDetailRegion()
+                requestDetailPreview(viewport: lastDetailViewport, zoom: lastDetailZoom, force: true)
+            }
         } else if detailImage != nil, !detailInFlight {
             // 整帧模式：参数变了，用同一档分辨率强制重渲染。
             requestDetailPreview(viewport: lastDetailViewport, zoom: lastDetailZoom, force: true)
@@ -1563,6 +1571,9 @@ final class EditorModel: ObservableObject {
                 }
             case .curves:
                 copy.curves.reset()
+            case .optics:
+                copy.removeChromaticAberration = false
+                copy.profileCorrection = false
             }
         }
         // 蒙版调整页的长按归零：只动当前蒙版的这一类局部参数。

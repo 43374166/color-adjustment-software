@@ -520,6 +520,10 @@ struct EditState: Equatable {
     var curves = CurveState()
     var hsl = HslState()
     var grading = GradingState()
+    /// 光学：删除色差（固定强度横向色差校正）。
+    var removeChromaticAberration = false
+    /// 光学：启用配置文件校正（核心内置档案：畸变 -0.06）。
+    var profileCorrection = false
     var crop = CropState()
     var masks: [MaskUi] = []
 }
@@ -542,6 +546,11 @@ enum EditJSON {
         root["curves"] = curvesJson(state.curves)
         root["hsl"] = hslJson(state.hsl)
         root["grading"] = gradingJson(state.grading)
+        root["lens"] = [
+            "profile_correction": state.profileCorrection,
+            "chromatic_aberration": state.removeChromaticAberration ? 25.0 : 0.0,
+            "vignette": 0.0,
+        ]
         root["crop"] = cropJson(state.crop, applyRect: applyCropRect)
         root["masks"] = state.masks.map(maskJson)
         return serialize(root)
@@ -706,6 +715,11 @@ enum EditJSON {
         state.curves = parseCurves(root["curves"])
         state.hsl = parseHsl(root["hsl"])
         state.grading = parseGrading(root["grading"])
+        if let lens = root["lens"] as? [String: Any] {
+            state.profileCorrection = (lens["profile_correction"] as? Bool) ?? false
+            let ca = (lens["chromatic_aberration"] as? NSNumber)?.floatValue ?? 0
+            state.removeChromaticAberration = ca != 0
+        }
         state.crop = parseCrop(root["crop"])
         state.masks = parseMasks(root["masks"])
         return state

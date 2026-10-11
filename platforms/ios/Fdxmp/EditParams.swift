@@ -3,10 +3,11 @@ import Foundation
 /// 调色分类（底部面板的一级 Tab）。
 enum EditCategory: String, CaseIterable, Identifiable {
     case light = "亮度"
+    case curves = "曲线"
     case color = "颜色"
     case effects = "效果"
     case detail = "细节"
-    case curves = "曲线"
+    case optics = "光学"
 
     var id: String { rawValue }
 
@@ -14,10 +15,11 @@ enum EditCategory: String, CaseIterable, Identifiable {
     var icon: String {
         switch self {
         case .light: return "sun.max"
+        case .curves: return "point.topleft.down.curvedto.point.bottomright.up"
         case .color: return "drop"
         case .effects: return "camera.filters"
         case .detail: return "triangle"
-        case .curves: return "point.topleft.down.curvedto.point.bottomright.up"
+        case .optics: return "camera.aperture"
         }
     }
 }

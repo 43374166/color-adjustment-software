@@ -944,7 +944,7 @@ struct EditorTabView: View {
         }
     }
 
-    /// 参数区（滑块 / HSL / 分级 / 曲线）。
+    /// 参数区（滑块 / HSL / 分级 / 曲线 / 光学）。
     @ViewBuilder
     private var editContent: some View {
         if model.category == .curves {
@@ -953,6 +953,8 @@ struct EditorTabView: View {
             hslPanel
         } else if model.category == .color, model.colorTab == .grading {
             gradingPanel
+        } else if model.category == .optics {
+            opticsPanel
         } else {
             sliderList
         }
@@ -1390,6 +1392,58 @@ struct EditorTabView: View {
             .opacity(model.sliderVisible("明亮度") ? 1 : 0)
             .allowsHitTesting(model.sliderVisible("明亮度"))
         }
+    }
+
+    // MARK: - 光学（删除色差 / 启用镜头校正）
+
+    private var opticsPanel: some View {
+        ScrollView {
+            VStack(spacing: 0) {
+                opticsToggle(
+                    title: "删除色差",
+                    hint: "去掉高对比边缘的红 / 青彩边（横向色差，固定强度）",
+                    isOn: Binding(
+                        get: { model.state.removeChromaticAberration },
+                        set: { newValue in
+                            Haptics.tick()
+                            model.applyEdit("删除色差") { state in
+                                state.removeChromaticAberration = newValue
+                            }
+                        }
+                    )
+                )
+                opticsToggle(
+                    title: "启用镜头校正",
+                    hint: "内置档案校正桶形畸变（广角镜头明显）",
+                    isOn: Binding(
+                        get: { model.state.profileCorrection },
+                        set: { newValue in
+                            Haptics.tick()
+                            model.applyEdit("镜头校正") { state in
+                                state.profileCorrection = newValue
+                            }
+                        }
+                    )
+                )
+            }
+            .padding(.vertical, 10)
+        }
+        .scrollDisabled(model.draggingSlider != nil)
+    }
+
+    private func opticsToggle(title: String, hint: String, isOn: Binding<Bool>) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Toggle(isOn: isOn) {
+                Text(title)
+                    .font(.footnote)
+            }
+            .tint(Color.accentColor)
+            Text(hint)
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 10)
     }
 
     // MARK: - 裁切
