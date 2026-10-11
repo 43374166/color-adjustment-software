@@ -104,7 +104,6 @@ struct CenteredSlider: View {
     @State private var didDrag = false
     @State private var maxDistance: CGFloat = 0
     @State private var lastTapTime = Date.distantPast
-    @State private var pendingStep: DispatchWorkItem?
     /// 长按进入微调（拖动速度降到 1/5）。
     @State private var fineMode = false
     @State private var fineAnchorX: CGFloat?
@@ -144,11 +143,6 @@ struct CenteredSlider: View {
                         .frame(width: width, height: 5)
                         .offset(y: 18.5)
                 }
-                // 中性点刻度
-                Rectangle()
-                    .fill(Color.white.opacity(0.4))
-                    .frame(width: 2, height: 18)
-                    .offset(x: neutralX - 1, y: 12)
                 // 进度（从中性点画到当前值）
                 if abs(thumbX - neutralX) > 0.5 {
                     Capsule()
@@ -156,18 +150,23 @@ struct CenteredSlider: View {
                         .frame(width: abs(thumbX - neutralX), height: 5)
                         .offset(x: min(thumbX, neutralX), y: 18.5)
                 }
-                // 圆点
+                // 初始化（中性点）标记：很小的白色圆点，压在轨道中间。
                 Circle()
-                    .fill(Color.clear)
+                    .fill(Color.white.opacity(0.9))
+                    .frame(width: 6, height: 6)
+                    .offset(x: neutralX - 3, y: 18)
+                // 圆点：外圈白色、内点浅蓝；内圈整圈填浅蓝，不再露出黑底。
+                Circle()
+                    .fill(Color(red: 0.45, green: 0.72, blue: 1.0).opacity(0.55))
                     .frame(width: 26, height: 26)
                     .overlay(
-                        // 外圈白色、内点浅蓝（和 Lightroom 的圆点一致）。
-                        Circle().strokeBorder(Color.white.opacity(0.92), lineWidth: 2.5)
+                        Circle()
+                            .fill(Color(red: 0.45, green: 0.72, blue: 1.0).opacity(0.9))
+                            .frame(width: 15, height: 15)
                     )
                     .overlay(
-                        Circle()
-                            .fill(Color.accentColor.opacity(0.55))
-                            .frame(width: 15, height: 15)
+                        // 外圈白色（和 Lightroom 的圆点一致）。
+                        Circle().strokeBorder(Color.white.opacity(0.95), lineWidth: 2.5)
                     )
                     .offset(x: thumbX - 13, y: 8)
             }
@@ -183,9 +182,6 @@ struct CenteredSlider: View {
                             didDrag = false
                             maxDistance = 0
                             dragAxis = nil
-                            // 新的触摸取消上一次待执行的单击步进。
-                            pendingStep?.cancel()
-                            pendingStep = nil
                             onBegin()
                         }
                         maxDistance = max(
@@ -261,16 +257,14 @@ struct CenteredSlider: View {
                         // 移动距离过大（纵向滚动）时不当作点击。
                         guard maxDistance < 8 else { return }
                         // 轻点：
-                        // - 双击（且落在圆点附近）→ 归零（默认值）；
-                        // - 单击 → 延迟 0.3s 执行 ±step（若期间出现第二击则取消，
-                        //   保证双击归零时不会先留下一次步进）。
+                        // - 单击 → 立即执行 ±step（不再等 0.3s 判定双击，点击没有延迟）；
+                        // - 双击（0.3s 内的第二击，且落在圆点附近）→ 归零（默认值），
+                        //   覆盖第一击的步进；双击在轨道上 → 再走一步。
                         let now = Date()
                         let isDoubleTap = now.timeIntervalSince(lastTapTime) < 0.30
                         let onThumb = abs(gesture.startLocation.x - thumbX) <= 30
                         if isDoubleTap {
                             lastTapTime = .distantPast
-                            pendingStep?.cancel()
-                            pendingStep = nil
                             if onThumb {
                                 Haptics.light()
                                 onChange(neutral.clamped(to: range))
@@ -280,11 +274,7 @@ struct CenteredSlider: View {
                             }
                         } else {
                             lastTapTime = now
-                            let work = DispatchWorkItem {
-                                applyStep(from: gesture.startLocation.x, thumbX: thumbX)
-                            }
-                            pendingStep = work
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30, execute: work)
+                            applyStep(from: gesture.startLocation.x, thumbX: thumbX)
                         }
                     }
             )

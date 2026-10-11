@@ -22,14 +22,25 @@ struct EditorTabView: View {
     @State private var baseZoom: CGFloat = 1
     @State private var pan: CGSize = .zero
     @State private var basePan: CGSize = .zero
-    /// 长按看原图后，短时间内忽略单击（避免松手瞬间触发沉浸切换）。
-    @State private var suppressTapUntil = Date.distantPast
+    /// 照片触摸跟踪状态：轻点 / 长按自己判定（不再用「双击手势压制单击」，
+    /// 避免单击要等 0.3s 才有响应）。
+    @State private var photoTouchActive = false
+    @State private var photoTouchMoved = false
+    @State private var photoHoldActive = false
+    @State private var photoHoldWork: DispatchWorkItem?
+    /// 上一次轻点的时间（300ms 内两次 = 双击放大 / 还原）。
+    @State private var lastPhotoTapAt = Date.distantPast
+    /// 本次轻点前是否已沉浸（双击放大要把单击的沉浸切换还原）。
+    @State private var immersiveBeforeTap = false
     /// 蒙版画布交互控制器（拖动 / 涂抹 / 双指手势）。
     @State private var maskController = MaskCanvasController()
     /// 分类参数面板是否收起（点同一个分类两次 = 收起 / 再展开）。
     @State private var categoryCollapsed = false
-    /// 长按分类预览后，短时间内忽略这次点击（避免顺带切换 / 收起）。
-    @State private var suppressCategoryTapUntil = Date.distantPast
+    /// 分类导航触摸跟踪状态（轻点 = 展开 / 收起，长按 = 只看这类参数复原）。
+    @State private var categoryTouchActive = false
+    @State private var categoryTouchMoved = false
+    @State private var categoryPreviewActive = false
+    @State private var categoryHoldWork: DispatchWorkItem?
     /// 长按撤销键后，短时间内忽略这次点击（避免顺带撤销一步）。
     @State private var suppressUndoTapUntil = Date.distantPast
     /// 长按照片前是否已处于沉浸模式（松手后按原样恢复）。
@@ -249,9 +260,11 @@ struct EditorTabView: View {
                 } else {
                     VStack(spacing: 0) {
                         editorColumn
-                        if !immersive {
-                            panel
-                        }
+                        // 沉浸查看（长按看原图 / 轻点隐藏 UI）时面板只隐不撤：
+                        // 预览区尺寸不变，图片和曲线编辑区都不跳位。
+                        panel
+                            .opacity(immersive ? 0 : 1)
+                            .allowsHitTesting(!immersive)
                     }
                 }
             }
@@ -273,11 +286,12 @@ struct EditorTabView: View {
 
     @ViewBuilder
     private var editorColumn: some View {
-        if !immersive && !hidesChrome {
-            // 拖动滑块时顶部栏只隐藏不位移：图片位置不跳动（保持从灵动岛下面开始）。
+        if !hidesChrome {
+            // 拖动滑块 / 沉浸查看时顶部栏只隐藏不位移：
+            // 图片位置不跳动（保持从灵动岛下面开始），轻点 / 长按也不会让画面移位。
             topBar
-                .opacity(model.draggingSlider == nil ? 1 : 0)
-                .allowsHitTesting(model.draggingSlider == nil)
+                .opacity(model.draggingSlider == nil && !immersive ? 1 : 0)
+                .allowsHitTesting(model.draggingSlider == nil && !immersive)
         }
         previewArea
     }
@@ -423,23 +437,13 @@ struct EditorTabView: View {
                     // 蒙版模式：触摸全部交给 MaskTouchLayer（单指操作蒙版，双指缩放 / 平移）。
                     previewBody(geo: geo)
                 } else if model.tool == .edit && model.category == .curves {
-                    // 曲线：图片上的曲线编辑区自己收手势，避免误触沉浸 / 看原图。
+                    // 曲线：图片上的曲线编辑区自己收手势（长按看原图由它转发）。
                     previewBody(geo: geo)
                 } else {
                     previewBody(geo: geo)
                         .contentShape(Rectangle())
                         .gesture(previewGesture(viewWidth: geo.size.width))
-                        .onTapGesture(count: 2) {
-                            toggleZoom()
-                        }
-                        .onTapGesture {
-                            if Date() < suppressTapUntil { return }
-                            guard overlayEnabled else { return }
-                            withAnimation(.easeInOut(duration: 0.2)) {
-                                immersive.toggle()
-                            }
-                        }
-                        .simultaneousGesture(holdToPreviewGesture(viewSize: geo.size))
+                        .simultaneousGesture(photoTouchGesture(viewSize: geo.size))
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
@@ -539,7 +543,13 @@ struct EditorTabView: View {
             }
             // 曲线：正方形透明编辑区直接叠在图片上（无背景板）。
             if model.tool == .edit && model.category == .curves {
-                CurveOverlay(model: model, viewSize: geo.size)
+                CurveOverlay(model: model, viewSize: geo.size) { active in
+                    if active {
+                        beginHoldPreview()
+                    } else {
+                        endHoldPreview()
+                    }
+                }
             }
             // 拖动滑块时隐藏所有 UI（只留滑块 + 画面）。
             if !immersive && model.draggingSlider == nil {
@@ -636,40 +646,94 @@ struct EditorTabView: View {
         }
     }
 
-    /// 长按 0.5 秒看原图：长按识别后继续跟踪手指，松手恢复调色效果。
+    /// 预览区触摸：轻点 / 双击 / 长按都在这里判定，单击不再等双击判定 → 点击没有延迟。
     ///
-    /// 用"长按 → 串接拖动"的串行手势（而不是 onLongPressGesture 的 pressing 回调），
-    /// 能稳定拿到"按下 0.5s"与"松手"两个时刻，不会被缩放/拖动手势抢占。
-    /// 直方图区域内的长按交给直方图自己（切换剪裁警告），不触发看原图。
-    private func holdToPreviewGesture(viewSize: CGSize) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.5, maximumDistance: 30)
-            .sequenced(before: DragGesture(minimumDistance: 0))
+    /// - 轻点：切换沉浸（隐藏 / 显示 UI），立刻生效；
+    /// - 双击（300ms 内两次轻点）：放大 / 还原，并把单击造成的沉浸切换还原；
+    /// - 长按 0.5s：看原图（同时隐藏 UI），松手恢复；长按期间移动手指不会取消；
+    /// - 直方图卡片里的触摸交给直方图自己（点一下切通道 / 长按切换剪裁警告）；
+    /// - 拖动（缩放后平移 / 左右滑动切图）超过 12pt 就不再算轻点。
+    private func photoTouchGesture(viewSize: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0)
             .onChanged { value in
-                guard overlayEnabled else { return }
-                if case .second(true, let drag?) = value,
-                   histogramFrame(in: viewSize).contains(drag.startLocation)
-                {
+                if !photoTouchActive {
+                    photoTouchActive = true
+                    photoTouchMoved = false
+                    photoHoldActive = false
+                    // 直方图卡片自己收手势。
+                    guard !histogramFrame(in: viewSize).contains(value.startLocation) else {
+                        return
+                    }
+                    let work = DispatchWorkItem {
+                        guard photoTouchActive, !photoTouchMoved, !photoHoldActive else { return }
+                        photoHoldActive = true
+                        beginHoldPreview()
+                    }
+                    photoHoldWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
                     return
                 }
-                if case .second(true, _) = value {
-                    if !model.showOriginal {
-                        Haptics.medium()
-                        // 长按看原图时把 UI 一并隐藏（沉浸查看），松手恢复。
-                        immersiveBeforeHold = immersive
-                        model.showOriginal = true
-                        withAnimation(.easeInOut(duration: 0.18)) {
-                            immersive = true
-                        }
+                if !photoTouchMoved,
+                   hypot(value.translation.width, value.translation.height) > 12 {
+                    photoTouchMoved = true
+                    photoHoldWork?.cancel()
+                    photoHoldWork = nil
+                }
+            }
+            .onEnded { value in
+                photoHoldWork?.cancel()
+                photoHoldWork = nil
+                let wasActive = photoTouchActive
+                let moved = photoTouchMoved
+                let held = photoHoldActive
+                photoTouchActive = false
+                photoTouchMoved = false
+                photoHoldActive = false
+                guard wasActive else { return }
+                if held {
+                    endHoldPreview()
+                    return
+                }
+                guard !moved, overlayEnabled else { return }
+                guard !histogramFrame(in: viewSize).contains(value.startLocation) else { return }
+                // 刚捏合完的瞬间不算轻点（捏合松手时两根手指的收拢）。
+                guard Date().timeIntervalSince(lastPinchAt) > 0.25 else { return }
+                let now = Date()
+                if now.timeIntervalSince(lastPhotoTapAt) < 0.35 {
+                    // 双击：放大 / 还原，并把第一击的沉浸切换还原。
+                    lastPhotoTapAt = .distantPast
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        immersive = immersiveBeforeTap
                     }
-                    suppressTapUntil = Date().addingTimeInterval(0.5)
+                    toggleZoom()
+                } else {
+                    lastPhotoTapAt = now
+                    immersiveBeforeTap = immersive
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        immersive.toggle()
+                    }
                 }
             }
-            .onEnded { _ in
-                model.showOriginal = false
-                withAnimation(.easeInOut(duration: 0.18)) {
-                    immersive = immersiveBeforeHold
-                }
-            }
+    }
+
+    /// 长按看原图：隐藏全部 UI 沉浸查看（松手按长按前的状态恢复）。
+    /// 照片区和曲线编辑区共用；长按期间曲线 / 参数都不变化。
+    private func beginHoldPreview() {
+        guard overlayEnabled, !model.showOriginal else { return }
+        Haptics.medium()
+        immersiveBeforeHold = immersive
+        model.showOriginal = true
+        withAnimation(.easeInOut(duration: 0.18)) {
+            immersive = true
+        }
+    }
+
+    private func endHoldPreview() {
+        guard model.showOriginal else { return }
+        model.showOriginal = false
+        withAnimation(.easeInOut(duration: 0.18)) {
+            immersive = immersiveBeforeHold
+        }
     }
 
     /// 直方图卡片在预览区里的位置（与 previewBody 的 HUD 布局一致，外加一点手指容差）。
@@ -986,39 +1050,39 @@ struct EditorTabView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 ForEach(EditCategory.allCases) { category in
-                    Button {
-                        guard Date() >= suppressCategoryTapUntil else { return }
-                        toggleCategory(category)
-                    } label: {
-                        VStack(spacing: 5) {
-                            Image(systemName: category.icon)
-                                .font(.system(size: 16))
-                            Text(category.rawValue)
-                                .font(.caption2)
-                        }
-                        .frame(width: 58)
-                        .padding(.vertical, 7)
-                        .background(
-                            RoundedRectangle(cornerRadius: 10)
-                                .fill(
-                                    model.category == category
-                                        ? Color.white.opacity(0.14)
-                                        : Color.clear
-                                )
-                        )
-                        .foregroundStyle(
-                            model.category == category
-                                ? Color.white
-                                : Color.white.opacity(0.6)
-                        )
-                    }
-                    .buttonStyle(.plain)
-                    .simultaneousGesture(categoryHoldGesture(category))
+                    categoryButton(category)
                 }
             }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+
+    /// 分类按钮（自己判定触摸）：轻点展开 / 收起，长按只做"这一类参数复原"对比。
+    private func categoryButton(_ category: EditCategory) -> some View {
+        VStack(spacing: 5) {
+            Image(systemName: category.icon)
+                .font(.system(size: 16))
+            Text(category.rawValue)
+                .font(.caption2)
+        }
+        .frame(width: 58)
+        .padding(.vertical, 7)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(
+                    model.category == category
+                        ? Color.white.opacity(0.14)
+                        : Color.clear
+                )
+        )
+        .foregroundStyle(
+            model.category == category
+                ? Color.white
+                : Color.white.opacity(0.6)
+        )
+        .contentShape(Rectangle())
+        .simultaneousGesture(categoryTouchGesture(category))
     }
 
     /// 点分类：从下往上展开参数；再点同一个分类收起。
@@ -1034,22 +1098,51 @@ struct EditorTabView: View {
         }
     }
 
-    /// 长按分类（0.5s）：临时把该分类的参数归零，松手恢复——
-    /// 和「长按照片看原图」一样用来单独对比这个分类的调色变化。
-    private func categoryHoldGesture(_ category: EditCategory) -> some Gesture {
-        LongPressGesture(minimumDuration: 0.5, maximumDistance: 40)
-            .sequenced(before: DragGesture(minimumDistance: 0))
+    /// 分类导航的触摸判定（轻点 = 展开 / 收起；长按 0.5s = 只看这类参数复原）。
+    ///
+    /// 不再用「Button + 同时长按」：那样长按松手还会顺带触发一次点击（展开 / 收起）。
+    /// 这里自己判定，长按松手只结束对比，不做别的；横向滑动交给外层 ScrollView。
+    private func categoryTouchGesture(_ category: EditCategory) -> some Gesture {
+        DragGesture(minimumDistance: 0)
             .onChanged { value in
-                if case .second(true, _) = value {
-                    if model.previewCategory != category {
+                if !categoryTouchActive {
+                    categoryTouchActive = true
+                    categoryTouchMoved = false
+                    categoryPreviewActive = false
+                    let work = DispatchWorkItem {
+                        guard categoryTouchActive, !categoryTouchMoved, !categoryPreviewActive
+                        else { return }
+                        categoryPreviewActive = true
                         Haptics.medium()
                         model.beginCategoryPreview(category)
                     }
-                    suppressCategoryTapUntil = Date().addingTimeInterval(0.4)
+                    categoryHoldWork = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+                    return
+                }
+                if !categoryTouchMoved,
+                   hypot(value.translation.width, value.translation.height) > 12 {
+                    categoryTouchMoved = true
+                    categoryHoldWork?.cancel()
+                    categoryHoldWork = nil
                 }
             }
             .onEnded { _ in
-                model.endCategoryPreview()
+                categoryHoldWork?.cancel()
+                categoryHoldWork = nil
+                let wasActive = categoryTouchActive
+                let moved = categoryTouchMoved
+                let previewing = categoryPreviewActive
+                categoryTouchActive = false
+                categoryTouchMoved = false
+                categoryPreviewActive = false
+                guard wasActive else { return }
+                if previewing {
+                    model.endCategoryPreview()
+                    return
+                }
+                guard !moved else { return }
+                toggleCategory(category)
             }
     }
 
@@ -1526,6 +1619,8 @@ private struct ShareSheet: UIViewControllerRepresentable {
 private struct CurveOverlay: View {
     @ObservedObject var model: EditorModel
     let viewSize: CGSize
+    /// 长按曲线编辑区看原图（true = 开始，false = 结束）；曲线本身不变化。
+    let onPreviewHold: (Bool) -> Void
 
     var body: some View {
         let side = min(viewSize.width, viewSize.height) * 0.84
@@ -1539,7 +1634,8 @@ private struct CurveOverlay: View {
             onParametricChange: { values, commit in
                 model.updateParametric(values, commit: commit)
             },
-            transparent: true
+            transparent: true,
+            onHoldPreview: onPreviewHold
         )
         .frame(width: side, height: side)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
