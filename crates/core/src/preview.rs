@@ -453,10 +453,13 @@ pub fn render_preview_image_at(
         });
     }
 
-    // 第二遍：细节（锐化 / 降噪）需要邻域。
+    // 第二遍：纹理 / 清晰度 / 去雾（需要模糊参考；和 GPU `pipeline_detail` 同序同强度）。
+    apply_micro_contrast(&mut out, params);
+
+    // 第三遍：细节（锐化 / 降噪）需要邻域（GPU 里也在纹理 / 清晰度之后）。
     apply_detail(&mut out, &params.detail);
 
-    // 第三遍：全局效果（暗角 / 颗粒），同样逐像素独立。
+    // 第四遍：全局效果（暗角 / 颗粒），同样逐像素独立。
     let out_width = out.width().max(1);
     {
         let pixels: &mut [u8] = &mut out;
@@ -839,8 +842,8 @@ fn adjust_pixel(mut rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [
     } else {
         ((max - min) / max).clamp(0.0, 1.0)
     };
-    let saturation_factor = 1.0 + color.saturation / 100.0;
-    let vibrance_factor = 1.0 + (color.vibrance / 100.0) * (1.0 - pixel_saturation);
+    let saturation_factor = 1.0 + color.saturation / 100.0 * 1.25;
+    let vibrance_factor = 1.0 + (color.vibrance / 100.0) * (1.0 - pixel_saturation) * 1.35;
     let factor = saturation_factor * vibrance_factor;
     for channel in &mut rgb {
         *channel = luminance_now + (*channel - luminance_now) * factor;
@@ -850,6 +853,92 @@ fn adjust_pixel(mut rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [
     rgb = apply_hsl(rgb, &params.hsl);
     // 颜色分级（阴影 / 中间调 / 高光）。
     apply_grading(rgb, &params.grading)
+}
+
+/// 纹理 / 清晰度 / 去雾（显示空间；模糊参考取自当前调色结果）。
+///
+/// 旧实现 CPU 路径完全没有这三个效果、GPU 强度也偏弱（纹理 / 清晰度局部对比
+/// 只有 ~2/255 的平均像素差，肉眼看不见）。这里与 GPU 同结构：
+/// 纹理用细半径参考（微反差），清晰度用大半径参考（中间调局部对比），去雾拉黑场 + 提对比。
+fn apply_micro_contrast(image: &mut RgbaImage, params: &EditParams) {
+    let effects = &params.effects;
+    let texture = (effects.texture / 100.0).clamp(-1.0, 1.0);
+    let clarity = (effects.clarity / 100.0).clamp(-1.0, 1.0);
+    let dehaze = (effects.dehaze / 100.0).clamp(-1.0, 1.0);
+    if texture == 0.0 && clarity == 0.0 && dehaze == 0.0 {
+        return;
+    }
+    // 半径与 GPU 同比例：细节半径按渲染长边 / 2048 缩放（1×..4×），
+    // 这样预览、1:1 与全分辨率导出的观感一致。
+    let edge = image.width().max(image.height()) as f32;
+    let scale = (edge / 2048.0).clamp(1.0, 4.0);
+    let fine = if texture != 0.0 {
+        let radius = (params.detail.sharpen.radius.max(0.5) * scale)
+            .round()
+            .max(1.0);
+        Some(blur_rgb(image, radius as u32))
+    } else {
+        None
+    };
+    let big = if clarity != 0.0 {
+        let radius = (4.0 * scale).round().max(1.0) as u32;
+        Some(blur_rgb(image, radius))
+    } else {
+        None
+    };
+    {
+        let pixels: &mut [u8] = &mut *image;
+        pixels
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(index, pixel)| {
+                let mut rgb = [
+                    pixel[0] as f32 / 255.0,
+                    pixel[1] as f32 / 255.0,
+                    pixel[2] as f32 / 255.0,
+                ];
+                if let Some(blur) = &fine {
+                    for channel in 0..3 {
+                        rgb[channel] += (rgb[channel] - blur[index][channel]) * texture * 1.5;
+                    }
+                }
+                if let Some(blur) = &big {
+                    let luma = luminance(rgb);
+                    let midtone = (1.0 - (luma - 0.5).abs() * 1.6).max(0.0);
+                    for channel in 0..3 {
+                        rgb[channel] +=
+                            (rgb[channel] - blur[index][channel]) * clarity * midtone * 1.6;
+                    }
+                }
+                if dehaze > 0.0 {
+                    // 去雾：拉黑场 + 提对比 + 提饱和。GPU 在线性域做这一步，
+                    // 这里同样转到线性域算，预览与导出观感一致。
+                    for channel in &mut rgb {
+                        let linear = srgb_to_linear(*channel);
+                        let adjusted = ((linear - 0.10 * dehaze) * (1.0 + dehaze * 0.65)).max(0.0);
+                        *channel = linear_to_srgb_f32(adjusted);
+                    }
+                    let gray = luminance(rgb);
+                    let boost = 1.0 + dehaze * 0.3;
+                    for channel in &mut rgb {
+                        *channel = gray + (*channel - gray) * boost;
+                    }
+                } else if dehaze < 0.0 {
+                    let veil = -dehaze;
+                    for channel in &mut rgb {
+                        let linear = srgb_to_linear(*channel);
+                        let adjusted = (linear * (1.0 - veil * 0.3) + veil * 0.10).max(0.0);
+                        *channel = linear_to_srgb_f32(adjusted);
+                    }
+                }
+                for channel in &mut rgb {
+                    *channel = channel.clamp(0.0, 1.0);
+                }
+                pixel[0] = to_u8(rgb[0]);
+                pixel[1] = to_u8(rgb[1]);
+                pixel[2] = to_u8(rgb[2]);
+            });
+    }
 }
 
 /// 全局效果：暗角 + 颗粒。
@@ -925,21 +1014,21 @@ fn apply_tone_zones(rgb: [f32; 3], light: &LightParams) -> [f32; 3] {
         let mut value = s;
         if h > 0.0 {
             // 向白渐进：白场不动，越亮位移越小。
-            value += h * w_hi * (1.0 - s).max(0.0) * 0.45;
+            value += h * w_hi * (1.0 - s).max(0.0) * 0.55;
         } else if h < 0.0 {
             // 向中灰回收：纯白略微保留（顶部 0.85 以上渐收，保证单调）。
             let shape = (s - 0.5).max(0.0) * (1.0 - 0.55 * smoothstep(0.85, 1.0, s));
-            value += h * w_hi * shape * 0.45;
+            value += h * w_hi * shape * 0.55;
         }
         if sh > 0.0 {
             // 向中灰提亮：越暗提得越多，到 0.55 为止。
-            value += sh * w_sh * (0.55 - s).max(0.0) * 0.40;
+            value += sh * w_sh * (0.55 - s).max(0.0) * 0.30;
         } else if sh < 0.0 {
             // 向黑渐进：越暗压得越多，不会越界。
-            value += sh * w_sh * s * 0.35;
+            value += sh * w_sh * s * 0.30;
         }
-        // 白点 / 黑点：端点位移（±100 → ±0.10）。
-        value += (wv * w_wh + bl * w_bl) * 0.10;
+        // 白点 / 黑点：端点位移（±100 → ±0.13）。
+        value += (wv * w_wh + bl * w_bl) * 0.13;
         out[index] = value.clamp(0.0, 1.0);
     }
     out
@@ -1007,9 +1096,17 @@ fn apply_hsl(rgb: [f32; 3], hsl: &HslParams) -> [f32; 3] {
     luminance_shift /= weight_total;
 
     let visible = smoothstep(0.02, 0.22, saturation);
-    let new_hue = (hue + hue_shift * visible * 0.08).rem_euclid(1.0);
-    let new_saturation = (saturation * (1.0 + saturation_shift * visible)).clamp(0.0, 1.0);
-    let new_value = (value + luminance_shift * visible * 0.22).clamp(0.0, 1.0);
+    let new_hue = (hue + hue_shift * visible * 0.09).rem_euclid(1.0);
+    let new_saturation = (saturation * (1.0 + saturation_shift * visible * 1.15)).clamp(0.0, 1.0);
+    // 明亮度：+ 方向渐进逼近 1（越亮增益越小，不再把脸"漂白"）；
+    // - 方向按比例压暗（与 GPU 同公式）。
+    let shift = luminance_shift * visible;
+    let new_value = if shift >= 0.0 {
+        value + shift * (1.0 - value) * 0.55
+    } else {
+        value + shift * value * 0.45
+    };
+    let new_value = new_value.clamp(0.0, 1.0);
     hsv_to_rgb(new_hue, new_saturation, new_value)
 }
 
@@ -1880,7 +1977,10 @@ mod tests {
             ..Default::default()
         };
         let out = apply_tone_zones([1.0, 1.0, 1.0], &light);
-        assert!((out[0] - 0.9).abs() < 0.02, "白色 -100 应回收白点：{out:?}");
+        assert!(
+            (out[0] - 0.87).abs() < 0.02,
+            "白色 -100 应回收白点：{out:?}"
+        );
 
         let light = LightParams {
             blacks: -100.0,
@@ -1921,28 +2021,28 @@ mod tests {
 
     #[test]
     fn tone_zones_lightroom_strength() {
-        // 目标（对齐 Lightroom 手感）：阴影 +100 ≈ 0.30；高光 +100 ≈ 0.85；
-        // 高光 -100 ≈ 0.75；白色 -100（纯白）≈ 0.90。
+        // 目标（对齐 Lightroom 手感）：阴影 +100 ≈ 0.26；高光 +100 ≈ 0.86；
+        // 高光 -100 ≈ 0.71；白色 -100（纯白）≈ 0.87。
         let light = LightParams {
             shadows: 100.0,
             ..Default::default()
         };
         let out = apply_tone_zones([0.13, 0.13, 0.13], &light);
-        assert!((out[0] - 0.30).abs() < 0.04, "阴影 +100 ≈0.30：{out:?}");
+        assert!((out[0] - 0.26).abs() < 0.04, "阴影 +100 ≈0.26：{out:?}");
 
         let light = LightParams {
             highlights: 100.0,
             ..Default::default()
         };
         let out = apply_tone_zones([0.75, 0.75, 0.75], &light);
-        assert!((out[0] - 0.845).abs() < 0.03, "高光 +100 ≈0.85：{out:?}");
+        assert!((out[0] - 0.86).abs() < 0.03, "高光 +100 ≈0.86：{out:?}");
 
         let light = LightParams {
             highlights: -100.0,
             ..Default::default()
         };
         let out = apply_tone_zones([0.90, 0.90, 0.90], &light);
-        assert!((out[0] - 0.75).abs() < 0.05, "高光 -100 ≈0.75：{out:?}");
+        assert!((out[0] - 0.71).abs() < 0.05, "高光 -100 ≈0.71：{out:?}");
     }
 
     #[test]

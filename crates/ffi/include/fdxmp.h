@@ -50,6 +50,10 @@ uint8_t *fdxmp_preset_bytes_from_params_json(const char *json,
                                              const char *name,
                                              const char *author,
                                              size_t *out_len);
+/* 预设元数据 + 参数（name / author / description / params）；失败返回 NULL。 */
+char *fdxmp_preset_json_from_bytes(const uint8_t *bytes, size_t len);
+/* 从 Lightroom XMP 文本导入预设（name / author / params）；失败返回 NULL。 */
+char *fdxmp_preset_json_from_xmp(const char *xmp);
 
 /* ---- 解码探测 ---- */
 

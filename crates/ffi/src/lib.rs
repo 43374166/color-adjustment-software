@@ -399,6 +399,70 @@ pub unsafe extern "C" fn fdxmp_preset_bytes_from_params_json(
     })
 }
 
+/// 解析 `.fdxmp` 字节流，返回预设 JSON（`name` / `author` / `description` / `params`），
+/// 失败返回 NULL（调用方释放返回值）。
+///
+/// # Safety
+///
+/// `bytes`/`len` 必须描述一段有效字节，或 `bytes` 为 NULL。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_preset_json_from_bytes(bytes: *const u8, len: usize) -> *mut c_char {
+    guard(ptr::null_mut(), || {
+        let Some(bytes) = bytes_from_raw(bytes, len) else {
+            set_last_error("bytes 为空指针");
+            return ptr::null_mut();
+        };
+        match PresetFile::from_bytes(bytes) {
+            Ok(preset) => {
+                let payload = serde_json::json!({
+                    "name": preset.name,
+                    "author": preset.author,
+                    "description": preset.description,
+                    "params": preset.params,
+                });
+                into_c_string(payload.to_string())
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
+/// 解析 Lightroom `.xmp` 预设文本，返回预设 JSON（`name` / `author` / `params`），
+/// 失败返回 NULL（调用方释放返回值）。
+///
+/// # Safety
+///
+/// `xmp` 必须为合法 C 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_preset_json_from_xmp(xmp: *const c_char) -> *mut c_char {
+    guard(ptr::null_mut(), || {
+        let text = match cstr_to_str(xmp, "xmp") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        match PresetFile::from_lightroom_xmp(text) {
+            Ok(preset) => {
+                let payload = serde_json::json!({
+                    "name": preset.name,
+                    "author": preset.author,
+                    "params": preset.params,
+                });
+                into_c_string(payload.to_string())
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 探测图像格式与尺寸，返回 JSON（调用方释放），失败返回 NULL。
 ///
 /// # Safety
@@ -1212,7 +1276,42 @@ mod tests {
             let json = CStr::from_ptr(json_ptr).to_str().unwrap().to_string();
             assert!(json.contains("version"));
             fdxmp_string_free(json_ptr);
+
+            // 新增接口：`.fdxmp` 元数据 + 参数 JSON。
+            let meta_ptr = fdxmp_preset_json_from_bytes(bytes, out_len);
+            assert!(!meta_ptr.is_null());
+            let meta = CStr::from_ptr(meta_ptr).to_str().unwrap().to_string();
+            assert!(meta.contains("ffi-preset"));
+            assert!(meta.contains("params"));
+            fdxmp_string_free(meta_ptr);
             fdxmp_bytes_free(bytes, out_len);
+        }
+    }
+
+    #[test]
+    fn preset_json_from_xmp_through_ffi() {
+        // SAFETY: 所有指针均指向本测试构造的合法 C 字符串。
+        unsafe {
+            let xmp = CString::new(
+                r#"<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:Description xmlns:crs="http://ns.adobe.com/camera-raw-settings/1.0/"
+      xmp:PresetName="FFI 导入"
+      crs:Exposure2012="+0.75"
+      crs:Saturation="10" />
+</x:xmpmeta>"#,
+            )
+            .unwrap();
+            let pointer = fdxmp_preset_json_from_xmp(xmp.as_ptr());
+            assert!(!pointer.is_null());
+            let json = CStr::from_ptr(pointer).to_str().unwrap().to_string();
+            fdxmp_string_free(pointer);
+            assert!(json.contains("FFI 导入"), "{json}");
+            assert!(json.contains("exposure"), "{json}");
+
+            // 非 XMP / 没有 crs 属性：报错并返回 NULL。
+            let invalid = CString::new("<xmpmeta></xmpmeta>").unwrap();
+            let pointer = fdxmp_preset_json_from_xmp(invalid.as_ptr());
+            assert!(pointer.is_null());
         }
     }
 

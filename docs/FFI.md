@@ -57,6 +57,8 @@
 | `fdxmp_engine_history_len` / `fdxmp_engine_history_index` | 历史状态 |
 | `fdxmp_preset_params_json_from_bytes` | 解析 `.fdxmp` → 参数 JSON |
 | `fdxmp_preset_bytes_from_params_json` | 参数 JSON + 名称 + 作者 → `.fdxmp` 字节流 |
+| `fdxmp_preset_json_from_bytes` | 解析 `.fdxmp` → 名称 / 作者 / 描述 / 参数 JSON |
+| `fdxmp_preset_json_from_xmp` | 解析 Lightroom `.xmp` 文本 → 名称 / 作者 / 参数 JSON |
 | `fdxmp_probe_json` | 探测格式 / 尺寸 |
 | `fdxmp_render_preview_rgba` | CPU 预览渲染：解码 + 调色 → `width/height + RGBA8` |
 | `fdxmp_cache_total_size` / `fdxmp_cache_clear` | 缓存统计 / 清除 |

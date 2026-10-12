@@ -80,7 +80,7 @@ pub struct LightParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ColorParams {
-    /// 色温，-100..=100（相对值：0 = 5500K，1 单位 = 55K，
+    /// 色温，-100..=100（相对值：0 = 5500K；暖端 1 单位 = 90K、冷端 23K，
     /// 与 XMP 导入的开尔文映射共用同一换算，见 `white_balance` 模块）。
     pub temperature: f32,
     /// 色调，-100..=100（正 = 洋红，负 = 绿色）。

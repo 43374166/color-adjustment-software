@@ -543,8 +543,8 @@ mod tests {
         assert!((preset.params.color.tint - 12.0).abs() < 1e-5);
         assert!((preset.params.effects.dehaze - 8.0).abs() < 1e-5);
         assert!((preset.params.detail.noise.color - 35.0).abs() < 1e-5);
-        // 7000K → (7000-5500)/55 ≈ 27.3
-        assert!((preset.params.color.temperature - 27.27).abs() < 0.5);
+        // 7000K → (7000-5500)/90 ≈ 16.7（暖端每单位 90K）
+        assert!((preset.params.color.temperature - 16.67).abs() < 0.5);
         assert!(preset.description.contains("识别"));
     }
 
@@ -557,7 +557,11 @@ mod tests {
     #[test]
     fn kelvin_mapping_is_clamped() {
         assert!((kelvin_to_relative(5500.0) - 0.0).abs() < 1e-6);
-        assert!((kelvin_to_relative(2000.0) + 63.6).abs() < 0.5);
+        // 冷端每单位 23K：3200K → -100（再冷就夹住）。
+        assert!((kelvin_to_relative(3200.0) + 100.0).abs() < 1e-4);
+        assert!((kelvin_to_relative(2000.0) + 100.0).abs() < 1e-4);
+        // 暖端每单位 90K：14500K → +100；50000K 夹住。
+        assert!((kelvin_to_relative(14500.0) - 100.0).abs() < 1e-4);
         assert!((kelvin_to_relative(50000.0) - 100.0).abs() < 1e-6);
     }
 

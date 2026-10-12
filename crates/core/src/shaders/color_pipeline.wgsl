@@ -246,11 +246,11 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
         let hi_shape_neg = max(tone_s - vec3<f32>(0.5), vec3<f32>(0.0))
             * (vec3<f32>(1.0) - 0.55 * smoothstep(vec3<f32>(0.85), vec3<f32>(1.0), tone_s));
         let sh_shape_pos = max(vec3<f32>(0.55) - tone_s, vec3<f32>(0.0));
-        let tone_delta = vec3<f32>(h_pos * w_hi * 0.45) * hi_shape_pos
-            - vec3<f32>(h_neg * w_hi * 0.45) * hi_shape_neg
-            + vec3<f32>(sh_pos * w_sh * 0.40) * sh_shape_pos
-            - vec3<f32>(sh_neg * w_sh * 0.35) * tone_s
-            + vec3<f32>((wv * w_wh + bl * w_bl) * 0.10);
+        let tone_delta = vec3<f32>(h_pos * w_hi * 0.55) * hi_shape_pos
+            - vec3<f32>(h_neg * w_hi * 0.55) * hi_shape_neg
+            + vec3<f32>(sh_pos * w_sh * 0.30) * sh_shape_pos
+            - vec3<f32>(sh_neg * w_sh * 0.30) * tone_s
+            + vec3<f32>((wv * w_wh + bl * w_bl) * 0.13);
         let tone_shifted = clamp(tone_s + tone_delta, vec3<f32>(0.0), vec3<f32>(1.0));
         c = srgb_to_linear(tone_shifted) + tone_headroom;
     }
@@ -288,14 +288,22 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
     var lum_shift = 0.0;
     for (var band = 0u; band < 8u; band = band + 1u) {
         let weight = band_weights[band];
-        hue_shift = hue_shift + weight * p(32u + band * 3u) / 100.0 * (1.0 / 12.0);
+        hue_shift = hue_shift + weight * p(32u + band * 3u) / 100.0 * 0.09;
         sat_scale = sat_scale + weight * p(33u + band * 3u) / 100.0;
         lum_shift = lum_shift + weight * p(34u + band * 3u) / 100.0;
     }
     if (abs(hue_shift) + abs(sat_scale) + abs(lum_shift) > 0.0001) {
         hsv.x = fract(hsv.x + hue_shift);
-        hsv.y = clamp(hsv.y * (1.0 + sat_scale), 0.0, 1.0);
-        hsv.z = clamp(hsv.z * (1.0 + lum_shift), 0.0, 4.0);
+        hsv.y = clamp(hsv.y * (1.0 + sat_scale * 1.15), 0.0, 1.0);
+        // 明亮度：+ 方向渐进逼近 1（越亮增益越小，不再把脸"漂白"）；
+        // - 方向按比例压暗。-100 ≈ ×0.55，+100 ≈ 提亮 55% 直到白场。
+        let lum_pos = max(lum_shift, 0.0);
+        let lum_neg = max(-lum_shift, 0.0);
+        hsv.z = clamp(
+            hsv.z + lum_pos * (1.0 - min(hsv.z, 1.0)) * 0.55 - lum_neg * hsv.z * 0.45,
+            0.0,
+            4.0
+        );
         let adjusted = hsv_to_rgb(hsv);
         // 显示域参考 → 线性；>1 的余量单独保留后统一还原峰值缩放
         let base = min(adjusted, vec3<f32>(1.0));
@@ -345,9 +353,9 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
     let max_channel = max(max(c.r, c.g), c.b);
     let min_channel = min(min(c.r, c.g), c.b);
     let chroma = max_channel - min_channel;
-    let vibrance_factor = 1.0 + p(8) / 100.0 * (1.0 - clamp(chroma, 0.0, 1.0));
+    let vibrance_factor = 1.0 + p(8) / 100.0 * (1.0 - clamp(chroma, 0.0, 1.0)) * 1.35;
     c = gray + (c - gray) * vibrance_factor;
-    c = gray + (c - gray) * (1.0 + p(9) / 100.0);
+    c = gray + (c - gray) * (1.0 + p(9) / 100.0 * 1.25);
 
     return c;
 }
@@ -367,24 +375,33 @@ fn pipeline_detail(
 ) -> vec3<f32> {
     var c = input_color;
 
-    // 10) 纹理 / 清晰度（共用大半径模糊参考）与去雾
+    // 10) 纹理（细半径微反差）/ 清晰度（大半径中间调局部对比）/ 去雾
+    let fine = select(blurred, textureLoad(aux_tex, coord, 0).rgb, p(79) > 0.5);
     let texture_weight = p(10) / 100.0;
     let clarity_weight = p(11) / 100.0;
-    if (abs(texture_weight) + abs(clarity_weight) > 0.0001) {
-        let detail = c - blurred;
-        let midtone_weight = 1.0 - abs(luminance(c) - 0.5) * 1.6;
-        c = c + detail * texture_weight * 0.7;
-        c = c + detail * clarity_weight * max(midtone_weight, 0.0) * 0.9;
+    if (abs(texture_weight) > 0.0001) {
+        c = c + (c - fine) * texture_weight * 1.5;
+    }
+    if (abs(clarity_weight) > 0.0001) {
+        let midtone_weight = max(1.0 - abs(luminance(c) - 0.5) * 1.6, 0.0);
+        c = c + (c - blurred) * clarity_weight * midtone_weight * 1.6;
     }
     let dehaze = p(12) / 100.0;
-    c = max((c - vec3<f32>(0.02 * dehaze)) * (1.0 + dehaze * 0.35), vec3<f32>(0.0));
+    if (dehaze > 0.0001) {
+        // 去雾：拉黑场 + 提对比 + 提饱和（正方向）；负方向加"雾"（提黑场、降对比）。
+        c = max((c - vec3<f32>(0.10 * dehaze)) * (1.0 + dehaze * 0.65), vec3<f32>(0.0));
+        let gray = vec3<f32>(luminance(c));
+        c = gray + (c - gray) * (1.0 + dehaze * 0.3);
+    } else if (dehaze < -0.0001) {
+        let veil = -dehaze;
+        c = max(c * (1.0 - veil * 0.3) + vec3<f32>(veil * 0.10), vec3<f32>(0.0));
+    }
 
-    // 11) 锐化：数量 / 半径 / 细节 / 蒙版
-    let fine = select(blurred, textureLoad(aux_tex, coord, 0).rgb, p(79) > 0.5);
+    // 11) 锐化：数量 / 半径 / 细节 / 蒙版（参考 = 细半径模糊）
     let sharpen_amount = p(15) / 100.0;
     if (sharpen_amount > 0.0001) {
         let detail_mix = clamp(p(17) / 100.0, 0.0, 1.0);
-        var signal = mix(c - blurred, c - fine, detail_mix);
+        var signal = c - mix(fine, blurred, 0.4 * (1.0 - detail_mix));
         // 蒙版：按局部梯度只在边缘处锐化（0 = 全图锐化）
         let mask_amount = clamp(p(18) / 100.0, 0.0, 1.0);
         if (mask_amount > 0.0001) {
@@ -398,11 +415,11 @@ fn pipeline_detail(
         }
         // 半径越大，锐化过渡越柔和（半径 0.5..3.0 → 系数 0.78..1.2）
         let radius_scale = 0.7 + 0.5 * clamp(p(16), 0.5, 3.0) / 3.0;
-        c = c + signal * sharpen_amount * radius_scale;
+        c = c + signal * sharpen_amount * radius_scale * 1.8;
     }
 
     // 12) 降噪：亮度（细节 / 对比度）
-    let luminance_amount = clamp(p(19) / 100.0, 0.0, 1.0) * 0.8;
+    let luminance_amount = clamp(p(19) / 100.0, 0.0, 1.0) * 0.9;
     if (luminance_amount > 0.0001) {
         let luma_detail = clamp(p(20) / 100.0, 0.0, 1.0);
         let denoise_source = mix(blurred, fine, luma_detail);
@@ -414,7 +431,7 @@ fn pipeline_detail(
     }
 
     // 13) 降噪：颜色（细节 / 平滑度）
-    let color_amount = clamp(p(22) / 100.0, 0.0, 1.0) * 0.8;
+    let color_amount = clamp(p(22) / 100.0, 0.0, 1.0) * 0.9;
     if (color_amount > 0.0001) {
         let color_detail = clamp(p(23) / 100.0, 0.0, 1.0);
         let color_smoothness = clamp(p(24) / 100.0, 0.0, 1.0);
@@ -455,16 +472,26 @@ fn pipeline_detail(
         c = c * (1.0 - vignette * falloff * 0.8);
     }
 
-    // 15) 颗粒（大小 = 噪声格子尺寸，粗糙度 = 细噪声占比）
+    // 15) 颗粒（大小 = 噪声格子尺寸，粗糙度 = 细噪声占比；中间调最明显）
     let grain = p(14) / 100.0;
     if (grain > 0.0001) {
         let grain_size = clamp(p(104) / 100.0, 0.0, 1.0);
         let roughness = clamp(p(105) / 100.0, 0.0, 1.0);
-        let scale = 1.0 + grain_size * 7.0;
+        // 颗粒尺度随输出分辨率缩放：预览 2048 与全分辨率导出观感一致。
+        // 基础格子 1.5px 起（1px 格子在缩放视图里会被降采样抹掉，像"没有颗粒"）。
+        let grain_scale = clamp(max(frame_size.x, frame_size.y) / 2048.0, 1.0, 4.0);
+        let scale = mix(1.5, 11.5, grain_size) * grain_scale;
         let smooth_noise = value_noise(frame_coord / scale, p(65));
+        let fine_noise = value_noise(frame_coord / max(scale * 0.4, 1.0), p(65) + 3.0);
         let rough_noise = hash_noise(frame_coord, p(65) + 7.0);
-        let noise = mix(smooth_noise, rough_noise, roughness);
-        c = c + (noise - 0.5) * grain * 0.12;
+        let noise = mix(mix(smooth_noise, fine_noise, 0.5), rough_noise, roughness);
+        let grain_luma = clamp(
+            luminance(linear_to_srgb(clamp(c, vec3<f32>(0.0), vec3<f32>(1.0)))),
+            0.0,
+            1.0
+        );
+        let grain_weight = max(1.0 - abs(grain_luma - 0.5) * 1.2, 0.0);
+        c = c + (noise - 0.5) * grain * grain_weight * 0.25;
     }
 
     return max(c, vec3<f32>(0.0));

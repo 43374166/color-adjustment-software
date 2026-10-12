@@ -983,7 +983,189 @@ final class EditorModel: ObservableObject {
 
     /// 结束预设强度拖动。
     func commitPresetStrengthEdit() {
-        commitEdit()
+        // 与普通编辑的 commit 不同：调完强度后预设仍是"当前预设"（缩略图上的
+        // 强度控件要继续可用），因此这里不清 presetName / presetRef。
+        if let before = dragSnapshot, before != state {
+            pushUndo(before)
+        }
+        dragSnapshot = nil
+        draggingSlider = nil
+        draggingSliderText = nil
+        persist()
+        scheduleRender(immediate: true)
+        refreshDetailIfNeeded()
+    }
+
+    // MARK: - 预设导入 / 导出 / 剪贴板
+
+    /// 预设的完整参数快照（用户预设：勾选的分组应用到默认状态）。
+    func presetSnapshot(_ preset: UserPreset) -> EditState {
+        var state = EditState()
+        preset.apply(to: &state)
+        return state
+    }
+
+    /// 预设的完整参数快照（系统预设：参数覆盖默认值）。
+    func presetSnapshot(_ preset: BuiltinPreset) -> EditState {
+        var state = EditState()
+        var values = EditorSpec.defaultValues()
+        for (key, value) in preset.params {
+            values[key] = value
+        }
+        state.values = values
+        return state
+    }
+
+    /// 复制预设到系统剪贴板（带 `fdxmp_preset` 标记的 JSON 文本）。
+    func copyPresetToPasteboard(name: String, state: EditState) {
+        let paramsJson = EditJSON.build(state: state, applyCropRect: false)
+        guard
+            let params = Self.jsonObject(paramsJson),
+            let payload = try? JSONSerialization.data(withJSONObject: [
+                "fdxmp_preset": 1,
+                "name": name,
+                "params": params,
+            ]),
+            let text = String(data: payload, encoding: .utf8)
+        else {
+            message = "复制预设失败"
+            return
+        }
+        UIPasteboard.general.string = text
+        message = "已复制预设「\(name)」"
+    }
+
+    /// 从系统剪贴板粘贴预设（不存在 / 格式不对时给出提示）。
+    @discardableResult
+    func pastePresetFromPasteboard() -> UserPreset? {
+        guard
+            let text = UIPasteboard.general.string?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            !text.isEmpty,
+            let root = Self.jsonObject(text),
+            let params = root["params"],
+            let paramsData = try? JSONSerialization.data(withJSONObject: params),
+            let paramsJson = String(data: paramsData, encoding: .utf8)
+        else {
+            message = "剪贴板里没有可粘贴的预设"
+            return nil
+        }
+        let name = (root["name"] as? String) ?? "粘贴的预设"
+        return importUserPreset(name: name, paramsJson: paramsJson)
+    }
+
+    /// 从 `.fdxmp` 字节流导入预设。
+    @discardableResult
+    func importPresetFile(_ data: Data) -> UserPreset? {
+        guard
+            let json = NativeCore.shared.presetJsonFromFdxmp(data),
+            let imported = Self.importedPresetPayload(json)
+        else {
+            message = "导入失败：文件格式不支持"
+            return nil
+        }
+        return importUserPreset(name: imported.name, paramsJson: imported.paramsJson)
+    }
+
+    /// 从 Lightroom `.xmp` 文本导入预设。
+    @discardableResult
+    func importPresetXmp(_ text: String) -> UserPreset? {
+        guard
+            let json = NativeCore.shared.presetJsonFromXmp(text),
+            let imported = Self.importedPresetPayload(json)
+        else {
+            message = "导入失败：XMP 里没有可识别的参数"
+            return nil
+        }
+        return importUserPreset(name: imported.name, paramsJson: imported.paramsJson)
+    }
+
+    /// 导出预设为 `.fdxmp` 临时文件（供系统分享面板使用）。
+    func exportPresetFile(name: String, state: EditState) -> URL? {
+        let paramsJson = EditJSON.build(state: state, applyCropRect: false)
+        guard
+            let bytes = NativeCore.shared.presetBytes(
+                paramsJson: paramsJson,
+                name: name,
+                author: "fdxmp"
+            )
+        else {
+            message = "导出预设失败：\(NativeCore.shared.lastError() ?? "未知错误")"
+            return nil
+        }
+        let safeName = name
+            .replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("\(safeName.isEmpty ? "预设" : safeName).fdxmp")
+        do {
+            try Data(bytes).write(to: url, options: .atomic)
+            return url
+        } catch {
+            message = "导出预设失败：\(error.localizedDescription)"
+            return nil
+        }
+    }
+
+    /// 由参数 JSON 建用户预设（导入 / 粘贴共用）：放进「导入」文件夹。
+    @discardableResult
+    func importUserPreset(name: String, paramsJson: String) -> UserPreset? {
+        let parsed = EditJSON.parse(paramsJson)
+        let folder = ensureImportFolder()
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preset = UserPreset.make(
+            from: parsed,
+            name: trimmed.isEmpty ? "导入的预设" : trimmed,
+            folderId: folder.id,
+            sections: Set(PresetSection.allCases)
+        )
+        userPresets.append(preset)
+        persistPresetLibrary()
+        message = "已导入预设「\(preset.name)」"
+        refreshPresetThumbnails()
+        return preset
+    }
+
+    /// 显示一条提示（导入失败等场景由视图调用）。
+    func showMessage(_ text: String) {
+        message = text
+    }
+
+    /// 导入文件夹（不存在时创建，并把新预设放进这里）。
+    private func ensureImportFolder() -> PresetFolder {
+        if let existing = presetFolders.first(where: { $0.name == "导入" }) {
+            return existing
+        }
+        let folder = PresetFolder(id: UUID().uuidString, name: "导入", createdAt: Date())
+        presetFolders.append(folder)
+        return folder
+    }
+
+    /// 解析导入 JSON（`{name, params}`）→ 名称 + 参数 JSON 文本。
+    private static func importedPresetPayload(
+        _ json: String
+    ) -> (name: String, paramsJson: String)? {
+        guard
+            let root = jsonObject(json),
+            let params = root["params"],
+            let paramsData = try? JSONSerialization.data(withJSONObject: params),
+            let paramsJson = String(data: paramsData, encoding: .utf8)
+        else {
+            return nil
+        }
+        let name = (root["name"] as? String) ?? ""
+        return (name.isEmpty ? "导入的预设" : name, paramsJson)
+    }
+
+    /// JSON 文本 → 对象（解析失败返回 nil）。
+    private static func jsonObject(_ json: String) -> [String: Any]? {
+        guard
+            let data = json.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data)
+        else {
+            return nil
+        }
+        return object as? [String: Any]
     }
 
     /// 全部归零。

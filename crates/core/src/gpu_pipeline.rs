@@ -2369,7 +2369,10 @@ fn div_ceil(value: u32, divisor: u32) -> u32 {
 /// 是否需要小半径细节模糊（锐化或亮度降噪启用；蒙版独立参数一并考虑）。
 /// 是否需要小半径模糊参考（锐化 / 亮度降噪的"细节"参数用）。
 fn needs_small_blur(params: &EditParams) -> bool {
-    params.detail.sharpen.amount > 0.0 || params.detail.noise.luminance > 0.0
+    // 纹理也依赖细半径参考（微反差）；锐化 / 亮度降噪同样。
+    params.effects.texture.abs() > 0.0
+        || params.detail.sharpen.amount > 0.0
+        || params.detail.noise.luminance > 0.0
 }
 
 /// 是否需要大半径模糊参考（纹理 / 清晰度 / 锐化 / 亮度降噪 / 颜色降噪）。

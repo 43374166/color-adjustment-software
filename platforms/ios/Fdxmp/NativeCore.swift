@@ -153,6 +153,48 @@ final class NativeCore {
             height: height
         )
     }
+
+    // MARK: - 预设（.fdxmp / XMP）
+
+    /// 从 `.fdxmp` 字节流读取预设元数据 + 参数 JSON（`{name, author, params}`）。
+    func presetJsonFromFdxmp(_ data: Data) -> String? {
+        guard !data.isEmpty else { return nil }
+        let pointer = data.withUnsafeBytes { raw -> UnsafeMutablePointer<CChar>? in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return nil }
+            return fdxmp_preset_json_from_bytes(base, data.count)
+        }
+        guard let pointer else { return nil }
+        defer { fdxmp_string_free(pointer) }
+        return String(cString: pointer)
+    }
+
+    /// 从 Lightroom XMP 文本读取预设（`{name, author, params}`）。
+    func presetJsonFromXmp(_ text: String) -> String? {
+        let pointer = text.withCString { fdxmp_preset_json_from_xmp($0) }
+        guard let pointer else { return nil }
+        defer { fdxmp_string_free(pointer) }
+        return String(cString: pointer)
+    }
+
+    /// 由参数 JSON 打包 `.fdxmp` 字节流（导出预设）。
+    func presetBytes(paramsJson: String, name: String, author: String) -> [UInt8]? {
+        var outLen = 0
+        let pointer = paramsJson.withCString { json in
+            name.withCString { presetName in
+                author.withCString { presetAuthor in
+                    fdxmp_preset_bytes_from_params_json(
+                        json,
+                        presetName,
+                        presetAuthor,
+                        &outLen
+                    )
+                }
+            }
+        }
+        guard let pointer, outLen > 0 else { return nil }
+        defer { fdxmp_bytes_free(pointer, outLen) }
+        return Array(UnsafeBufferPointer(start: pointer, count: outLen))
+    }
 }
 
 /// GPU 预览会话（Metal；核心 `gpu` feature）。

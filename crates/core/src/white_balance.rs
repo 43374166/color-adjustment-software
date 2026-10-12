@@ -1,6 +1,8 @@
 //! 白平衡：滑杆（相对值）↔ 开尔文映射 + Bradford 色适应矩阵。
 //!
-//! 滑杆刻度与 Lightroom XMP 导入保持同一映射：`0` 对应 5500K，每 1 个单位 = 55K
+//! 滑杆刻度与 Lightroom XMP 导入保持同一映射：`0` 对应 5500K；
+//! 暖端（> 0）每单位 90K（+100 → 14500K），冷端（< 0）每单位 23K（-100 → 3200K）——
+//! 旧的对称 55K/单位在冷端会一路压到 ~1000K，画面蓝得"像反相"。
 //! （由 [`kelvin_to_relative`] / [`relative_to_kelvin`] 定义，两处必须一致）。
 //! 实际校正在线性 sRGB 域用 Bradford 色适应完成：把"假定照明"白点
 //! `W(T, tint)` 适应到参考白点 `W(5500K, 0)`——滑杆为 0 时矩阵恰为恒等。
@@ -12,20 +14,32 @@
 /// 参考色温（滑杆 0 点，K）。
 pub const REFERENCE_KELVIN: f32 = 5500.0;
 
-/// 每个滑杆单位对应的开尔文数（与 XMP 导入一致）。
-pub const KELVIN_PER_UNIT: f32 = 55.0;
+/// 暖端（滑杆 > 0）每单位开尔文数：+100 → 14500K。
+pub const KELVIN_PER_UNIT_WARM: f32 = 90.0;
+
+/// 冷端（滑杆 < 0）每单位开尔文数：-100 → 3200K。
+pub const KELVIN_PER_UNIT_COOL: f32 = 23.0;
 
 /// 色调滑杆 ±100 对应的 Duv 偏移（垂直黑体轨迹，正 = 洋红方向）。
-const TINT_DUV: f32 = 0.025;
+const TINT_DUV: f32 = 0.032;
 
 /// Lightroom 色温（开尔文）→ 相对滑杆值（5500K 为 0±100）。
 pub fn kelvin_to_relative(kelvin: f32) -> f32 {
-    ((kelvin - REFERENCE_KELVIN) / KELVIN_PER_UNIT).clamp(-100.0, 100.0)
+    let delta = kelvin - REFERENCE_KELVIN;
+    if delta >= 0.0 {
+        (delta / KELVIN_PER_UNIT_WARM).clamp(0.0, 100.0)
+    } else {
+        (delta / KELVIN_PER_UNIT_COOL).clamp(-100.0, 0.0)
+    }
 }
 
 /// 相对滑杆值 → 开尔文（[`kelvin_to_relative`] 的逆映射）。
 pub fn relative_to_kelvin(relative: f32) -> f32 {
-    REFERENCE_KELVIN + relative * KELVIN_PER_UNIT
+    if relative >= 0.0 {
+        REFERENCE_KELVIN + relative * KELVIN_PER_UNIT_WARM
+    } else {
+        REFERENCE_KELVIN + relative * KELVIN_PER_UNIT_COOL
+    }
 }
 
 /// Planckian locus 近似（Kim et al. 2002）：色温 → CIE xy。
@@ -234,7 +248,8 @@ mod tests {
 
     #[test]
     fn kelvin_roundtrips_through_slider() {
-        for kelvin in [2000.0f32, 3200.0, 5500.0, 6500.0, 9000.0] {
+        // 范围外的开尔文会被滑杆夹住（-100 → 3200K / +100 → 14500K），只测范围内的往返。
+        for kelvin in [3200.0f32, 4200.0, 5500.0, 6500.0, 9000.0, 14000.0] {
             let back = relative_to_kelvin(kelvin_to_relative(kelvin));
             assert!(
                 (back - kelvin).abs() < 1.0,

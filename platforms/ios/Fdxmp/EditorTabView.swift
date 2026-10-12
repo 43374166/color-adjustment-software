@@ -281,6 +281,7 @@ struct EditorTabView: View {
         }
         .animation(.easeInOut(duration: 0.24), value: panelHeight)
         .animation(.easeInOut(duration: 0.24), value: hidesChrome)
+        .animation(.easeInOut(duration: 0.24), value: hidesToolBar)
     }
 
     @ViewBuilder
@@ -305,6 +306,11 @@ struct EditorTabView: View {
         model.tool == .mask
             || (model.tool == .edit && model.category == .curves)
             || hslFocused
+    }
+
+    /// 预设工具下隐藏底部工具条（顶部栏保留，列表占满下方空间）。
+    private var hidesToolBar: Bool {
+        hidesChrome || model.tool == .presets
     }
 
     private var emptyState: some View {
@@ -807,7 +813,8 @@ struct EditorTabView: View {
     private var panelHeight: CGFloat {
         switch model.tool {
         // 预设树（文件夹 + 预设竖排）比原来的卡片行高一些，给列表多留窗口。
-        case .presets: return 250
+        // 预设树：底部 tabbar 已隐藏，列表高一些、每项也更高（缩略图 64×42）。
+        case .presets: return 300
         case .edit:
             if categoryCollapsed {
                 return 64
@@ -816,6 +823,10 @@ struct EditorTabView: View {
                 // 曲线面板压到最下面：普通通道只需要"标题 + 提示 + 通道 + 完成"，
                 // 给一块矮面板（少挡画面）；参数通道再高一些，给滑块留窗口。
                 return model.curveChannel == .parametric ? 288 : 172
+            }
+            if model.category == .optics {
+                // 光学只有两个开关：面板压矮，少挡画面。
+                return 224
             }
             return 288
         case .crop: return 210
@@ -843,8 +854,8 @@ struct EditorTabView: View {
                 }
             }
             .frame(height: panelHeight)
-            // 主工具条固定在最底部（Lightroom / Android 布局）；曲线 / 蒙版下隐藏。
-            if !hidesChrome {
+            // 主工具条固定在最底部（Lightroom / Android 布局）；曲线 / 蒙版 / 预设下隐藏。
+            if !hidesToolBar {
                 // 沉浸拖动：工具条只隐藏不位移（滑块保持原位）。
                 toolBar
                     .opacity(model.draggingSlider == nil ? 1 : 0)
@@ -1009,7 +1020,8 @@ struct EditorTabView: View {
 
     private var categoryRow: some View {
         ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
+            // 分类项之间收紧（6 项含「光学」后间距太大，亮度 / 曲线之间尤其明显）。
+            HStack(spacing: 4) {
                 ForEach(EditCategory.allCases) { category in
                     categoryButton(category)
                 }
@@ -1036,7 +1048,7 @@ struct EditorTabView: View {
                 Text(category.rawValue)
                     .font(.caption2)
             }
-            .frame(width: 58)
+            .frame(width: 54)
             .padding(.vertical, 7)
             .background(
                 RoundedRectangle(cornerRadius: 10)
