@@ -26,9 +26,19 @@ pub use crate::params::{
 ///
 /// 渲染、叠加、导出在不同分辨率下都会命中（自动双线性重采样），
 /// 切换图片 / 参数变化时由 [`clear_ai_raster_cache`] 或 mask_key 变化自然失效。
-pub(crate) fn ai_raster_cache() -> &'static Mutex<HashMap<u64, Arc<MaskRaster>>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<MaskRaster>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+pub(crate) fn ai_raster_cache() -> &'static Mutex<AiRasterCache> {
+    static CACHE: OnceLock<Mutex<AiRasterCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(AiRasterCache::default()))
+}
+
+/// AI / 平台蒙版栅格缓存：基础栅格 + 按分辨率重采样的副本。
+///
+/// 副本记录自己来自哪份基础栅格（`base_key`）：基础栅格被替换（重新生成）时
+/// 立刻丢掉旧副本，避免「重新生成后某些分辨率仍用旧栅格」。
+#[derive(Default)]
+pub(crate) struct AiRasterCache {
+    bases: HashMap<u64, Arc<MaskRaster>>,
+    exacts: HashMap<u64, (u64, Arc<MaskRaster>)>,
 }
 
 /// AI / 平台蒙版基础键：只保留「形状来源」字段（kind），
@@ -72,10 +82,13 @@ pub fn insert_ai_raster(mask: &MaskParams, raster: MaskRaster) -> Result<()> {
         .lock()
         .map_err(|_| FdxmpError::Unsupported("AI 蒙版缓存锁失效".to_string()))?;
     // 同一张图内的多个 AI 蒙版可能共享缓存；上限 24 份，超出整体清空（幂等重建）。
-    if map.len() >= 24 && !map.contains_key(&key) {
-        map.clear();
+    if map.bases.len() >= 24 && !map.bases.contains_key(&key) {
+        map.bases.clear();
+        map.exacts.clear();
     }
-    map.insert(key, Arc::new(base));
+    // 重新提交（重新生成）时：丢弃旧的按分辨率副本，保证所有分辨率拿到新栅格。
+    map.exacts.retain(|_, (base_key, _)| *base_key != key);
+    map.bases.insert(key, Arc::new(base));
     Ok(())
 }
 
@@ -87,13 +100,15 @@ pub fn cached_ai_raster(mask: &MaskParams, width: u32, height: u32) -> Option<Ma
     let cache = ai_raster_cache();
     {
         let map = cache.lock().ok()?;
-        if let Some(hit) = map.get(&exact_key) {
-            return Some((**hit).clone());
+        if let Some((entry_base, hit)) = map.exacts.get(&exact_key) {
+            if *entry_base == base_key {
+                return Some((**hit).clone());
+            }
         }
     }
     let base = {
         let map = cache.lock().ok()?;
-        map.get(&base_key).cloned()
+        map.bases.get(&base_key).cloned()
     }?;
     let resized = if base.width == width && base.height == height {
         (*base).clone()
@@ -111,8 +126,13 @@ pub fn cached_ai_raster(mask: &MaskParams, width: u32, height: u32) -> Option<Ma
         }
     };
     if let Ok(mut map) = cache.lock() {
-        if map.len() < 24 {
-            map.insert(exact_key, Arc::new(resized.clone()));
+        if map.exacts.len() >= 64 {
+            let keep = base_key;
+            map.exacts.retain(|_, (entry_base, _)| *entry_base == keep);
+        }
+        if map.exacts.len() < 64 {
+            map.exacts
+                .insert(exact_key, (base_key, Arc::new(resized.clone())));
         }
     }
     Some(resized)
@@ -123,15 +143,21 @@ pub fn ai_raster_ready(mask: &MaskParams) -> bool {
     let key = ai_base_key(mask);
     ai_raster_cache()
         .lock()
-        .map(|map| map.contains_key(&key))
+        .map(|map| map.bases.contains_key(&key))
         .unwrap_or(false)
 }
 
 /// 清空全部 AI / 平台蒙版栅格（切换图片 / 释放缓存时调用）。
+///
+/// 同时清掉**渲染侧**的派生栅格缓存（[`crate::preview::clear_mask_raster_cache`]）：
+/// 渲染缓存按「蒙版参数 + 尺寸」索引、不含图片身份，若不一并清掉，
+/// 切换图片后渲染仍会命中上一张图的栅格（真机实测的「换图后蒙版还是上一张」）。
 pub fn clear_ai_raster_cache() {
     if let Ok(mut map) = ai_raster_cache().lock() {
-        map.clear();
+        map.bases.clear();
+        map.exacts.clear();
     }
+    crate::preview::clear_mask_raster_cache();
 }
 
 /// 测试用：串行化访问全局栅格缓存的用例（cargo test 默认多线程并行）。

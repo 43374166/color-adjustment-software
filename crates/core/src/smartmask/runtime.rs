@@ -119,7 +119,10 @@ fn output_kind(kind: &MaskKind) -> Option<SmartMaskKind> {
 /// - 同一张图上的多次调用会命中 [`MaskPipeline`] 内部缓存（只推理一次算法路径）；
 /// - `AiBackground` 自动取主体反向；
 /// - 来源模型 / 版本写入栅格元数据（透明度 / 羽化 / 反向仍由渲染侧统一后处理）。
-pub fn generate_into_cache(mask: &MaskParams, image: &Image) -> std::result::Result<(), RuntimeError> {
+pub fn generate_into_cache(
+    mask: &MaskParams,
+    image: &Image,
+) -> std::result::Result<(), RuntimeError> {
     let Some(kind) = output_kind(&mask.kind) else {
         return Err(RuntimeError::Unsupported(format!(
             "该蒙版类型（{:?}）暂由平台实现提供",

@@ -34,9 +34,9 @@ pub mod runtime;
 
 pub use mask::{MaskMorphology, PolygonMask, SmartMask, SmartMaskKind};
 pub use pipeline::{MaskPipeline, MaskSet, PipelineConfig};
+pub use retouch::{DataRecorder, JsonlRecorder, NoopRetouchEngine, RetouchParams, TrainingSample};
 #[cfg(any(feature = "ai", feature = "ai-static"))]
 pub use runtime::{generate_into_cache, runtime_available, RuntimeError};
-pub use retouch::{DataRecorder, JsonlRecorder, NoopRetouchEngine, RetouchParams, TrainingSample};
 pub use spec::{
     ColorSpace, ExecutionProvider, InputLayout, ModelRegistry, ModelSpec, ModelTask, Precision,
 };

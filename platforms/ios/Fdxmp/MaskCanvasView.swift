@@ -846,14 +846,17 @@ struct MaskOverlayLayer: View {
     var body: some View {
         ZStack {
             if let mask = model.selectedMask {
+                // 叠加层与照片使用同一套几何（fittedRect：横图 / 方图整体上移），
+                // 否则横图蒙版会比照片低一截。
+                let fitted = fittedRect(imageSize: imageSize, in: viewSize)
                 if model.maskOverlayVisible, let overlay = model.maskOverlays[mask.id] {
                     Image(uiImage: overlay)
                         .resizable()
                         .scaledToFit()
-                        .frame(width: viewSize.width, height: viewSize.height)
+                        .frame(width: fitted.width, height: fitted.height)
+                        .position(x: fitted.midX, y: fitted.midY)
                 }
-                Canvas { context, size in
-                    let fitted = fittedRect(imageSize: imageSize, in: size)
+                Canvas { context, _ in
                     drawControls(&context, mask: mask, fitted: fitted)
                 }
                 .frame(width: viewSize.width, height: viewSize.height)

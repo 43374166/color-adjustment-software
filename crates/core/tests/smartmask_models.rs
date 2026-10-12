@@ -480,3 +480,61 @@ fn onnx_runtime_generates_and_caches_each_mask_kind() {
 fn kind_name(kind: &fdxmp_core::params::MaskKind) -> String {
     format!("{kind:?}").replace(['(', ')', '{', '}', ' ', ':', ','], "")
 }
+
+/// 回归：切换图片后（清栅格缓存）重新生成，必须得到新图的蒙版，而不是上一张的。
+#[test]
+fn onnx_runtime_regenerates_after_photo_switch() {
+    use fdxmp_core::params::{MaskKind, MaskParams, PeoplePart};
+
+    let Some(dir) = model_dir() else {
+        eprintln!("跳过：未找到模型目录");
+        return;
+    };
+    let portrait_a = std::env::var_os("FDXMP_TEST_PORTRAIT").map(std::path::PathBuf::from);
+    let portrait_b = std::env::var_os("FDXMP_TEST_PORTRAIT_B").map(std::path::PathBuf::from);
+    let (Some(portrait_a), Some(portrait_b)) = (portrait_a, portrait_b) else {
+        eprintln!("跳过：未设置 FDXMP_TEST_PORTRAIT / FDXMP_TEST_PORTRAIT_B");
+        return;
+    };
+    std::env::set_var("FDXMP_MODEL_DIR", &dir);
+    let registry = ModelRegistry::with_dir(dir);
+    if !ensure_models(&registry) {
+        return;
+    }
+    let load = |path: &std::path::PathBuf| image::open(path).expect("打开测试人像失败").to_rgba8();
+    let image_a = load(&portrait_a);
+    let image_b = load(&portrait_b);
+    assert_ne!(image_a.as_raw(), image_b.as_raw(), "两张图必须不同");
+
+    let make_mask = |id: &str| MaskParams {
+        id: id.to_string(),
+        kind: MaskKind::AiPeople {
+            part: PeoplePart::Body,
+        },
+        ..MaskParams::default()
+    };
+
+    // 图片 A：第一次生成。
+    let mask_a = make_mask("a");
+    fdxmp_core::smartmask::runtime::generate_into_cache(&mask_a, &image_a).unwrap();
+    let raster_a = fdxmp_core::masks::cached_ai_raster(&mask_a, 256, 256).unwrap();
+
+    // 切图：iOS 会清栅格缓存（fdxmp_mask_raster_clear）。
+    fdxmp_core::masks::clear_ai_raster_cache();
+    assert!(!fdxmp_core::masks::ai_raster_ready(&mask_a));
+
+    // 图片 B：同一类型蒙版必须重新推理出 B 的蒙版。
+    let mask_b = make_mask("b");
+    fdxmp_core::smartmask::runtime::generate_into_cache(&mask_b, &image_b).unwrap();
+    let raster_b = fdxmp_core::masks::cached_ai_raster(&mask_b, 256, 256).unwrap();
+
+    let diff: f32 = raster_a
+        .weights
+        .iter()
+        .zip(raster_b.weights.iter())
+        .map(|(a, b)| (a - b).abs())
+        .sum::<f32>()
+        / raster_a.weights.len() as f32;
+    assert!(diff > 0.01, "切图后蒙版不应与上一张相同（平均差异 {diff}）");
+    fdxmp_core::masks::clear_ai_raster_cache();
+}

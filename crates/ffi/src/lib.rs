@@ -861,7 +861,9 @@ pub unsafe extern "C" fn fdxmp_smartmask_generate(
                 return FDXMP_ERR;
             }
         };
-        let expected = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        let expected = (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4);
         if width == 0
             || height == 0
             || width > 4096

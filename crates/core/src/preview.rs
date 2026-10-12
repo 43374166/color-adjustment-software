@@ -5,7 +5,9 @@
 //! 同公式）；分区色调（高光 / 阴影 / 白色 / 黑色）、饱和度 / 自然饱和度、
 //! 暗角与颗粒为 CPU 近似实现，纹理 / 清晰度 / 去雾暂未纳入。
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use image::RgbaImage;
 use rayon::prelude::*;
@@ -659,17 +661,54 @@ fn mask_kind_needs_reference(kind: &crate::params::MaskKind) -> bool {
 }
 
 /// 蒙版栅格缓存（按 mask_key + 尺寸）：只调参数 / 滑块时无需重算距离场与模糊。
+///
+/// 注意：键里**不含图片身份**（内容相关蒙版如颜色范围 / AI 栅格随图变化），
+/// 切换图片时必须调用 [`clear_mask_raster_cache`]（[`crate::masks::clear_ai_raster_cache`]
+/// 会一并清掉），否则渲染会命中上一张图的栅格。
+fn mask_raster_cache() -> &'static MaskRasterCache {
+    static CACHE: OnceLock<MaskRasterCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+type MaskRasterCache = Mutex<HashMap<u64, crate::masks::MaskRaster>>;
+
+/// 清空渲染侧蒙版栅格缓存（切换图片 / 替换模型 / 清空 AI 栅格时调用）。
+pub fn clear_mask_raster_cache() {
+    if let Ok(mut map) = mask_raster_cache().lock() {
+        map.clear();
+    }
+}
+
+/// 参考图指纹（抽样 512 字节；内容相关蒙版的缓存键用）。
+fn reference_fingerprint(image: &RgbaImage) -> u64 {
+    let raw = image.as_raw();
+    if raw.is_empty() {
+        return 0;
+    }
+    let step = (raw.len() / 512).max(1);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut index = 0usize;
+    while index < raw.len() {
+        hash ^= raw[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += step;
+    }
+    hash
+}
+
 fn cached_mask(
     mask: &crate::params::MaskParams,
     image: &RgbaImage,
     width: u32,
     height: u32,
 ) -> Option<crate::masks::MaskRaster> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<HashMap<u64, crate::masks::MaskRaster>>> = OnceLock::new();
-    let key = crate::masks::mask_key(mask, width, height);
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut key = crate::masks::mask_key(mask, width, height);
+    // 内容相关蒙版（颜色范围 / 亮度范围 / AI 栅格）的栅格随参考图变化：
+    // 键里混入参考图指纹，切换图片后即使没清缓存也不会串图。
+    if mask_kind_needs_reference(&mask.kind) {
+        key ^= reference_fingerprint(image).rotate_left(17);
+    }
+    let cache = mask_raster_cache();
     if let Ok(map) = cache.lock() {
         if let Some(hit) = map.get(&key) {
             return Some(hit.clone());
@@ -1765,6 +1804,55 @@ mod tests {
         assert_eq!(mask_raster_edge(200), 512);
         assert_eq!(mask_raster_edge(4096), 2048);
         assert_eq!(mask_raster_edge(20000), 2048);
+    }
+
+    /// 回归（真机 bug）：换图后蒙版还是上一张 —— 渲染缓存必须随栅格清理一起失效。
+    #[test]
+    fn clearing_rasters_invalidates_render_cache_between_photos() {
+        use crate::masks::{clear_ai_raster_cache, insert_ai_raster, MaskRaster};
+        use crate::params::{EditParams, MaskKind, MaskParams};
+
+        let mut mask = MaskParams {
+            id: "m".to_string(),
+            kind: MaskKind::AiSubject,
+            ..MaskParams::default()
+        };
+        mask.adjustments.light.exposure = 1.0;
+        let mut params = EditParams::default();
+        params.masks = vec![mask.clone()];
+
+        // 第一张图：主体蒙版全 1 → 整幅 +1EV。
+        let mut ones = MaskRaster::zeros(4, 4);
+        ones.weights.iter_mut().for_each(|weight| *weight = 1.0);
+        insert_ai_raster(&mask, ones.clone()).unwrap();
+        let mut image_a = RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255]));
+        let original_a = image_a.clone();
+        apply_masks(&mut image_a, &params);
+        assert_ne!(image_a, original_a, "全 1 蒙版应改变画面");
+
+        // 切换图片：清全部蒙版栅格（iOS / Windows 打开新图都会调用）。
+        clear_ai_raster_cache();
+
+        // 第二张图：主体蒙版全 0（空蒙版）→ 画面必须保持不变。
+        insert_ai_raster(&mask, MaskRaster::zeros(4, 4)).unwrap();
+        let mut image_b = RgbaImage::from_pixel(16, 16, image::Rgba([128, 128, 128, 255]));
+        let original_b = image_b.clone();
+        apply_masks(&mut image_b, &params);
+        assert_eq!(
+            image_b, original_b,
+            "空蒙版不应改变画面（不得命中上一张图的渲染缓存）"
+        );
+
+        // 结构兜底：即使忘了清缓存，内容相关蒙版的键含参考图指纹，也不会串图。
+        insert_ai_raster(&mask, ones).unwrap();
+        let mut photo_a = RgbaImage::from_pixel(16, 16, image::Rgba([10, 10, 10, 255]));
+        apply_masks(&mut photo_a, &params);
+        insert_ai_raster(&mask, MaskRaster::zeros(4, 4)).unwrap();
+        let mut photo_b = RgbaImage::from_pixel(16, 16, image::Rgba([200, 200, 200, 255]));
+        let original_b = photo_b.clone();
+        apply_masks(&mut photo_b, &params);
+        assert_eq!(photo_b, original_b, "不同参考图不应命中同一缓存键");
+        clear_ai_raster_cache();
     }
 
     #[test]
