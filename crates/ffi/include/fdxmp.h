@@ -176,6 +176,19 @@ int32_t fdxmp_mask_polygons_submit(const char *params_json,
  * 返回的字符串用 fdxmp_string_free 释放；失败返回 NULL。 */
 char *fdxmp_smartmask_models_json(void);
 
+/* 用随包 ONNX 模型生成智能蒙版（双阶段流水线），写入共享栅格缓存。
+ * 返回：0 成功；2 模型/运行库不可用或该类型不支持（调用方回退平台实现，
+ * 如 iOS Vision）；-1 推理失败（原因见 fdxmp_last_error_message）。 */
+#define FDXMP_SMARTMASK_FALLBACK 2
+int32_t fdxmp_smartmask_generate(const char *params_json,
+                                 const char *mask_id,
+                                 const uint8_t *rgba,
+                                 uint32_t width,
+                                 uint32_t height);
+
+/* 随包 ONNX 模型是否可用：1 = 就绪，0 = 不可用。 */
+int32_t fdxmp_smartmask_runtime_ready(void);
+
 /* ---- GPU 预览会话（Metal / DX12 / Vulkan；iOS 以 `--features gpu` 构建启用）----
  *
  * 移动端实时预览：源图只上传一次，参数变化时重渲染并回读 RGBA8。

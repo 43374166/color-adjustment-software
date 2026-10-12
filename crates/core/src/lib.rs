@@ -10,7 +10,7 @@
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
-#[cfg(feature = "ai")]
+#[cfg(any(feature = "ai", feature = "ai-static"))]
 pub mod ai;
 pub mod cache;
 pub mod color;

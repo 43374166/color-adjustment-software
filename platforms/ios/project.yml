@@ -27,6 +27,11 @@ targets:
       - path: Fdxmp
         excludes:
           - Info.plist
+      # 智能蒙版模型（CI 下载到 dist/ios/models；文件夹引用随包进 App，
+      # 核心默认目录 = 可执行文件同级的 models/）。
+      - path: ../../dist/ios/models
+        type: folder
+        buildPhase: resources
     dependencies:
       # Rust 核心静态库（由 packaging/ios/build-ipa.sh 生成）
       - framework: ../../dist/ios/FdxmpCore.xcframework
@@ -50,6 +55,11 @@ targets:
         OTHER_LDFLAGS:
           - $(inherited)
           - -lc++
+          # 随包 ONNX Runtime（pyke 静态库）需要的系统框架
+          - -framework
+          - CoreML
+          - -framework
+          - Accelerate
         HEADER_SEARCH_PATHS:
           - $(SRCROOT)/../../crates/ffi/include
         LD_RUNPATH_SEARCH_PATHS:

@@ -1566,31 +1566,43 @@ final class EditorModel: ObservableObject {
         maskAssetQueue.async { [weak self] in
             var failure: String?
             var ready = false
-            do {
-                switch try SmartMaskEngine.generate(kind: kind, buffer: buffer) {
-                case let .plane(width, height, data):
-                    ready = NativeCore.shared.submitMaskRaster(
-                        paramsJson: paramsJson,
-                        maskId: maskId,
-                        width: width,
-                        height: height,
-                        weights: data
-                    )
-                case let .polygons(include, exclude):
-                    ready = NativeCore.shared.submitMaskPolygons(
-                        paramsJson: paramsJson,
-                        maskId: maskId,
-                        width: buffer.width,
-                        height: buffer.height,
-                        polygonsJson: SmartMaskPolygons.json(include: include, exclude: exclude),
-                        feather: 2.0
-                    )
+            // 1) 随包 ONNX 模型（SCRFD / MODNet / BiSeNet / U²-Net）：主体、人像与五官。
+            let modelCode = NativeCore.shared.smartMaskGenerate(
+                paramsJson: paramsJson,
+                maskId: maskId,
+                buffer: buffer
+            )
+            if modelCode == 0 {
+                ready = true
+            } else {
+                let modelMessage = NativeCore.shared.lastError() ?? "模型不可用"
+                // 2) 回退 Apple Vision（系统端侧模型；模型未随包 / 该类型无模型时）。
+                do {
+                    switch try SmartMaskEngine.generate(kind: kind, buffer: buffer) {
+                    case let .plane(width, height, data):
+                        ready = NativeCore.shared.submitMaskRaster(
+                            paramsJson: paramsJson,
+                            maskId: maskId,
+                            width: width,
+                            height: height,
+                            weights: data
+                        )
+                    case let .polygons(include, exclude):
+                        ready = NativeCore.shared.submitMaskPolygons(
+                            paramsJson: paramsJson,
+                            maskId: maskId,
+                            width: buffer.width,
+                            height: buffer.height,
+                            polygonsJson: SmartMaskPolygons.json(include: include, exclude: exclude),
+                            feather: 2.0
+                        )
+                    }
+                    if !ready {
+                        failure = "模型：\(modelMessage)；Vision：\(NativeCore.shared.lastError() ?? "提交失败")"
+                    }
+                } catch {
+                    failure = "模型：\(modelMessage)；Vision：\(error.localizedDescription)"
                 }
-                if !ready {
-                    failure = NativeCore.shared.lastError() ?? "蒙版提交失败"
-                }
-            } catch {
-                failure = error.localizedDescription
             }
             Task { @MainActor in
                 guard let self else { return }

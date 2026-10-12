@@ -64,6 +64,18 @@ impl OnnxStages {
     pub fn matting(&self) -> Arc<dyn Stage2PersonMatting> {
         self.matting.clone()
     }
+
+    /// 组装完整双阶段流水线（人脸路径 + 人像路径）。
+    pub fn pipeline(&self) -> crate::smartmask::pipeline::MaskPipeline {
+        crate::smartmask::pipeline::MaskPipeline::new(
+            self.detector(),
+            self.segmenter(),
+            Some(self.parser()),
+            Some(self.matting()),
+            None,
+            crate::smartmask::pipeline::PipelineConfig::default(),
+        )
+    }
 }
 
 /// 加载会话（校验模型存在与哈希，初始化 ONNX Runtime）。
@@ -422,6 +434,7 @@ fn face_label_kind(label: usize) -> Option<SmartMaskKind> {
         2 => Some(SmartMaskKind::Nose),
         4 | 5 => Some(SmartMaskKind::Eyes),
         6 | 7 => Some(SmartMaskKind::Eyebrows),
+        8 | 9 | 15 => Some(SmartMaskKind::Ears),
         10 => Some(SmartMaskKind::Teeth),
         11 | 12 => Some(SmartMaskKind::Lips),
         13 => Some(SmartMaskKind::Hair),
@@ -479,6 +492,7 @@ impl Stage2FaceParser for BiseNetParser {
             SmartMaskKind::Nose,
             SmartMaskKind::Eyes,
             SmartMaskKind::Eyebrows,
+            SmartMaskKind::Ears,
             SmartMaskKind::Teeth,
             SmartMaskKind::Lips,
             SmartMaskKind::Hair,
@@ -524,6 +538,7 @@ impl Stage2FaceParser for BiseNetParser {
                 SmartMaskKind::Teeth => result.teeth = Some(mask),
                 SmartMaskKind::Lips => result.lips = Some(mask),
                 SmartMaskKind::Hair => result.hair = Some(mask),
+                SmartMaskKind::Ears => result.extra.push((SmartMaskKind::Ears, mask)),
                 _ => {}
             }
         }

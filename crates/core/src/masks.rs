@@ -134,6 +134,13 @@ pub fn clear_ai_raster_cache() {
     }
 }
 
+/// 测试用：串行化访问全局栅格缓存的用例（cargo test 默认多线程并行）。
+#[cfg(test)]
+pub(crate) fn test_cache_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// 蒙版栅格缓存键（只含影响栅格的字段 + 尺寸）。
 ///
 /// GPU 权重纹理、叠加层与 AI 栅格缓存都用它判断是否需要重新生成。
@@ -912,6 +919,7 @@ mod tests {
 
     #[test]
     fn ai_masks_use_submitted_raster_and_resample() {
+        let _guard = test_cache_lock();
         let image = gray_image(8, 8, 128);
         let mask = mask(MaskKind::AiSky);
         // 平台提供者提交 4×4 基础栅格 → 8×8 请求应自动重采样命中。
@@ -952,6 +960,7 @@ mod tests {
 
     #[test]
     fn ai_raster_survives_feather_opacity_and_visibility_changes() {
+        let _guard = test_cache_lock();
         let image = gray_image(8, 8, 128);
         let base = mask(MaskKind::AiSubject);
         let mut raster = MaskRaster::zeros(4, 4);

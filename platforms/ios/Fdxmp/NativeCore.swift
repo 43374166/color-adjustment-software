@@ -180,6 +180,32 @@ final class NativeCore {
         fdxmp_mask_raster_clear() == 0
     }
 
+    /// 用随包 ONNX 模型生成智能蒙版（双阶段流水线），写入共享缓存。
+    ///
+    /// 返回：0 = 成功；2 = 模型/运行库不可用或该类型不支持（调用方回退 Vision）；
+    /// 其它 = 推理失败（原因见 `lastError()`）。
+    /// 阻塞调用（首次约数秒，之后同图命中缓存），必须在工作线程执行。
+    func smartMaskGenerate(paramsJson: String, maskId: String, buffer: RgbaBuffer) -> Int32 {
+        buffer.pixels.withUnsafeBufferPointer { pixels in
+            maskId.withCString { mask in
+                paramsJson.withCString { params in
+                    fdxmp_smartmask_generate(
+                        params,
+                        mask,
+                        pixels.baseAddress,
+                        UInt32(buffer.width),
+                        UInt32(buffer.height)
+                    )
+                }
+            }
+        }
+    }
+
+    /// 随包 ONNX 模型是否可用（1 = 就绪，0 = 不可用）。
+    var smartMaskRuntimeReady: Bool {
+        fdxmp_smartmask_runtime_ready() == 1
+    }
+
     /// 智能蒙版模型清单与状态（JSON；macOS / 桌面端 ONNX 用，iOS 走 Vision）。
     func smartMaskModelsJson() -> String? {
         guard let pointer = fdxmp_smartmask_models_json() else { return nil }

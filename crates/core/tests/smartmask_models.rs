@@ -372,3 +372,111 @@ fn probe_segmenter_stats() {
         );
     }
 }
+
+/// 运行时（FFI `fdxmp_smartmask_generate` 背后的实现）：按蒙版类型生成并写入缓存。
+///
+/// 需要 `FDXMP_TEST_PORTRAIT=<照片路径>`；未设置时跳过。
+#[test]
+fn onnx_runtime_generates_and_caches_each_mask_kind() {
+    use fdxmp_core::params::{MaskKind, MaskParams, PeoplePart};
+
+    let Some(portrait_env) = std::env::var_os("FDXMP_TEST_PORTRAIT") else {
+        eprintln!("跳过：未设置 FDXMP_TEST_PORTRAIT");
+        return;
+    };
+    let Some(dir) = model_dir() else {
+        eprintln!("跳过：未找到模型目录");
+        return;
+    };
+    // 运行时从默认目录读模型（FFI 在 iOS 上就是从 App 包里的 models/ 读）。
+    std::env::set_var("FDXMP_MODEL_DIR", &dir);
+    let registry = ModelRegistry::with_dir(dir.clone());
+    if !ensure_models(&registry) {
+        return;
+    }
+    let image = image::open(std::path::PathBuf::from(portrait_env))
+        .expect("打开测试人像失败")
+        .to_rgba8();
+    let scale = 1024.0 / image.width().max(image.height()) as f32;
+    let image = if scale < 1.0 {
+        image::imageops::resize(
+            &image,
+            (image.width() as f32 * scale) as u32,
+            (image.height() as f32 * scale) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+
+    assert!(
+        fdxmp_core::smartmask::runtime::runtime_available(),
+        "模型应可用（随包场景）"
+    );
+    let kinds = [
+        MaskKind::AiSubject,
+        MaskKind::AiBackground,
+        MaskKind::AiPeople {
+            part: PeoplePart::Body,
+        },
+        MaskKind::AiPeople {
+            part: PeoplePart::Face,
+        },
+        MaskKind::AiPeople {
+            part: PeoplePart::Skin,
+        },
+        MaskKind::AiPeople {
+            part: PeoplePart::Hair,
+        },
+        MaskKind::AiPeople {
+            part: PeoplePart::Eyes,
+        },
+        MaskKind::AiPeople {
+            part: PeoplePart::Lips,
+        },
+    ];
+    for kind in kinds {
+        let mask = MaskParams {
+            id: format!("m-{}", kind_name(&kind)),
+            kind: kind.clone(),
+            ..MaskParams::default()
+        };
+        fdxmp_core::smartmask::runtime::generate_into_cache(&mask, &image)
+            .unwrap_or_else(|err| panic!("{kind:?} 生成失败：{err}"));
+        assert!(
+            fdxmp_core::masks::ai_raster_ready(&mask),
+            "{kind:?} 栅格未写入缓存"
+        );
+        // 渲染侧能取到（按任意分辨率重采样）。
+        assert!(
+            fdxmp_core::masks::cached_ai_raster(&mask, 640, 480).is_some(),
+            "{kind:?} 按预览分辨率取不到"
+        );
+    }
+    // 背景 ≈ 主体反向：权重互补。
+    let subject = MaskParams {
+        id: "s".to_string(),
+        kind: MaskKind::AiSubject,
+        ..MaskParams::default()
+    };
+    let background = MaskParams {
+        id: "b".to_string(),
+        kind: MaskKind::AiBackground,
+        ..MaskParams::default()
+    };
+    let subject_raster = fdxmp_core::masks::cached_ai_raster(&subject, 256, 256).unwrap();
+    let background_raster = fdxmp_core::masks::cached_ai_raster(&background, 256, 256).unwrap();
+    let sum: f32 = subject_raster
+        .weights
+        .iter()
+        .zip(background_raster.weights.iter())
+        .map(|(a, b)| (a + b - 1.0).abs())
+        .sum::<f32>()
+        / subject_raster.weights.len() as f32;
+    assert!(sum < 0.01, "主体 + 背景应互补（平均偏差 {sum}）");
+    fdxmp_core::masks::clear_ai_raster_cache();
+}
+
+fn kind_name(kind: &fdxmp_core::params::MaskKind) -> String {
+    format!("{kind:?}").replace(['(', ')', '{', '}', ' ', ':', ','], "")
+}

@@ -824,6 +824,108 @@ pub unsafe extern "C" fn fdxmp_mask_overlay_rgba(
 /// 提交栅格的像素数上限（4096×4096，约 64 MB f32）。
 const SMARTMASK_MAX_PIXELS: usize = 4096 * 4096;
 
+/// 智能蒙版返回值：模型不可用 / 该类型不支持 —— 调用方应回退平台实现（如 iOS Vision）。
+pub const FDXMP_SMARTMASK_FALLBACK: i32 = 2;
+
+/// 用随包 ONNX 模型生成智能蒙版（双阶段流水线），并写入共享栅格缓存。
+///
+/// 返回值：
+/// - [`FDXMP_OK`]：已生成（后续渲染 / 叠加 / 导出直接复用）；
+/// - [`FDXMP_SMARTMASK_FALLBACK`]：模型 / 运行库不可用，或该蒙版类型没有对应模型
+///   —— 调用方回退平台实现（iOS Vision / 其它）；
+/// - [`FDXMP_ERR`]：推理失败（无人脸 / 无人像等），原因见 `fdxmp_last_error_message`。
+///
+/// # Safety
+///
+/// `params_json`、`mask_id` 必须为合法 C 字符串；`rgba` 至少 `width × height × 4` 字节可读。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_smartmask_generate(
+    params_json: *const c_char,
+    mask_id: *const c_char,
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let mask_id = match cstr_to_str(mask_id, "mask_id") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let expected = (width as usize).saturating_mul(height as usize).saturating_mul(4);
+        if width == 0
+            || height == 0
+            || width > 4096
+            || height > 4096
+            || rgba.is_null()
+            || expected == 0
+        {
+            set_last_error(format!("图像尺寸非法：{width}×{height}"));
+            return FDXMP_ERR;
+        }
+        let mask = match find_mask_params(params_json, mask_id) {
+            Ok(mask) => mask,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            // SAFETY: 调用方保证 rgba 至少 width × height × 4 字节可读。
+            let buffer = std::slice::from_raw_parts(rgba, expected);
+            let image = match image::RgbaImage::from_raw(width, height, buffer.to_vec()) {
+                Some(image) => image,
+                None => {
+                    set_last_error("RGBA 缓冲尺寸不匹配");
+                    return FDXMP_ERR;
+                }
+            };
+            match fdxmp_core::smartmask::runtime::generate_into_cache(&mask, &image) {
+                Ok(()) => FDXMP_OK,
+                Err(error) => {
+                    set_last_error(error.message().to_string());
+                    if error.should_fallback() {
+                        FDXMP_SMARTMASK_FALLBACK
+                    } else {
+                        FDXMP_ERR
+                    }
+                }
+            }
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            let _ = (mask, rgba, expected);
+            set_last_error("当前构建未启用 ONNX 模型（ai / ai-static）");
+            FDXMP_SMARTMASK_FALLBACK
+        }
+    })
+}
+
+/// 随包 ONNX 模型是否可用：1 = 就绪，0 = 不可用。
+#[no_mangle]
+pub extern "C" fn fdxmp_smartmask_runtime_ready() -> i32 {
+    guard(0, || {
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            i32::from(fdxmp_core::smartmask::runtime::runtime_available())
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            0
+        }
+    })
+}
+
 /// 解析参数 JSON 并取出指定蒙版。
 fn find_mask_params(
     params_json: &str,

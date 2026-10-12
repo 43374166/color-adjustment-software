@@ -26,11 +26,16 @@ pub mod retouch;
 pub mod spec;
 pub mod traits;
 
-#[cfg(feature = "ai")]
+#[cfg(any(feature = "ai", feature = "ai-static"))]
 pub mod onnx;
+
+#[cfg(any(feature = "ai", feature = "ai-static"))]
+pub mod runtime;
 
 pub use mask::{MaskMorphology, PolygonMask, SmartMask, SmartMaskKind};
 pub use pipeline::{MaskPipeline, MaskSet, PipelineConfig};
+#[cfg(any(feature = "ai", feature = "ai-static"))]
+pub use runtime::{generate_into_cache, runtime_available, RuntimeError};
 pub use retouch::{DataRecorder, JsonlRecorder, NoopRetouchEngine, RetouchParams, TrainingSample};
 pub use spec::{
     ColorSpace, ExecutionProvider, InputLayout, ModelRegistry, ModelSpec, ModelTask, Precision,

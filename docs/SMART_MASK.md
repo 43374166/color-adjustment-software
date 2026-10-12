@@ -88,17 +88,35 @@ masks:: 共享栅格缓存（按蒙版类型缓存；按请求分辨率自动重
 调度：有人脸 → 并行「五官解析 + 精细抠图」；无人脸 → 只走人像路径；
 纯磨皮 / 肤色场景可配置跳过精细抠图（`PipelineConfig::skip_matting_without_face`）。
 
-## 5. iOS（Vision，端侧）
+## 5. iOS（随包模型 + Vision 兜底）
 
-不下载模型、不联网：`VNDetectFaceLandmarksRequest`（五官关键点）+ 人物分割
-（`VNGeneratePersonSegmentationRequest`）+ 前景实例分割（iOS 17+）。
+### 5.1 主线：随包 ONNX 模型（与 Windows 同一套流水线）
 
+- ONNX Runtime：`ai-static` feature = pyke 预编译静态库（`ort/download-binaries` +
+  `ort/coreml`，ORT 1.28 + CoreML 后端），静态链接进 `libfdxmp_ffi.a`，
+  App 侧链接 `-framework CoreML -framework Accelerate`（project.yml）；
+- 模型（≈123 MB）随 IPA 打包进 `Fdxmp.app/models/`（CI 下载 + `shasum` 校验，
+  哈希与 `ModelRegistry` 一致；核心从「可执行文件同级 models/」读取）；
+- Swift 调 `fdxmp_smartmask_generate` → 核心 [`runtime`] 跑双阶段流水线
+  （SCRFD 人脸检测 / MODNet 人像 / BiSeNet 五官 / U²-Net 抠图）→ 写共享栅格缓存；
+  同一张图的多次生成命中流水线缓存（只推理一次算法路径）；
+- 运行时同样做 SHA-256 校验；模型缺失 / 类型不支持时返回 `FDXMP_SMARTMASK_FALLBACK`。
+
+### 5.2 兜底：Apple Vision（系统端侧模型，无需打包文件）
+
+`fdxmp_smartmask_generate` 返回 2（模型不可用 / 无对应模型）或推理失败时自动回退：
+
+- `VNDetectFaceLandmarksRequest`（五官关键点）+ 人物分割
+  （`VNGeneratePersonSegmentationRequest`）+ 前景实例分割（iOS 17+）；
 - 分割类（主体 / 人像）：f32 平面经 `fdxmp_mask_raster_submit` 提交核心缓存；
 - 关键点类（面部 / 皮肤 / 眼睛 / 眉毛 / 鼻子 / 嘴唇 / 牙齿）：
   归一化多边形经 `fdxmp_mask_polygons_submit` → 核心扫描线光栅化 + 羽化 + 缓存；
 - 渲染 / 叠加 / 导出与 Windows 共用同一套核心后处理与坐标；
 - 失败可恢复：无人脸 / 无人像 → 面板提示 + 「重新生成」，不影响其它编辑；
 - 切换图片时清空栅格缓存（`fdxmp_mask_raster_clear`），编辑记录恢复后自动补生成。
+
+> 说明：Android / HarmonyOS 当前构建未启用 `ai-static`，`fdxmp_smartmask_generate`
+> 直接返回 2（回退平台实现），接口已就位。
 
 ## 6. 安全
 

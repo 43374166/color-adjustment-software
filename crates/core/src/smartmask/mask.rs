@@ -41,6 +41,8 @@ pub enum SmartMaskKind {
     Lips,
     /// 牙齿。
     Teeth,
+    /// 耳朵。
+    Ears,
     /// 衣服。
     Clothes,
 }
@@ -62,6 +64,7 @@ impl SmartMaskKind {
             SmartMaskKind::Nose => "nose",
             SmartMaskKind::Lips => "lips",
             SmartMaskKind::Teeth => "teeth",
+            SmartMaskKind::Ears => "ears",
             SmartMaskKind::Clothes => "clothes",
         }
     }

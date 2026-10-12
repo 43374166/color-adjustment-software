@@ -57,11 +57,13 @@ flate2 = "1.1.4"
 # 16bit ICC 转换需要按像素类型重解释切片（零拷贝）
 bytemuck = "1.25.2"
 
-# Windows AI 蒙版：ONNX Runtime（load-dynamic：运行时加载 onnxruntime.dll）
+# AI 蒙版：ONNX Runtime。
+# - 桌面（Windows）：core 的 `ai` feature 打开 `ort/load-dynamic`（运行时加载 onnxruntime.dll）；
+# - 移动（iOS）：core 的 `ai-static` feature 打开 `ort/download-binaries` + `ort/coreml`
+#   （pyke 预编译静态库，静态链接进 Rust 静态库，CoreML 后端可加速）。
 ort = { version = "2.0.0-rc.13", default-features = false, features = [
     "std",
     "ndarray",
-    "load-dynamic",
 ] }
 # 模型下载（hf-mirror 等镜像）
 ureq = "3.4.2"

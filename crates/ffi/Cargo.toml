@@ -19,8 +19,13 @@ default = []
 gpu = ["fdxmp-core/gpu"]
 raw = ["fdxmp-core/raw"]
 heif = ["fdxmp-core/heif"]
+# 桌面：ONNX Runtime（运行时加载 onnxruntime.dll）
+ai = ["fdxmp-core/ai"]
+# iOS：ONNX Runtime 静态链接（pyke 预编译 + CoreML 后端）
+ai-static = ["fdxmp-core/ai-static"]
 full = ["gpu", "raw", "heif"]
 
 [dependencies]
 fdxmp-core.workspace = true
 serde_json.workspace = true
+image.workspace = true

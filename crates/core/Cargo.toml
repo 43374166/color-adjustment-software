@@ -18,8 +18,16 @@ gpu = ["dep:wgpu", "dep:tokio"]
 raw = ["dep:rsraw"]
 # libheif 封装（libheif-rs）
 heif = ["dep:libheif-rs"]
-# Windows AI 蒙版（ONNX Runtime，运行时加载 onnxruntime.dll）
-ai = ["dep:ort", "dep:ureq"]
+# 桌面 AI 蒙版（ONNX Runtime，运行时加载 onnxruntime.dll）
+ai = ["dep:ort", "dep:ureq", "ort/load-dynamic"]
+# 移动 AI 蒙版（iOS：pyke 预编译静态库 + CoreML 后端，静态链接进静态库）
+ai-static = [
+    "dep:ort",
+    "dep:ureq",
+    "ort/download-binaries",
+    "ort/coreml",
+    "ort/tls-rustls",
+]
 # 全能力（四端最终形态）
 full = ["gpu", "raw", "heif", "ai"]
 
