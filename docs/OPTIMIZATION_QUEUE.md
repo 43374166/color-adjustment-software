@@ -139,11 +139,15 @@
         （8 字节大端宽高 + RGBA8；`fdxmp_bytes_free` 释放；`fdxmp.h` 同步）；
       - iOS 构建打开 `raw` feature（CI 两个 target `--features gpu,raw`），
         工程显式链接 `-lc++`（LibRaw 为 C++ 静态库）；
-      - iOS 应用接入：ProRAW / DNG（`.photoRAW` 子类型或原始资源为 raw-image）
-        从 `PHAssetResource` 取原始文件字节 → LibRaw 解调 → 基础预览缓冲；
+      - iOS 应用接入：ProRAW / DNG（按 `PHAssetResource` 的 UTI `*-raw-image`
+        与文件扩展名判定，优先 `.alternatePhoto`）取原始文件字节 →
+        LibRaw 解调 → 基础预览缓冲；
         放大 1:1 细节帧改用 LibRaw 细节缓冲（≤2560，>24MP 自动半尺寸；区域渲染暂缓）；
         导出同样走 LibRaw（与预览同源）；任何一步失败都静默回退系统解码路径；
-      - 测试：核心 128 + FFI 8 全过（新增 DNG 解码 / 内存字节 RGBA8 缩放 /
+      - 大图内存：`DecodedImage::display_proxy_fast` —— 16bit → RGBA8 直接分块降采样，
+        不再中转整帧 RGBA8（48MP 线性 DNG 的 LibRaw 输出约 290MB，
+        原实现还要再吃 ~190MB 中转，现在峰值只有目标缓冲）；
+      - 测试：核心 129（默认）/ 128（raw）+ FFI 8 全过（新增 DNG 解码 / 内存字节 RGBA8 缩放 /
         FFI 往返 3 个用例，本机实测；iOS 侧由 CI 编译验证）
 
 ## 待做

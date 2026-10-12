@@ -261,7 +261,10 @@ fn decode_raw_rgba_from_bytes_decodes_and_scales() {
     };
     let preview = fdxmp_core::preview::decode_raw_rgba(&bytes, 1024, false).unwrap();
     let longest = preview.width.max(preview.height);
-    assert!((512..=1024).contains(&longest), "长边应按 max_edge 缩放：{longest}");
+    assert!(
+        (512..=1024).contains(&longest),
+        "长边应按 max_edge 缩放：{longest}"
+    );
     assert_eq!(
         preview.rgba.len(),
         (preview.width as usize) * (preview.height as usize) * 4

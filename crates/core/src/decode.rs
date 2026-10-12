@@ -250,6 +250,35 @@ impl DecodedImage {
         pixels.to_rgba8()
     }
 
+    /// 内存敏感的显示代理：按目标尺寸**分块降采样成 RGBA8**，不中转整帧 RGBA8。
+    ///
+    /// 与 [`Self::display_proxy`] 的差异只在实现路径：RAW 大图（45MP RGB16 ≈ 260MB）
+    /// 先 `to_rgba8()` 再缩放会再吃一份整帧 RGBA8（48MP ≈ 190MB），iOS 上容易触顶；
+    /// 这里直接对 16bit 源分块取平均（等价于盒式降采样）输出目标尺寸。
+    pub fn display_proxy_fast(&self, max_edge: u32) -> image::RgbaImage {
+        let longest = self.width.max(self.height);
+        if max_edge == 0 || longest <= max_edge {
+            return self.pixels.to_rgba8();
+        }
+        let scale = max_edge as f64 / longest as f64;
+        let target_width = ((self.width as f64 * scale).round() as u32).max(1);
+        let target_height = ((self.height as f64 * scale).round() as u32).max(1);
+        match &self.pixels {
+            image::DynamicImage::ImageRgb16(image) => {
+                box_downscale_u16(image, target_width, target_height)
+            }
+            image::DynamicImage::ImageRgba16(image) => {
+                box_downscale_u16(image, target_width, target_height)
+            }
+            image::DynamicImage::ImageLuma16(image) => {
+                box_downscale_u16(image, target_width, target_height)
+            }
+            other => other
+                .resize(max_edge, max_edge, image::imageops::FilterType::Triangle)
+                .to_rgba8(),
+        }
+    }
+
     /// 全分辨率线性 f32 RGBA（sRGB 解码到线性，0..1，不裁剪）。
     ///
     /// 供 GPU 以 `rgba16float` 上传，避免 16bit RAW 在解码 → 上传环节
@@ -684,6 +713,63 @@ fn probe_raw_size(_path: &Path) -> Option<(u32, u32)> {
     None
 }
 
+/// 16bit 图像 → RGBA8 的盒式降采样（每个目标像素对源块求平均，单遍扫过源数据）。
+///
+/// 与「先 `to_rgba8()` 再 Triangle 缩放」肉眼无差，但峰值内存只有目标缓冲：
+/// 48MP RAW 的 16bit 输出约 290MB，中转整帧 RGBA8 会再多 ~190MB。
+fn box_downscale_u16<P>(
+    image: &image::ImageBuffer<P, Vec<u16>>,
+    target_width: u32,
+    target_height: u32,
+) -> image::RgbaImage
+where
+    P: image::Pixel<Subpixel = u16>,
+{
+    let (width, height) = (image.width(), image.height());
+    let mut output = image::RgbaImage::new(target_width.max(1), target_height.max(1));
+    for ty in 0..output.height() {
+        let y0 = (ty as u64 * height as u64 / output.height() as u64) as u32;
+        let y1 = (((ty as u64 + 1) * height as u64).div_ceil(output.height() as u64))
+            .min(height as u64) as u32;
+        let y1 = y1.max(y0 + 1).min(height);
+        for tx in 0..output.width() {
+            let x0 = (tx as u64 * width as u64 / output.width() as u64) as u32;
+            let x1 = (((tx as u64 + 1) * width as u64).div_ceil(output.width() as u64))
+                .min(width as u64) as u32;
+            let x1 = x1.max(x0 + 1).min(width);
+            let mut sums = [0u64; 4];
+            let mut count = 0u64;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (r, g, b, a) = image.get_pixel(x, y).channels4();
+                    sums[0] += r as u64;
+                    sums[1] += g as u64;
+                    sums[2] += b as u64;
+                    sums[3] += a as u64;
+                    count += 1;
+                }
+            }
+            let count = count.max(1) as f32;
+            let to_u8 = |sum: u64| -> u8 {
+                (sum as f32 / count * (255.0 / 65535.0))
+                    .round()
+                    .clamp(0.0, 255.0) as u8
+            };
+            output.put_pixel(
+                tx,
+                ty,
+                image::Rgba([
+                    to_u8(sums[0]),
+                    to_u8(sums[1]),
+                    to_u8(sums[2]),
+                    to_u8(sums[3]),
+                ]),
+            );
+        }
+    }
+    output
+}
+
 /// HEIF 尺寸探测（只读容器信息，不解码像素）。
 #[cfg(feature = "heif")]
 fn probe_heif_size(path: &Path) -> Option<(u32, u32)> {
@@ -754,6 +840,37 @@ mod tests {
         assert_eq!(ImageFormat::from_extension(".CR3"), Some(ImageFormat::Raw));
         assert_eq!(ImageFormat::from_extension("heic"), Some(ImageFormat::Heif));
         assert_eq!(ImageFormat::from_extension("txt"), None);
+    }
+
+    #[test]
+    fn display_proxy_fast_box_downscales_u16() {
+        // 4×4 线性渐变；降采样到 2×2 时每个目标像素取对应 2×2 源块的平均。
+        let mut image = image::ImageBuffer::<image::Rgb<u16>, Vec<u16>>::new(4, 4);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x as u16 + y as u16 * 4) * 1000, 0, 0]);
+        }
+        let decoded = DecodedImage {
+            format: ImageFormat::Raw,
+            source: DecodeSource::FullRaw,
+            width: 4,
+            height: 4,
+            pixels: image::DynamicImage::ImageRgb16(image),
+            metadata: None,
+            elapsed_ms: 0,
+        };
+        let proxy = decoded.display_proxy_fast(2);
+        assert_eq!((proxy.width(), proxy.height()), (2, 2));
+        // 块 (0,0)：值 0/1000/4000/5000 → 均值 2500 → 2500×255/65535 ≈ 10。
+        assert!((proxy.get_pixel(0, 0).0[0] as i32 - 10).abs() <= 1);
+        // 块 (0,1)：值 8000/9000/12000/13000 → 均值 10500 ≈ 41。
+        assert!((proxy.get_pixel(0, 1).0[0] as i32 - 41).abs() <= 1);
+        // 不需要缩放时等价于原始 16bit → RGBA8。
+        let full = decoded.display_proxy_fast(8);
+        assert_eq!((full.width(), full.height()), (4, 4));
+        assert_eq!(
+            full.get_pixel(3, 0).0[0],
+            (((3 * 1000) as f32) * 255.0 / 65535.0).round() as u8
+        );
     }
 
     #[cfg(not(feature = "raw"))]

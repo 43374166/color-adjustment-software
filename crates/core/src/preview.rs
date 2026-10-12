@@ -47,7 +47,8 @@ pub fn decode_raw_rgba(bytes: &[u8], max_edge: u32, full_size: bool) -> Result<P
         camera_white_balance: true,
     };
     let decoded = crate::decode::decode_raw_bytes(bytes, &options, std::time::Instant::now())?;
-    let proxy = decoded.display_proxy(max_edge.clamp(64, 8192));
+    // 大图不中转整帧 RGBA8（48MP ProRAW 的 16bit 输出 + 中转会超 400MB）。
+    let proxy = decoded.display_proxy_fast(max_edge.clamp(64, 8192));
     Ok(PreviewRgba {
         width: proxy.width(),
         height: proxy.height(),
