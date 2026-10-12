@@ -133,23 +133,31 @@ pub fn status() -> AiStatus {
 ///
 /// Windows 应用启动或首次推理前调用；智能蒙版适配器（`smartmask::onnx`）复用。
 pub fn ensure_runtime() -> Result<()> {
-    static RUNTIME: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-    let result = RUNTIME.get_or_init(|| {
-        // 必须显式给出 dll 路径：load-dynamic 下 `ort::init()` 找不到库会 panic，
-        // 而本模块约定「所有错误可恢复，不 panic」。
-        let Some(path) = ort_dll_path() else {
-            return Err(
-                "未找到 onnxruntime.dll（可放到 exe 目录，或设置 FDXMP_ORT_DLL）".to_string(),
-            );
-        };
-        ort::init_from(&path)
-            .map_err(|err| format!("加载 {} 失败：{err}", path.display()))?
-            .commit();
+    #[cfg(feature = "ai")]
+    {
+        static RUNTIME: OnceLock<std::result::Result<(), String>> = OnceLock::new();
+        let result = RUNTIME.get_or_init(|| {
+            // 必须显式给出 dll 路径：load-dynamic 下 `ort::init()` 找不到库会 panic，
+            // 而本模块约定「所有错误可恢复，不 panic」。
+            let Some(path) = ort_dll_path() else {
+                return Err(
+                    "未找到 onnxruntime.dll（可放到 exe 目录，或设置 FDXMP_ORT_DLL）".to_string(),
+                );
+            };
+            ort::init_from(&path)
+                .map_err(|err| format!("加载 {} 失败：{err}", path.display()))?
+                .commit();
+            Ok(())
+        });
+        result.clone().map_err(|message| {
+            FdxmpError::Unsupported(format!("ONNX Runtime 初始化失败：{message}"))
+        })
+    }
+    // 静态链接（iOS `ai-static`）：运行库已随包，ORT 首次使用时自动初始化默认环境。
+    #[cfg(not(feature = "ai"))]
+    {
         Ok(())
-    });
-    result
-        .clone()
-        .map_err(|message| FdxmpError::Unsupported(format!("ONNX Runtime 初始化失败：{message}")))
+    }
 }
 
 /// 模型种类。
