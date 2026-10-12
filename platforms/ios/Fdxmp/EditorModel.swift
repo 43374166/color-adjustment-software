@@ -396,6 +396,8 @@ final class EditorModel: ObservableObject {
         }
         // 有保存过修图参数的照片：后台重算修图缓冲。
         prepareRetouchAfterLoad()
+        // Vision 人像蒙版（MODNet 不随包）：后台算好提交给核心（身体塑形 / 人像路径用）。
+        prepareVisionPersonMask()
     }
 
     /// RAW：后台解一版更精细的缓冲（≤2560）供放大 1:1 / 区域细节复用。
@@ -1588,8 +1590,212 @@ final class EditorModel: ObservableObject {
         "身体塑形…",
     ]
 
+    // MARK: 手动工具（污点修复 / 液化）
+
+    /// 手动祛痘笔的污点列表（归一化坐标 + 半径像素 + 强度）。
+    @Published private(set) var healSpots: [HealSpot] = []
+    /// 液化笔画列表（归一化坐标）。
+    @Published private(set) var liquifyStrokes: [LiquifyStrokeUi] = []
+    /// 污点修复 / 液化进行中（小加载提示）。
+    @Published private(set) var manualWorkStage: String?
+
+    /// 修图子模式：美颜（预设 + 参数）/ 污点修复 / 液化。
+    enum RetouchModeUi: String, CaseIterable, Identifiable {
+        case beauty = "美颜"
+        case spot = "污点"
+        case liquify = "液化"
+
+        var id: String { rawValue }
+    }
+
+    @Published var retouchMode: RetouchModeUi = .beauty
+    /// 笔刷半径（长边百分比，1..20）。
+    @Published var brushRadius: Float = 6
+    /// 笔刷强度（1..100）。
+    @Published var brushStrength: Float = 70
+
+    struct HealSpot: Equatable {
+        var x: Float
+        var y: Float
+        var radius: Float
+        var strength: Float
+    }
+
+    struct LiquifyStrokeUi: Equatable {
+        var points: [CGPoint]
+        var radius: Float
+        var strength: Float
+
+        var jsonObject: [String: Any] {
+            [
+                "points": points.map { [Double($0.x), Double($0.y)] },
+                "radius": Double(radius),
+                "strength": Double(strength),
+            ]
+        }
+    }
+
+    /// 修复 / 液化后的基础缓冲（链：baseBuffer → 污点 → 液化 → 修图参数）。
+    private var healBuffer: RgbaBuffer?
+    private var liquifyBuffer: RgbaBuffer?
+
+    /// 修图链的输入缓冲（污点 → 液化 → 原图）。
+    private var retouchInputBuffer: RgbaBuffer? { liquifyBuffer ?? healBuffer ?? baseBuffer }
+
+    /// 手动污点修复（点的归一化坐标；radius 相对长边的像素）。
+    func applyHeal(at point: CGPoint, radius: Float, strength: Float) {
+        guard let base = retouchInputBuffer, manualWorkStage == nil else { return }
+        let spot = HealSpot(
+            x: Float(point.x),
+            y: Float(point.y),
+            radius: radius,
+            strength: strength
+        )
+        healSpots.append(spot)
+        manualWorkStage = "污点修复中…"
+        Haptics.light()
+        retouchQueue.async { [weak self] in
+            guard let self else { return }
+            let output = NativeCore.shared.healApply(
+                buffer: base,
+                x: spot.x,
+                y: spot.y,
+                radius: spot.radius,
+                strength: spot.strength
+            )
+            Task { @MainActor in
+                self.manualWorkStage = nil
+                guard let output else {
+                    self.showMessage("污点修复失败：\(NativeCore.shared.lastError() ?? "未知原因")")
+                    self.healSpots.removeLast()
+                    return
+                }
+                self.healBuffer = output
+                self.recomputeRetouch(force: true)
+            }
+        }
+    }
+
+    /// 撤销上一个污点（从原图重建整条链）。
+    func undoLastHeal() {
+        guard !healSpots.isEmpty, manualWorkStage == nil else { return }
+        healSpots.removeLast()
+        rebuildManualChain()
+    }
+
+    /// 应用一笔液化（宽/高归一的笔画点）。
+    func applyLiquifyStroke(points: [CGPoint], radius: Float, strength: Float) {
+        guard let base = retouchInputBuffer, points.count >= 2, manualWorkStage == nil else {
+            return
+        }
+        let stroke = LiquifyStrokeUi(points: points, radius: radius, strength: strength)
+        liquifyStrokes.append(stroke)
+        manualWorkStage = "液化处理中…"
+        Haptics.light()
+        retouchQueue.async { [weak self] in
+            guard let self else { return }
+            let json = Self.strokesJson([stroke])
+            let output = NativeCore.shared.liquifyApply(buffer: base, strokesJson: json)
+            Task { @MainActor in
+                self.manualWorkStage = nil
+                guard let output else {
+                    self.showMessage("液化失败：\(NativeCore.shared.lastError() ?? "未知原因")")
+                    self.liquifyStrokes.removeLast()
+                    return
+                }
+                self.liquifyBuffer = output
+                self.recomputeRetouch(force: true)
+            }
+        }
+    }
+
+    /// 撤销最近一笔液化。
+    func undoLastLiquify() {
+        guard !liquifyStrokes.isEmpty, manualWorkStage == nil else { return }
+        liquifyStrokes.removeLast()
+        rebuildManualChain()
+    }
+
+    /// 从原图重建「污点 → 液化」链（撤销 / 清空时用）。
+    private func rebuildManualChain() {
+        guard let base = baseBuffer else { return }
+        let spots = healSpots
+        let strokes = liquifyStrokes
+        manualWorkStage = "重建修图链…"
+        retouchQueue.async { [weak self] in
+            guard let self else { return }
+            var buffer = base
+            for spot in spots {
+                if let output = NativeCore.shared.healApply(
+                    buffer: buffer,
+                    x: spot.x,
+                    y: spot.y,
+                    radius: spot.radius,
+                    strength: spot.strength
+                ) {
+                    buffer = output
+                }
+            }
+            let healed = spots.isEmpty ? nil : buffer
+            if !strokes.isEmpty,
+               let output = NativeCore.shared.liquifyApply(
+                   buffer: buffer,
+                   strokesJson: Self.strokesJson(strokes)
+               ) {
+                buffer = output
+            }
+            let liquified = strokes.isEmpty ? nil : buffer
+            Task { @MainActor in
+                self.manualWorkStage = nil
+                self.healBuffer = healed
+                self.liquifyBuffer = liquified
+                self.recomputeRetouch(force: true)
+            }
+        }
+    }
+
+    /// 清空手动工具（污点 / 液化）。
+    func clearManualTools() {
+        guard !healSpots.isEmpty || !liquifyStrokes.isEmpty else { return }
+        healSpots.removeAll()
+        liquifyStrokes.removeAll()
+        rebuildManualChain()
+    }
+
+    private static func strokesJson(_ strokes: [LiquifyStrokeUi]) -> String {
+        let array = strokes.map(\.jsonObject)
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: array, options: [.sortedKeys]),
+            let text = String(data: data, encoding: .utf8)
+        else {
+            return "[]"
+        }
+        return text
+    }
+
+    /// 准备 Vision 人像蒙版（MODNet 不随包；提交给核心供修图 / 身体塑形使用）。
+    private func prepareVisionPersonMask() {
+        guard let buffer = baseBuffer else { return }
+        guard let cgImage = SmartMaskEngine.makeCGImage(buffer: buffer) else { return }
+        retouchQueue.async { [weak self] in
+            guard let self else { return }
+            guard let plane = SmartMaskEngine.personMaskPlane(cgImage: cgImage, buffer: buffer) else {
+                return
+            }
+            _ = NativeCore.shared.retouchSubmitPersonMask(
+                buffer: buffer,
+                plane: plane.data,
+                planeWidth: plane.width,
+                planeHeight: plane.height
+            )
+            _ = self
+        }
+    }
+
     /// 渲染 / 显示用的当前源图（修图后 = 修图结果，否则原图）。
-    private var renderSource: RgbaBuffer? { retouchBuffer ?? baseBuffer }
+    private var renderSource: RgbaBuffer? {
+        retouchBuffer ?? liquifyBuffer ?? healBuffer ?? baseBuffer
+    }
 
     /// 切换照片时重置修图状态（核心按图像指纹自动失效识别结果）。
     private func resetRetouchState() {
@@ -1602,6 +1808,11 @@ final class EditorModel: ObservableObject {
         retouchAnalysis = nil
         retouchWorkInFlight = false
         retouchPending = false
+        healSpots.removeAll()
+        liquifyStrokes.removeAll()
+        healBuffer = nil
+        liquifyBuffer = nil
+        manualWorkStage = nil
     }
 
     /// 载入完成后：若该图有已保存的修图参数 → 后台重算；否则保持原图。
@@ -1675,6 +1886,17 @@ final class EditorModel: ObservableObject {
         recomputeRetouch()
     }
 
+    /// 应用手动美颜预设（一键美颜）：设置参数并立即重算。
+    func applyRetouchPreset(_ preset: RetouchPresetUi) {
+        guard manualWorkStage == nil else { return }
+        Haptics.light()
+        applyEdit("美颜·\(preset.rawValue)") { state in
+            state.retouch = preset.params
+        }
+        manualWorkStage = "应用美颜预设（\(preset.rawValue)）…"
+        recomputeRetouch(completion: { self.manualWorkStage = nil }, force: true)
+    }
+
     /// 导出 / 细节帧用：在给定分辨率上应用修图。
     ///
     /// 超过 4096 长边时先降采样再上采样（保内存；修图主要作用于皮肤，损失可接受）。
@@ -1705,13 +1927,13 @@ final class EditorModel: ObservableObject {
     }
 
     /// 重算修图缓冲（后台；完成后重建 GPU 会话并刷新预览）。
-    func recomputeRetouch(completion: (() -> Void)? = nil) {
-        guard let buffer = baseBuffer else {
+    func recomputeRetouch(completion: (() -> Void)? = nil, force: Bool = false) {
+        guard let buffer = retouchInputBuffer else {
             completion?()
             return
         }
         let params = state.retouch
-        if params == retouchApplied {
+        if params == retouchApplied, !force {
             completion?()
             return
         }

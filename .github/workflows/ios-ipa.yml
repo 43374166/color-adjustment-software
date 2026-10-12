@@ -40,21 +40,18 @@ jobs:
           base=https://hf-mirror.com
           curl -L --fail --retry 3 -o dist/ios/models/face_detector_scrfd2p5g_bnkps_fp32.onnx \
             "$base/RuteNL/SCRFD-face-detection-ONNX/resolve/main/2.5g_bnkps.onnx"
-          curl -L --fail --retry 3 -o dist/ios/models/person_coarse_modnet_fp32.onnx \
-            "$base/Xenova/modnet/resolve/main/onnx/model.onnx"
-          curl -L --fail --retry 3 -o dist/ios/models/face_parsing_quantized.onnx \
-            "$base/Xenova/face-parsing/resolve/main/onnx/model_quantized.onnx"
           curl -L --fail --retry 3 -o dist/ios/models/u2netp.onnx \
             "$base/BritishWerewolf/U-2-Netp/resolve/main/onnx/model.onnx"
           curl -L --fail --retry 3 -o dist/ios/models/face_landmarks_mediapipe_v2_fp32.onnx \
             "$base/fernandotonon/QtMeshEditor-facemesh-onnx/resolve/main/face_landmarks.onnx"
+          # 人脸解析：自转 BiSeNet-19（MIT 权重，见 packaging/models/）——随仓库携带，保证哈希一致。
+          cp models/face_parsing_bisenet19_fp32.onnx dist/ios/models/
           cd dist/ios/models
           shasum -a 256 -c <<'EOF'
           3f1ac54e769cb5fd76eda11ac3c088eed78d1f51a935a839d04d49b0e770219e  face_detector_scrfd2p5g_bnkps_fp32.onnx
-          07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9  person_coarse_modnet_fp32.onnx
-          5bab9bfb3cb979f3098ac3b934b1641dbf87f835e0b03c2ca6d88dcf18c83d27  face_parsing_quantized.onnx
           309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  u2netp.onnx
           d16e5a55e6a480284d468ee32469692464049518c311662ab3956681de31e3e9  face_landmarks_mediapipe_v2_fp32.onnx
+          2453dcc1592590d1f9f7b064b3031c20f35bca74375445d23ab7f5ad3c38ea2f  face_parsing_bisenet19_fp32.onnx
           EOF
           ls -lh
 

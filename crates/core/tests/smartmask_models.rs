@@ -83,7 +83,7 @@ fn onnx_stages_load_verify_and_run_all_four_models() {
         stages.detector(),
         stages.segmenter(),
         Some(stages.parser()),
-        Some(stages.matting()),
+        stages.matting(),
         None,
         PipelineConfig::default(),
     );
@@ -253,6 +253,7 @@ fn onnx_face_path_on_real_portrait() {
     // 2) 人像粗分割。
     let coarse = stages
         .segmenter()
+        .expect("需要人像粗分割模型")
         .segment_coarse(&image)
         .expect("人像粗分割失败");
     assert!(coarse.mean() > 0.01, "人像粗分割不应为空");
@@ -281,13 +282,18 @@ fn onnx_face_path_on_real_portrait() {
             fdxmp_core::smartmask::SmartMaskKind::Skin
             | fdxmp_core::smartmask::SmartMaskKind::Hair
             | fdxmp_core::smartmask::SmartMaskKind::Face => 0.02,
+            // 耳朵常被头发遮住：允许为空（只要求类别存在）。
+            fdxmp_core::smartmask::SmartMaskKind::Ears => 0.0,
             _ => 0.002,
         };
-        assert!(
-            mask.mean() > minimum,
-            "{kind:?} 蒙版几乎为空（mean={:.4}）",
-            mask.mean()
-        );
+        // minimum = 0 表示「允许为空」（如被头发遮住的耳朵）。
+        if minimum > 0.0 {
+            assert!(
+                mask.mean() > minimum,
+                "{kind:?} 蒙版几乎为空（mean={:.4}）",
+                mask.mean()
+            );
+        }
     }
 
     // 4) 精细抠图（用粗分割包围盒裁剪）。
@@ -300,7 +306,11 @@ fn onnx_face_path_on_real_portrait() {
         (bbox.3 - bbox.1).max(1),
     )
     .to_image();
-    let fine = stages.matting().matting_fine(&crop).expect("精细抠图失败");
+    let fine = stages
+        .matting()
+        .expect("需要精细抠图模型")
+        .matting_fine(&crop)
+        .expect("精细抠图失败");
     assert!(fine.mean() > 0.01, "精细抠图不应为空");
     eprintln!("精细抠图覆盖率：{:.3}", fine.coverage(0.5));
 
@@ -540,7 +550,8 @@ fn probe_modnet_quantized() {
         image
     };
     let size = 512u32;
-    let resized = image::imageops::resize(&image, size, size, image::imageops::FilterType::Triangle);
+    let resized =
+        image::imageops::resize(&image, size, size, image::imageops::FilterType::Triangle);
     let pixels = (size as usize) * (size as usize);
     let mut data = vec![0.0f32; pixels * 3];
     for (index, pixel) in resized.pixels().enumerate() {
@@ -557,7 +568,9 @@ fn probe_modnet_quantized() {
         let tensor =
             Tensor::from_array((vec![1usize, 3, size as usize, size as usize], data.clone()))
                 .unwrap();
-        let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).ok()?;
+        let outputs = session
+            .run(ort::inputs![input_name.as_str() => tensor])
+            .ok()?;
         let (name, value) = outputs
             .iter()
             .find(|(name, _)| name.contains("output"))
@@ -676,12 +689,15 @@ fn probe_humanseg_candidate() {
             }
         }
         let input_name = session.inputs()[0].name().to_string();
-        let tensor = Tensor::from_array((vec![1usize, 3, size as usize, size as usize], data))
-            .unwrap();
+        let tensor =
+            Tensor::from_array((vec![1usize, 3, size as usize, size as usize], data)).unwrap();
         let outputs = match session.run(ort::inputs![input_name.as_str() => tensor]) {
             Ok(outputs) => outputs,
             Err(err) => {
-                eprintln!("size {size}: 推理失败（{}）", err.to_string().lines().next().unwrap_or(""));
+                eprintln!(
+                    "size {size}: 推理失败（{}）",
+                    err.to_string().lines().next().unwrap_or("")
+                );
                 continue;
             }
         };
@@ -715,7 +731,8 @@ fn probe_humanseg_candidate() {
             continue;
         }
         let mean = alpha.iter().sum::<f32>() / alpha.len() as f32;
-        let coverage = alpha.iter().filter(|value| **value > 0.5).count() as f32 / alpha.len() as f32;
+        let coverage =
+            alpha.iter().filter(|value| **value > 0.5).count() as f32 / alpha.len() as f32;
         eprintln!("  alpha mean={mean:.3} coverage(0.5)={coverage:.3}");
         if let Some(out_dir) = std::env::var_os("FDXMP_TEST_OUT") {
             let out_dir = std::path::PathBuf::from(out_dir);
@@ -757,7 +774,9 @@ fn probe_faceparser_candidate() {
         eprintln!("跳过：未找到模型目录");
         return;
     };
-    let path = dir.join("_candidate_faceparser_sim.onnx");
+    let candidate = std::env::var("FDXMP_FACEPARSER_CANDIDATE")
+        .unwrap_or_else(|_| "_candidate_faceparser_sim.onnx".to_string());
+    let path = dir.join(candidate);
     if !path.is_file() {
         eprintln!("跳过：缺少候选模型 {}", path.display());
         return;
@@ -784,6 +803,11 @@ fn probe_faceparser_candidate() {
     )
     .unwrap();
     let crop = fdxmp_core::smartmask::pipeline::warp_image(&image, &transform, 512);
+    if let Some(out_dir) = std::env::var_os("FDXMP_TEST_OUT") {
+        let out_dir = std::path::PathBuf::from(out_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+        let _ = crop.save(out_dir.join("candidate-aligned-512.png"));
+    }
 
     let mut builder = Session::builder().unwrap();
     let mut session = builder.commit_from_file(&path).unwrap();
@@ -806,7 +830,9 @@ fn probe_faceparser_candidate() {
     }
     let input_name = session.inputs()[0].name().to_string();
     let tensor = Tensor::from_array((vec![1usize, 3, 512, 512], data)).unwrap();
-    let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).unwrap();
+    let outputs = session
+        .run(ort::inputs![input_name.as_str() => tensor])
+        .unwrap();
     let (shape, values) = outputs[0].try_extract_tensor::<f32>().unwrap();
     eprintln!("  out0 shape={:?}", shape);
     let dims: Vec<usize> = shape.iter().map(|dim| *dim as usize).collect();
@@ -834,8 +860,25 @@ fn probe_faceparser_candidate() {
         histogram[best] += 1;
     }
     let names = [
-        "background", "skin", "nose", "eye_g", "l_eye", "r_eye", "l_brow", "r_brow", "l_ear",
-        "r_ear", "mouth", "u_lip", "l_lip", "hair", "hat", "ear_r", "neck_l", "neck", "cloth",
+        "background",
+        "skin",
+        "nose",
+        "eye_g",
+        "l_eye",
+        "r_eye",
+        "l_brow",
+        "r_brow",
+        "l_ear",
+        "r_ear",
+        "mouth",
+        "u_lip",
+        "l_lip",
+        "hair",
+        "hat",
+        "ear_r",
+        "neck_l",
+        "neck",
+        "cloth",
     ];
     for (class, count) in histogram.iter().enumerate() {
         if *count > 0 {
@@ -850,10 +893,25 @@ fn probe_faceparser_candidate() {
         let out_dir = std::path::PathBuf::from(out_dir);
         let _ = std::fs::create_dir_all(&out_dir);
         let palette: [[u8; 3]; 19] = [
-            [0, 0, 0], [255, 200, 170], [200, 120, 90], [120, 120, 255], [80, 200, 255],
-            [80, 200, 255], [255, 160, 60], [255, 160, 60], [230, 180, 140], [230, 180, 140],
-            [180, 60, 60], [240, 90, 90], [200, 60, 60], [90, 70, 50], [200, 200, 0],
-            [255, 255, 0], [160, 140, 120], [170, 150, 130], [60, 120, 200],
+            [0, 0, 0],
+            [255, 200, 170],
+            [200, 120, 90],
+            [120, 120, 255],
+            [80, 200, 255],
+            [80, 200, 255],
+            [255, 160, 60],
+            [255, 160, 60],
+            [230, 180, 140],
+            [230, 180, 140],
+            [180, 60, 60],
+            [240, 90, 90],
+            [200, 60, 60],
+            [90, 70, 50],
+            [200, 200, 0],
+            [255, 255, 0],
+            [160, 140, 120],
+            [170, 150, 130],
+            [60, 120, 200],
         ];
         let buffer: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
             image::ImageBuffer::from_fn(width as u32, height as u32, |x, y| {
@@ -863,6 +921,23 @@ fn probe_faceparser_candidate() {
         let path = out_dir.join("candidate-faceparser-labels.png");
         let _ = buffer.save(&path);
         eprintln!("  已导出 {}", path.display());
+        // 关键类别单独导出（确认类别语义：皮肤 / 鼻子 / 眉毛 / 头发 / 脖子）。
+        for (class, name) in [
+            (1usize, "skin"),
+            (2, "nose"),
+            (6, "l_brow"),
+            (13, "hair"),
+            (17, "neck"),
+        ] {
+            let buffer: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
+                image::ImageBuffer::from_fn(width as u32, height as u32, |x, y| {
+                    let label = labels[(y as usize) * width + x as usize];
+                    image::Luma([if label == class { 255 } else { 0 }])
+                });
+            let path = out_dir.join(format!("candidate-class-{class:02}-{name}.png"));
+            let _ = buffer.save(&path);
+        }
+        eprintln!("  各类别掩膜已导出");
     }
 }
 

@@ -866,6 +866,166 @@ fn soften_mask(plane: &MaskPlane, radius: f32) -> MaskPlane {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 手动工具：污点修复 / 液化（v1.5.0）
+// ---------------------------------------------------------------------------
+
+/// 一条液化笔画（归一化坐标 + 归一化半径 + 强度 -1..1）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LiquifyStroke {
+    /// 笔画路径（归一化坐标，0..1）。
+    pub points: Vec<[f32; 2]>,
+    /// 笔刷半径（相对长边的比例，0.01..0.5）。
+    pub radius: f32,
+    /// 强度（正 = 沿笔画方向推，负 = 反向收）。
+    pub strength: f32,
+}
+
+/// 污点修复：以 (cx, cy) 为圆心、`radius` 像素为半径，用环形中位数盖住瑕疵。
+///
+/// 参考帧来自周围一圈像素（半径 1.2~2.2 倍处）的中位数（抗边缘污染），
+/// 按羽化权重混合进目标区 —— 手动点瑕的"祛痘笔"。
+pub fn spot_heal(image: &mut image::RgbaImage, cx: f32, cy: f32, radius: f32, strength: f32) {
+    let (width, height) = (image.width(), image.height());
+    let radius = radius.max(1.0);
+    let strength = strength.clamp(0.0, 1.0);
+    if strength <= 0.0 || width == 0 || height == 0 {
+        return;
+    }
+    // 环形参考像素（1.2~2.0 倍半径）→ 每通道中位数。
+    let mut samples: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    let inner = radius * 1.2;
+    let outer = radius * 2.0;
+    let steps = ((outer * 6.0) as usize).clamp(24, 96);
+    for index in 0..steps {
+        let angle = std::f32::consts::TAU * index as f32 / steps as f32;
+        let sample_radius = inner + (outer - inner) * ((index % 3) as f32 / 2.0);
+        let x = (cx + sample_radius * angle.cos()).round();
+        let y = (cy + sample_radius * angle.sin()).round();
+        if x < 0.0 || y < 0.0 || x >= width as f32 || y >= height as f32 {
+            continue;
+        }
+        let pixel = image.get_pixel(x as u32, y as u32).0;
+        for channel in 0..3 {
+            samples[channel].push(pixel[channel]);
+        }
+    }
+    if samples[0].is_empty() {
+        return;
+    }
+    let mut reference = [0u8; 3];
+    for channel in 0..3 {
+        samples[channel].sort_unstable();
+        reference[channel] = samples[channel][samples[channel].len() / 2];
+    }
+    let (x0, y0) = (
+        (cx - radius).floor().max(0.0) as u32,
+        (cy - radius).floor().max(0.0) as u32,
+    );
+    let (x1, y1) = (
+        ((cx + radius).ceil() as u32).min(width),
+        ((cy + radius).ceil() as u32).min(height),
+    );
+    let mut buffer = image.clone();
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > radius {
+                continue;
+            }
+            let falloff = 1.0 - (distance / radius).powi(2);
+            let weight = (falloff * strength).clamp(0.0, 1.0);
+            let source = image.get_pixel(x, y).0;
+            let mut out = [0u8; 4];
+            for channel in 0..3 {
+                let value = source[channel] as f32
+                    + (reference[channel] as f32 - source[channel] as f32) * weight;
+                out[channel] = value.round().clamp(0.0, 255.0) as u8;
+            }
+            out[3] = source[3];
+            buffer.put_pixel(x, y, image::Rgba(out));
+        }
+    }
+    *image = buffer;
+}
+
+/// 液化：按笔画顺序做局部推挤（逆映射 + 双线性采样）。
+pub fn liquify(image: &image::RgbaImage, strokes: &[LiquifyStroke]) -> image::RgbaImage {
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    if strokes.is_empty() {
+        return image.clone();
+    }
+    // 每个笔画：为覆盖区累加位移场（输出像素 → 源像素的偏移）。
+    let mut field: Vec<[f32; 2]> = vec![[0.0, 0.0]; (width as usize) * (height as usize)];
+    let long_edge = width.max(height) as f32;
+    for stroke in strokes {
+        if stroke.points.len() < 2 {
+            continue;
+        }
+        let radius = (stroke.radius.clamp(0.01, 0.5) * long_edge).max(2.0);
+        let strength = stroke.strength.clamp(-1.0, 1.0);
+        for pair in stroke.points.windows(2) {
+            let (ax, ay) = (pair[0][0] * width as f32, pair[0][1] * height as f32);
+            let (bx, by) = (pair[1][0] * width as f32, pair[1][1] * height as f32);
+            let (dx, dy) = (bx - ax, by - ay);
+            let length = (dx * dx + dy * dy).sqrt();
+            if length < 0.5 {
+                continue;
+            }
+            // 沿笔画方向的位移量（正：向外推，负：向内收）。
+            let push = (dx / length, dy / length);
+            let amount = (length * 0.9).min(radius * 0.6) * strength;
+            let (x0, y0) = (
+                (ax.min(bx) - radius).max(0.0) as u32,
+                (ay.min(by) - radius).max(0.0) as u32,
+            );
+            let (x1, y1) = (
+                ((ax.max(bx) + radius).min(width as f32)) as u32,
+                ((ay.max(by) + radius).min(height as f32)) as u32,
+            );
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
+                    // 到线段的距离。
+                    let t = (((px - ax) * dx + (py - ay) * dy) / (length * length)).clamp(0.0, 1.0);
+                    let (closest_x, closest_y) = (ax + dx * t, ay + dy * t);
+                    let distance = ((px - closest_x).powi(2) + (py - closest_y).powi(2)).sqrt();
+                    if distance > radius {
+                        continue;
+                    }
+                    let falloff = (1.0 - (distance / radius).powi(2)).powi(2);
+                    let index = (y as usize) * (width as usize) + (x as usize);
+                    field[index][0] += push.0 * amount * falloff;
+                    field[index][1] += push.1 * amount * falloff;
+                }
+            }
+        }
+    }
+    let raw = image.as_raw().clone();
+    let stride = (width as usize) * 4;
+    let rows: Vec<Vec<u8>> = (0..height as usize)
+        .into_par_iter()
+        .map(|y| {
+            let mut row = vec![0u8; stride];
+            for x in 0..width as usize {
+                let index = y * width as usize + x;
+                let (sx, sy) = (
+                    x as f32 + 0.5 - field[index][0],
+                    y as f32 + 0.5 - field[index][1],
+                );
+                for channel in 0..4 {
+                    row[x * 4 + channel] = sample(&raw, width, height, sx - 0.5, sy - 0.5, channel);
+                }
+            }
+            row
+        })
+        .collect();
+    let flat: Vec<u8> = rows.into_iter().flatten().collect();
+    image::RgbaImage::from_raw(width, height, flat).unwrap_or_else(|| image.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,5 +1336,53 @@ mod tests {
         assert!(moved > 100, "瘦身应改变腰腹边缘（移动 {moved}）");
         // 头部区域不动。
         assert_eq!(image.get_pixel(100, 60).0, out.get_pixel(100, 60).0);
+    }
+
+    #[test]
+    fn spot_heal_removes_dark_dot_and_leaves_far_pixels() {
+        let mut image = image::RgbaImage::from_pixel(64, 64, image::Rgba([200, 170, 150, 255]));
+        for y in 30..34 {
+            for x in 30..34 {
+                image.put_pixel(x, y, image::Rgba([110, 80, 70, 255]));
+            }
+        }
+        let reference = image.clone();
+        spot_heal(&mut image, 32.0, 32.0, 5.0, 1.0);
+        let center = image.get_pixel(32, 32).0[0] as i32;
+        assert!((center - 200).abs() < 25, "痘点应被周围颜色盖住：{center}");
+        assert_eq!(
+            image.get_pixel(5, 5).0,
+            reference.get_pixel(5, 5).0,
+            "远处像素不动"
+        );
+    }
+
+    #[test]
+    fn liquify_pushes_pixels_along_stroke() {
+        let image = image::RgbaImage::from_fn(120, 120, |x, y| {
+            let value = if (x / 4 + y / 4) % 2 == 0 { 60 } else { 200 };
+            image::Rgba([value, value, value, 255])
+        });
+        let stroke = LiquifyStroke {
+            points: vec![[0.5, 0.4], [0.65, 0.4]],
+            radius: 0.15,
+            strength: 0.9,
+        };
+        let out = liquify(&image, &[stroke]);
+        assert_eq!(out.dimensions(), image.dimensions());
+        let mut moved = 0usize;
+        for y in 40..60 {
+            for x in 70..95 {
+                if image.get_pixel(x, y).0[0] != out.get_pixel(x, y).0[0] {
+                    moved += 1;
+                }
+            }
+        }
+        assert!(moved > 100, "液化应改变笔画前方像素（移动 {moved}）");
+        // 远处不动。
+        assert_eq!(image.get_pixel(5, 5).0, out.get_pixel(5, 5).0);
+        // 空笔画 = 原样。
+        let same = liquify(&image, &[]);
+        assert_eq!(same.as_raw(), image.as_raw());
     }
 }

@@ -24,7 +24,21 @@
 | 任务 | 模型 | 文件 | 说明 |
 | --- | --- | --- | --- |
 | 五官关键点 | MediaPipe FaceMesh v2（478 点） | `face_landmarks_mediapipe_v2_fp32.onnx`（4.9 MB，Apache-2.0） | 256×256 NHWC，`(x−127.5)/127.5`；输出 478×3 + 人脸置信度 |
-| 皮肤 / 人像 / 人脸蒙版 | 复用智能蒙版模型 | SCRFD / MODNet / BiSeNet / U²-Net | 同一个 `MaskPipeline`，按图像缓存 |
+| 人脸解析 19 类 | **自转 BiSeNet-19**（MIT，见 `packaging/models/`） | `face_parsing_bisenet19_fp32.onnx`（50.7 MB，512²，zllrunning 类别顺序写在 `class_map`） | 皮肤 / 五官 / 头发；类别语义经与旧模型交叉 IoU 验证 |
+| 人像分割 | **iOS：Vision 人像分割**（0 MB，ANE）；ONNX 侧 MODNet 可选（跨端一致时随包） | — | Vision α 经 `fdxmp_retouch_submit_person_mask` 提交，按图像指纹绑定 |
+
+## 手动修图工具（v1.5.1 新增）
+
+修图 Tab 分三个子模式：
+
+- **美颜**：一键修图 + 手动预设（自然 / 精致 / 质感 / 清透，即"一键美颜"）+ 参数滑杆；
+- **污点**：手动祛痘笔——点按 / 轻拖瑕疵处，核心用环形中位数把瑕疵盖住（`fdxmp_heal_apply`，
+  纯算法）；支持撤销上一个 / 清空；
+- **液化**：拖动推挤像素（`fdxmp_liquify_apply`，位移场逆映射 + 双线性采样，纯算法）；
+  半径 / 强度可调，笔画可撤销。
+
+手动工具链：`原图 → 污点修复 → 液化 → 修图参数（磨皮等）→ 显示/导出`，
+撤销按"重建链条"实现（点列表 / 笔画列表重放）。
 
 关键点映射：SCRFD 检出 → ArcFace 5 点对齐 → FaceMesh 跑对齐裁剪 → 仿射逆变换回原图坐标。
 模型随 IPA 打包（CI `shasum` 校验），加载前核心再校验一次 SHA-256；

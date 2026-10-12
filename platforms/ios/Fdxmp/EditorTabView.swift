@@ -10,6 +10,9 @@ struct EditorTabView: View {
     let asset: PHAsset?
     /// 当前项目（nil = 设备单张模式：不显示同步、不做左右切换、不自动基础调色）。
     var project: Project?
+    /// 相册式左右滑动的邻居预览（设备 / 项目队列里的前一张 / 后一张）。
+    var prevAsset: PHAsset?
+    var nextAsset: PHAsset?
     /// 返回回调（退出编辑会话，回到来源页面）。
     var onClose: () -> Void = {}
     /// 未放大时左右滑动切图：上一张 / 下一张（队列与边界由父层提供）。
@@ -55,6 +58,11 @@ struct EditorTabView: View {
     @AppStorage("fdxmp_hsl_style") private var hslStyle = "dots"
     /// 预览区尺寸（用于按视口取放大细节帧分辨率）。
     @State private var previewAreaSize: CGSize = .zero
+    /// 相册式左右滑动：内容偏移（手指跟随 / 回弹）。
+    @State private var swipeOffset: CGFloat = 0
+    @State private var swipeAnimating = false
+    /// 相邻照片的低清预览（滑动手感像系统图库）。
+    @State private var neighborImages: [String: UIImage] = [:]
 
     @Environment(\.displayScale) private var displayScale
 
@@ -86,7 +94,11 @@ struct EditorTabView: View {
             immersive = false
             model.clearDetailPreview()
             loadIfNeeded()
+            prefetchNeighbors()
+            swipeOffset = 0
         }
+        .onChange(of: prevAsset?.localIdentifier) { _ in prefetchNeighbors() }
+        .onChange(of: nextAsset?.localIdentifier) { _ in prefetchNeighbors() }
         .onChange(of: model.tool) { _ in
             resetZoom()
             model.clearDetailPreview()
@@ -190,6 +202,38 @@ struct EditorTabView: View {
     private func loadIfNeeded() {
         guard let asset else { return }
         model.load(asset: asset)
+    }
+
+    /// 预取相邻照片的低清预览（相册式滑动时随手指滑入）。
+    private func prefetchNeighbors() {
+        for neighbor in [prevAsset, nextAsset].compactMap({ $0 }) {
+            let id = neighbor.localIdentifier
+            if neighborImages[id] != nil { continue }
+            let options = PHImageRequestOptions()
+            options.deliveryMode = .fastFormat
+            options.resizeMode = .fast
+            options.isNetworkAccessAllowed = true
+            let target = CGSize(width: 1024, height: 1024)
+            PHImageManager.default().requestImage(
+                for: neighbor,
+                targetSize: target,
+                contentMode: .aspectFit,
+                options: options
+            ) { image, _ in
+                guard let image else { return }
+                DispatchQueue.main.async {
+                    neighborImages[id] = image
+                    if neighborImages.count > 8 {
+                        // 只留最近用到的几张（避免缓存无限涨）。
+                        let keep = Set(
+                            [prevAsset, nextAsset, asset]
+                                .compactMap { $0?.localIdentifier }
+                        )
+                        neighborImages = neighborImages.filter { keep.contains($0.key) }
+                    }
+                }
+            }
+        }
     }
 
     /// 按当前缩放 / 视口请求"够用"的高分辨率细节帧（缩到 1x 时释放）。
@@ -367,13 +411,42 @@ struct EditorTabView: View {
                 .foregroundStyle(.secondary)
             }
             Spacer()
-            // 项目内：一键同步（调色 / 修图 / 两者）；设备单张编辑不显示。
-            if model.project != nil {
-                Menu {
+            // 修图 / 调色一键切换。
+            Button {
+                Haptics.tick()
+                if model.tool == .retouch {
+                    model.selectTool(.edit)
+                } else {
+                    model.selectTool(.retouch)
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: model.tool == .retouch ? "wand.and.rays" : "slider.horizontal.3")
+                        .font(.caption)
+                    Text(model.tool == .retouch ? "修图" : "调色")
+                        .font(.caption.weight(.semibold))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    Capsule().fill(Color.accentColor.opacity(0.22))
+                )
+                .foregroundStyle(Color.accentColor)
+            }
+            .accessibilityLabel("切换修图 / 调色")
+            // 更多：导出 / 同步 / 重置。
+            Menu {
+                Button {
+                    model.export()
+                } label: {
+                    Label("导出", systemImage: "square.and.arrow.up")
+                }
+                if model.project != nil {
+                    Divider()
                     Button {
                         model.syncEdits(scope: .all)
                     } label: {
-                        Label("同步调色 + 修图", systemImage: "square.on.square")
+                        Label("同步到项目照片（调色 + 修图）", systemImage: "square.on.square")
                     }
                     Button {
                         model.syncEdits(scope: .retouchOnly)
@@ -385,12 +458,18 @@ struct EditorTabView: View {
                     } label: {
                         Label("仅同步调色", systemImage: "slider.horizontal.3")
                     }
-                } label: {
-                    Image(systemName: "square.on.square.intersection.dashed")
-                        .foregroundStyle(Color.accentColor)
                 }
-                .accessibilityLabel("同步到项目内照片")
+                Divider()
+                Button(role: .destructive) {
+                    model.resetAll()
+                } label: {
+                    Label("重置全部编辑", systemImage: "arrow.counterclockwise")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+                    .font(.body)
             }
+            .accessibilityLabel("更多（导出 / 同步 / 重置）")
             Button {
                 guard Date() >= suppressUndoTapUntil else { return }
                 model.undo()
@@ -433,24 +512,12 @@ struct EditorTabView: View {
                         compareSplit == nil ? Color.white.opacity(0.9) : Color.accentColor
                     )
             }
-            Button {
-                model.resetAll()
-            } label: {
-                Text("重置")
-                    .font(.caption)
+            // 导出进度（导出入口在「•••」菜单里）。
+            if let progress = model.exportProgress {
+                Text("\(Int(progress * 100))%")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(Color.accentColor)
             }
-            Button {
-                model.export()
-            } label: {
-                if let progress = model.exportProgress {
-                    Text("\(Int(progress * 100))%")
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(Color.accentColor)
-                } else {
-                    Image(systemName: "square.and.arrow.up")
-                }
-            }
-            .disabled(model.isExporting || model.previewImage == nil)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -523,6 +590,31 @@ struct EditorTabView: View {
     private func previewBody(geo: GeometryProxy) -> some View {
         ZStack {
             Color.black
+            // 相册式左右滑动：两侧邻居照片随手指滑入（低清预览，加载完成后替换）。
+            if swipeOffset > 1,
+               let prev = prevAsset,
+               let image = neighborImages[prev.localIdentifier]
+            {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
+                    .offset(x: swipeOffset - geo.size.width)
+                    .allowsHitTesting(false)
+            }
+            if swipeOffset < -1,
+               let next = nextAsset,
+               let image = neighborImages[next.localIdentifier]
+            {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: geo.size.width, height: geo.size.height)
+                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
+                    .offset(x: swipeOffset + geo.size.width)
+                    .allowsHitTesting(false)
+            }
             if let split = compareSplit, let before = model.beforeImage, let edited = shownImage {
                 // 对比模式：左「调色前」/ 右「调色后」，分割线可拖。
                 Image(uiImage: before)
@@ -581,7 +673,8 @@ struct EditorTabView: View {
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
                 .scaleEffect(zoom)
-                .offset(pan)
+                // 手指跟随时整块内容平移（相册式滑动）。
+                .offset(x: pan.width + (zoom <= 1.01 ? swipeOffset : 0), y: pan.height)
             } else if model.isLoading {
                 VStack(spacing: 10) {
                     ProgressView()
@@ -643,6 +736,16 @@ struct EditorTabView: View {
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
             }
+            // 修图手动工具（污点修复 / 液化）：点按 / 拖动直接作用在图上。
+            if model.tool == .retouch, model.retouchMode != .beauty {
+                RetouchTouchLayer(
+                    model: model,
+                    imageSize: previewImageSize,
+                    viewSize: geo.size,
+                    zoom: zoom,
+                    pan: pan
+                )
+            }
             // 曲线：正方形透明编辑区直接叠在图片上（无背景板）。
             if model.tool == .edit && model.category == .curves {
                 CurveOverlay(model: model, viewSize: geo.size) { active in
@@ -698,7 +801,8 @@ struct EditorTabView: View {
             .onChanged { value in
                 guard overlayEnabled else { return }
                 lastPinchAt = Date()
-                zoom = (baseZoom * value).clamped(to: 1...6)
+                // 放到"能看到毛孔"的倍率（1:1 之上继续放大，细节帧按区域渲染）。
+                zoom = (baseZoom * value).clamped(to: 1...24)
             }
             .onEnded { _ in
                 guard overlayEnabled else { return }
@@ -713,22 +817,77 @@ struct EditorTabView: View {
                     compareSplit = (value.location.x / max(viewWidth, 1)).clamped(to: 0.05...0.95)
                     return
                 }
-                guard overlayEnabled, zoom > 1 else { return }
-                pan = CGSize(
-                    width: basePan.width + value.translation.width,
-                    height: basePan.height + value.translation.height
-                )
+                guard overlayEnabled else { return }
+                if zoom > 1 {
+                    pan = CGSize(
+                        width: basePan.width + value.translation.width,
+                        height: basePan.height + value.translation.height
+                    )
+                    return
+                }
+                // 图库式左右滑动：内容跟着手指走，边缘带阻尼。
+                var offset = value.translation.width
+                if (offset > 0 && !canSwipePrev) || (offset < 0 && !canSwipeNext) {
+                    offset *= 0.28
+                }
+                swipeOffset = offset
             }
             .onEnded { value in
                 if zoom > 1 {
                     basePan = pan
                     return
                 }
-                // 未放大时：左右滑动切上一张 / 下一张照片。
                 guard overlayEnabled, compareSplit == nil else { return }
-                handleSwipeToSwitch(value.translation)
+                endSwipe(value)
             }
         return SimultaneousGesture(magnify, drag)
+    }
+
+    /// 松手收尾：过半 / 快速甩动 → 切图（回弹动画），否则弹回原位。
+    private func endSwipe(_ value: DragGesture.Value) {
+        guard !swipeAnimating else { return }
+        let translation = value.translation
+        guard abs(translation.width) >= abs(translation.height) * 1.2 else {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                swipeOffset = 0
+            }
+            return
+        }
+        guard Date().timeIntervalSince(lastPinchAt) > 0.35 else {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                swipeOffset = 0
+            }
+            return
+        }
+        let width = max(previewAreaSize.width, 1)
+        let velocity = value.predictedEndTranslation.width - translation.width
+        let forward = translation.width < 0
+        let commit = abs(translation.width) > width * 0.2 || abs(velocity) > 650
+        if commit, forward ? canSwipeNext : canSwipePrev {
+            let direction: CGFloat = forward ? -1 : 1
+            swipeAnimating = true
+            Haptics.light()
+            withAnimation(.easeOut(duration: 0.2)) {
+                swipeOffset = direction * width
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
+                if forward {
+                    onSwipeNext()
+                } else {
+                    onSwipePrev()
+                }
+                // 新照片从另一侧滑入。
+                swipeOffset = -direction * width * 0.3
+                withAnimation(.easeOut(duration: 0.18)) {
+                    swipeOffset = 0
+                }
+                swipeAnimating = false
+            }
+        } else {
+            withAnimation(.spring(response: 0.3, dampingFraction: 0.86)) {
+                swipeOffset = 0
+            }
+        }
     }
 
     /// 未放大时的左右滑动切图：横向位移要足够大且明显占主导；

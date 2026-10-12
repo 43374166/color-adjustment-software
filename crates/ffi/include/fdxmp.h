@@ -209,6 +209,38 @@ uint8_t *fdxmp_retouch_apply(const char *params_json,
                              uint32_t *out_height,
                              size_t *out_len);
 
+/* 提交平台人像蒙版（iOS Vision 人像分割 α，f32 0..1）：MODNet 不随包时补位；
+ * 与图像内容绑定，换图自动失效。返回 0 = 成功。 */
+int32_t fdxmp_retouch_submit_person_mask(const uint8_t *rgba,
+                                         uint32_t width,
+                                         uint32_t height,
+                                         const float *plane,
+                                         uint32_t plane_width,
+                                         uint32_t plane_height);
+
+/* 污点修复（手动祛痘笔）：x / y 归一化，radius 像素，strength 0..1；纯算法。
+ * 返回「8 字节大端宽高 + RGBA8」，用 fdxmp_bytes_free 释放；失败返回 NULL。 */
+uint8_t *fdxmp_heal_apply(const uint8_t *rgba,
+                          uint32_t width,
+                          uint32_t height,
+                          float x,
+                          float y,
+                          float radius,
+                          float strength,
+                          uint32_t *out_width,
+                          uint32_t *out_height,
+                          size_t *out_len);
+
+/* 液化：[{"points":[[x,y],...],"radius":0.06,"strength":0.8}, ...]；纯算法。
+ * 返回格式同上；失败返回 NULL。 */
+uint8_t *fdxmp_liquify_apply(const uint8_t *rgba,
+                             uint32_t width,
+                             uint32_t height,
+                             const char *strokes_json,
+                             uint32_t *out_width,
+                             uint32_t *out_height,
+                             size_t *out_len);
+
 /* ---- GPU 预览会话（Metal / DX12 / Vulkan；iOS 以 `--features gpu` 构建启用）----
  *
  * 移动端实时预览：源图只上传一次，参数变化时重渲染并回读 RGBA8。

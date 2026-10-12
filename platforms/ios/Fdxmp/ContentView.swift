@@ -46,6 +46,8 @@ struct ContentView: View {
                     EditorTabView(
                         asset: asset,
                         project: editProject,
+                        prevAsset: neighborAsset(offset: -1),
+                        nextAsset: neighborAsset(offset: 1),
                         onClose: { closeEditor() },
                         onSwipePrev: { stepEditor(by: -1) },
                         onSwipeNext: { stepEditor(by: 1) },
@@ -58,8 +60,8 @@ struct ContentView: View {
                         onOpen: { asset, queue in
                             openEditor(asset: asset, queue: queue, origin: .edit)
                         },
-                        onOpenProject: { project, assets in
-                            openProject(project, assets: assets)
+                        onOpenProject: { project, assets, startAt in
+                            openProject(project, assets: assets, startAt: startAt)
                         }
                     )
                     .toolbar(.visible, for: .tabBar)
@@ -94,6 +96,14 @@ struct ContentView: View {
         return index + 1 < editQueue.count
     }
 
+    /// 当前照片在队列中的前 / 后邻居（相册式滑动的预览用）。
+    private func neighborAsset(offset: Int) -> PHAsset? {
+        guard let index = editIndex else { return nil }
+        let target = index + offset
+        guard editQueue.indices.contains(target) else { return nil }
+        return editQueue[target]
+    }
+
     /// 打开编辑会话：带上当前列表（设备页网格 / 列表 / 全屏预览、最近编辑列表）。
     private func openEditor(asset: PHAsset, queue: [PHAsset], origin: Tab) {
         withAnimation(.easeInOut(duration: 0.25)) {
@@ -106,8 +116,8 @@ struct ContentView: View {
     }
 
     /// 打开项目编辑会话（队列 = 项目内照片，可左右切换 / 一键同步）。
-    private func openProject(_ project: Project, assets: [PHAsset]) {
-        guard let first = assets.first else { return }
+    private func openProject(_ project: Project, assets: [PHAsset], startAt: PHAsset? = nil) {
+        guard let first = startAt ?? assets.first else { return }
         withAnimation(.easeInOut(duration: 0.25)) {
             editAsset = first
             editQueue = assets

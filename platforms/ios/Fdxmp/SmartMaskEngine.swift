@@ -113,6 +113,36 @@ enum SmartMaskEngine {
 
     // MARK: - 人脸关键点（面部 / 皮肤 / 五官）
 
+    /// 人像分割 α → f32 平面（供核心「平台人像蒙版」用；MODNet 不随包时补位）。
+    ///
+    /// 与 `personMask` 同一条 Vision 路径，但直接返回平面数据（不经过多边形/位图）。
+    static func personMaskPlane(
+        cgImage: CGImage,
+        buffer: RgbaBuffer
+    ) -> (data: [Float], width: Int, height: Int)? {
+        let request = VNGeneratePersonSegmentationRequest()
+        request.qualityLevel = .accurate
+        request.outputPixelFormat = kCVPixelFormatType_OneComponent8
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        do {
+            try handler.perform([request])
+        } catch {
+            return nil
+        }
+        guard let observation = request.results?.first,
+              let outcome = pixelBufferToPlane(
+                  observation.pixelBuffer,
+                  targetWidth: buffer.width,
+                  targetHeight: buffer.height
+              ),
+              case let .plane(width, height, data) = outcome
+        else {
+            return nil
+        }
+        guard width > 0, height > 0 else { return nil }
+        return (data, width, height)
+    }
+
     private static func facePartMask(kind: MaskKindUi, cgImage: CGImage) throws -> Outcome {
         let request = VNDetectFaceLandmarksRequest()
         let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
@@ -218,7 +248,7 @@ enum SmartMaskEngine {
     }
 
     /// RGBA8 缓冲 → CGImage（与渲染用的同一缓冲，坐标一一对应）。
-    private static func makeCGImage(buffer: RgbaBuffer) -> CGImage? {
+    static func makeCGImage(buffer: RgbaBuffer) -> CGImage? {
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let data = Data(buffer.pixels)
         guard let provider = CGDataProvider(data: data as CFData) else { return nil }

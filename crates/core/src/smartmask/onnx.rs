@@ -25,9 +25,9 @@ use crate::smartmask::traits::{
 /// 一组加载完成的 ONNX 阶段（四个模型）。
 pub struct OnnxStages {
     detector: Arc<ScrfdDetector>,
-    segmenter: Arc<ModnetSegmenter>,
+    segmenter: Option<Arc<ModnetSegmenter>>,
     parser: Arc<BiseNetParser>,
-    matting: Arc<U2NetMatting>,
+    matting: Option<Arc<U2NetMatting>>,
     landmarks: Option<Arc<FaceMeshLandmarks>>,
 }
 
@@ -35,24 +35,40 @@ impl OnnxStages {
     /// 按注册表加载并校验（SHA-256）全部模型。
     pub fn load(registry: &ModelRegistry) -> Result<Self> {
         let detector = ScrfdDetector::load(registry)?;
-        let segmenter = ModnetSegmenter::load(registry)?;
         let parser = BiseNetParser::load(registry)?;
-        let matting = U2NetMatting::load(registry)?;
+        // 人像 / 抠图模型可选：iOS 用人像分割走 Vision，不随包 MODNet；
+        // 缺失时只退化「人像 / 身体」相关路径，人脸路径不受影响。
+        let available = |task: ModelTask| {
+            registry
+                .spec_for(task)
+                .map(|spec| registry.path_of(spec).is_file())
+                .unwrap_or(false)
+        };
+        let segmenter = if available(ModelTask::PersonCoarse) {
+            ModnetSegmenter::load(registry).ok().map(Arc::new)
+        } else {
+            None
+        };
+        let matting = if available(ModelTask::PersonMatting) {
+            U2NetMatting::load(registry).ok().map(Arc::new)
+        } else {
+            None
+        };
+        if segmenter.is_none() && matting.is_none() {
+            // 两个都缺：仍可用（人脸路径 + 平台人像蒙版），但要能看见原因。
+            eprintln!("[smartmask] 未随包人像 / 抠图模型，人像路径由平台实现提供");
+        }
         // 关键点模型可选：缺失（老用户未下载）时不影响蒙版流水线。
-        let landmarks = if registry
-            .spec_for(ModelTask::FaceLandmarks)
-            .map(|spec| registry.path_of(spec).is_file())
-            .unwrap_or(false)
-        {
+        let landmarks = if available(ModelTask::FaceLandmarks) {
             FaceMeshLandmarks::load(registry).ok().map(Arc::new)
         } else {
             None
         };
         Ok(Self {
             detector: Arc::new(detector),
-            segmenter: Arc::new(segmenter),
+            segmenter,
             parser: Arc::new(parser),
-            matting: Arc::new(matting),
+            matting,
             landmarks,
         })
     }
@@ -63,8 +79,10 @@ impl OnnxStages {
     }
 
     /// 第一阶段人像粗分割。
-    pub fn segmenter(&self) -> Arc<dyn Stage1PersonSegmenter> {
-        self.segmenter.clone()
+    pub fn segmenter(&self) -> Option<Arc<dyn Stage1PersonSegmenter>> {
+        self.segmenter
+            .clone()
+            .map(|segmenter| segmenter as Arc<dyn Stage1PersonSegmenter>)
     }
 
     /// 第二阶段人脸解析。
@@ -73,8 +91,10 @@ impl OnnxStages {
     }
 
     /// 第二阶段精细抠图。
-    pub fn matting(&self) -> Arc<dyn Stage2PersonMatting> {
-        self.matting.clone()
+    pub fn matting(&self) -> Option<Arc<dyn Stage2PersonMatting>> {
+        self.matting
+            .clone()
+            .map(|matting| matting as Arc<dyn Stage2PersonMatting>)
     }
 
     /// 第二阶段人脸关键点（可选；未随包时返回 None）。
@@ -90,7 +110,7 @@ impl OnnxStages {
             self.detector(),
             self.segmenter(),
             Some(self.parser()),
-            Some(self.matting()),
+            self.matting(),
             None,
             crate::smartmask::pipeline::PipelineConfig::default(),
         )
@@ -456,19 +476,56 @@ impl BiseNetParser {
     }
 }
 
-/// 19 类标签 → 标准蒙版类型（None = 不属于该类型）。
-fn face_label_kind(label: usize) -> Option<SmartMaskKind> {
-    match label {
-        1 => Some(SmartMaskKind::Skin),
-        2 => Some(SmartMaskKind::Nose),
-        4 | 5 => Some(SmartMaskKind::Eyes),
-        6 | 7 => Some(SmartMaskKind::Eyebrows),
-        8 | 9 | 15 => Some(SmartMaskKind::Ears),
-        10 => Some(SmartMaskKind::Teeth),
-        11 | 12 => Some(SmartMaskKind::Lips),
-        13 => Some(SmartMaskKind::Hair),
-        _ => None,
+/// 由 `ModelSpec.postprocess.class_map` 构建「类别下标 → 标准蒙版类型」查询表。
+///
+/// 换模型（类别顺序不同）只改配置；映射缺省时回退到 CelebAMask-HQ 标准顺序。
+fn label_kind_table(spec: &ModelSpec) -> Vec<Option<SmartMaskKind>> {
+    let mut table = vec![None; 19];
+    let mut apply = |name: &str, kind: SmartMaskKind| {
+        if let Some(labels) = spec.postprocess.class_map.get(name) {
+            for label in labels {
+                if let Some(slot) = table.get_mut(*label) {
+                    *slot = Some(kind);
+                }
+            }
+        }
+    };
+    apply("skin", SmartMaskKind::Skin);
+    apply("nose", SmartMaskKind::Nose);
+    apply("eyes", SmartMaskKind::Eyes);
+    apply("eyebrows", SmartMaskKind::Eyebrows);
+    apply("ears", SmartMaskKind::Ears);
+    apply("teeth", SmartMaskKind::Teeth);
+    apply("lips", SmartMaskKind::Lips);
+    apply("hair", SmartMaskKind::Hair);
+    apply("clothes", SmartMaskKind::Clothes);
+    if table.iter().all(Option::is_none) {
+        // 缺省：CelebAMask-HQ 标准顺序（0 背景、1 皮肤、2 鼻、3 眼镜、4/5 眼、6/7 眉、
+        // 8/9 耳、10 嘴、11/12 唇、13 发、14 帽、15 耳环、16/17 脖子、18 衣服）。
+        table[1] = Some(SmartMaskKind::Skin);
+        table[2] = Some(SmartMaskKind::Nose);
+        table[4] = Some(SmartMaskKind::Eyes);
+        table[5] = Some(SmartMaskKind::Eyes);
+        table[6] = Some(SmartMaskKind::Eyebrows);
+        table[7] = Some(SmartMaskKind::Eyebrows);
+        table[8] = Some(SmartMaskKind::Ears);
+        table[9] = Some(SmartMaskKind::Ears);
+        table[10] = Some(SmartMaskKind::Teeth);
+        table[11] = Some(SmartMaskKind::Lips);
+        table[12] = Some(SmartMaskKind::Lips);
+        table[13] = Some(SmartMaskKind::Hair);
+        table[15] = Some(SmartMaskKind::Ears);
+        table[18] = Some(SmartMaskKind::Clothes);
     }
+    table
+}
+
+/// 该类别是否属于「面部」（Face 蒙版 = 皮肤 + 五官；配置了 `face` 就用配置）。
+fn label_is_face(spec: &ModelSpec, label: usize) -> bool {
+    if let Some(labels) = spec.postprocess.class_map.get("face") {
+        return labels.contains(&label);
+    }
+    matches!(label, 1 | 2 | 4 | 5 | 6 | 7 | 10 | 11 | 12)
 }
 
 impl Stage2FaceParser for BiseNetParser {
@@ -516,6 +573,7 @@ impl Stage2FaceParser for BiseNetParser {
         let mask_width = aligned_face.width().max(1);
         let mask_height = aligned_face.height().max(1);
         let mut result = FaceParseResult::empty();
+        let table = label_kind_table(&self.spec);
         let kinds = [
             SmartMaskKind::Skin,
             SmartMaskKind::Nose,
@@ -525,18 +583,19 @@ impl Stage2FaceParser for BiseNetParser {
             SmartMaskKind::Teeth,
             SmartMaskKind::Lips,
             SmartMaskKind::Hair,
+            SmartMaskKind::Clothes,
         ];
         for kind in kinds {
             let mut plane = vec![0.0f32; pixels];
             for (index, label) in labels.iter().enumerate() {
-                if face_label_kind(*label) == Some(kind) {
+                if table.get(*label).copied().flatten() == Some(kind) {
                     plane[index] = 1.0;
                 }
             }
             // Face = 皮肤 + 五官（不含头发 / 衣服 / 背景）。
             if kind == SmartMaskKind::Skin {
                 for (index, label) in labels.iter().enumerate() {
-                    if matches!(label, 1 | 2 | 4 | 5 | 6 | 7 | 10 | 11 | 12) {
+                    if label_is_face(&self.spec, *label) {
                         plane[index] = 1.0;
                     }
                 }
@@ -568,6 +627,7 @@ impl Stage2FaceParser for BiseNetParser {
                 SmartMaskKind::Lips => result.lips = Some(mask),
                 SmartMaskKind::Hair => result.hair = Some(mask),
                 SmartMaskKind::Ears => result.extra.push((SmartMaskKind::Ears, mask)),
+                SmartMaskKind::Clothes => result.extra.push((SmartMaskKind::Clothes, mask)),
                 _ => {}
             }
         }

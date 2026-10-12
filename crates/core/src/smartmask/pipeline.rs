@@ -73,7 +73,8 @@ impl MaskSet {
 /// 双阶段蒙版流水线（组件全部可替换；模型缺失时用 Mock 或平台实现接入）。
 pub struct MaskPipeline {
     detector: Arc<dyn Stage1FaceDetector>,
-    segmenter: Arc<dyn Stage1PersonSegmenter>,
+    /// 人像粗分割（可选：iOS 上人像走 Vision，缺模型时只退化人像路径）。
+    segmenter: Option<Arc<dyn Stage1PersonSegmenter>>,
     parser: Option<Arc<dyn Stage2FaceParser>>,
     matting: Option<Arc<dyn Stage2PersonMatting>>,
     refiner: Option<Arc<dyn MaskRefiner>>,
@@ -85,7 +86,7 @@ impl MaskPipeline {
     /// 组装流水线（第二阶段可缺省：缺省时只出人像 / 主体蒙版）。
     pub fn new(
         detector: Arc<dyn Stage1FaceDetector>,
-        segmenter: Arc<dyn Stage1PersonSegmenter>,
+        segmenter: Option<Arc<dyn Stage1PersonSegmenter>>,
         parser: Option<Arc<dyn Stage2FaceParser>>,
         matting: Option<Arc<dyn Stage2PersonMatting>>,
         refiner: Option<Arc<dyn MaskRefiner>>,
@@ -109,7 +110,7 @@ impl MaskPipeline {
         };
         Self::new(
             Arc::new(MockFaceDetector { face_present }),
-            Arc::new(MockPersonSegmenter),
+            Some(Arc::new(MockPersonSegmenter)),
             Some(Arc::new(MockFaceParser)),
             Some(Arc::new(MockPersonMatting)),
             Some(Arc::new(MockRefiner)),
@@ -127,7 +128,10 @@ impl MaskPipeline {
         format!(
             "detect:{};coarse:{};parse:{};matting:{};refine:{}",
             self.detector.version_id(),
-            self.segmenter.version_id(),
+            self.segmenter
+                .as_ref()
+                .map(|segmenter| segmenter.version_id())
+                .unwrap_or_else(|| "-".to_string()),
             self.parser
                 .as_ref()
                 .map(|parser| parser.version_id())
@@ -212,7 +216,10 @@ impl MaskPipeline {
         // 第一阶段：人脸检测 + 人像粗分割，并行（只负责「看哪里」）。
         let (faces_result, coarse_result) = rayon::join(
             || self.detector.detect(image),
-            || self.segmenter.segment_coarse(image),
+            || match self.segmenter.as_ref() {
+                Some(segmenter) => segmenter.segment_coarse(image).map(Some),
+                None => Ok(None),
+            },
         );
         let faces = match faces_result {
             Ok(mut faces) => {
@@ -226,7 +233,7 @@ impl MaskPipeline {
             }
             Err(_) => Vec::new(),
         };
-        let coarse = coarse_result.ok();
+        let coarse = coarse_result.ok().flatten();
         if coarse.is_none() && faces.is_empty() {
             return Err(FdxmpError::Unsupported(
                 "双阶段推理失败：人脸检测与人像粗分割都不可用".to_string(),

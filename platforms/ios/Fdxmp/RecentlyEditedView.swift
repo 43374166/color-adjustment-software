@@ -5,11 +5,13 @@ import SwiftUI
 struct RecentlyEditedView: View {
     /// 打开编辑页：照片 + 整个最近编辑列表（编辑页内可左右滑动切上一张 / 下一张）。
     let onOpen: (PHAsset, [PHAsset]) -> Void
-    /// 打开项目（照片队列 = 项目内照片）。
-    var onOpenProject: (Project, [PHAsset]) -> Void = { _, _ in }
+    /// 打开项目（照片队列 = 项目内照片；startAt = 从哪张开始）。
+    var onOpenProject: (Project, [PHAsset], PHAsset) -> Void = { _, _, _ in }
 
     @State private var entries: [RecentEntry] = []
     @State private var projects: [Project] = []
+    /// 展开的项目（点项目行展开 / 收起，展开后显示项目内照片）。
+    @State private var expandedProjects: Set<String> = []
     @State private var showPicker = false
     @State private var renameTarget: Project?
     @State private var renameText = ""
@@ -124,12 +126,20 @@ struct RecentlyEditedView: View {
                 .foregroundStyle(.secondary)
                 .padding(.leading, 2)
             ForEach(projects) { project in
+                let expanded = expandedProjects.contains(project.id)
+                let assets = ProjectStore.assets(for: project)
                 Button {
-                    let assets = ProjectStore.assets(for: project)
-                    guard !assets.isEmpty else { return }
-                    onOpenProject(project, assets)
+                    // 点项目行：展开 / 收起（看照片）；再点照片进入项目编辑。
+                    Haptics.tick()
+                    withAnimation(.easeInOut(duration: 0.22)) {
+                        if expanded {
+                            expandedProjects.remove(project.id)
+                        } else {
+                            expandedProjects.insert(project.id)
+                        }
+                    }
                 } label: {
-                    projectRow(project)
+                    projectRow(project, expanded: expanded)
                 }
                 .buttonStyle(.plain)
                 .contextMenu {
@@ -146,11 +156,29 @@ struct RecentlyEditedView: View {
                         Label("删除项目（照片保留在图库）", systemImage: "trash")
                     }
                 }
+                if expanded {
+                    // 项目内的照片比项目缩进一点（层级关系一眼可见）。
+                    ForEach(assets, id: \.localIdentifier) { photo in
+                        Button {
+                            onOpenProject(project, assets, photo)
+                        } label: {
+                            projectPhotoRow(photo)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.leading, 22)
+                    }
+                    if assets.isEmpty {
+                        Text("项目里的照片已从图库移除")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .padding(.leading, 24)
+                    }
+                }
             }
         }
     }
 
-    private func projectRow(_ project: Project) -> some View {
+    private func projectRow(_ project: Project, expanded: Bool) -> some View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
@@ -169,14 +197,38 @@ struct RecentlyEditedView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            // 箭头随展开 / 收起旋转。
             Image(systemName: "chevron.right")
                 .font(.caption)
                 .foregroundStyle(.tertiary)
+                .rotationEffect(.degrees(expanded ? 90 : 0))
         }
         .padding(10)
         .background(
             RoundedRectangle(cornerRadius: 10)
                 .fill(Color.white.opacity(0.06))
+        )
+        .animation(.easeInOut(duration: 0.22), value: expanded)
+    }
+
+    /// 项目内的照片行（缩进显示，点一下直接从这张进项目编辑）。
+    private func projectPhotoRow(_ asset: PHAsset) -> some View {
+        HStack(spacing: 10) {
+            RecentThumbnail(asset: asset)
+                .frame(width: 44, height: 44)
+            Text(asset.displayName)
+                .font(.footnote)
+                .lineLimit(1)
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(.vertical, 4)
+        .padding(.horizontal, 10)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.white.opacity(0.04))
         )
     }
 

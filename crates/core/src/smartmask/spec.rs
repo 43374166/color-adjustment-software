@@ -139,6 +139,11 @@ pub struct PostprocessSpec {
     pub mask_threshold: f32,
     /// 缩放回原图方式。
     pub resize: ResizeMode,
+    /// 分类模型的类别映射：标准蒙版类型名（`skin` / `nose` / `eyes` / `hair` …）→ 类别下标列表。
+    ///
+    /// 不同训练仓库的类别顺序不同（如 zllrunning face-parsing 与 CelebAMask-HQ 标准顺序
+    /// 就不一样），换模型只改这里，不需要动解析代码。
+    pub class_map: std::collections::BTreeMap<String, Vec<usize>>,
 }
 
 impl Default for PostprocessSpec {
@@ -149,6 +154,7 @@ impl Default for PostprocessSpec {
             nms_iou: 0.4,
             mask_threshold: 0.0,
             resize: ResizeMode::Bilinear,
+            class_map: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -490,6 +496,7 @@ impl ModelRegistry {
                     nms_iou: 0.4,
                     mask_threshold: 0.0,
                     resize: ResizeMode::Bilinear,
+                    ..PostprocessSpec::default()
                 },
                 provider: ExecutionProvider::Cpu,
                 precision: Precision::Fp32,
@@ -522,6 +529,7 @@ impl ModelRegistry {
                     nms_iou: 0.4,
                     mask_threshold: 0.0,
                     resize: ResizeMode::Bilinear,
+                    ..PostprocessSpec::default()
                 },
                 provider: ExecutionProvider::Cpu,
                 precision: Precision::Fp32,
@@ -533,10 +541,10 @@ impl ModelRegistry {
                 version: "1.0.0".to_string(),
             },
             ModelSpec {
-                name: "bisenet-face-parsing".to_string(),
+                name: "bisenet19-face-parsing".to_string(),
                 task: ModelTask::FaceParse,
-                path: "face_parsing_quantized.onnx".to_string(),
-                sha256: "5bab9bfb3cb979f3098ac3b934b1641dbf87f835e0b03c2ca6d88dcf18c83d27"
+                path: "face_parsing_bisenet19_fp32.onnx".to_string(),
+                sha256: "2453dcc1592590d1f9f7b064b3031c20f35bca74375445d23ab7f5ad3c38ea2f"
                     .to_string(),
                 input_size: (512, 512),
                 input_layout: InputLayout::Nchw,
@@ -544,7 +552,11 @@ impl ModelRegistry {
                 input_mean: [0.485, 0.456, 0.406],
                 input_std: [0.229, 0.224, 0.225],
                 input_scale: 1.0 / 255.0,
-                output_names: Vec::new(),
+                output_names: vec![
+                    "output".to_string(),
+                    "output16".to_string(),
+                    "output32".to_string(),
+                ],
                 output_shapes: vec![vec![1, 19, 512, 512]],
                 postprocess: PostprocessSpec {
                     activation: Activation::Softmax,
@@ -552,15 +564,38 @@ impl ModelRegistry {
                     nms_iou: 0.4,
                     mask_threshold: 0.0,
                     resize: ResizeMode::Nearest,
+                    // zllrunning face-parsing 的类别顺序（由跨模型 IoU 交叉比对确认）：
+                    // 0 背景 / 1 皮肤 / 2-3 眉 / 4-5 眼 / 6 眼镜 / 7-8 耳 / 9 耳环 /
+                    // 10 鼻 / 11 口腔（牙） / 12-13 上-下唇 / 14 脖子 / 15 项链 / 16 衣服 /
+                    // 17 头发 / 18 帽子。
+                    class_map: {
+                        let mut map = std::collections::BTreeMap::new();
+                        map.insert("skin".to_string(), vec![1]);
+                        map.insert("eyebrows".to_string(), vec![2, 3]);
+                        map.insert("eyes".to_string(), vec![4, 5]);
+                        map.insert("ears".to_string(), vec![7, 8, 9]);
+                        map.insert("nose".to_string(), vec![10]);
+                        map.insert("teeth".to_string(), vec![11]);
+                        map.insert("lips".to_string(), vec![12, 13]);
+                        map.insert("hair".to_string(), vec![17]);
+                        map.insert("clothes".to_string(), vec![16]);
+                        map.insert(
+                            "face".to_string(),
+                            vec![1, 2, 3, 4, 5, 6, 10, 11, 12, 13],
+                        );
+                        map
+                    },
                 },
                 provider: ExecutionProvider::Cpu,
-                precision: Precision::Int8,
+                precision: Precision::Fp32,
                 license: "MIT".to_string(),
                 source_url:
-                    "https://hf-mirror.com/Xenova/face-parsing/resolve/main/onnx/model_quantized.onnx"
+                    "https://hf-mirror.com/vivym/face-parsing-bisenet/resolve/main/79999_iter.pth"
                         .to_string(),
                 trainable: true,
-                training_repo: Some("https://github.com/zllrunning/face-parsing.PyTorch".to_string()),
+                training_repo: Some(
+                    "https://github.com/zllrunning/face-parsing.PyTorch".to_string(),
+                ),
                 version: "1.0.0".to_string(),
             },
             ModelSpec {
@@ -583,6 +618,7 @@ impl ModelRegistry {
                     nms_iou: 0.4,
                     mask_threshold: 0.0,
                     resize: ResizeMode::Bilinear,
+                    ..PostprocessSpec::default()
                 },
                 provider: ExecutionProvider::Cpu,
                 precision: Precision::Fp32,
@@ -618,6 +654,7 @@ impl ModelRegistry {
                     nms_iou: 0.4,
                     mask_threshold: 0.0,
                     resize: ResizeMode::Bilinear,
+                    ..PostprocessSpec::default()
                 },
                 provider: ExecutionProvider::Cpu,
                 precision: Precision::Fp32,

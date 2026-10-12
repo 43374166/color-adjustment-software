@@ -249,6 +249,75 @@ final class NativeCore {
         return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
     }
 
+    /// 提交平台人像蒙版（Vision 人像分割 α；MODNet 不随包时补位）。
+    @discardableResult
+    func retouchSubmitPersonMask(buffer: RgbaBuffer, plane: [Float], planeWidth: Int, planeHeight: Int) -> Bool {
+        let code = plane.withUnsafeBufferPointer { weights in
+            buffer.pixels.withUnsafeBufferPointer { pixels in
+                fdxmp_retouch_submit_person_mask(
+                    pixels.baseAddress,
+                    UInt32(buffer.width),
+                    UInt32(buffer.height),
+                    weights.baseAddress,
+                    UInt32(planeWidth),
+                    UInt32(planeHeight)
+                )
+            }
+        }
+        return code == 0
+    }
+
+    /// 污点修复（手动祛痘笔）：x / y 归一化、radius 像素；返回修好的缓冲。
+    func healApply(
+        buffer: RgbaBuffer,
+        x: Float,
+        y: Float,
+        radius: Float,
+        strength: Float
+    ) -> RgbaBuffer? {
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in
+            fdxmp_heal_apply(
+                pixels.baseAddress,
+                UInt32(buffer.width),
+                UInt32(buffer.height),
+                x,
+                y,
+                radius,
+                strength,
+                &outWidth,
+                &outHeight,
+                &outLen
+            )
+        }
+        guard let result = decodePayload(pointer: pointer, outLen: outLen) else { return nil }
+        return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
+    }
+
+    /// 液化：按笔画 JSON 推挤变形，返回处理后的缓冲。
+    func liquifyApply(buffer: RgbaBuffer, strokesJson: String) -> RgbaBuffer? {
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = strokesJson.withCString { strokes in
+            buffer.pixels.withUnsafeBufferPointer { pixels in
+                fdxmp_liquify_apply(
+                    pixels.baseAddress,
+                    UInt32(buffer.width),
+                    UInt32(buffer.height),
+                    strokes,
+                    &outWidth,
+                    &outHeight,
+                    &outLen
+                )
+            }
+        }
+        guard let result = decodePayload(pointer: pointer, outLen: outLen) else { return nil }
+        return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
+    }
+
     /// 智能蒙版模型清单与状态（JSON；macOS / 桌面端 ONNX 用，iOS 走 Vision）。
     func smartMaskModelsJson() -> String? {
         guard let pointer = fdxmp_smartmask_models_json() else { return nil }

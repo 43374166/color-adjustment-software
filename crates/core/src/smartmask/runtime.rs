@@ -203,6 +203,59 @@ fn retouch_session_cell() -> &'static Mutex<Option<RetouchSession>> {
     CELL.get_or_init(|| Mutex::new(None))
 }
 
+/// 平台人像蒙版（iOS Vision 人像分割）：按图像指纹缓存，补上不随包 MODNet 的缺口。
+fn platform_person_cell() -> &'static Mutex<Option<(u64, crate::retouch::MaskPlane)>> {
+    static CELL: OnceLock<Mutex<Option<(u64, crate::retouch::MaskPlane)>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// 提交平台人像蒙版（iOS：Vision 人像分割 α，与图像指纹绑定）。
+///
+/// `retouch_analyze` / 智能蒙版人像路径会在缺模型时自动取用；换图后自动失效。
+pub fn submit_platform_person_mask(
+    image: &Image,
+    plane_width: u32,
+    plane_height: u32,
+    weights: Vec<f32>,
+) -> std::result::Result<(), RuntimeError> {
+    let expected = (plane_width as usize).saturating_mul(plane_height as usize);
+    if plane_width == 0
+        || plane_height == 0
+        || plane_width > 4096
+        || plane_height > 4096
+        || weights.len() != expected
+        || weights.iter().any(|value| !value.is_finite())
+    {
+        return Err(RuntimeError::Failed(
+            "平台人像蒙版尺寸非法或包含非法数值".to_string(),
+        ));
+    }
+    let resized = crate::retouch::MaskPlane {
+        width: image.width().max(1),
+        height: image.height().max(1),
+        data: crate::smartmask::mask::resize_plane(
+            &weights,
+            plane_width,
+            plane_height,
+            image.width().max(1),
+            image.height().max(1),
+        ),
+    };
+    let mut guard = platform_person_cell()
+        .lock()
+        .map_err(|_| RuntimeError::Failed("平台人像蒙版锁失效".to_string()))?;
+    *guard = Some((fingerprint(image), resized));
+    Ok(())
+}
+
+/// 平台人像蒙版是否可用（UI 用来提示"身体塑形可用"）。
+pub fn platform_person_ready() -> bool {
+    platform_person_cell()
+        .lock()
+        .map(|guard| guard.is_some())
+        .unwrap_or(false)
+}
+
 /// 图像指纹（抽样；与图片内容绑定）。
 fn fingerprint(image: &Image) -> u64 {
     let raw = image.as_raw();
@@ -245,7 +298,28 @@ pub fn retouch_analyze(image: &Image) -> std::result::Result<RetouchAnalysis, Ru
     {
         masks.person = Some(crate::retouch::MaskPlane::from_smart(person, width, height));
     } else {
-        warnings.push("未识别到人像（身体塑形不可用）".to_string());
+        // iOS：MODNet 不随包，人像蒙版由 Vision 提交（按图像指纹取用）。
+        let platform = platform_person_cell()
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .filter(|(key, _)| *key == fingerprint(image))
+            .map(|(_, plane)| crate::retouch::MaskPlane {
+                width: plane.width,
+                height: plane.height,
+                data: crate::smartmask::mask::resize_plane(
+                    &plane.data,
+                    plane.width.max(1),
+                    plane.height.max(1),
+                    width,
+                    height,
+                ),
+            });
+        if let Some(person) = platform {
+            masks.person = Some(person);
+        } else {
+            warnings.push("未识别到人像（身体塑形不可用）".to_string());
+        }
     }
 
     // FaceMesh：取最大的人脸对齐后跑 478 点，映射回原图坐标。

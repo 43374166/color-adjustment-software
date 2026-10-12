@@ -1,9 +1,9 @@
-﻿; fdxmp Windows 安装向导（NSIS 3.x / Unicode）
+; fdxmp Windows 安装向导（NSIS 3.x / Unicode）
 ; 生成：用 NSIS 的 makensis 编译本脚本 → dist\fdxmp-setup.exe
 Unicode true
 
 !define APP_NAME "fdxmp"
-!define APP_VERSION "1.5.0"
+!define APP_VERSION "1.5.1"
 !define APP_PUBLISHER "fdxmp"
 !define APP_DESC "fdxmp 专业图像处理（对标 Lightroom）"
 !define UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"

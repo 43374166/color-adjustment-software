@@ -427,6 +427,68 @@ struct RetouchAnalysisUi: Equatable {
     var hasLandmarks: Bool { landmarks > 200 }
 }
 
+/// 手动美颜预设（"一键美颜"）：一键把修图参数设成对应风格。
+enum RetouchPresetUi: String, CaseIterable, Identifiable {
+    case natural = "自然"
+    case refined = "精致"
+    case texture = "质感"
+    case clean = "清透"
+
+    var id: String { rawValue }
+
+    /// 参数组合（0..100）。
+    var params: RetouchUi {
+        switch self {
+        case .natural:
+            // 轻度：保留皮肤质感，适合日常。
+            return RetouchUi(
+                blemish: 40,
+                smoothLow: 25,
+                smoothMid: 35,
+                smoothHigh: 25,
+                skinTone: 30
+            )
+        case .refined:
+            // 精致：磨皮与塑形都上（接近"一键美颜"默认）。
+            return RetouchUi(
+                blemish: 60,
+                smoothLow: 40,
+                smoothMid: 52,
+                smoothHigh: 40,
+                skinTone: 45,
+                faceSlim: 30,
+                chin: 15,
+                eyeEnlarge: 15,
+                noseSlim: 12,
+                bodySlim: 20
+            )
+        case .texture:
+            // 质感：少磨中频、保留毛孔纹理（摄影师向）。
+            return RetouchUi(
+                blemish: 50,
+                smoothLow: 30,
+                smoothMid: 22,
+                smoothHigh: 18,
+                skinTone: 35,
+                faceSlim: 12
+            )
+        case .clean:
+            // 清透：肤色统一为主，提亮干净。
+            return RetouchUi(
+                blemish: 55,
+                smoothLow: 35,
+                smoothMid: 40,
+                smoothHigh: 30,
+                skinTone: 60,
+                faceSlim: 18,
+                chin: 8,
+                eyeEnlarge: 10,
+                noseSlim: 8
+            )
+        }
+    }
+}
+
 /// 蒙版类型（几何三种：线性渐变 / 径向渐变 / 画笔；v1.4.0 增加智能蒙版）。
 enum MaskKindUi: String, CaseIterable, Identifiable {
     case linear = "线性渐变"

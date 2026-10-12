@@ -30,12 +30,6 @@ download_model() {
 download_model face_detector_scrfd2p5g_bnkps_fp32.onnx \
     "https://hf-mirror.com/RuteNL/SCRFD-face-detection-ONNX/resolve/main/2.5g_bnkps.onnx" \
     3f1ac54e769cb5fd76eda11ac3c088eed78d1f51a935a839d04d49b0e770219e
-download_model person_coarse_modnet_fp32.onnx \
-    "https://hf-mirror.com/Xenova/modnet/resolve/main/onnx/model.onnx" \
-    07c308cf0fc7e6e8b2065a12ed7fc07e1de8febb7dc7839d7b7f15dd66584df9
-download_model face_parsing_quantized.onnx \
-    "https://hf-mirror.com/Xenova/face-parsing/resolve/main/onnx/model_quantized.onnx" \
-    5bab9bfb3cb979f3098ac3b934b1641dbf87f835e0b03c2ca6d88dcf18c83d27
 download_model u2netp.onnx \
     "https://hf-mirror.com/BritishWerewolf/U-2-Netp/resolve/main/onnx/model.onnx" \
     309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8
@@ -43,6 +37,22 @@ download_model u2netp.onnx \
 download_model face_landmarks_mediapipe_v2_fp32.onnx \
     "https://hf-mirror.com/fernandotonon/QtMeshEditor-facemesh-onnx/resolve/main/face_landmarks.onnx" \
     d16e5a55e6a480284d468ee32469692464049518c311662ab3956681de31e3e9
+# 人脸解析：自转 BiSeNet-19（MIT 权重）——随仓库携带，直接复制 + 校验哈希。
+check_or_copy_local_model() {
+    local file="$1" sha="$2"
+    local source="models/$file"
+    local target="dist/ios/models/$file"
+    [ -f "$target" ] && echo "$sha  $target" | shasum -a 256 -c - >/dev/null 2>&1 && return
+    if [ -f "$source" ]; then
+        cp "$source" "$target"
+        echo "$sha  $target" | shasum -a 256 -c -
+    else
+        echo "缺少 $source（见 packaging/models/README.md 重新生成）" >&2
+        exit 1
+    fi
+}
+check_or_copy_local_model face_parsing_bisenet19_fp32.onnx \
+    2453dcc1592590d1f9f7b064b3031c20f35bca74375445d23ab7f5ad3c38ea2f
 
 # gpu feature：预览走 wgpu（iOS = Metal），失败自动回退 CPU；
 # raw feature：LibRaw（rsraw）解相机 RAW / DNG，工程侧需链接 libc++（见 project.yml）；

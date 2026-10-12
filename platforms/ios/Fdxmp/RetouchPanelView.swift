@@ -1,5 +1,95 @@
 import SwiftUI
 
+/// 修图手动工具画布：点按 / 拖动直接作用在图上（污点修复 / 液化）。
+struct RetouchTouchLayer: View {
+    @ObservedObject var model: EditorModel
+    let imageSize: CGSize
+    let viewSize: CGSize
+    let zoom: CGFloat
+    let pan: CGSize
+
+    @State private var points: [CGPoint] = []
+    @State private var cursor: CGPoint?
+
+    var body: some View {
+        GeometryReader { _ in
+            ZStack {
+                Color.clear.contentShape(Rectangle())
+                if points.count > 1, model.retouchMode == .liquify {
+                    Path { path in
+                        path.addLines(points)
+                    }
+                    .stroke(Color.accentColor.opacity(0.85), lineWidth: 2)
+                }
+                if let cursor {
+                    Circle()
+                        .stroke(Color.white.opacity(0.9), lineWidth: 1.5)
+                        .background(Circle().fill(Color.white.opacity(0.06)))
+                        .frame(width: cursorRadius * 2, height: cursorRadius * 2)
+                        .position(cursor)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+        .frame(width: viewSize.width, height: viewSize.height)
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onChanged { value in
+                    cursor = value.location
+                    if model.retouchMode == .liquify {
+                        points.append(value.location)
+                    }
+                }
+                .onEnded { value in
+                    cursor = nil
+                    defer { points = [] }
+                    let geometry = MaskCanvasGeometry(
+                        imageSize: imageSize,
+                        viewSize: viewSize,
+                        zoom: zoom,
+                        pan: pan
+                    )
+                    let longEdge = max(imageSize.width, imageSize.height)
+                    let radiusPx = Float(model.brushRadius) / 100 * Float(longEdge)
+                    switch model.retouchMode {
+                    case .spot:
+                        let normalized = geometry.normalized(value.location)
+                        guard (0...1).contains(normalized.x), (0...1).contains(normalized.y) else {
+                            return
+                        }
+                        model.applyHeal(
+                            at: normalized,
+                            radius: radiusPx,
+                            strength: Float(model.brushStrength) / 100
+                        )
+                    case .liquify:
+                        var path = points
+                        path.append(value.location)
+                        let normalized = path
+                            .map { geometry.normalized($0) }
+                            .map { CGPoint(x: min(max($0.x, 0), 1), y: min(max($0.y, 0), 1)) }
+                        guard normalized.count >= 2 else { return }
+                        model.applyLiquifyStroke(
+                            points: normalized,
+                            radius: Float(model.brushRadius) / 100,
+                            strength: Float(model.brushStrength) / 100
+                        )
+                    case .beauty:
+                        break
+                    }
+                }
+        )
+    }
+
+    /// 笔刷光标半径（view 坐标：图像像素 × 显示比例 × 缩放）。
+    private var cursorRadius: CGFloat {
+        let fitted = fittedRect(imageSize: imageSize, in: viewSize)
+        let scale = fitted.width / max(imageSize.width, 1) * zoom
+        let radiusPx = CGFloat(model.brushRadius) / 100 * max(imageSize.width, imageSize.height)
+        return max(6, radiusPx * scale)
+    }
+}
+
 /// AI 修图全屏加载动画（识别五官 / 去瑕疵 / 磨皮 / 肤色 / 塑形）。
 struct RetouchProgressOverlay: View {
     let text: String
@@ -58,10 +148,161 @@ struct RetouchPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            oneTapRow
+            modeRow
             Divider()
                 .overlay(Color.white.opacity(0.08))
+            switch model.retouchMode {
+            case .beauty:
+                beautyContent
+            case .spot:
+                brushContent(
+                    hint: "在画面上点按或轻拖瑕疵处 → 自动用周围皮肤盖住（手动祛痘笔）",
+                    undoTitle: "撤销上一个",
+                    canUndo: !model.healSpots.isEmpty,
+                    undo: { model.undoLastHeal() }
+                )
+            case .liquify:
+                brushContent(
+                    hint: "在画面上拖动 → 像素沿拖动方向推挤（液化）；半径 / 强度可调",
+                    undoTitle: "撤销一笔",
+                    canUndo: !model.liquifyStrokes.isEmpty,
+                    undo: { model.undoLastLiquify() }
+                )
+            }
+        }
+    }
+
+    // MARK: - 子模式
+
+    private var modeRow: some View {
+        Picker(
+            "",
+            selection: Binding(
+                get: { model.retouchMode },
+                set: { model.retouchMode = $0 }
+            )
+        ) {
+            ForEach(EditorModel.RetouchModeUi.allCases) { mode in
+                Text(mode.rawValue).tag(mode)
+            }
+        }
+        .pickerStyle(.segmented)
+        .padding(.horizontal, 14)
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+        .allowsHitTesting(model.draggingSlider == nil)
+    }
+
+    // MARK: - 美颜（一键修图 + 预设 + 参数）
+
+    private var beautyContent: some View {
+        VStack(spacing: 0) {
+            oneTapRow
+            presetsRow
             sliders
+        }
+    }
+
+    private var presetsRow: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 8) {
+                ForEach(RetouchPresetUi.allCases) { preset in
+                    Button {
+                        model.applyRetouchPreset(preset)
+                    } label: {
+                        Text(preset.rawValue)
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(
+                                Capsule().fill(Color.white.opacity(0.10))
+                            )
+                            .overlay(
+                                Capsule().stroke(Color.white.opacity(0.12))
+                            )
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 4)
+        }
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+        .allowsHitTesting(model.draggingSlider == nil)
+    }
+
+    // MARK: - 笔刷（污点 / 液化）
+
+    private func brushContent(
+        hint: String,
+        undoTitle: String,
+        canUndo: Bool,
+        undo: @escaping () -> Void
+    ) -> some View {
+        VStack(spacing: 0) {
+            Text(hint)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+                .opacity(model.draggingSlider == nil ? 1 : 0)
+            ValueSliderRow(
+                label: model.retouchMode == .liquify ? "笔刷半径" : "笔刷大小",
+                value: model.brushRadius,
+                range: 1...20,
+                neutral: 6,
+                step: 1,
+                decimals: 0,
+                onBegin: {},
+                onChange: { model.brushRadius = $0 },
+                onCommit: {}
+            )
+            .opacity(model.sliderVisible("笔刷大小") && model.sliderVisible("笔刷半径") ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible("笔刷大小") && model.sliderVisible("笔刷半径"))
+            ValueSliderRow(
+                label: "强度",
+                value: model.brushStrength,
+                range: 5...100,
+                neutral: 70,
+                step: 5,
+                decimals: 0,
+                onBegin: {},
+                onChange: { model.brushStrength = $0 },
+                onCommit: {}
+            )
+            .opacity(model.sliderVisible("强度") ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible("强度"))
+            HStack {
+                Button(undoTitle, action: undo)
+                    .font(.caption)
+                    .foregroundStyle(canUndo ? Color.accentColor : Color.white.opacity(0.3))
+                    .disabled(!canUndo)
+                Spacer()
+                Button("清空") {
+                    Haptics.light()
+                    model.clearManualTools()
+                }
+                .font(.caption)
+                .foregroundStyle(
+                    (model.healSpots.isEmpty && model.liquifyStrokes.isEmpty)
+                        ? Color.white.opacity(0.3)
+                        : Color.accentColor
+                )
+                .disabled(model.healSpots.isEmpty && model.liquifyStrokes.isEmpty)
+                if let stage = model.manualWorkStage {
+                    Text(stage)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 6)
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
+            Spacer(minLength: 0)
         }
     }
 

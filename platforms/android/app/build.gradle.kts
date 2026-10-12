@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 42
-        versionName = "1.5.0"
+        versionName = "1.5.1"
         ndk {
             // Rust 桥接产物（cargo ndk 生成）
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")

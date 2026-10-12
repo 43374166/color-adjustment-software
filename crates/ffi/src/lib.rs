@@ -973,6 +973,188 @@ pub unsafe extern "C" fn fdxmp_retouch_apply(
     })
 }
 
+/// 打包图像为「8 字节大端宽高 + RGBA8」载荷（供上述接口返回）。
+fn image_to_payload(
+    image: &image::RgbaImage,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    let mut payload = Vec::with_capacity(8 + image.as_raw().len());
+    payload.extend_from_slice(&image.width().to_be_bytes());
+    payload.extend_from_slice(&image.height().to_be_bytes());
+    payload.extend_from_slice(image.as_raw());
+    // SAFETY: 调用方（本文件内）已校验非空。
+    unsafe {
+        *out_width = image.width();
+        *out_height = image.height();
+    }
+    let mut boxed = payload.into_boxed_slice();
+    // SAFETY: 调用方（本文件内）已校验非空。
+    unsafe {
+        *out_len = boxed.len();
+    }
+    let pointer = boxed.as_mut_ptr();
+    std::mem::forget(boxed);
+    pointer
+}
+
+/// 提交平台人像蒙版（iOS：Vision 人像分割 α，f32 0..1）——MODNet 不随包时补位。
+///
+/// 与图像内容（指纹）绑定；换图自动失效。返回 [`FDXMP_OK`] / [`FDXMP_ERR`]。
+///
+/// # Safety
+///
+/// `rgba` 至少 `width × height × 4` 字节可读；`plane` 至少 `plane_width × plane_height` 个 f32。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_retouch_submit_person_mask(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    plane: *const f32,
+    plane_width: u32,
+    plane_height: u32,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            let image = match rgba_to_image(rgba, width, height) {
+                Ok(image) => image,
+                Err(message) => {
+                    set_last_error(message);
+                    return FDXMP_ERR;
+                }
+            };
+            let expected = (plane_width as usize).saturating_mul(plane_height as usize);
+            if plane.is_null() || expected == 0 || plane_width > 4096 || plane_height > 4096 {
+                set_last_error("人像蒙版尺寸非法");
+                return FDXMP_ERR;
+            }
+            // SAFETY: 调用方保证 plane 至少 expected 个 f32 可读。
+            let weights = std::slice::from_raw_parts(plane, expected).to_vec();
+            match fdxmp_core::smartmask::runtime::submit_platform_person_mask(
+                &image,
+                plane_width,
+                plane_height,
+                weights,
+            ) {
+                Ok(()) => FDXMP_OK,
+                Err(err) => {
+                    set_last_error(err.message().to_string());
+                    FDXMP_ERR
+                }
+            }
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            let _ = (rgba, width, height, plane, plane_width, plane_height);
+            set_last_error("当前构建未启用智能蒙版（ai / ai-static）");
+            FDXMP_ERR
+        }
+    })
+}
+
+/// 污点修复（手动祛痘笔）：`x` / `y` 归一化坐标，`radius` 像素，`strength` 0..1。
+///
+/// 返回修好的图像载荷（8 字节大端宽高 + RGBA8，用 `fdxmp_bytes_free` 释放）。
+/// 纯算法，不依赖模型。
+///
+/// # Safety
+///
+/// `rgba` 至少 `width × height × 4` 字节可读；`out_*` 非空。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_heal_apply(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    x: f32,
+    y: f32,
+    radius: f32,
+    strength: f32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let mut image = match rgba_to_image(rgba, width, height) {
+            Ok(image) => image,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        if !x.is_finite() || !y.is_finite() || !radius.is_finite() || !strength.is_finite() {
+            set_last_error("修复参数包含非有限数值");
+            return ptr::null_mut();
+        }
+        fdxmp_core::retouch::spot_heal(
+            &mut image,
+            x.clamp(0.0, 1.0) * width as f32,
+            y.clamp(0.0, 1.0) * height as f32,
+            radius.clamp(1.0, 200.0),
+            strength.clamp(0.0, 1.0),
+        );
+        image_to_payload(&image, out_width, out_height, out_len)
+    })
+}
+
+/// 液化：`strokes_json` = `[{"points":[[x,y],...],"radius":0.06,"strength":0.8}, ...]`。
+///
+/// 返回处理后的图像载荷（8 字节大端宽高 + RGBA8，用 `fdxmp_bytes_free` 释放）。纯算法。
+///
+/// # Safety
+///
+/// `rgba` 至少 `width × height × 4` 字节可读；`strokes_json` 合法 C 字符串；`out_*` 非空。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_liquify_apply(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    strokes_json: *const c_char,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let strokes_json = match cstr_to_str(strokes_json, "strokes_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let image = match rgba_to_image(rgba, width, height) {
+            Ok(image) => image,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let strokes: Vec<fdxmp_core::retouch::LiquifyStroke> =
+            match serde_json::from_str(strokes_json) {
+                Ok(strokes) => strokes,
+                Err(err) => {
+                    set_last_error(format!("strokes_json 解析失败：{err}"));
+                    return ptr::null_mut();
+                }
+            };
+        if strokes.len() > 512 {
+            set_last_error("液化笔画过多（≤ 512）");
+            return ptr::null_mut();
+        }
+        let output = fdxmp_core::retouch::liquify(&image, &strokes);
+        image_to_payload(&output, out_width, out_height, out_len)
+    })
+}
+
 /// 用随包 ONNX 模型生成智能蒙版（双阶段流水线），并写入共享栅格缓存。
 ///
 /// 返回值：
