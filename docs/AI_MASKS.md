@@ -1,4 +1,8 @@
-# Windows AI 蒙版（阶段 7，2026-10-03）
+# Windows AI 蒙版（阶段 7，2026-10-03；v1.4.0 新增智能蒙版，见 `docs/SMART_MASK.md`）
+
+> **v1.4.0 变更**：新增「智能蒙版」模块（`fdxmp-core::smartmask`）——双阶段、模型可插拔、
+> 安全优先，iOS（Vision）与 Windows（ONNX）双端接入，五官蒙版（眼睛 / 眉毛 / 鼻子 /
+> 嘴唇 / 牙齿 / 耳朵）上线。架构、模型清单与换模型步骤见 [SMART_MASK.md](SMART_MASK.md)。
 
 ## 1. 能力
 

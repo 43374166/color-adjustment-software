@@ -744,13 +744,21 @@ pub fn render_mask_overlay_rgba(
         height: raster_height,
         rgba: vec![0u8; (raster_width as usize) * (raster_height as usize) * 4],
     };
-    let geometric = matches!(
+    // 可渲染：几何型（画笔 / 线性 / 径向）+ AI / 平台蒙版（栅格来自共享缓存，
+    // 不需要参考图，按请求分辨率自动重采样）。颜色 / 亮度范围仍需要原图，
+    // 这里没有参考图，返回透明叠加。
+    let renderable = matches!(
         mask.kind,
         crate::params::MaskKind::Brush(_)
             | crate::params::MaskKind::LinearGradient { .. }
             | crate::params::MaskKind::RadialGradient { .. }
+            | crate::params::MaskKind::AiSubject
+            | crate::params::MaskKind::AiSky
+            | crate::params::MaskKind::AiBackground
+            | crate::params::MaskKind::AiPeople { .. }
+            | crate::params::MaskKind::AiObject { .. }
     );
-    if !geometric || !mask.visible {
+    if !renderable || !mask.visible {
         return Ok(transparent());
     }
     // 几何型蒙版不需要参考图（1×1 占位即可）。

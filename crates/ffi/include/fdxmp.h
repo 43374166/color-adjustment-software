@@ -128,7 +128,9 @@ uint8_t *fdxmp_render_region_rgba(const uint8_t *rgba,
  * 输入：EditParams JSON + 蒙版 id + 目标宽高（预览画布或缩略图尺寸）；
  * 输出：8 字节大端宽高 + 预乘 RGBA8 像素（红色半透明覆盖），
  * 必须用 fdxmp_bytes_free(ptr, len) 释放。失败返回 NULL。
- * 只支持几何型蒙版（画笔 / 线性 / 径向）；隐藏的蒙版返回全透明叠加。
+ * 支持几何型蒙版（画笔 / 线性 / 径向）与智能蒙版（AI / 平台提交的栅格，
+ * 见 fdxmp_mask_raster_submit / fdxmp_mask_polygons_submit）；隐藏的蒙版
+ * 返回全透明叠加。
  */
 uint8_t *fdxmp_mask_overlay_rgba(const char *params_json,
                                  const char *mask_id,
@@ -137,6 +139,42 @@ uint8_t *fdxmp_mask_overlay_rgba(const char *params_json,
                                  uint32_t *out_width,
                                  uint32_t *out_height,
                                  size_t *out_len);
+
+/* ---- 智能蒙版（v1.4.0）----
+ *
+ * 平台提供者（iOS Vision / CoreML、桌面 ONNX）把像素级蒙版交给核心统一缓存、
+ * 渲染、叠加与导出：栅格按蒙版参数缓存（与分辨率无关，按请求自动重采样），
+ * 参数变化 / 切换图片后自然失效（也可主动 fdxmp_mask_raster_clear）。
+ */
+
+/* 提交权重栅格：weights 为行优先 f32（0..1），长度必须等于 width × height；
+ * 单边 ≤ 4096、总像素 ≤ 16777216。成功返回 FDXMP_OK。 */
+int32_t fdxmp_mask_raster_submit(const char *params_json,
+                                 const char *mask_id,
+                                 uint32_t width,
+                                 uint32_t height,
+                                 const float *weights,
+                                 size_t len);
+
+/* 蒙版栅格是否已生成：1 = 就绪，0 = 未生成，负值 = 参数错误。 */
+int32_t fdxmp_mask_raster_ready(const char *params_json, const char *mask_id);
+
+/* 清空智能蒙版栅格缓存（切换图片 / 释放内存时调用）。 */
+int32_t fdxmp_mask_raster_clear(void);
+
+/* 提交多边形蒙版（五官关键点）：polygons_json 形如
+ * {"include": [[[x,y],...]], "exclude": [[[x,y],...]]}，归一化坐标 0..1
+ * （原点左上角）；核心负责光栅化、羽化（feather_px，0..=128）与缓存。 */
+int32_t fdxmp_mask_polygons_submit(const char *params_json,
+                                   const char *mask_id,
+                                   uint32_t width,
+                                   uint32_t height,
+                                   const char *polygons_json,
+                                   float feather_px);
+
+/* 智能蒙版模型清单与状态（JSON；含 SHA-256 校验状态、许可证、来源）。
+ * 返回的字符串用 fdxmp_string_free 释放；失败返回 NULL。 */
+char *fdxmp_smartmask_models_json(void);
 
 /* ---- GPU 预览会话（Metal / DX12 / Vulkan；iOS 以 `--features gpu` 构建启用）----
  *

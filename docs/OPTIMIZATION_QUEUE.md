@@ -161,7 +161,18 @@
       - CPU / GPU 同公式；新增 GPU↔CPU 一致性探针 `probe_tone_cpu_gpu_parity`
         （灰度台阶逐格对比，最大差 1/255）+ 2 个回归单测（纯黑不动 / 暗色比例保持），
         核心 131 项全过
+- [x] 1.4.0 智能蒙版（双阶段、模型可插拔、iOS + Windows 接入；双仓库推送）：
+      - 核心新模块 `crates/core/src/smartmask/`：`ModelSpec` 配置驱动 + SHA-256 / 白名单 +
+      双阶段并行调度（`MaskPipeline`）+ 标准蒙版（羽化 / 形态学 / 组合 / 仿射坐标映射）
+      + 多边形光栅化（五官）+ `RetouchEngine` / `DataRecorder` 预留接口 + Mock 跑通；
+      - Windows：ONNX 适配器（SCRFD-2.5G 人脸检测 / MODNet 人像 / BiSeNet 人脸解析 /
+      U²-Net 抠图）跑通人脸路径；AI 面板新增五官按钮（眼睛 / 眉毛 / 鼻子 / 嘴唇 / 牙齿 / 耳朵）；
+      - iOS：Vision 端侧（前景实例 / 人物分割 / 人脸关键点）→ 核心缓存统一渲染 / 叠加 / 导出，
+      新增 9 种智能蒙版按钮；
+      - 共享栅格缓存（平台提供者提交、按分辨率重采样、羽化 / 不透明度不触发重新推理）；
+      - FFI 新增 `fdxmp_mask_raster_submit` / `fdxmp_mask_polygons_submit` / `fdxmp_smartmask_models_json` 等；
+      - 详细文档：`docs/SMART_MASK.md`
 
 ## 待做
 
-（无 —— 1.3.7 已全部落地，待打包验证）
+（无 —— 1.4.0 已全部落地，双仓库推送 + 云打包验证中）

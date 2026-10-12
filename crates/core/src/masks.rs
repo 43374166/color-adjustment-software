@@ -5,11 +5,134 @@
 //! - 输出为 0..1 的权重栅格（每像素一个 f32），供 GPU 局部调整使用
 
 use rayon::prelude::*;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::error::{FdxmpError, Result};
 pub use crate::params::{
     BrushSettings, BrushStroke, MaskKind, MaskParams, OverlayColor, PeoplePart,
 };
+
+/// AI / 平台蒙版栅格缓存。
+///
+/// 键：
+/// - **基础键**：模型一次推理产出的原始栅格（任意分辨率），
+///   由 ONNX（Windows）或平台提供者（iOS Vision / CoreML / NNAPI）提交；
+/// - **精确键** `mask_key(mask, width, height)`：按渲染请求分辨率重采样后的副本。
+///
+/// 基础键只取「类型」等会改变蒙版形状的字段：可见性 / 反向 / 羽化 / 不透明度
+/// 由 [`generate_mask`] 在取用后统一后处理，调整这些参数不会让已生成的
+/// 智能蒙版失效（无需重新推理）。
+///
+/// 渲染、叠加、导出在不同分辨率下都会命中（自动双线性重采样），
+/// 切换图片 / 参数变化时由 [`clear_ai_raster_cache`] 或 mask_key 变化自然失效。
+pub(crate) fn ai_raster_cache() -> &'static Mutex<HashMap<u64, Arc<MaskRaster>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<MaskRaster>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// AI / 平台蒙版基础键：只保留「形状来源」字段（kind），
+/// 忽略 visible / inverted / feather / opacity（这些由 `generate_mask` 后处理）。
+fn ai_base_key(mask: &MaskParams) -> u64 {
+    let mut normalized = mask.clone();
+    normalized.visible = true;
+    normalized.inverted = false;
+    normalized.feather = 0.0;
+    normalized.opacity = 100.0;
+    mask_key(&normalized, 0, 0)
+}
+
+/// 提交一份 AI / 平台蒙版栅格（按「基础键」存储，分辨率任意）。
+///
+/// 权重会被 clamp 到 0..1；尺寸非法 / 数据量不匹配会被拒绝。
+pub fn insert_ai_raster(mask: &MaskParams, raster: MaskRaster) -> Result<()> {
+    if raster.width == 0
+        || raster.height == 0
+        || raster.weights.len() != (raster.width as usize) * (raster.height as usize)
+    {
+        return Err(FdxmpError::Unsupported(
+            "AI 蒙版栅格尺寸非法或数据量不匹配".to_string(),
+        ));
+    }
+    if raster.weights.iter().any(|value| !value.is_finite()) {
+        return Err(FdxmpError::Unsupported("AI 蒙版包含非有限数值".to_string()));
+    }
+    let mut weights = raster.weights;
+    for value in &mut weights {
+        *value = value.clamp(0.0, 1.0);
+    }
+    let base = MaskRaster {
+        width: raster.width,
+        height: raster.height,
+        weights,
+    };
+    let key = ai_base_key(mask);
+    let cache = ai_raster_cache();
+    let mut map = cache
+        .lock()
+        .map_err(|_| FdxmpError::Unsupported("AI 蒙版缓存锁失效".to_string()))?;
+    // 同一张图内的多个 AI 蒙版可能共享缓存；上限 24 份，超出整体清空（幂等重建）。
+    if map.len() >= 24 && !map.contains_key(&key) {
+        map.clear();
+    }
+    map.insert(key, Arc::new(base));
+    Ok(())
+}
+
+/// 查询 AI / 平台蒙版栅格；命中时按请求分辨率重采样并回填精确键。
+pub fn cached_ai_raster(mask: &MaskParams, width: u32, height: u32) -> Option<MaskRaster> {
+    let (width, height) = (width.max(1), height.max(1));
+    let base_key = ai_base_key(mask);
+    let exact_key = mask_key(mask, width, height);
+    let cache = ai_raster_cache();
+    {
+        let map = cache.lock().ok()?;
+        if let Some(hit) = map.get(&exact_key) {
+            return Some((**hit).clone());
+        }
+    }
+    let base = {
+        let map = cache.lock().ok()?;
+        map.get(&base_key).cloned()
+    }?;
+    let resized = if base.width == width && base.height == height {
+        (*base).clone()
+    } else {
+        MaskRaster {
+            width,
+            height,
+            weights: crate::smartmask::mask::resize_plane(
+                &base.weights,
+                base.width,
+                base.height,
+                width,
+                height,
+            ),
+        }
+    };
+    if let Ok(mut map) = cache.lock() {
+        if map.len() < 24 {
+            map.insert(exact_key, Arc::new(resized.clone()));
+        }
+    }
+    Some(resized)
+}
+
+/// 是否已有某个蒙版的基础栅格（FFI 状态查询用；不做重采样）。
+pub fn ai_raster_ready(mask: &MaskParams) -> bool {
+    let key = ai_base_key(mask);
+    ai_raster_cache()
+        .lock()
+        .map(|map| map.contains_key(&key))
+        .unwrap_or(false)
+}
+
+/// 清空全部 AI / 平台蒙版栅格（切换图片 / 释放缓存时调用）。
+pub fn clear_ai_raster_cache() {
+    if let Ok(mut map) = ai_raster_cache().lock() {
+        map.clear();
+    }
+}
 
 /// 蒙版栅格缓存键（只含影响栅格的字段 + 尺寸）。
 ///
@@ -119,29 +242,13 @@ pub fn generate_mask(
         | MaskKind::AiBackground
         | MaskKind::AiPeople { .. }
         | MaskKind::AiObject { .. } => {
-            #[cfg(feature = "ai")]
-            {
-                match crate::ai::cached_raster(mask, width, height) {
-                    Some(raster) if raster.weights.len() == (width * height) as usize => {
-                        MaskRaster {
-                            width,
-                            height,
-                            weights: raster.weights.clone(),
-                        }
-                    }
-                    _ => {
-                        return Err(FdxmpError::Unsupported(
-                            "AI 蒙版尚未生成（请在蒙版面板点击 AI 按钮）".to_string(),
-                        ))
-                    }
-                }
-            }
-            #[cfg(not(feature = "ai"))]
-            {
-                return Err(FdxmpError::Unsupported(
-                    "AI 蒙版需要启用 ai feature（Windows ONNX Runtime）".to_string(),
-                ));
-            }
+            // 栅格由模型（Windows ONNX）或平台提供者（iOS Vision / CoreML）提交进缓存；
+            // 这里只取用并按请求分辨率重采样，不关心来源。
+            cached_ai_raster(mask, width, height).ok_or_else(|| {
+                FdxmpError::Unsupported(
+                    "AI 蒙版尚未生成（请在蒙版面板点击智能蒙版按钮）".to_string(),
+                )
+            })?
         }
     };
 
@@ -798,24 +905,79 @@ mod tests {
         let err = generate_mask(&mask(MaskKind::AiSky), &image, 8, 8).unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("尚未生成") || message.contains("需要启用 ai feature"),
+            message.contains("尚未生成"),
             "未生成时提示应说明原因：{message}"
         );
     }
 
-    #[cfg(feature = "ai")]
     #[test]
-    fn ai_masks_use_cached_raster() {
+    fn ai_masks_use_submitted_raster_and_resample() {
         let image = gray_image(8, 8, 128);
         let mask = mask(MaskKind::AiSky);
-        let mut raster = MaskRaster::zeros(8, 8);
+        // 平台提供者提交 4×4 基础栅格 → 8×8 请求应自动重采样命中。
+        let mut raster = MaskRaster::zeros(4, 4);
         for weight in raster.weights.iter_mut() {
             *weight = 0.75;
         }
-        crate::ai::insert_cached(&mask, 8, 8, raster);
+        insert_ai_raster(&mask, raster).unwrap();
+        assert!(ai_raster_ready(&mask));
         let generated = generate_mask(&mask, &image, 8, 8).unwrap();
         assert!((generated.mean() - 0.75).abs() < 1e-4);
-        crate::ai::clear_cache();
+        // 非法栅格必须被拒绝（NaN / 数据量不匹配）。
+        assert!(insert_ai_raster(
+            &mask,
+            MaskRaster {
+                width: 2,
+                height: 2,
+                weights: vec![0.0; 3],
+            }
+        )
+        .is_err());
+        assert!(insert_ai_raster(
+            &mask,
+            MaskRaster {
+                width: 2,
+                height: 2,
+                weights: vec![f32::NAN; 4],
+            }
+        )
+        .is_err());
+        clear_ai_raster_cache();
+        assert!(!ai_raster_ready(&mask));
+        assert!(
+            generate_mask(&mask, &image, 8, 8).is_err(),
+            "清空后应回到未生成状态"
+        );
+    }
+
+    #[test]
+    fn ai_raster_survives_feather_opacity_and_visibility_changes() {
+        let image = gray_image(8, 8, 128);
+        let base = mask(MaskKind::AiSubject);
+        let mut raster = MaskRaster::zeros(4, 4);
+        for weight in raster.weights.iter_mut() {
+            *weight = 1.0;
+        }
+        insert_ai_raster(&base, raster).unwrap();
+        // 调羽化 / 不透明度 / 反向 / 可见性：基础栅格不失效，后处理仍然生效。
+        let mut adjusted = base.clone();
+        adjusted.feather = 0.0;
+        adjusted.opacity = 50.0;
+        assert!(ai_raster_ready(&adjusted));
+        let generated = generate_mask(&adjusted, &image, 8, 8).unwrap();
+        assert!((generated.mean() - 0.5).abs() < 1e-3, "不透明度 50% 生效");
+        let mut inverted = base.clone();
+        inverted.inverted = true;
+        let generated = generate_mask(&inverted, &image, 8, 8).unwrap();
+        assert!(generated.mean() < 0.01, "反向生效");
+        let mut hidden = base.clone();
+        hidden.visible = false;
+        let generated = generate_mask(&hidden, &image, 8, 8).unwrap();
+        assert_eq!(generated.mean(), 0.0, "隐藏的蒙版不产生覆盖");
+        // 换类型（形状来源不同）必须失效。
+        let other = mask(MaskKind::AiSky);
+        assert!(!ai_raster_ready(&other));
+        clear_ai_raster_cache();
     }
 
     #[test]

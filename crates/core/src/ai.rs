@@ -13,15 +13,14 @@
 //! ONNX Runtime 以 `load-dynamic` 方式加载：优先 `FDXMP_ORT_DLL`，
 //! 其次 exe 同目录 / 模型目录下的 `onnxruntime.dll`。
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::error::{FdxmpError, Result};
-use crate::masks::{mask_key, MaskRaster};
+use crate::masks::MaskRaster;
 use crate::params::{MaskKind, MaskParams, PeoplePart};
 
 /// 模型文件名与下载地址（hf-mirror 镜像）。
@@ -130,21 +129,23 @@ pub fn status() -> AiStatus {
     }
 }
 
-/// 初始化 ONNX Runtime（幂等）。
-fn ensure_runtime() -> Result<()> {
+/// 初始化 ONNX Runtime（幂等；显式 dll 路径，找不到时返回可恢复错误）。
+///
+/// Windows 应用启动或首次推理前调用；智能蒙版适配器（`smartmask::onnx`）复用。
+pub fn ensure_runtime() -> Result<()> {
     static RUNTIME: OnceLock<std::result::Result<(), String>> = OnceLock::new();
     let result = RUNTIME.get_or_init(|| {
-        let committed = match ort_dll_path() {
-            Some(path) => ort::init_from(&path)
-                .map_err(|err| format!("加载 {} 失败：{err}", path.display()))?
-                .commit(),
-            None => ort::init().commit(),
+        // 必须显式给出 dll 路径：load-dynamic 下 `ort::init()` 找不到库会 panic，
+        // 而本模块约定「所有错误可恢复，不 panic」。
+        let Some(path) = ort_dll_path() else {
+            return Err(
+                "未找到 onnxruntime.dll（可放到 exe 目录，或设置 FDXMP_ORT_DLL）".to_string(),
+            );
         };
-        if committed || ort_dll_path().is_some() {
-            Ok(())
-        } else {
-            Err("未找到 onnxruntime.dll（可放到 exe 目录，或设置 FDXMP_ORT_DLL）".to_string())
-        }
+        ort::init_from(&path)
+            .map_err(|err| format!("加载 {} 失败：{err}", path.display()))?
+            .commit();
+        Ok(())
     });
     result
         .clone()
@@ -213,37 +214,26 @@ fn engine() -> &'static Mutex<Engine> {
     ENGINE.get_or_init(|| Mutex::new(Engine::default()))
 }
 
-/// AI 蒙版栅格缓存：键为 [`mask_key`]（随蒙版参数与图像尺寸变化）。
-fn raster_cache() -> &'static Mutex<HashMap<u64, Arc<MaskRaster>>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Arc<MaskRaster>>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 查询已生成的 AI 蒙版栅格。
-pub fn cached_raster(mask: &MaskParams, width: u32, height: u32) -> Option<Arc<MaskRaster>> {
-    let key = mask_key(mask, width, height);
-    raster_cache().lock().ok()?.get(&key).cloned()
+/// 查询已生成的 AI 蒙版栅格（按请求分辨率自动重采样）。
+///
+/// 栅格缓存在 [`crate::masks`]（与平台提供者共用）；这里只做兼容包装。
+pub fn cached_raster(
+    mask: &MaskParams,
+    width: u32,
+    height: u32,
+) -> Option<std::sync::Arc<MaskRaster>> {
+    crate::masks::cached_ai_raster(mask, width, height).map(std::sync::Arc::new)
 }
 
 /// 清空缓存（切换图片 / 重建代理时调用）。
 pub fn clear_cache() {
-    if let Ok(mut cache) = raster_cache().lock() {
-        cache.clear();
-    }
+    crate::masks::clear_ai_raster_cache();
 }
 
-/// 生成 AI 蒙版并写入缓存（工作线程中调用）。
+/// 生成 AI 蒙版并写入共享缓存（工作线程中调用）。
 pub fn generate_into_cache(mask: &MaskParams, image: &image::RgbaImage) -> Result<()> {
-    let (width, height) = (image.width().max(1), image.height().max(1));
-    let key = mask_key(mask, width, height);
     let raster = generate(mask, image)?;
-    if let Ok(mut cache) = raster_cache().lock() {
-        cache.insert(key, Arc::new(raster));
-        if cache.len() > 16 {
-            cache.clear();
-        }
-    }
-    Ok(())
+    crate::masks::insert_ai_raster(mask, raster)
 }
 
 /// 按蒙版类型生成基础权重栅格（不含反向 / 不透明度 / 羽化，由 `masks::generate_mask` 统一处理）。
@@ -411,6 +401,14 @@ fn face_label_weight(label: usize, part: PeoplePart) -> f32 {
         PeoplePart::Skin => matches!(label, 1 | 8 | 9 | 15 | 16 | 17),
         PeoplePart::Hair => matches!(label, 13),
         PeoplePart::Clothes => matches!(label, 18),
+        // 五官（v1.4.0 智能蒙版）：
+        PeoplePart::Eyes => matches!(label, 4 | 5),
+        PeoplePart::Eyebrows => matches!(label, 6 | 7),
+        PeoplePart::Nose => matches!(label, 2),
+        PeoplePart::Lips => matches!(label, 11 | 12),
+        // 牙齿：口腔内部（嘴部区域，含牙齿 / 舌头等内部结构）。
+        PeoplePart::Teeth => matches!(label, 10),
+        PeoplePart::Ears => matches!(label, 8 | 9 | 15),
     };
     if matches {
         1.0
@@ -657,10 +655,9 @@ fn download_file(
 /// 把栅格插入缓存（测试用）。
 #[cfg(test)]
 pub(crate) fn insert_cached(mask: &MaskParams, width: u32, height: u32, raster: MaskRaster) {
-    let key = mask_key(mask, width, height);
-    if let Ok(mut cache) = raster_cache().lock() {
-        cache.insert(key, Arc::new(raster));
-    }
+    let _ = width;
+    let _ = height;
+    let _ = crate::masks::insert_ai_raster(mask, raster);
 }
 
 #[cfg(test)]
@@ -706,6 +703,18 @@ mod tests {
         assert_eq!(face_label_weight(0, PeoplePart::Body), 0.0);
         assert_eq!(face_label_weight(18, PeoplePart::Body), 1.0);
         assert_eq!(face_label_weight(13, PeoplePart::Face), 0.0);
+        // v1.4.0 五官映射。
+        assert_eq!(face_label_weight(4, PeoplePart::Eyes), 1.0);
+        assert_eq!(face_label_weight(5, PeoplePart::Eyes), 1.0);
+        assert_eq!(face_label_weight(1, PeoplePart::Eyes), 0.0);
+        assert_eq!(face_label_weight(6, PeoplePart::Eyebrows), 1.0);
+        assert_eq!(face_label_weight(7, PeoplePart::Eyebrows), 1.0);
+        assert_eq!(face_label_weight(2, PeoplePart::Nose), 1.0);
+        assert_eq!(face_label_weight(11, PeoplePart::Lips), 1.0);
+        assert_eq!(face_label_weight(12, PeoplePart::Lips), 1.0);
+        assert_eq!(face_label_weight(10, PeoplePart::Teeth), 1.0);
+        assert_eq!(face_label_weight(11, PeoplePart::Teeth), 0.0);
+        assert_eq!(face_label_weight(8, PeoplePart::Ears), 1.0);
     }
 
     #[test]

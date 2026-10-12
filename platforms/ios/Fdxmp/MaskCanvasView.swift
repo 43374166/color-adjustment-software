@@ -343,6 +343,10 @@ enum MaskHitTester {
         case .linear: return hitTestLinear(mask, point, geometry)
         case .radial: return hitTestRadial(mask, point, geometry)
         case .brush: return .none
+        case .aiSubject, .aiPortrait, .aiFace, .aiSkin,
+            .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+            // 智能蒙版没有画布控件（栅格由端侧识别生成）。
+            return .none
         }
     }
 
@@ -868,6 +872,9 @@ struct MaskOverlayLayer: View {
             drawRadial(&context, mask: mask, fitted: fitted)
         case .brush:
             drawBrushCursor(&context, mask: mask, fitted: fitted)
+        case .aiSubject, .aiPortrait, .aiFace, .aiSkin,
+            .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+            break
         }
     }
 

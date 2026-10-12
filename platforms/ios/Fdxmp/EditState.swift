@@ -309,11 +309,21 @@ func clampedCropRect(_ rect: CGRect) -> CGRect {
 
 // MARK: - 蒙版
 
-/// 蒙版类型（首期三种：线性渐变 / 径向渐变 / 画笔）。
+/// 蒙版类型（几何三种：线性渐变 / 径向渐变 / 画笔；v1.4.0 增加智能蒙版）。
 enum MaskKindUi: String, CaseIterable, Identifiable {
     case linear = "线性渐变"
     case radial = "径向渐变"
     case brush = "画笔"
+    // v1.4.0 智能蒙版（Vision）：主体 / 人像 / 五官。
+    case aiSubject = "智能主体"
+    case aiPortrait = "智能人像"
+    case aiFace = "智能面部"
+    case aiSkin = "智能皮肤"
+    case aiEyes = "智能眼睛"
+    case aiEyebrows = "智能眉毛"
+    case aiNose = "智能鼻子"
+    case aiLips = "智能嘴唇"
+    case aiTeeth = "智能牙齿"
 
     var id: String { rawValue }
 
@@ -322,6 +332,9 @@ enum MaskKindUi: String, CaseIterable, Identifiable {
         case .brush: return "brush"
         case .linear: return "linear_gradient"
         case .radial: return "radial_gradient"
+        case .aiSubject: return "ai_subject"
+        case .aiPortrait, .aiFace, .aiSkin, .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+            return "ai_people"
         }
     }
 
@@ -330,12 +343,75 @@ enum MaskKindUi: String, CaseIterable, Identifiable {
         case .brush: return "paintbrush.pointed"
         case .linear: return "line.diagonal"
         case .radial: return "circle.dashed"
+        case .aiSubject: return "person.crop.rectangle"
+        case .aiPortrait: return "person.fill"
+        case .aiFace: return "face.smiling"
+        case .aiSkin: return "wand.and.stars"
+        case .aiEyes: return "eye"
+        case .aiEyebrows: return "eyebrow"
+        case .aiNose: return "triangle"
+        case .aiLips: return "mouth"
+        case .aiTeeth: return "square.grid.2x2"
         }
     }
 
+    /// 是否需要智能（Vision）推理。
+    var isSmart: Bool {
+        switch self {
+        case .linear, .radial, .brush: return false
+        default: return true
+        }
+    }
+
+    /// 按 JSON 类型名恢复（不含部位）。
     static func from(jsonName: String) -> MaskKindUi? {
         allCases.first { $0.jsonName == jsonName }
     }
+
+    /// ai_people 的部位（几何蒙版为 nil）。
+    var peoplePart: PeoplePartUi? {
+        switch self {
+        case .aiPortrait: return .body
+        case .aiFace: return .face
+        case .aiSkin: return .skin
+        case .aiEyes: return .eyes
+        case .aiEyebrows: return .eyebrows
+        case .aiNose: return .nose
+        case .aiLips: return .lips
+        case .aiTeeth: return .teeth
+        default: return nil
+        }
+    }
+
+    /// 由 JSON 类型 + 部位恢复（解析用）。
+    static func from(jsonName: String, part: String?) -> MaskKindUi? {
+        guard jsonName == "ai_people" else {
+            return from(jsonName: jsonName)
+        }
+        switch part {
+        case "body": return .aiPortrait
+        case "face": return .aiFace
+        case "skin": return .aiSkin
+        case "eyes": return .aiEyes
+        case "eyebrows": return .aiEyebrows
+        case "nose": return .aiNose
+        case "lips": return .aiLips
+        case "teeth": return .aiTeeth
+        default: return .aiPortrait
+        }
+    }
+}
+
+/// 智能蒙版「人物部位」（与核心 `PeoplePart` 的 snake_case JSON 值对齐）。
+enum PeoplePartUi: String, CaseIterable {
+    case body
+    case face
+    case skin
+    case eyes
+    case eyebrows
+    case nose
+    case lips
+    case teeth
 }
 
 /// 一条画笔笔画：点序列 + 落笔时的参数快照 + 是否擦除。
@@ -670,6 +746,10 @@ enum EditJSON {
                 "rotation": Double(mask.rotation),
                 "inner": inner,
             ]
+        case .aiSubject:
+            kindData = [:]
+        case .aiPortrait, .aiFace, .aiSkin, .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+            kindData = ["part": mask.kind.peoplePart?.rawValue ?? "body"]
         }
         return [
             "id": mask.id,
@@ -838,12 +918,13 @@ enum EditJSON {
         return list.compactMap { item -> MaskUi? in
             guard
                 let kindObject = item["kind"] as? [String: Any],
-                let typeName = kindObject["type"] as? String,
-                let kind = MaskKindUi.from(jsonName: typeName)
+                let typeName = kindObject["type"] as? String
             else {
                 return nil
             }
             let data = kindObject["data"] as? [String: Any] ?? [:]
+            guard let kind = MaskKindUi.from(jsonName: typeName, part: data["part"] as? String)
+            else { return nil }
             var mask = MaskUi(
                 id: item["id"] as? String ?? UUID().uuidString,
                 name: item["name"] as? String ?? kind.rawValue,
@@ -894,6 +975,10 @@ enum EditJSON {
                 // 兼容两种写法：0..1 分数（Rust / 新版）或 0..100 百分比（旧版）。
                 let innerFraction = inner <= 1 ? inner : inner / 100
                 mask.radialFeather = max(0, min(100, (1 - innerFraction) * 100))
+            case .aiSubject, .aiPortrait, .aiFace, .aiSkin,
+                .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+                // 智能蒙版：栅格由 Vision 生成并提交给核心缓存（无几何参数）。
+                break
             }
             return mask
         }

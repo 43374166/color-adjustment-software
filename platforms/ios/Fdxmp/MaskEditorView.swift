@@ -263,11 +263,22 @@ struct MaskPanelView: View {
 
     private var addCard: some View {
         Menu {
-            ForEach(MaskKindUi.allCases) { kind in
-                Button {
-                    model.addMask(kind)
-                } label: {
-                    Label(kind.rawValue, systemImage: kind.icon)
+            Section("几何蒙版") {
+                ForEach(MaskKindUi.allCases.filter { !$0.isSmart }) { kind in
+                    Button {
+                        model.addMask(kind)
+                    } label: {
+                        Label(kind.rawValue, systemImage: kind.icon)
+                    }
+                }
+            }
+            Section("智能蒙版（端侧识别）") {
+                ForEach(MaskKindUi.allCases.filter { $0.isSmart }) { kind in
+                    Button {
+                        model.addMask(kind)
+                    } label: {
+                        Label(kind.rawValue, systemImage: kind.icon)
+                    }
                 }
             }
         } label: {
@@ -366,6 +377,9 @@ struct MaskPanelView: View {
             // 局部调色 → 子 nav（反转 / 复制 / 重置 / 重命名 / 删除）。
             // 羽化 / 叠加色 / 不透明度这些都在长按卡片的「蒙版设置」里。
             VStack(spacing: 0) {
+                if mask.kind.isSmart {
+                    smartStatusRow(mask)
+                }
                 adjustControls
                 actionRow
             }
@@ -377,6 +391,47 @@ struct MaskPanelView: View {
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 16)
         }
+    }
+
+    /// 智能蒙版状态行：生成中 / 失败重试 / 已生成提示。
+    @ViewBuilder
+    private func smartStatusRow(_ mask: MaskUi) -> some View {
+        HStack(spacing: 8) {
+            if model.smartMaskGenerating.contains(mask.id) {
+                ProgressView()
+                    .controlSize(.mini)
+                Text("正在端侧识别\(mask.kind.rawValue)…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let failure = model.smartMaskFailed[mask.id] {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                Text(failure)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+                Button("重新生成") {
+                    Haptics.light()
+                    model.retrySmartMask(mask.id)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(Color.accentColor)
+            } else {
+                Image(systemName: "wand.and.stars")
+                    .font(.caption)
+                    .foregroundStyle(Color.accentColor)
+                Text("已生成（端侧识别）：可调局部参数；长按卡片进「蒙版设置」调羽化 / 不透明度")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 4)
+        .opacity(model.draggingSlider == nil ? 1 : 0)
+        .allowsHitTesting(model.draggingSlider == nil)
     }
 
     // MARK: - 形状参数
@@ -391,6 +446,9 @@ struct MaskPanelView: View {
                 radialControls(mask)
             case .brush:
                 brushControls(mask)
+            case .aiSubject, .aiPortrait, .aiFace, .aiSkin,
+                .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+                hintText("智能蒙版由端侧识别生成（离线）；长按卡片可在「蒙版设置」里调羽化 / 不透明度")
             }
         }
         .padding(.vertical, 4)

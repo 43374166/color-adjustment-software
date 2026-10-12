@@ -257,6 +257,10 @@ final class EditorModel: ObservableObject {
         previewOutputSize = nil
         maskOverlays = [:]
         maskThumbnails = [:]
+        smartMaskGenerating.removeAll()
+        smartMaskFailed.removeAll()
+        // 智能蒙版栅格与图像内容绑定：切换图片时清空核心缓存（重新生成 / 重新提交）。
+        NativeCore.shared.clearMaskRasters()
         maskInteracting = false
         brushCursor = nil
         brushErase = false
@@ -1481,7 +1485,7 @@ final class EditorModel: ObservableObject {
 
     // MARK: - 蒙版
 
-    /// 新建蒙版（线性 / 径向 / 画笔），并选中它。
+    /// 新建蒙版（线性 / 径向 / 画笔 / 智能），并选中它。
     func addMask(_ kind: MaskKindUi) {
         let count = state.masks.filter { $0.kind == kind }.count + 1
         var mask = MaskUi(
@@ -1504,6 +1508,10 @@ final class EditorModel: ObservableObject {
             mask.brushFeather = 50
             mask.brushFlow = 100
             mask.brushDensity = 100
+        case .aiSubject, .aiPortrait, .aiFace, .aiSkin,
+            .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+            // 智能蒙版：无几何参数；栅格由 Vision 生成后提交核心缓存。
+            break
         }
         mask.values = EditorSpec.defaultValues()
         applyEdit("新建\(kind.rawValue)") { state in
@@ -1511,6 +1519,92 @@ final class EditorModel: ObservableObject {
         }
         selectedMaskId = mask.id
         brushErase = false
+        if kind.isSmart {
+            generateSmartMask(mask.id)
+        }
+    }
+
+    // MARK: - 智能蒙版（Vision）
+
+    /// 正在生成中的智能蒙版 id（UI 显示转圈）。
+    @Published private(set) var smartMaskGenerating: Set<String> = []
+
+    /// 生成失败的智能蒙版 id → 原因（避免自动重试死循环；可手动「重新生成」）。
+    @Published private(set) var smartMaskFailed: [String: String] = [:]
+
+    /// 补生成缺失的智能蒙版（加载图片 / 恢复编辑记录 / 撤销重做后调用）。
+    func ensureSmartMasksReady() {
+        guard baseBuffer != nil else { return }
+        let paramsJson = currentJson(applyCropRect: true)
+        for mask in state.masks where mask.kind.isSmart {
+            guard !smartMaskGenerating.contains(mask.id) else { continue }
+            guard smartMaskFailed[mask.id] == nil else { continue }
+            if !NativeCore.shared.maskRasterReady(paramsJson: paramsJson, maskId: mask.id) {
+                generateSmartMask(mask.id)
+            }
+        }
+    }
+
+    /// 手动重新生成（清除失败标记）。
+    func retrySmartMask(_ id: String) {
+        smartMaskFailed.removeValue(forKey: id)
+        generateSmartMask(id)
+    }
+
+    /// 为指定的智能蒙版生成权重（后台线程：Vision 分析 → 提交核心缓存）。
+    func generateSmartMask(_ id: String) {
+        guard let mask = state.masks.first(where: { $0.id == id }), mask.kind.isSmart else {
+            return
+        }
+        guard let buffer = baseBuffer else { return }
+        guard !smartMaskGenerating.contains(id) else { return }
+        let paramsJson = currentJson(applyCropRect: true)
+        smartMaskGenerating.insert(id)
+        showMessage("正在生成\(mask.kind.rawValue)…")
+        let kind = mask.kind
+        let maskId = mask.id
+        maskAssetQueue.async { [weak self] in
+            var failure: String?
+            var ready = false
+            do {
+                switch try SmartMaskEngine.generate(kind: kind, buffer: buffer) {
+                case let .plane(width, height, data):
+                    ready = NativeCore.shared.submitMaskRaster(
+                        paramsJson: paramsJson,
+                        maskId: maskId,
+                        width: width,
+                        height: height,
+                        weights: data
+                    )
+                case let .polygons(include, exclude):
+                    ready = NativeCore.shared.submitMaskPolygons(
+                        paramsJson: paramsJson,
+                        maskId: maskId,
+                        width: buffer.width,
+                        height: buffer.height,
+                        polygonsJson: SmartMaskPolygons.json(include: include, exclude: exclude),
+                        feather: 2.0
+                    )
+                }
+                if !ready {
+                    failure = NativeCore.shared.lastError() ?? "蒙版提交失败"
+                }
+            } catch {
+                failure = error.localizedDescription
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                self.smartMaskGenerating.remove(maskId)
+                if let failure {
+                    self.smartMaskFailed[maskId] = failure
+                    self.showMessage("智能蒙版生成失败：\(failure)")
+                } else {
+                    self.smartMaskFailed.removeValue(forKey: maskId)
+                    self.scheduleRender(immediate: true)
+                    self.scheduleMaskAssetsRefresh(immediate: true)
+                }
+            }
+        }
     }
 
     /// 复制选中蒙版（插在原蒙版之后）。
@@ -1797,6 +1891,8 @@ final class EditorModel: ObservableObject {
             maskThumbnails = [:]
             return
         }
+        // 智能蒙版：加载 / 撤销重做 / 恢复编辑记录后自动补齐缺失的栅格。
+        ensureSmartMasksReady()
         let json = currentJson(applyCropRect: true)
         let size = previewImage?.size ?? originalImage?.size ?? CGSize(width: 4, height: 3)
         let overlaySize = Self.cappedSize(

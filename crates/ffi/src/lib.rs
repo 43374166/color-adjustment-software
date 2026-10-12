@@ -819,6 +819,307 @@ pub unsafe extern "C" fn fdxmp_mask_overlay_rgba(
     })
 }
 
+// MARK: - 智能蒙版（v1.4.0）
+
+/// 提交栅格的像素数上限（4096×4096，约 64 MB f32）。
+const SMARTMASK_MAX_PIXELS: usize = 4096 * 4096;
+
+/// 解析参数 JSON 并取出指定蒙版。
+fn find_mask_params(
+    params_json: &str,
+    mask_id: &str,
+) -> std::result::Result<fdxmp_core::params::MaskParams, String> {
+    let params: fdxmp_core::params::EditParams =
+        serde_json::from_str(params_json).map_err(|err| format!("params_json 解析失败：{err}"))?;
+    params
+        .masks
+        .iter()
+        .find(|mask| mask.id == mask_id)
+        .cloned()
+        .ok_or_else(|| format!("找不到蒙版 {mask_id}"))
+}
+
+/// 提交平台提供者生成的蒙版权重栅格（智能蒙版）。
+///
+/// - `weights`：行优先 f32，取值 0..1，长度必须等于 `width × height`；
+/// - 栅格按「蒙版参数」缓存（与尺寸无关），预览 / 叠加 / 导出会按各自
+///   分辨率自动重采样复用；换图或参数变化后旧栅格自然失效；
+/// - 单边上限 4096、总像素上限 16777216，超限拒绝（防 DoS）；
+/// - 返回 [`FDXMP_OK`] / [`FDXMP_ERR`]。
+///
+/// # Safety
+///
+/// `params_json`、`mask_id` 必须为合法 C 字符串；`weights` 在 `len` 范围内可读。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_mask_raster_submit(
+    params_json: *const c_char,
+    mask_id: *const c_char,
+    width: u32,
+    height: u32,
+    weights: *const f32,
+    len: usize,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let mask_id = match cstr_to_str(mask_id, "mask_id") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let expected = (width as usize).saturating_mul(height as usize);
+        if width == 0
+            || height == 0
+            || width > 4096
+            || height > 4096
+            || expected > SMARTMASK_MAX_PIXELS
+        {
+            set_last_error(format!(
+                "蒙版栅格尺寸非法：{width}×{height}（单边 ≤ 4096，总像素 ≤ {SMARTMASK_MAX_PIXELS}）"
+            ));
+            return FDXMP_ERR;
+        }
+        if weights.is_null() || len != expected {
+            set_last_error(format!(
+                "权重长度不匹配：len={len}，期望 {width}×{height}={expected}"
+            ));
+            return FDXMP_ERR;
+        }
+        let mask = match find_mask_params(params_json, mask_id) {
+            Ok(mask) => mask,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        // SAFETY: 调用方保证 weights 至少 len 个 f32 可读。
+        let data = std::slice::from_raw_parts(weights, len);
+        let raster = fdxmp_core::masks::MaskRaster {
+            width,
+            height,
+            weights: data.to_vec(),
+        };
+        match fdxmp_core::masks::insert_ai_raster(&mask, raster) {
+            Ok(()) => FDXMP_OK,
+            Err(err) => {
+                set_last_error(err.to_string());
+                FDXMP_ERR
+            }
+        }
+    })
+}
+
+/// 查询蒙版栅格是否已生成：1 = 就绪，0 = 未生成（参数非法时返回 [`FDXMP_ERR`]）。
+///
+/// # Safety
+///
+/// `params_json`、`mask_id` 必须为合法 C 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_mask_raster_ready(
+    params_json: *const c_char,
+    mask_id: *const c_char,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let mask_id = match cstr_to_str(mask_id, "mask_id") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        match find_mask_params(params_json, mask_id) {
+            Ok(mask) => i32::from(fdxmp_core::masks::ai_raster_ready(&mask)),
+            Err(message) => {
+                set_last_error(message);
+                FDXMP_ERR
+            }
+        }
+    })
+}
+
+/// 清空 AI / 平台蒙版栅格缓存（切换图片时调用）。返回 [`FDXMP_OK`]。
+#[no_mangle]
+pub extern "C" fn fdxmp_mask_raster_clear() -> i32 {
+    guard(FDXMP_ERR, || {
+        fdxmp_core::masks::clear_ai_raster_cache();
+        FDXMP_OK
+    })
+}
+
+/// 提交多边形蒙版（五官关键点 → 核心光栅化 + 羽化 + 缓存）。
+///
+/// `polygons_json` 形如：
+/// ```json
+/// {"include": [[[x, y], ...]], "exclude": [[[x, y], ...]]}
+/// ```
+/// 坐标为归一化 0..1（原点左上角，与图像坐标一致）。返回 [`FDXMP_OK`] / [`FDXMP_ERR`]。
+///
+/// # Safety
+///
+/// `params_json`、`mask_id`、`polygons_json` 必须为合法 C 字符串。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_mask_polygons_submit(
+    params_json: *const c_char,
+    mask_id: *const c_char,
+    width: u32,
+    height: u32,
+    polygons_json: *const c_char,
+    feather_px: f32,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let mask_id = match cstr_to_str(mask_id, "mask_id") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let polygons_json = match cstr_to_str(polygons_json, "polygons_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let expected = (width as usize).saturating_mul(height as usize);
+        if width == 0
+            || height == 0
+            || width > 4096
+            || height > 4096
+            || expected > SMARTMASK_MAX_PIXELS
+        {
+            set_last_error(format!("多边形蒙版尺寸非法：{width}×{height}"));
+            return FDXMP_ERR;
+        }
+        if !feather_px.is_finite() || !(0.0..=128.0).contains(&feather_px) {
+            set_last_error("feather_px 必须在 0..=128");
+            return FDXMP_ERR;
+        }
+        let polygons: fdxmp_core::smartmask::PolygonMask = match serde_json::from_str(polygons_json)
+        {
+            Ok(value) => value,
+            Err(err) => {
+                set_last_error(format!("polygons_json 解析失败：{err}"));
+                return FDXMP_ERR;
+            }
+        };
+        // 规模与数值校验（防 DoS / NaN）。
+        let total_points: usize = polygons
+            .include
+            .iter()
+            .chain(polygons.exclude.iter())
+            .map(|polygon| polygon.len())
+            .sum();
+        if polygons.include.len() > 64 || polygons.exclude.len() > 64 || total_points > 4096 {
+            set_last_error("多边形数量过多（≤ 64 个 / ≤ 4096 点）");
+            return FDXMP_ERR;
+        }
+        if polygons
+            .include
+            .iter()
+            .chain(polygons.exclude.iter())
+            .flat_map(|polygon| polygon.iter())
+            .any(|point| !point[0].is_finite() || !point[1].is_finite())
+        {
+            set_last_error("多边形包含非有限坐标");
+            return FDXMP_ERR;
+        }
+        let mask = match find_mask_params(params_json, mask_id) {
+            Ok(mask) => mask,
+            Err(message) => {
+                set_last_error(message);
+                return FDXMP_ERR;
+            }
+        };
+        let rasterized = match polygons.rasterize(
+            fdxmp_core::smartmask::SmartMaskKind::Face,
+            width,
+            height,
+            feather_px,
+        ) {
+            Ok(mask) => mask,
+            Err(err) => {
+                set_last_error(err.to_string());
+                return FDXMP_ERR;
+            }
+        };
+        match fdxmp_core::masks::insert_ai_raster(&mask, rasterized.to_raster()) {
+            Ok(()) => FDXMP_OK,
+            Err(err) => {
+                set_last_error(err.to_string());
+                FDXMP_ERR
+            }
+        }
+    })
+}
+
+/// 智能蒙版模型清单与状态（JSON 字符串，调用方用 `fdxmp_string_free` 释放）。
+///
+/// 返回 `{"dir": "...", "models": [{name, task, path, present, bytes,
+/// hash_state, license, trainable, version, input_size, provider, precision,
+/// source_url}]}`；失败返回 NULL。
+#[no_mangle]
+pub extern "C" fn fdxmp_smartmask_models_json() -> *mut c_char {
+    guard(ptr::null_mut(), || {
+        let registry = fdxmp_core::smartmask::ModelRegistry::new();
+        let models: Vec<serde_json::Value> = registry
+            .status()
+            .into_iter()
+            .zip(registry.specs().iter())
+            .map(|(status, spec)| {
+                serde_json::json!({
+                    "name": status.name,
+                    "task": spec.task,
+                    "path": status.path,
+                    "present": status.present,
+                    "bytes": status.bytes,
+                    "hash_state": status.hash_state,
+                    "hash_registered": status.hash_registered,
+                    "license": status.license,
+                    "trainable": status.trainable,
+                    "version": spec.version,
+                    "input_size": [spec.input_size.0, spec.input_size.1],
+                    "provider": spec.provider,
+                    "precision": spec.precision,
+                    "source_url": spec.source_url,
+                })
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "dir": registry.dir().display().to_string(),
+            "models": models,
+        });
+        match serde_json::to_string(&payload) {
+            Ok(text) => into_c_string(text),
+            Err(err) => {
+                set_last_error(format!("序列化模型状态失败：{err}"));
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 缓存总大小（字节）；失败返回 [`FDXMP_U64_ERR`]。
 ///
 /// # Safety
@@ -1278,6 +1579,194 @@ mod tests {
         // SAFETY: 返回的是库内静态字符串。
         let version = unsafe { CStr::from_ptr(ptr) }.to_str().unwrap();
         assert!(!version.is_empty());
+    }
+
+    #[test]
+    fn smartmask_raster_submit_flows_into_overlay_and_render() {
+        // 一张 8×8 的径向蒙版（不依赖模型），用提交的栅格走完整链路。
+        let params = CString::new(
+            r#"{"version":1,"masks":[{"id":"m1","name":"AI 主体","visible":true,"inverted":false,"feather":0,"opacity":100,"overlay":"red","kind":{"type":"ai_subject"}}]}"#,
+        )
+        .unwrap();
+        let mask_id = CString::new("m1").unwrap();
+        unsafe {
+            // 1) 未提交前：状态 0，叠加层为全透明。
+            assert_eq!(
+                fdxmp_mask_raster_ready(params.as_ptr(), mask_id.as_ptr()),
+                0
+            );
+            let mut out_w = 0u32;
+            let mut out_h = 0u32;
+            let mut out_len = 0usize;
+            let empty = fdxmp_mask_overlay_rgba(
+                params.as_ptr(),
+                mask_id.as_ptr(),
+                8,
+                8,
+                &mut out_w,
+                &mut out_h,
+                &mut out_len,
+            );
+            assert!(!empty.is_null());
+            let transparent = (0..(out_w as usize) * (out_h as usize))
+                .all(|index| *empty.add(8 + index * 4 + 3) == 0);
+            assert!(transparent, "未提交栅格时叠加层应全透明");
+            fdxmp_bytes_free(empty, out_len);
+
+            // 2) 提交 4×4 基础栅格（8×8 请求会重采样）。
+            let weights = vec![0.6f32; 16];
+            assert_eq!(
+                fdxmp_mask_raster_submit(
+                    params.as_ptr(),
+                    mask_id.as_ptr(),
+                    4,
+                    4,
+                    weights.as_ptr(),
+                    weights.len(),
+                ),
+                FDXMP_OK
+            );
+            assert_eq!(
+                fdxmp_mask_raster_ready(params.as_ptr(), mask_id.as_ptr()),
+                1
+            );
+
+            let overlay = fdxmp_mask_overlay_rgba(
+                params.as_ptr(),
+                mask_id.as_ptr(),
+                8,
+                8,
+                &mut out_w,
+                &mut out_h,
+                &mut out_len,
+            );
+            assert!(!overlay.is_null());
+            assert_eq!((out_w, out_h), (8, 8));
+            assert_eq!(out_len, 8 + 8 * 8 * 4);
+            // 权重 0.6 × 叠加层最大不透明度 0.45 → alpha ≈ 69。
+            let alpha = *overlay.add(8 + 3);
+            assert!((alpha as i32 - 69).abs() <= 2, "alpha={alpha}");
+            fdxmp_bytes_free(overlay, out_len);
+
+            // 3) 非法输入被拒绝。
+            assert_eq!(
+                fdxmp_mask_raster_submit(
+                    params.as_ptr(),
+                    mask_id.as_ptr(),
+                    4,
+                    4,
+                    weights.as_ptr(),
+                    15,
+                ),
+                FDXMP_ERR,
+                "长度不匹配必须拒绝"
+            );
+            assert_eq!(
+                fdxmp_mask_raster_submit(
+                    params.as_ptr(),
+                    mask_id.as_ptr(),
+                    4097,
+                    4,
+                    weights.as_ptr(),
+                    16,
+                ),
+                FDXMP_ERR,
+                "超限尺寸必须拒绝"
+            );
+            assert_eq!(fdxmp_mask_raster_clear(), FDXMP_OK);
+            assert_eq!(
+                fdxmp_mask_raster_ready(params.as_ptr(), mask_id.as_ptr()),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn smartmask_polygons_submit_rasterizes_in_core() {
+        let params = CString::new(
+            r#"{"version":1,"masks":[{"id":"f1","name":"AI 面部","visible":true,"inverted":false,"feather":0,"opacity":100,"overlay":"red","kind":{"type":"ai_people","data":{"part":"face"}}}]}"#,
+        )
+        .unwrap();
+        let mask_id = CString::new("f1").unwrap();
+        let polygons = CString::new(
+            r#"{"include":[[[0.1,0.1],[0.9,0.1],[0.9,0.9],[0.1,0.9]]],"exclude":[[[0.4,0.4],[0.6,0.4],[0.6,0.6],[0.4,0.6]]]}"#,
+        )
+        .unwrap();
+        unsafe {
+            assert_eq!(
+                fdxmp_mask_polygons_submit(
+                    params.as_ptr(),
+                    mask_id.as_ptr(),
+                    32,
+                    32,
+                    polygons.as_ptr(),
+                    0.5,
+                ),
+                FDXMP_OK
+            );
+            assert_eq!(
+                fdxmp_mask_raster_ready(params.as_ptr(), mask_id.as_ptr()),
+                1
+            );
+            // 几何非法 / 空多边形必须拒绝。
+            let empty = CString::new(r#"{"include":[],"exclude":[]}"#).unwrap();
+            assert_eq!(
+                fdxmp_mask_polygons_submit(
+                    params.as_ptr(),
+                    mask_id.as_ptr(),
+                    32,
+                    32,
+                    empty.as_ptr(),
+                    0.0,
+                ),
+                FDXMP_ERR
+            );
+            let bad_feather =
+                CString::new(r#"{"include":[[[0.1,0.1],[0.9,0.1],[0.5,0.9]]]}"#).unwrap();
+            assert_eq!(
+                fdxmp_mask_polygons_submit(
+                    params.as_ptr(),
+                    mask_id.as_ptr(),
+                    32,
+                    32,
+                    bad_feather.as_ptr(),
+                    f32::NAN,
+                ),
+                FDXMP_ERR
+            );
+            fdxmp_mask_raster_clear();
+        }
+    }
+
+    #[test]
+    fn smartmask_models_json_lists_specs_and_hashes() {
+        let pointer = fdxmp_smartmask_models_json();
+        assert!(!pointer.is_null());
+        // SAFETY: 返回的是本库分配的 C 字符串。
+        let text = unsafe {
+            let text = CStr::from_ptr(pointer).to_str().unwrap().to_string();
+            fdxmp_string_free(pointer);
+            text
+        };
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let models = value["models"].as_array().unwrap();
+        assert_eq!(models.len(), 4);
+        let tasks: Vec<String> = models
+            .iter()
+            .map(|model| model["task"].as_str().unwrap().to_string())
+            .collect();
+        for task in [
+            "face_detect",
+            "person_coarse",
+            "face_parse",
+            "person_matting",
+        ] {
+            assert!(tasks.contains(&task.to_string()), "缺少任务 {task}");
+        }
+        for model in models {
+            assert!(model["hash_state"].is_string());
+            assert!(model["license"].as_str().unwrap().len() > 0);
+        }
     }
 
     #[test]

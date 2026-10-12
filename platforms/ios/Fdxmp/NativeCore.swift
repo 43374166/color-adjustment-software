@@ -109,6 +109,84 @@ final class NativeCore {
         return decodePayload(pointer: pointer, outLen: outLen)
     }
 
+    // MARK: - 智能蒙版（v1.4.0）
+
+    /// 提交权重栅格（f32 0..1，行优先）：核心缓存后供渲染 / 叠加 / 导出复用。
+    ///
+    /// 阻塞调用，必须在工作线程执行；失败返回 false（原因见 `lastError()`）。
+    func submitMaskRaster(
+        paramsJson: String,
+        maskId: String,
+        width: Int,
+        height: Int,
+        weights: [Float]
+    ) -> Bool {
+        let pointer = weights.withUnsafeBufferPointer { buffer in
+            maskId.withCString { mask in
+                paramsJson.withCString { params in
+                    fdxmp_mask_raster_submit(
+                        params,
+                        mask,
+                        UInt32(width),
+                        UInt32(height),
+                        buffer.baseAddress,
+                        weights.count
+                    )
+                }
+            }
+        }
+        return pointer == 0
+    }
+
+    /// 提交多边形蒙版（五官关键点，归一化坐标）：核心负责光栅化与羽化。
+    func submitMaskPolygons(
+        paramsJson: String,
+        maskId: String,
+        width: Int,
+        height: Int,
+        polygonsJson: String,
+        feather: Float
+    ) -> Bool {
+        let code = polygonsJson.withCString { polygons in
+            maskId.withCString { mask in
+                paramsJson.withCString { params in
+                    fdxmp_mask_polygons_submit(
+                        params,
+                        mask,
+                        UInt32(width),
+                        UInt32(height),
+                        polygons,
+                        feather
+                    )
+                }
+            }
+        }
+        return code == 0
+    }
+
+    /// 蒙版栅格是否已生成。
+    func maskRasterReady(paramsJson: String, maskId: String) -> Bool {
+        let code = maskId.withCString { mask in
+            paramsJson.withCString { params in
+                fdxmp_mask_raster_ready(params, mask)
+            }
+        }
+        return code == 1
+    }
+
+    /// 清空智能蒙版栅格缓存（切换图片时调用）。
+    @discardableResult
+    func clearMaskRasters() -> Bool {
+        fdxmp_mask_raster_clear() == 0
+    }
+
+    /// 智能蒙版模型清单与状态（JSON；macOS / 桌面端 ONNX 用，iOS 走 Vision）。
+    func smartMaskModelsJson() -> String? {
+        guard let pointer = fdxmp_smartmask_models_json() else { return nil }
+        defer { fdxmp_string_free(pointer) }
+        return String(cString: pointer)
+    }
+
     /// 只渲染整帧的一块区域（放大 1:1 看细节；暗角 / 颗粒与蒙版按整帧坐标算）。
     ///
     /// `buffer` 是区域像素（已含余量），各坐标都是**该缓冲所对应源图的像素坐标**。

@@ -1296,6 +1296,27 @@ impl FdxmpApp {
                 );
             }
         });
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("五官（v1.4.0）：");
+            for (label, part) in [
+                ("面部", fdxmp_core::params::PeoplePart::Face),
+                ("皮肤", fdxmp_core::params::PeoplePart::Skin),
+                ("头发", fdxmp_core::params::PeoplePart::Hair),
+                ("眼睛", fdxmp_core::params::PeoplePart::Eyes),
+                ("眉毛", fdxmp_core::params::PeoplePart::Eyebrows),
+                ("鼻子", fdxmp_core::params::PeoplePart::Nose),
+                ("嘴唇", fdxmp_core::params::PeoplePart::Lips),
+                ("牙齿", fdxmp_core::params::PeoplePart::Teeth),
+            ] {
+                if ui.small_button(label).clicked() {
+                    self.right_module = RightModule::Mask;
+                    self.create_ai_mask(
+                        fdxmp_core::params::MaskKind::AiPeople { part },
+                        &format!("AI 人物-{label}"),
+                    );
+                }
+            }
+        });
         ui.add_space(4.0);
         ui.weak("创建后自动切到「蒙版」模块；模型缺失时先在上面下载。");
     }
@@ -3505,6 +3526,12 @@ impl FdxmpApp {
                     ("皮肤", fdxmp_core::params::PeoplePart::Skin),
                     ("头发", fdxmp_core::params::PeoplePart::Hair),
                     ("衣服", fdxmp_core::params::PeoplePart::Clothes),
+                    ("眼睛", fdxmp_core::params::PeoplePart::Eyes),
+                    ("眉毛", fdxmp_core::params::PeoplePart::Eyebrows),
+                    ("鼻子", fdxmp_core::params::PeoplePart::Nose),
+                    ("嘴唇", fdxmp_core::params::PeoplePart::Lips),
+                    ("牙齿", fdxmp_core::params::PeoplePart::Teeth),
+                    ("耳朵", fdxmp_core::params::PeoplePart::Ears),
                 ] {
                     if ui.button(label).clicked() {
                         self.create_ai_mask(
