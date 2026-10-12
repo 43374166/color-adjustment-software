@@ -1,5 +1,6 @@
 import Foundation
 import Photos
+import PhotosUI
 import SwiftUI
 
 /// 一个项目：一组被添加进来的照片（编辑 Tab 的「＋」创建）。

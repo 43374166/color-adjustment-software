@@ -1630,7 +1630,6 @@ final class EditorModel: ObservableObject {
                 analysis = RetouchAnalysisUi.from(json: json)
             }
             Task { @MainActor in
-                guard let self else { return }
                 self.retouchAnalysis = analysis
                 let params = RetouchUi.autoDefaults(
                     faces: analysis?.faces ?? 0,
@@ -1730,7 +1729,6 @@ final class EditorModel: ObservableObject {
                 output = NativeCore.shared.retouchApply(paramsJson: json, buffer: buffer)
             }
             Task { @MainActor in
-                guard let self else { return }
                 self.retouchWorkInFlight = false
                 if params.isIdentity {
                     self.retouchBuffer = nil
