@@ -2,9 +2,9 @@ import Foundation
 
 /// Rust 核心桥接（C ABI，对应 crates/ffi 与 crates/ffi/include/fdxmp.h）。
 ///
-/// iOS 走「系统解码 + Rust 调色」：PhotoKit 负责解码 HEIC / JPEG / RAW，
-/// 再把 RGBA8 像素交给 `fdxmp_render_memory_rgba` 应用编辑参数。
-/// 因此 iOS 构建不需要 LibRaw / libheif（`raw` / `heif` feature 保持关闭）。
+/// iOS 走「解码 + Rust 调色」：HEIC / JPEG 由 PhotoKit 解码后把 RGBA8 像素交给
+/// `fdxmp_render_memory_rgba`；相机 RAW / DNG（ProRAW 等）走 Rust 核心的
+/// LibRaw（`fdxmp_decode_raw_rgba8`）解调，预览 / 导出与桌面端同源。
 final class NativeCore {
     static let shared = NativeCore()
 
@@ -58,6 +58,31 @@ final class NativeCore {
             }
         }
         return decodePayload(pointer: pointer, outLen: outLen)
+    }
+
+    /// 用 LibRaw（rsraw）解码相机 RAW / DNG 字节，返回 RGBA8 缓冲。
+    ///
+    /// `fullSize = false` 走半尺寸解调（预览，快）；`true` 走全尺寸解调（导出）。
+    /// 输出按 `maxEdge` 等比缩小（不放大）。阻塞调用，必须在工作线程执行；
+    /// 失败返回 nil（原因见 `lastError()`）。
+    func decodeRaw(data: Data, maxEdge: Int, fullSize: Bool) -> RgbaBuffer? {
+        guard !data.isEmpty else { return nil }
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = data.withUnsafeBytes { bytes in
+            fdxmp_decode_raw_rgba8(
+                bytes.bindMemory(to: UInt8.self).baseAddress,
+                data.count,
+                UInt32(max(maxEdge, 64)),
+                fullSize ? 1 : 0,
+                &outWidth,
+                &outHeight,
+                &outLen
+            )
+        }
+        guard let result = decodePayload(pointer: pointer, outLen: outLen) else { return nil }
+        return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
     }
 
     /// 生成单个蒙版的叠加层（红色半透明，预乘 RGBA8），供画布叠加与列表缩略图使用。

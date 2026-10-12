@@ -34,6 +34,27 @@ pub fn render_preview_rgba(path: &Path, params_json: &str, max_edge: u32) -> Res
     finish_preview(proxy, &params)
 }
 
+/// 从内存字节解码相机 RAW（rsraw / LibRaw）并转成 RGBA8 缓冲（iOS 编辑 / 导出用）。
+///
+/// - `full_size = false`：半尺寸解调（预览，快）；`true`：全尺寸解调（导出）；
+/// - 相机白平衡 + 相机内嵌色彩矩阵，与桌面 [`crate::decode::decode_raw`] 同路径，
+///   预览与导出观感一致（不做内嵌预览替代，避免编辑结果与导出不一致）；
+/// - 输出按 `max_edge` 等比缩小（不放大）。
+pub fn decode_raw_rgba(bytes: &[u8], max_edge: u32, full_size: bool) -> Result<PreviewRgba> {
+    let options = crate::decode::DecodeOptions {
+        use_embedded_preview: false,
+        half_size: !full_size,
+        camera_white_balance: true,
+    };
+    let decoded = crate::decode::decode_raw_bytes(bytes, &options, std::time::Instant::now())?;
+    let proxy = decoded.display_proxy(max_edge.clamp(64, 8192));
+    Ok(PreviewRgba {
+        width: proxy.width(),
+        height: proxy.height(),
+        rgba: proxy.into_raw(),
+    })
+}
+
 /// 对调用方提供的内存 RGBA8 图像应用编辑参数（图像已由系统解码的场景，如 iOS）。
 ///
 /// `rgba` 为行优先 RGBA8 像素，长度至少 `width × height × 4`；

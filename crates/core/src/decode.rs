@@ -495,7 +495,19 @@ fn apply_input_icc(pixels: image::DynamicImage, icc: &[u8]) -> Result<image::Dyn
 #[cfg(feature = "raw")]
 pub fn decode_raw(path: &Path, options: &DecodeOptions, started: Instant) -> Result<DecodedImage> {
     let bytes = std::fs::read(path)?;
-    let mut raw = rsraw::RawImage::open(&bytes)
+    decode_raw_bytes(&bytes, options, started)
+}
+
+/// 从内存字节解码 RAW（iOS 从 PhotoKit 拿原始 DNG / RAW 数据时用，免落临时文件）。
+///
+/// 桌面路径 [`decode_raw`] 读文件后同样进这里，两端行为完全一致。
+#[cfg(feature = "raw")]
+pub fn decode_raw_bytes(
+    bytes: &[u8],
+    options: &DecodeOptions,
+    started: Instant,
+) -> Result<DecodedImage> {
+    let mut raw = rsraw::RawImage::open(bytes)
         .map_err(|err| FdxmpError::Raw(format!("LibRaw 打开失败：{err}")))?;
     let metadata = raw_metadata(&raw);
 
@@ -585,6 +597,18 @@ pub fn decode_raw(
         "构建时启用 feature `raw` 后可用：{}",
         path.display()
     )))
+}
+
+/// 未启用 `raw` feature 时的提示（内存字节入口）。
+#[cfg(not(feature = "raw"))]
+pub fn decode_raw_bytes(
+    _bytes: &[u8],
+    _options: &DecodeOptions,
+    _started: Instant,
+) -> Result<DecodedImage> {
+    Err(FdxmpError::RawUnavailable(
+        "构建时启用 feature `raw` 后可用（内存 RAW 解码）".to_string(),
+    ))
 }
 
 /// HEIF 解码（libheif-rs，需要本地 libheif ≥ 1.23）。

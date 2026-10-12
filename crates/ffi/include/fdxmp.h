@@ -59,6 +59,21 @@ char *fdxmp_preset_json_from_xmp(const char *xmp);
 
 char *fdxmp_probe_json(const char *path);
 
+/* ---- RAW 解码（LibRaw / rsraw，需构建时启用 raw feature）----
+ *
+ * 从内存字节（如 iOS 从 PhotoKit 取到的原始 DNG / RAW 数据）解码相机 RAW；
+ * full_size = 0 半尺寸解调（预览）/ 非 0 全尺寸解调（导出）；
+ * 输出按 max_edge 等比缩小（不放大）。返回格式与 fdxmp_render_preview_rgba 相同
+ * （8 字节大端宽高 + RGBA8 像素），必须用 fdxmp_bytes_free(ptr, len) 释放。
+ */
+uint8_t *fdxmp_decode_raw_rgba8(const uint8_t *bytes,
+                                size_t len,
+                                uint32_t max_edge,
+                                uint32_t full_size,
+                                uint32_t *out_width,
+                                uint32_t *out_height,
+                                size_t *out_len);
+
 /* ---- 预览渲染（CPU，移动端 / 无 GPU 环境）----
  *
  * 返回缓冲区前 8 字节为大端 width / height，其后为行优先 RGBA8 像素；

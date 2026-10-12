@@ -209,6 +209,73 @@ fn raw_custom_options_are_honoured() {
     assert_eq!(decoded.source, DecodeSource::HalfRaw);
 }
 
+/// DNG 样张（rsraw / LibRaw 内置 DNG 解码器；iPhone ProRAW 也走这条路径）。
+#[cfg(feature = "raw")]
+fn sample_dng() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FDXMP_TEST_DNG") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+    let candidate = std::path::Path::new(&home)
+        .join(".cache")
+        .join("fdxmp-tools")
+        .join("samples")
+        .join("exiftool-DNG.dng");
+    candidate.is_file().then_some(candidate)
+}
+
+#[cfg(feature = "raw")]
+#[test]
+fn decodes_dng_via_libraw() {
+    let Some(path) = sample_dng() else {
+        eprintln!(
+            "跳过 DNG 集成测试：未找到样张。可设置 FDXMP_TEST_DNG，或放到 \
+             %USERPROFILE%\\.cache\\fdxmp-tools\\samples\\exiftool-DNG.dng"
+        );
+        return;
+    };
+    let decoded = decode(&path).unwrap();
+    assert!(decoded.width > 1000 && decoded.height > 1000);
+    assert!(decoded.metadata.is_some());
+    eprintln!(
+        "DNG 解码：{}x{}（{}ms）| {}",
+        decoded.width,
+        decoded.height,
+        decoded.elapsed_ms,
+        decoded.metadata.as_ref().unwrap().summary()
+    );
+}
+
+#[cfg(feature = "raw")]
+#[test]
+fn decode_raw_rgba_from_bytes_decodes_and_scales() {
+    // 完整样张优先（NEF 带真实图像数据；DNG 样张可能只有元数据）。
+    let (bytes, complete) = if let Some(path) = sample_raw() {
+        (std::fs::read(&path).unwrap(), true)
+    } else if let Some(path) = sample_dng() {
+        (std::fs::read(&path).unwrap(), false)
+    } else {
+        eprintln!("跳过 RAW 内存解码测试：未找到样张（FDXMP_TEST_RAW / FDXMP_TEST_DNG）");
+        return;
+    };
+    let preview = fdxmp_core::preview::decode_raw_rgba(&bytes, 1024, false).unwrap();
+    let longest = preview.width.max(preview.height);
+    assert!((512..=1024).contains(&longest), "长边应按 max_edge 缩放：{longest}");
+    assert_eq!(
+        preview.rgba.len(),
+        (preview.width as usize) * (preview.height as usize) * 4
+    );
+    // 完整样张：确认真实解调出像素而不是纯色占位。
+    if complete {
+        let first = &preview.rgba[..4];
+        assert!(
+            preview.rgba.chunks_exact(4).any(|pixel| pixel != first),
+            "解码结果不应为纯色"
+        );
+    }
+}
+
 #[cfg(not(feature = "raw"))]
 #[test]
 fn raw_without_feature_reports_hint() {

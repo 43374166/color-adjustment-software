@@ -128,7 +128,24 @@
         CPU / GPU 同公式；
       - 新增回归单测：明亮度 +100 保留白场余量 + 通道差缩小（去饱和）、
         去雾 +100 压暗中间调但不压死（核心库 126 → 128 项全过）
+- [x] 1.3.6 iOS 接入 LibRaw（rsraw）：相机 RAW / DNG 真解码
+      - 结论：rsraw 0.1.1 内置 LibRaw 0.21.3 Release，**原生支持 DNG**
+        （编译清单含 `dng.cpp` / `fp_dng.cpp` / DNG SDK 胶水层），不需要单独接 DNG 解码器；
+        本机实测：Nikon Z8 NEF（8280×5520 全尺寸解调）与 Canon 350D DNG
+        （3474×2314，元数据 "Canon EOS 350D"）均正常解码；
+      - 核心：`decode::decode_raw_bytes`（内存字节解码；桌面读文件后进同一路径）、
+        `preview::decode_raw_rgba`（RAW 字节 → RGBA8，半尺寸 / 全尺寸，按 `max_edge` 缩放）；
+      - FFI 新增 `fdxmp_decode_raw_rgba8(bytes, len, max_edge, full_size, out_*)`
+        （8 字节大端宽高 + RGBA8；`fdxmp_bytes_free` 释放；`fdxmp.h` 同步）；
+      - iOS 构建打开 `raw` feature（CI 两个 target `--features gpu,raw`），
+        工程显式链接 `-lc++`（LibRaw 为 C++ 静态库）；
+      - iOS 应用接入：ProRAW / DNG（`.photoRAW` 子类型或原始资源为 raw-image）
+        从 `PHAssetResource` 取原始文件字节 → LibRaw 解调 → 基础预览缓冲；
+        放大 1:1 细节帧改用 LibRaw 细节缓冲（≤2560，>24MP 自动半尺寸；区域渲染暂缓）；
+        导出同样走 LibRaw（与预览同源）；任何一步失败都静默回退系统解码路径；
+      - 测试：核心 128 + FFI 8 全过（新增 DNG 解码 / 内存字节 RGBA8 缩放 /
+        FFI 往返 3 个用例，本机实测；iOS 侧由 CI 编译验证）
 
 ## 待做
 
-（无 —— 1.3.5 已全部落地，待打包验证）
+（无 —— 1.3.6 已全部落地，待打包验证）

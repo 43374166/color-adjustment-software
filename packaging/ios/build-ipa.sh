@@ -15,9 +15,10 @@ APP_PATH="platforms/ios/build/Build/Products/Release-iphoneos/Fdxmp.app"
 
 echo "==> 1/5 构建 Rust 静态库（$DEVICE_TARGET / $SIM_TARGET）"
 rustup target add "$DEVICE_TARGET" "$SIM_TARGET"
-# gpu feature：预览走 wgpu（iOS = Metal），失败自动回退 CPU。
-cargo rustc -p fdxmp-ffi --release --features gpu --target "$DEVICE_TARGET" --crate-type staticlib
-cargo rustc -p fdxmp-ffi --release --features gpu --target "$SIM_TARGET" --crate-type staticlib
+# gpu feature：预览走 wgpu（iOS = Metal），失败自动回退 CPU；
+# raw feature：LibRaw（rsraw）解相机 RAW / DNG，工程侧需链接 libc++（见 project.yml）。
+cargo rustc -p fdxmp-ffi --release --features gpu,raw --target "$DEVICE_TARGET" --crate-type staticlib
+cargo rustc -p fdxmp-ffi --release --features gpu,raw --target "$SIM_TARGET" --crate-type staticlib
 
 echo "==> 2/5 合并 FdxmpCore.xcframework"
 rm -rf dist/ios/FdxmpCore.xcframework

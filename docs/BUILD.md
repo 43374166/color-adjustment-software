@@ -172,6 +172,10 @@ brew install xcodegen
 推送后手动触发即可在云端产出未签名 IPA（用 Sideloadly / AltStore 签名安装），
 详见 [packaging/ios/README.md](../packaging/ios/README.md)。
 
+iOS 构建启用 `gpu,raw` 两个 feature：`raw` 会把 LibRaw（rsraw，C++）
+编进同一份静态库，工程需在链接阶段带上 `libc++`（`platforms/ios/project.yml`
+已配置 `-lc++`）。相机 RAW / DNG 在 App 内由 LibRaw 解调（与桌面端同一条路径）。
+
 ## 5. 桌面打包器
 
 ```powershell

@@ -71,6 +71,10 @@ enum EditorLimits {
     }
     /// 放大查看（原像素细节）用的最长边。
     static let detailMaxEdge = 4096
+    /// RAW 细节缓冲最长边（LibRaw 解一版备用，供放大 1:1 / 区域细节复用）。
+    static let rawDetailMaxEdge = 2560
+    /// RAW 全尺寸解调的像素上限（超过则用半尺寸，避免 48MP ProRAW 内存尖峰）。
+    static let rawFullSizePixelLimit = 24_000_000
 }
 
 /// 编辑界面状态机：照片加载 → 防抖渲染 → 直方图 / 撤销重做 / 导出。
@@ -157,6 +161,12 @@ final class EditorModel: ObservableObject {
     private(set) var asset: PHAsset?
 
     private var baseBuffer: RgbaBuffer?
+    /// 当前 RAW 照片的原始文件字节（LibRaw 解码源；细节帧 / 导出复用）。
+    private(set) var rawData: Data?
+    /// RAW 细节缓冲（LibRaw 解一版 ≤2560，供放大 1:1 / 区域细节复用；nil = 未就绪）。
+    private var rawDetailBuffer: RgbaBuffer?
+    private var rawDetailInFlight = false
+    private var rawDetailToken = 0
     /// GPU 预览会话（nil = GPU 不可用 / 未就绪，预览自动走 CPU）。
     private var gpuSession: GpuPreviewSession?
     /// GPU 会话代际（换图 / 重建后旧回调作废）。
@@ -238,6 +248,10 @@ final class EditorModel: ObservableObject {
         originalImage = nil
         histogram = nil
         baseBuffer = nil
+        rawData = nil
+        rawDetailBuffer = nil
+        rawDetailInFlight = false
+        rawDetailToken &+= 1
         fastBuffer = nil
         clearGpuSession()
         previewOutputSize = nil
@@ -279,7 +293,51 @@ final class EditorModel: ObservableObject {
             self.isLoading = false
         }
 
-        // 2) 正式图：转成像素缓冲后走 Rust 渲染。
+        // 2) 正式图：RAW（ProRAW / DNG）走 LibRaw 解调，其余交给系统解码后转像素缓冲。
+        if PhotoRaw.isRawAsset(asset) {
+            loadRawImage(asset: asset, token: token, maxEdge: maxEdge)
+        } else {
+            loadSystemImage(asset: asset, token: token, maxEdge: maxEdge)
+        }
+    }
+
+    /// RAW 正式图：取原始文件字节 → LibRaw 半尺寸解调 → RGBA8；失败回退系统解码。
+    private func loadRawImage(asset: PHAsset, token: Int, maxEdge: Int) {
+        PhotoRaw.requestData(for: asset) { [weak self] data in
+            Task { @MainActor in
+                guard let self, self.loadToken == token else { return }
+                guard let data, !data.isEmpty else {
+                    // 取不到原始数据（如 iCloud 拉取失败 / 资源缺失）：回退系统渲染。
+                    self.loadSystemImage(asset: asset, token: token, maxEdge: maxEdge)
+                    return
+                }
+                self.rawData = data
+                self.renderQueue.async { [weak self] in
+                    let buffer = NativeCore.shared.decodeRaw(
+                        data: data,
+                        maxEdge: maxEdge,
+                        fullSize: false
+                    )
+                    let original = buffer.flatMap { ImageUtil.image(from: $0) }
+                    Task { @MainActor in
+                        guard let self, self.loadToken == token else { return }
+                        guard buffer != nil else {
+                            // LibRaw 解不了（罕见格式等）：回退系统渲染并释放原始字节。
+                            self.rawData = nil
+                            self.loadSystemImage(asset: asset, token: token, maxEdge: maxEdge)
+                            return
+                        }
+                        self.finishLoading(buffer: buffer, original: original, token: token)
+                        // 后台再解一版细节缓冲（放大 1:1 / 区域细节复用）。
+                        self.prepareRawDetailBuffer(asset: asset)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 系统解码正式图（JPEG / HEIC / 非 RAW，也是 RAW 不可用时的回退）。
+    private func loadSystemImage(asset: PHAsset, token: Int, maxEdge: Int) {
         requestImage(
             asset: asset,
             maxEdge: maxEdge,
@@ -300,22 +358,55 @@ final class EditorModel: ObservableObject {
                 let original = buffer.flatMap { ImageUtil.image(from: $0) }
                 Task { @MainActor in
                     guard let self, self.loadToken == token else { return }
-                    self.isLoading = false
-                    guard let buffer else {
-                        self.message = "无法读取这张照片的像素数据"
-                        return
-                    }
-                    self.baseBuffer = buffer
-                    self.fastBuffer = ImageUtil.downscaled(
-                        buffer: buffer,
-                        maxEdge: EditorLimits.fastPreviewMaxEdge
+                    self.finishLoading(buffer: buffer, original: original, token: token)
+                }
+            }
+        }
+    }
+
+    /// 载入完成（系统解码与 LibRaw 共用）：缓冲 / 原图 / 首帧渲染 / GPU 会话。
+    private func finishLoading(buffer: RgbaBuffer?, original: UIImage?, token: Int) {
+        guard loadToken == token else { return }
+        isLoading = false
+        guard let buffer else {
+            message = "无法读取这张照片的像素数据"
+            return
+        }
+        baseBuffer = buffer
+        fastBuffer = ImageUtil.downscaled(
+            buffer: buffer,
+            maxEdge: EditorLimits.fastPreviewMaxEdge
+        )
+        originalImage = original
+        // 先显示原图占位，首帧渲染完成后替换为调色结果。
+        previewImage = original
+        scheduleRender(immediate: true)
+        // 首帧先走 CPU 保证立刻出图；GPU 会话在后台创建，就绪后接管预览渲染。
+        createGpuSession(for: buffer)
+    }
+
+    /// RAW：后台解一版更精细的缓冲（≤2560）供放大 1:1 / 区域细节复用。
+    private func prepareRawDetailBuffer(asset: PHAsset) {
+        guard let data = rawData, rawDetailBuffer == nil, !rawDetailInFlight else { return }
+        rawDetailToken &+= 1
+        let token = rawDetailToken
+        rawDetailInFlight = true
+        let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
+        let fullSize = pixels > 0 && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
+        let maxEdge = EditorLimits.rawDetailMaxEdge
+        renderQueue.async { [weak self] in
+            let buffer = NativeCore.shared.decodeRaw(data: data, maxEdge: maxEdge, fullSize: fullSize)
+            Task { @MainActor in
+                guard let self, self.rawDetailToken == token else { return }
+                self.rawDetailInFlight = false
+                self.rawDetailBuffer = buffer
+                // 用户已放大（有细节帧）：用更高精度缓冲重渲染一帧。
+                if buffer != nil, self.detailImage != nil {
+                    self.requestDetailPreview(
+                        viewport: self.lastDetailViewport,
+                        zoom: self.lastDetailZoom,
+                        force: true
                     )
-                    self.originalImage = original
-                    // 先显示原图占位，首帧渲染完成后替换为调色结果。
-                    self.previewImage = original
-                    self.scheduleRender(immediate: true)
-                    // 首帧先走 CPU 保证立刻出图；GPU 会话在后台创建，就绪后接管预览渲染。
-                    self.createGpuSession(for: buffer)
                 }
             }
         }
@@ -497,6 +588,28 @@ final class EditorModel: ObservableObject {
         detailToken &+= 1
         let token = detailToken
         let json = currentJson(applyCropRect: true)
+
+        // RAW：细节帧同源走 LibRaw 缓冲（避免混入系统渲染的观感差异）。
+        if rawData != nil {
+            let source = rawDetailBuffer ?? baseBuffer
+            renderQueue.async { [weak self] in
+                let result = source.flatMap {
+                    NativeCore.shared.render(buffer: $0, paramsJson: json)
+                }
+                let output = result.flatMap {
+                    ImageUtil.image(
+                        from: RgbaBuffer(pixels: $0.pixels, width: $0.width, height: $0.height)
+                    )
+                }
+                Task { @MainActor in
+                    guard let self, self.detailToken == token else { return }
+                    self.detailInFlight = false
+                    self.detailImage = output
+                }
+            }
+            return
+        }
+
         requestImage(
             asset: asset,
             maxEdge: maxEdge,
@@ -552,6 +665,8 @@ final class EditorModel: ObservableObject {
 
     /// 是否可用区域渲染（核心要求单位几何；蒙版类型也要能重建）。
     var canRenderRegionDetail: Bool {
+        // RAW：区域帧若走系统渲染会与 LibRaw 基础帧观感不一致，先用整帧细节帧。
+        guard rawData == nil else { return false }
         let crop = state.crop
         let identity = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
             && crop.rotation == 0
@@ -1999,6 +2114,37 @@ final class EditorModel: ObservableObject {
             && crop.rotation == 0
             && !crop.flipHorizontal
             && !crop.flipVertical
+        let json = currentJson(applyCropRect: true, usePreview: false)
+        // 读取原图 EXIF / GPS 等元数据（保留拍摄信息）。
+        var metadata: [String: Any]?
+        if keepMetadata {
+            metadata = Self.loadExportMetadata(asset: asset)
+        }
+
+        // RAW：LibRaw 解调作为导出源（与预览同源）；像素量超限时自动用半尺寸解调。
+        if let rawData {
+            exportProgress = 0.25
+            let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
+            let fullSize = pixels > 0 && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
+            renderQueue.async { [weak self] in
+                guard let self else { return }
+                let buffer = NativeCore.shared.decodeRaw(
+                    data: rawData,
+                    maxEdge: targetEdge,
+                    fullSize: fullSize
+                )
+                self.finishExport(
+                    buffer: buffer,
+                    paramsJson: json,
+                    identityGeometry: identityGeometry,
+                    metadata: metadata,
+                    format: format,
+                    quality: quality
+                )
+            }
+            return
+        }
+
         requestImage(
             asset: asset,
             maxEdge: targetEdge,
@@ -2012,64 +2158,77 @@ final class EditorModel: ObservableObject {
                 return
             }
             self.exportProgress = 0.25
-            let json = self.currentJson(applyCropRect: true, usePreview: false)
-            // 并行读取原图 EXIF / GPS 等元数据（保留拍摄信息）。
-            var metadata: [String: Any]?
-            if keepMetadata {
-                metadata = Self.loadExportMetadata(asset: asset)
-            }
             self.renderQueue.async { [weak self] in
                 guard let self else { return }
                 let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: targetEdge)
-                // 大图优先按横向条带分块渲染（每块只跑区域管线，内存峰值明显低于整帧）。
-                let renderedBuffer: RgbaBuffer?
-                if let buffer, let tiled = self.renderTiledExport(
+                self.finishExport(
                     buffer: buffer,
                     paramsJson: json,
-                    identityGeometry: identityGeometry
-                ) {
-                    renderedBuffer = tiled
-                } else if let buffer,
-                          let result = NativeCore.shared.render(buffer: buffer, paramsJson: json) {
-                    renderedBuffer = RgbaBuffer(
-                        pixels: result.pixels,
-                        width: result.width,
-                        height: result.height
-                    )
-                } else {
-                    renderedBuffer = nil
-                }
-                let failure = renderedBuffer == nil ? NativeCore.shared.lastError() : nil
-                let output = renderedBuffer.flatMap { ImageUtil.image(from: $0) }
-                Task { @MainActor [weak self] in
+                    identityGeometry: identityGeometry,
+                    metadata: metadata,
+                    format: format,
+                    quality: quality
+                )
+            }
+        }
+    }
+
+    /// 导出第二阶段（在渲染线程调用）：条带分块渲染 → 编码 → 存相册。
+    private func finishExport(
+        buffer: RgbaBuffer?,
+        paramsJson json: String,
+        identityGeometry: Bool,
+        metadata: [String: Any]?,
+        format: ExportFormat,
+        quality: Double
+    ) {
+        // 大图优先按横向条带分块渲染（每块只跑区域管线，内存峰值明显低于整帧）。
+        let renderedBuffer: RgbaBuffer?
+        if let buffer, let tiled = renderTiledExport(
+            buffer: buffer,
+            paramsJson: json,
+            identityGeometry: identityGeometry
+        ) {
+            renderedBuffer = tiled
+        } else if let buffer,
+                  let result = NativeCore.shared.render(buffer: buffer, paramsJson: json) {
+            renderedBuffer = RgbaBuffer(
+                pixels: result.pixels,
+                width: result.width,
+                height: result.height
+            )
+        } else {
+            renderedBuffer = nil
+        }
+        let failure = renderedBuffer == nil ? NativeCore.shared.lastError() : nil
+        let output = renderedBuffer.flatMap { ImageUtil.image(from: $0) }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let output else {
+                self.isExporting = false
+                self.exportProgress = nil
+                self.message = failure ?? (buffer == nil ? "导出失败：无法读取原图" : "导出失败")
+                return
+            }
+            self.exportProgress = 0.75
+            // 编码（JPEG/PNG/HEIC）放到工作线程，避免卡住界面。
+            self.renderQueue.async { [weak self] in
+                let fileURL = Self.writeExportFile(
+                    image: output,
+                    format: format,
+                    quality: quality,
+                    metadata: metadata
+                )
+                Task { @MainActor in
                     guard let self else { return }
-                    guard let output else {
+                    guard let fileURL else {
                         self.isExporting = false
                         self.exportProgress = nil
-                        self.message = failure ?? "导出失败"
+                        self.message = "导出失败：无法写入文件"
                         return
                     }
-                    self.exportProgress = 0.75
-                    // 编码（JPEG/PNG/HEIC）放到工作线程，避免卡住界面。
-                    self.renderQueue.async { [weak self] in
-                        let fileURL = Self.writeExportFile(
-                            image: output,
-                            format: format,
-                            quality: quality,
-                            metadata: metadata
-                        )
-                        Task { @MainActor in
-                            guard let self else { return }
-                            guard let fileURL else {
-                                self.isExporting = false
-                                self.exportProgress = nil
-                                self.message = "导出失败：无法写入文件"
-                                return
-                            }
-                            self.exportProgress = 0.9
-                            self.saveToLibrary(fileURL: fileURL)
-                        }
-                    }
+                    self.exportProgress = 0.9
+                    self.saveToLibrary(fileURL: fileURL)
                 }
             }
         }

@@ -553,6 +553,59 @@ pub unsafe extern "C" fn fdxmp_render_preview_rgba(
     })
 }
 
+/// 从内存字节解码相机 RAW（LibRaw / rsraw）并返回 RGBA8 缓冲区
+/// （前 8 字节大端 width / height，其后行优先 RGBA8；用 `fdxmp_bytes_free` 释放）。
+///
+/// `full_size = 0` 走半尺寸解调（预览）；非 0 走全尺寸解调（导出）。
+/// 输出按 `max_edge` 等比缩小（不放大）。未启用 `raw` feature 时返回 NULL 并给出提示。
+///
+/// # Safety
+///
+/// `bytes` 必须指向至少 `len` 字节的可读缓冲区；`out_width`、`out_height`、
+/// `out_len` 必须为非空可写指针。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_decode_raw_rgba8(
+    bytes: *const u8,
+    len: usize,
+    max_edge: u32,
+    full_size: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if bytes.is_null() || out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("bytes / out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        if len == 0 {
+            set_last_error("RAW 数据为空");
+            return ptr::null_mut();
+        }
+        // SAFETY: 调用方保证缓冲区至少 `len` 字节。
+        let data = std::slice::from_raw_parts(bytes, len);
+        match fdxmp_core::preview::decode_raw_rgba(data, max_edge, full_size != 0) {
+            Ok(decoded) => {
+                let mut payload = Vec::with_capacity(8 + decoded.rgba.len());
+                payload.extend_from_slice(&decoded.width.to_be_bytes());
+                payload.extend_from_slice(&decoded.height.to_be_bytes());
+                payload.extend_from_slice(&decoded.rgba);
+                *out_width = decoded.width;
+                *out_height = decoded.height;
+                let mut boxed = payload.into_boxed_slice();
+                *out_len = boxed.len();
+                let pointer = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                pointer
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 对调用方提供的内存 RGBA8 图像应用编辑参数，返回 RGBA8 像素缓冲区
 /// （调用方用 `fdxmp_bytes_free(ptr, len)` 释放）；失败返回 NULL。
 ///
@@ -1407,5 +1460,82 @@ mod tests {
             fdxmp_string_free(message);
             assert_eq!(fdxmp_cache_total_size(ptr::null()), FDXMP_U64_ERR);
         }
+    }
+
+    /// RAW 内存解码入口（与 iOS `NativeCore.decodeRaw` 调用同一个 FFI 函数）。
+    ///
+    /// 需要本机样张（`%USERPROFILE%\.cache\fdxmp-tools\samples\test-z8.NEF` 或
+    /// `exiftool-DNG.dng`，可用 FDXMP_TEST_RAW / FDXMP_TEST_DNG 指定）；没有则跳过。
+    #[test]
+    fn decode_raw_rgba8_through_ffi() {
+        let Some(path) = raw_sample_path() else {
+            eprintln!("跳过 FFI RAW 解码测试：未找到样张（FDXMP_TEST_RAW / FDXMP_TEST_DNG）");
+            return;
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let mut out_width = 0u32;
+        let mut out_height = 0u32;
+        let mut out_len = 0usize;
+        // SAFETY: bytes 缓冲区在整个调用期间存活；out_* 是本地可写变量。
+        let pointer = unsafe {
+            fdxmp_decode_raw_rgba8(
+                bytes.as_ptr(),
+                bytes.len(),
+                512,
+                0,
+                &mut out_width,
+                &mut out_height,
+                &mut out_len,
+            )
+        };
+        if cfg!(feature = "raw") {
+            assert!(!pointer.is_null(), "启用 raw 后解码应成功");
+            // SAFETY: 返回指针按约定是 8 字节大端宽高 + RGBA8 像素。
+            let payload = unsafe { std::slice::from_raw_parts(pointer, out_len) };
+            let width = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let height = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+            assert_eq!((width, height), (out_width, out_height));
+            assert!(width.max(height) <= 512, "长边应受 max_edge 限制");
+            assert_eq!(out_len, 8 + (width as usize) * (height as usize) * 4);
+            unsafe { fdxmp_bytes_free(pointer, out_len) };
+        } else {
+            assert!(pointer.is_null());
+            // SAFETY: 错误信息为库内字符串，读完即释放。
+            let message = unsafe {
+                let ptr = fdxmp_last_error_message();
+                assert!(!ptr.is_null());
+                let text = CStr::from_ptr(ptr).to_string_lossy().to_string();
+                fdxmp_string_free(ptr);
+                text
+            };
+            assert!(
+                message.contains("raw"),
+                "未启用 feature 时应给出提示：{message}"
+            );
+        }
+    }
+
+    /// 本机 RAW 样张路径（环境变量优先，其次默认缓存目录）。
+    fn raw_sample_path() -> Option<std::path::PathBuf> {
+        for key in ["FDXMP_TEST_RAW", "FDXMP_TEST_DNG"] {
+            if let Some(path) = std::env::var_os(key) {
+                let path = std::path::PathBuf::from(path);
+                if path.is_file() {
+                    return Some(path);
+                }
+            }
+        }
+        let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
+        let samples = std::path::Path::new(&home)
+            .join(".cache")
+            .join("fdxmp-tools")
+            .join("samples");
+        for name in ["test-z8.NEF", "exiftool-DNG.dng"] {
+            let candidate = samples.join(name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
     }
 }
