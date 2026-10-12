@@ -436,11 +436,12 @@ struct EditorTabView: View {
         model.tool != .crop && model.tool != .mask
     }
 
-    /// 横图 / 方图的上移量：顶距从"剩余空间 1/2（居中）"收到 1/3（与 fittedRect 一致）。
+    /// 横图 / 方图的上移量：顶距从"剩余空间 1/2（居中）"先后两次各上移 1/3，
+    /// 收到 2/9（与 fittedRect 一致）。
     /// 竖图（撑满高度）为 0，不受影响。
     private func fittedLift(imageSize: CGSize, viewSize: CGSize) -> CGFloat {
         let fitted = fittedRect(imageSize: imageSize, in: viewSize)
-        return max(0, (viewSize.height - fitted.height) / 6)
+        return max(0, (viewSize.height - fitted.height) * 5 / 18)
     }
 
     private var previewArea: some View {

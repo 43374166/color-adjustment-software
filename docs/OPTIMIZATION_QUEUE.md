@@ -91,6 +91,9 @@
       新增 4 个分区单测（端点 / 分区不串扰 / 强度对齐 / 单调）+ naga 着色器语法自检测试
       （本地 `cargo test` 就能拦住 WGSL 错误）；应用图标：`assets/图标.png` 裁掉外圈白底 →
       `assets/icon-1024.png` 并接入 iOS AppIcon（`packaging/ios/make-icon.py` 可重复生成）
+- [x] 1.3.3 横图 / 方图再上移 1/3：顶距从剩余空间的 1/3 收到 **2/9**
+      （先后两次各上移 1/3；竖图撑满高度不受影响）；显示与叠加层几何（fittedRect / fittedLift）同步，
+      蒙版画布跟随同一套几何、不做特例
 
 ## 待做
 

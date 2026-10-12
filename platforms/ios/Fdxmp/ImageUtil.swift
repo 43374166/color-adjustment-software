@@ -3,8 +3,9 @@ import UIKit
 
 /// 计算图像在给定区域内 aspect-fit 后的显示矩形。
 ///
-/// 水平居中；竖直方向整体偏上：顶距 = 剩余空间的 1/3（横图 / 方图不会停在中线，
-/// 下面多留一点给底部面板；竖图本来就被高度撑满，不受影响）。
+/// 水平居中；竖直方向整体偏上：顶距 = 剩余空间的 2/9
+/// （从"居中"先后两次各上移 1/3；横图 / 方图不会停在中线，下面多留一点给底部面板；
+/// 竖图本来就被高度撑满，不受影响）。
 func fittedRect(imageSize: CGSize, in bounds: CGSize) -> CGRect {
     guard imageSize.width > 0, imageSize.height > 0,
           bounds.width > 0, bounds.height > 0
@@ -15,7 +16,7 @@ func fittedRect(imageSize: CGSize, in bounds: CGSize) -> CGRect {
     let size = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
     return CGRect(
         x: (bounds.width - size.width) / 2,
-        y: (bounds.height - size.height) / 3,
+        y: (bounds.height - size.height) * 2 / 9,
         width: size.width,
         height: size.height
     )
