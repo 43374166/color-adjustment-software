@@ -14,27 +14,29 @@ enum PhotoRaw {
         "mrw", "x3f",
     ]
 
-    /// 资产是否为 RAW（ProRAW 子类型，或原始资源本身就是 RAW 文件）。
+    /// 资产是否为 RAW（原始资源里有 RAW 文件；ProRAW 的 DNG 在 `.alternatePhoto`）。
     static func isRawAsset(_ asset: PHAsset) -> Bool {
-        if asset.mediaSubtypes.contains(.photoRAW) {
-            return true
-        }
-        return rawResource(for: asset) != nil
+        rawResource(for: asset) != nil
     }
 
-    /// 原始 RAW 资源：ProRAW 存在 `.alternatePhoto`（就是 DNG）；否则按 UTI / 扩展名找。
+    /// 原始 RAW 资源：优先 `.alternatePhoto`（ProRAW / RAW+JPEG 的 RAW 面），
+    /// 否则取第一个 UTI / 扩展名像 RAW 的资源。
+    ///
+    /// 用资源判定而不是 `PHAssetMediaSubtype`：不同 SDK 的 RAW 子类型命名不一致，
+    /// 而 UTI（`*-raw-image`）与文件名扩展名跨系统版本稳定。
     static func rawResource(for asset: PHAsset) -> PHAssetResource? {
         let resources = PHAssetResource.assetResources(for: asset)
-        if let alternate = resources.first(where: { $0.type == .alternatePhoto }) {
-            return alternate
+        let rawCandidates = resources.filter(isRaw)
+        return rawCandidates.first { $0.type == .alternatePhoto } ?? rawCandidates.first
+    }
+
+    /// 资源本身是否为 RAW（UTI 以 raw-image 结尾，或文件名是 RAW 扩展名）。
+    private static func isRaw(_ resource: PHAssetResource) -> Bool {
+        if resource.uniformTypeIdentifier.lowercased().contains("raw-image") {
+            return true
         }
-        return resources.first { resource in
-            if resource.uniformTypeIdentifier.lowercased().contains("raw-image") {
-                return true
-            }
-            let ext = (resource.originalFilename as NSString).pathExtension.lowercased()
-            return rawExtensions.contains(ext)
-        }
+        let ext = (resource.originalFilename as NSString).pathExtension.lowercased()
+        return rawExtensions.contains(ext)
     }
 
     /// 读取原始 RAW 字节（iCloud 照片允许联网拉取）。
