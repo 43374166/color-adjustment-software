@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "fdxmp-android-bridge"
-version = "1.3.6"
+version = "1.3.7"
 dependencies = [
  "fdxmp-core",
  "jni",
@@ -1315,7 +1315,7 @@ dependencies = [
 
 [[package]]
 name = "fdxmp-cli"
-version = "1.3.6"
+version = "1.3.7"
 dependencies = [
  "fdxmp-core",
  "image",
@@ -1324,7 +1324,7 @@ dependencies = [
 
 [[package]]
 name = "fdxmp-core"
-version = "1.3.6"
+version = "1.3.7"
 dependencies = [
  "ab_glyph",
  "bytemuck",
@@ -1350,7 +1350,7 @@ dependencies = [
 
 [[package]]
 name = "fdxmp-ffi"
-version = "1.3.6"
+version = "1.3.7"
 dependencies = [
  "fdxmp-core",
  "serde_json",
@@ -1358,14 +1358,14 @@ dependencies = [
 
 [[package]]
 name = "fdxmp-ohos-bridge"
-version = "1.3.6"
+version = "1.3.7"
 dependencies = [
  "fdxmp-core",
 ]
 
 [[package]]
 name = "fdxmp-packer-ui"
-version = "1.3.6"
+version = "1.3.7"
 dependencies = [
  "eframe",
  "egui",
@@ -1378,7 +1378,7 @@ dependencies = [
 
 [[package]]
 name = "fdxmp-win-ui"
-version = "1.3.6"
+version = "1.3.7"
 dependencies = [
  "eframe",
  "egui",

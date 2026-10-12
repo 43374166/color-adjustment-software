@@ -222,34 +222,34 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
     }
 
     // 4) 高光 / 阴影 / 白色 / 黑色：显示空间分区色调（Lightroom 式）——
-    //    分区权重用显示亮度；高光 / 阴影是「向白 / 黑渐进」的有界位移（端点锚定），
-    //    白色 / 黑色是白点 / 黑点位移（只动端点，中灰不受影响）。
+    //    分区权重用显示亮度；阴影是「曝光式乘性增益」（纯黑保持纯黑、通道比例不变），
+    //    高光是「向白 / 黑渐进」的有界位移（端点锚定），白色 / 黑色是白点 / 黑点位移。
     //    与 CPU `preview::apply_tone_zones` 同公式。
     let tone_amount = abs(p(2)) + abs(p(3)) + abs(p(4)) + abs(p(5));
     if (tone_amount > 0.0001) {
-        let tone_headroom = max(c - vec3<f32>(1.0), vec3<f32>(0.0));
-        let tone_s = linear_to_srgb(c);
-        let tone_lum = luminance(tone_s);
         let h = clamp(p(2) / 100.0, -1.0, 1.0);
         let sh = clamp(p(3) / 100.0, -1.0, 1.0);
         let wv = clamp(p(4) / 100.0, -1.0, 1.0);
         let bl = clamp(p(5) / 100.0, -1.0, 1.0);
+        let tone_lum = luminance(linear_to_srgb(c));
         let w_hi = smoothstep(0.45, 0.85, tone_lum);
-        let w_sh = 1.0 - smoothstep(0.15, 0.55, tone_lum);
+        // 阴影掩膜集中在深暗部（0.03→0.33 淡出；对照实测 LR 阴影 +100 的提升也集中在这一段）。
+        let w_sh = 1.0 - smoothstep(0.03, 0.33, tone_lum);
         let w_wh = smoothstep(0.60, 0.95, tone_lum);
         let w_bl = 1.0 - smoothstep(0.05, 0.40, tone_lum);
+        // 阴影：曝光式乘性增益（+100 深暗部 ≈ +2EV，-100 ≈ -1.2EV）——乘性 → 纯黑
+        // 保持纯黑、通道比例不变；旧实现是显示域加法，把纯黑垫成 ~42/255 的灰（发灰根因）。
+        let sh_k = select(1.2, 2.0, sh >= 0.0);
+        c = c * exp2(sh * sh_k * w_sh);
+        let tone_headroom = max(c - vec3<f32>(1.0), vec3<f32>(0.0));
+        let tone_s = linear_to_srgb(c);
         let h_pos = max(h, 0.0);
         let h_neg = max(-h, 0.0);
-        let sh_pos = max(sh, 0.0);
-        let sh_neg = max(-sh, 0.0);
         let hi_shape_pos = max(vec3<f32>(1.0) - tone_s, vec3<f32>(0.0));
         let hi_shape_neg = max(tone_s - vec3<f32>(0.5), vec3<f32>(0.0))
             * (vec3<f32>(1.0) - 0.55 * smoothstep(vec3<f32>(0.85), vec3<f32>(1.0), tone_s));
-        let sh_shape_pos = max(vec3<f32>(0.55) - tone_s, vec3<f32>(0.0));
         let tone_delta = vec3<f32>(h_pos * w_hi * 0.55) * hi_shape_pos
             - vec3<f32>(h_neg * w_hi * 0.55) * hi_shape_neg
-            + vec3<f32>(sh_pos * w_sh * 0.30) * sh_shape_pos
-            - vec3<f32>(sh_neg * w_sh * 0.30) * tone_s
             + vec3<f32>((wv * w_wh + bl * w_bl) * 0.13);
         let tone_shifted = clamp(tone_s + tone_delta, vec3<f32>(0.0), vec3<f32>(1.0));
         c = srgb_to_linear(tone_shifted) + tone_headroom;

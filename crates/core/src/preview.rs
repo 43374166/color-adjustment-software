@@ -1025,14 +1025,19 @@ fn apply_tone_zones(rgb: [f32; 3], light: &LightParams) -> [f32; 3] {
         return rgb;
     }
     let luma = luminance(rgb);
-    // 分区权重（显示亮度）：高光只动上部、阴影只动下部、白 / 黑只动端点。
+    // 分区权重（显示亮度）：高光只动上部、阴影只动深暗部、白 / 黑只动端点。
     let w_hi = smoothstep(0.45, 0.85, luma);
-    let w_sh = 1.0 - smoothstep(0.15, 0.55, luma);
+    // 阴影掩膜集中在深暗部（0.03→0.33 淡出；对照实测 LR 阴影 +100 的提升也集中在这一段）。
+    let w_sh = 1.0 - smoothstep(0.03, 0.33, luma);
     let w_wh = smoothstep(0.60, 0.95, luma);
     let w_bl = 1.0 - smoothstep(0.05, 0.40, luma);
+    // 阴影：曝光式乘性增益（+100 深暗部 ≈ +2EV，-100 ≈ -1.2EV）——乘性 → 纯黑保持
+    // 纯黑、通道比例不变；旧实现是显示域加法，把纯黑垫成 ~42/255 的灰（发灰根因）。
+    let sh_k = if sh >= 0.0 { 2.0 } else { 1.2 };
+    let shadow_gain = (sh * sh_k * w_sh).exp2();
     let mut out = [0.0f32; 3];
     for (index, channel) in rgb.iter().enumerate() {
-        let s = *channel;
+        let s = linear_to_srgb_f32(srgb_to_linear(*channel) * shadow_gain);
         let mut value = s;
         if h > 0.0 {
             // 向白渐进：白场不动，越亮位移越小。
@@ -1041,13 +1046,6 @@ fn apply_tone_zones(rgb: [f32; 3], light: &LightParams) -> [f32; 3] {
             // 向中灰回收：纯白略微保留（顶部 0.85 以上渐收，保证单调）。
             let shape = (s - 0.5).max(0.0) * (1.0 - 0.55 * smoothstep(0.85, 1.0, s));
             value += h * w_hi * shape * 0.55;
-        }
-        if sh > 0.0 {
-            // 向中灰提亮：越暗提得越多，到 0.55 为止。
-            value += sh * w_sh * (0.55 - s).max(0.0) * 0.30;
-        } else if sh < 0.0 {
-            // 向黑渐进：越暗压得越多，不会越界。
-            value += sh * w_sh * s * 0.30;
         }
         // 白点 / 黑点：端点位移（±100 → ±0.13）。
         value += (wv * w_wh + bl * w_bl) * 0.13;
@@ -2073,14 +2071,14 @@ mod tests {
 
     #[test]
     fn tone_zones_lightroom_strength() {
-        // 目标（对齐 Lightroom 手感）：阴影 +100 ≈ 0.26；高光 +100 ≈ 0.86；
-        // 高光 -100 ≈ 0.71；白色 -100（纯白）≈ 0.87。
+        // 目标（对齐 Lightroom 实拍实测）：阴影 +100（0.13 输入）≈ 0.23（LR 实测 ≈ +0.09）；
+        // 高光 +100 ≈ 0.86；高光 -100 ≈ 0.71；白色 -100（纯白）≈ 0.87。
         let light = LightParams {
             shadows: 100.0,
             ..Default::default()
         };
         let out = apply_tone_zones([0.13, 0.13, 0.13], &light);
-        assert!((out[0] - 0.26).abs() < 0.04, "阴影 +100 ≈0.26：{out:?}");
+        assert!((out[0] - 0.23).abs() < 0.03, "阴影 +100 ≈0.23：{out:?}");
 
         let light = LightParams {
             highlights: 100.0,
@@ -2095,6 +2093,46 @@ mod tests {
         };
         let out = apply_tone_zones([0.90, 0.90, 0.90], &light);
         assert!((out[0] - 0.71).abs() < 0.05, "高光 -100 ≈0.71：{out:?}");
+    }
+
+    #[test]
+    fn tone_shadows_keep_black_black() {
+        // 阴影 +100 是"曝光式提亮"：纯黑仍为纯黑、深暗部保持很暗（旧实现把纯黑垫成 ~0.165 灰）。
+        let light = LightParams {
+            shadows: 100.0,
+            ..Default::default()
+        };
+        let out = apply_tone_zones([0.0, 0.0, 0.0], &light);
+        assert!(out[0].abs() < 1e-6, "阴影 +100 不应抬起纯黑：{out:?}");
+        let out = apply_tone_zones([0.02, 0.02, 0.02], &light);
+        assert!(out[0] < 0.08, "阴影 +100 后 0.02 仍应很暗：{out:?}");
+        // 暗部确实被提亮（比如 0.05 → 明显更亮）。
+        let dark = apply_tone_zones([0.05, 0.05, 0.05], &light);
+        assert!(dark[0] > 0.10, "阴影 +100 应提亮暗部：{dark:?}");
+        // 亮部 / 中调不动。
+        let mid = apply_tone_zones([0.5, 0.5, 0.5], &light);
+        assert!((mid[0] - 0.5).abs() < 0.01, "中调不应被阴影波及：{mid:?}");
+    }
+
+    #[test]
+    fn tone_shadows_preserve_color() {
+        // 乘性提亮：暗色（深蓝）通道比例在**线性域**保持不变，不会变成中性灰。
+        let light = LightParams {
+            shadows: 100.0,
+            ..Default::default()
+        };
+        let before = [0.06f32, 0.08, 0.10];
+        let out = apply_tone_zones(before, &light);
+        for index in 0..3 {
+            assert!(out[index] > before[index], "暗色应被提亮：{out:?}");
+        }
+        let linear = |v: f32| srgb_to_linear(v);
+        let ratio_before = linear(before[0]) / linear(before[1]);
+        let ratio_after = linear(out[0]) / linear(out[1]);
+        assert!(
+            (ratio_after - ratio_before).abs() < 1e-3,
+            "提亮后线性域通道比例应保持：{ratio_before} → {ratio_after}"
+        );
     }
 
     #[test]

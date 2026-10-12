@@ -741,7 +741,14 @@ where
             let mut count = 0u64;
             for y in y0..y1 {
                 for x in x0..x1 {
-                    let (r, g, b, a) = image.get_pixel(x, y).channels4();
+                    let pixel = image.get_pixel(x, y);
+                    let channels = pixel.channels();
+                    let (r, g, b, a) = match channels.len() {
+                        1 => (channels[0], channels[0], channels[0], u16::MAX),
+                        2 => (channels[0], channels[0], channels[0], channels[1]),
+                        3 => (channels[0], channels[1], channels[2], u16::MAX),
+                        _ => (channels[0], channels[1], channels[2], channels[3]),
+                    };
                     sums[0] += r as u64;
                     sums[1] += g as u64;
                     sums[2] += b as u64;

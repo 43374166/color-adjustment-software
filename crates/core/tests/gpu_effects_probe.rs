@@ -104,3 +104,46 @@ fn probe_effects_and_detail_strength() {
         chroma_noise(&render(&mut session, &|p| p.detail.noise.color = 100.0)),
     );
 }
+
+/// 色调分区（阴影 / 黑色）的 CPU ↔ GPU 一致性探针。
+///
+/// 同一张灰度台阶图分别走 CPU（`render_memory_rgba`）与 GPU 管线，
+/// 打印同位置像素——两条路径必须逐格接近（同公式硬要求）。
+#[test]
+#[ignore]
+fn probe_tone_cpu_gpu_parity() {
+    let (width, height) = (256u32, 64u32);
+    let steps: Vec<u8> = (0..width)
+        .map(|x| (x as u32 * 255 / (width - 1)) as u8)
+        .collect();
+    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
+    for _ in 0..height {
+        for &value in &steps {
+            rgba.extend_from_slice(&[value, value, value, 255]);
+        }
+    }
+
+    let params_json = r#"{"version":1,"light":{"shadows":100.0,"blacks":100.0}}"#;
+    let cpu = fdxmp_core::preview::render_memory_rgba(&rgba, width, height, params_json)
+        .expect("CPU 渲染失败");
+
+    let mut params = EditParams::default();
+    params.light.shadows = 100.0;
+    params.light.blacks = 100.0;
+    let mut session = PreviewSession::new(&rgba, width, height).expect("GPU 初始化失败");
+    let (_, _, gpu) = session.render(&params).expect("GPU 渲染失败");
+
+    println!("输入 | CPU | GPU （阴影 +100，黑色 +100）");
+    let mut max_gap = 0i32;
+    for index in [0usize, 1, 2, 5, 10, 20, 40, 80, 120, 200, 255] {
+        let offset = index * 4;
+        let gap = cpu.rgba[offset] as i32 - gpu[offset] as i32;
+        max_gap = max_gap.max(gap.abs());
+        println!(
+            "{:3} | {:3} | {:3}  (Δ{})",
+            steps[index], cpu.rgba[offset], gpu[offset], gap
+        );
+    }
+    println!("最大差异 = {max_gap}（应 ≤ 2）");
+    assert!(max_gap <= 2, "CPU / GPU 色调公式不一致：Δ={max_gap}");
+}
