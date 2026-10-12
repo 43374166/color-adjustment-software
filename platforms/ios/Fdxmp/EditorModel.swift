@@ -1687,6 +1687,10 @@ final class EditorModel: ObservableObject {
             fresh.brushFeather = source.brushFeather
             fresh.brushFlow = source.brushFlow
             fresh.brushDensity = source.brushDensity
+        case .aiSubject, .aiPortrait, .aiFace, .aiSkin,
+            .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+            // 智能蒙版重置：栅格与形状无关，保留即可（不重新推理）。
+            fresh.visible = source.visible
         }
         applyEdit("重置蒙版") { state in
             if let index = state.masks.firstIndex(where: { $0.id == id }) {

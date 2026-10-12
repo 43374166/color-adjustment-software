@@ -798,6 +798,9 @@ final class MaskCanvasController {
                 current.rotation += Float(step * 180 / .pi)
             case .brush:
                 break
+            case .aiSubject, .aiPortrait, .aiFace, .aiSkin,
+                .aiEyes, .aiEyebrows, .aiNose, .aiLips, .aiTeeth:
+                break
             }
         }
     }
