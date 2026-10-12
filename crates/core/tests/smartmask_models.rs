@@ -497,6 +497,375 @@ fn kind_name(kind: &fdxmp_core::params::MaskKind) -> String {
     format!("{kind:?}").replace(['(', ')', '{', '}', ' ', ':', ','], "")
 }
 
+/// 诊断：MODNet 量化版（`_candidate_modnet_quantized.onnx`）与 fp32 版的蒙版一致性（IoU）。
+#[test]
+#[ignore]
+fn probe_modnet_quantized() {
+    use ort::session::Session;
+    use ort::value::Tensor;
+
+    let Some(portrait_env) = std::env::var_os("FDXMP_TEST_PORTRAIT") else {
+        eprintln!("跳过：未设置 FDXMP_TEST_PORTRAIT");
+        return;
+    };
+    let Some(dir) = model_dir() else {
+        eprintln!("跳过：未找到模型目录");
+        return;
+    };
+    let quantized = dir.join("_candidate_modnet_quantized.onnx");
+    let fp32 = dir.join("person_coarse_modnet_fp32.onnx");
+    if !quantized.is_file() || !fp32.is_file() {
+        eprintln!("跳过：缺少模型");
+        return;
+    }
+    if std::env::var_os("FDXMP_ORT_DLL").is_none() {
+        let dll = dir.join("../onnxruntime.dll");
+        if dll.is_file() {
+            std::env::set_var("FDXMP_ORT_DLL", dll);
+        }
+    }
+    fdxmp_core::ai::ensure_runtime().expect("ONNX Runtime 初始化失败");
+    let image = image::open(std::path::PathBuf::from(portrait_env))
+        .expect("打开测试人像失败")
+        .to_rgba8();
+    let scale = 1024.0 / image.width().max(image.height()) as f32;
+    let image = if scale < 1.0 {
+        image::imageops::resize(
+            &image,
+            (image.width() as f32 * scale) as u32,
+            (image.height() as f32 * scale) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+    let size = 512u32;
+    let resized = image::imageops::resize(&image, size, size, image::imageops::FilterType::Triangle);
+    let pixels = (size as usize) * (size as usize);
+    let mut data = vec![0.0f32; pixels * 3];
+    for (index, pixel) in resized.pixels().enumerate() {
+        for channel in 0..3 {
+            let value = pixel.0[channel] as f32 / 255.0;
+            data[channel * pixels + index] = (value - 0.5) / 0.5;
+        }
+    }
+
+    let run = |path: &std::path::Path| -> Option<(Vec<usize>, Vec<f32>)> {
+        let mut builder = Session::builder().unwrap();
+        let mut session = builder.commit_from_file(path).ok()?;
+        let input_name = session.inputs()[0].name().to_string();
+        let tensor =
+            Tensor::from_array((vec![1usize, 3, size as usize, size as usize], data.clone()))
+                .unwrap();
+        let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).ok()?;
+        let (name, value) = outputs
+            .iter()
+            .find(|(name, _)| name.contains("output"))
+            .or_else(|| outputs.iter().next())?;
+        let (shape, values) = value.try_extract_tensor::<f32>().ok()?;
+        eprintln!(
+            "{}: out={name} shape={:?}",
+            path.file_name().unwrap().to_string_lossy(),
+            shape
+        );
+        Some((
+            shape.iter().map(|dim| *dim as usize).collect(),
+            values.to_vec(),
+        ))
+    };
+
+    let (shape_a, alpha_a) = run(&fp32).expect("fp32 推理失败");
+    let (shape_b, alpha_b) = run(&quantized).expect("quantized 推理失败");
+    let count = alpha_a.len().min(alpha_b.len());
+    let mut intersection = 0usize;
+    let mut union = 0usize;
+    let mut mean_diff = 0.0f32;
+    for index in 0..count {
+        let a = alpha_a[index] >= 0.5;
+        let b = alpha_b[index] >= 0.5;
+        if a && b {
+            intersection += 1;
+        }
+        if a || b {
+            union += 1;
+        }
+        mean_diff += (alpha_a[index] - alpha_b[index]).abs();
+    }
+    let iou = intersection as f32 / union.max(1) as f32;
+    eprintln!(
+        "fp32 shape={shape_a:?} / quant shape={shape_b:?}；像素平均差={:.4}，IoU(0.5)={iou:.4}",
+        mean_diff / count.max(1) as f32
+    );
+    // 导出一张（量化版）蒙版便于目测。
+    if let Some(out_dir) = std::env::var_os("FDXMP_TEST_OUT") {
+        let out_dir = std::path::PathBuf::from(out_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+        if shape_b.len() == 4 {
+            let (height, width) = (shape_b[2], shape_b[3]);
+            let buffer: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
+                image::ImageBuffer::from_fn(width as u32, height as u32, |x, y| {
+                    let value = alpha_b[(y as usize) * width + x as usize];
+                    image::Luma([(value.clamp(0.0, 1.0) * 255.0) as u8])
+                });
+            let path = out_dir.join("candidate-modnet-quantized.png");
+            let _ = buffer.save(&path);
+            eprintln!("已导出 {}", path.display());
+        }
+    }
+}
+
+/// 诊断：候选抠图模型 PP-HumanSeg（`_candidate_humanseg.onnx`，5.9MB）的输入尺寸与蒙版质量。
+#[test]
+#[ignore]
+fn probe_humanseg_candidate() {
+    use ort::session::Session;
+    use ort::value::Tensor;
+
+    let Some(portrait_env) = std::env::var_os("FDXMP_TEST_PORTRAIT") else {
+        eprintln!("跳过：未设置 FDXMP_TEST_PORTRAIT");
+        return;
+    };
+    let Some(dir) = model_dir() else {
+        eprintln!("跳过：未找到模型目录");
+        return;
+    };
+    let path = dir.join("_candidate_humanseg.onnx");
+    if !path.is_file() {
+        eprintln!("跳过：缺少候选模型 {}", path.display());
+        return;
+    }
+    if std::env::var_os("FDXMP_ORT_DLL").is_none() {
+        let dll = dir.join("../onnxruntime.dll");
+        if dll.is_file() {
+            std::env::set_var("FDXMP_ORT_DLL", dll);
+        }
+    }
+    fdxmp_core::ai::ensure_runtime().expect("ONNX Runtime 初始化失败");
+    let image = image::open(std::path::PathBuf::from(portrait_env))
+        .expect("打开测试人像失败")
+        .to_rgba8();
+    let scale = 1024.0 / image.width().max(image.height()) as f32;
+    let image = if scale < 1.0 {
+        image::imageops::resize(
+            &image,
+            (image.width() as f32 * scale) as u32,
+            (image.height() as f32 * scale) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+
+    for size in [192u32, 512, 256, 320, 384] {
+        let mut builder = Session::builder().unwrap();
+        let mut session = match builder.commit_from_file(&path) {
+            Ok(session) => session,
+            Err(err) => {
+                eprintln!("加载失败：{err}");
+                return;
+            }
+        };
+        let resized =
+            image::imageops::resize(&image, size, size, image::imageops::FilterType::Triangle);
+        let pixels = (size as usize) * (size as usize);
+        let mut data = vec![0.0f32; pixels * 3];
+        for (index, pixel) in resized.pixels().enumerate() {
+            for channel in 0..3 {
+                let value = pixel.0[channel] as f32 / 255.0;
+                data[channel * pixels + index] = (value - 0.5) / 0.5;
+            }
+        }
+        let input_name = session.inputs()[0].name().to_string();
+        let tensor = Tensor::from_array((vec![1usize, 3, size as usize, size as usize], data))
+            .unwrap();
+        let outputs = match session.run(ort::inputs![input_name.as_str() => tensor]) {
+            Ok(outputs) => outputs,
+            Err(err) => {
+                eprintln!("size {size}: 推理失败（{}）", err.to_string().lines().next().unwrap_or(""));
+                continue;
+            }
+        };
+        let (name, value) = outputs.iter().next().unwrap();
+        let (shape, values) = value.try_extract_tensor::<f32>().unwrap();
+        let dims: Vec<usize> = shape.iter().map(|dim| *dim as usize).collect();
+        let min = values.iter().copied().fold(f32::MAX, f32::min);
+        let max = values.iter().copied().fold(f32::MIN, f32::max);
+        eprintln!(
+            "size {size}: in={input_name} out={name} shape={dims:?} min={min:.3} max={max:.3}"
+        );
+        if dims.len() != 4 || dims[0] != 1 {
+            continue;
+        }
+        // [1,1,H,W]（概率）或 [1,2,H,W]（两类 logits）→ 前景 alpha。
+        let (out_h, out_w) = (dims[2], dims[3]);
+        let out_pixels = out_h * out_w;
+        let mut alpha = vec![0.0f32; out_pixels];
+        if dims[1] == 1 {
+            for (index, slot) in alpha.iter_mut().enumerate() {
+                *slot = values[index].clamp(0.0, 1.0);
+            }
+        } else if dims[1] == 2 {
+            for index in 0..out_pixels {
+                let foreground = values[out_pixels + index];
+                let background = values[index];
+                let probability = 1.0 / (1.0 + (-(foreground - background)).exp());
+                alpha[index] = probability;
+            }
+        } else {
+            continue;
+        }
+        let mean = alpha.iter().sum::<f32>() / alpha.len() as f32;
+        let coverage = alpha.iter().filter(|value| **value > 0.5).count() as f32 / alpha.len() as f32;
+        eprintln!("  alpha mean={mean:.3} coverage(0.5)={coverage:.3}");
+        if let Some(out_dir) = std::env::var_os("FDXMP_TEST_OUT") {
+            let out_dir = std::path::PathBuf::from(out_dir);
+            let _ = std::fs::create_dir_all(&out_dir);
+            let upscaled = fdxmp_core::smartmask::mask::resize_plane(
+                &alpha,
+                out_w as u32,
+                out_h as u32,
+                image.width(),
+                image.height(),
+            );
+            let buffer: image::ImageBuffer<image::Luma<u8>, Vec<u8>> =
+                image::ImageBuffer::from_fn(image.width(), image.height(), |x, y| {
+                    let value = upscaled[(y * image.width() + x) as usize];
+                    image::Luma([(value.clamp(0.0, 1.0) * 255.0) as u8])
+                });
+            let path = out_dir.join(format!("candidate-humanseg-{size}.png"));
+            let _ = buffer.save(&path);
+            eprintln!("  已导出 {}", path.display());
+        }
+        break;
+    }
+}
+
+/// 诊断：候选人脸解析模型（BiSeNet-19，`_candidate_faceparser_sim.onnx`）的标签分布与可视化。
+///
+/// 需要 `FDXMP_TEST_PORTRAIT`；`FDXMP_TEST_OUT` 指定导出目录（可选）。
+#[test]
+#[ignore]
+fn probe_faceparser_candidate() {
+    use ort::session::Session;
+    use ort::value::Tensor;
+
+    let Some(portrait_env) = std::env::var_os("FDXMP_TEST_PORTRAIT") else {
+        eprintln!("跳过：未设置 FDXMP_TEST_PORTRAIT");
+        return;
+    };
+    let Some(dir) = model_dir() else {
+        eprintln!("跳过：未找到模型目录");
+        return;
+    };
+    let path = dir.join("_candidate_faceparser_sim.onnx");
+    if !path.is_file() {
+        eprintln!("跳过：缺少候选模型 {}", path.display());
+        return;
+    }
+    std::env::set_var("FDXMP_MODEL_DIR", &dir);
+    if std::env::var_os("FDXMP_ORT_DLL").is_none() {
+        let dll = dir.join("../onnxruntime.dll");
+        if dll.is_file() {
+            std::env::set_var("FDXMP_ORT_DLL", dll);
+        }
+    }
+    fdxmp_core::ai::ensure_runtime().expect("ONNX Runtime 初始化失败");
+    let registry = ModelRegistry::with_dir(dir.clone());
+    let stages = OnnxStages::load(&registry).expect("加载模型失败");
+    let image = image::open(std::path::PathBuf::from(portrait_env))
+        .expect("打开测试人像失败")
+        .to_rgba8();
+    let faces = stages.detector().detect(&image).expect("人脸检测失败");
+    assert!(!faces.is_empty());
+    let transform = fdxmp_core::smartmask::pipeline::face_alignment(
+        &faces[0],
+        (image.width(), image.height()),
+        512,
+    )
+    .unwrap();
+    let crop = fdxmp_core::smartmask::pipeline::warp_image(&image, &transform, 512);
+
+    let mut builder = Session::builder().unwrap();
+    let mut session = builder.commit_from_file(&path).unwrap();
+    eprintln!("== candidate faceparser");
+    for input in session.inputs() {
+        eprintln!("  in  {}", input.name());
+    }
+    for output in session.outputs() {
+        eprintln!("  out {}", output.name());
+    }
+    // zllrunning face-parsing：ImageNet 归一化、512×512、NCHW。
+    let mean = [0.485f32, 0.456, 0.406];
+    let std = [0.229f32, 0.224, 0.225];
+    let mut data = vec![0.0f32; 512 * 512 * 3];
+    for (index, pixel) in crop.pixels().enumerate() {
+        for channel in 0..3 {
+            let value = pixel.0[channel] as f32 / 255.0;
+            data[channel * 512 * 512 + index] = (value - mean[channel]) / std[channel];
+        }
+    }
+    let input_name = session.inputs()[0].name().to_string();
+    let tensor = Tensor::from_array((vec![1usize, 3, 512, 512], data)).unwrap();
+    let outputs = session.run(ort::inputs![input_name.as_str() => tensor]).unwrap();
+    let (shape, values) = outputs[0].try_extract_tensor::<f32>().unwrap();
+    eprintln!("  out0 shape={:?}", shape);
+    let dims: Vec<usize> = shape.iter().map(|dim| *dim as usize).collect();
+    let (classes, height, width) = match dims.as_slice() {
+        [1, classes, height, width] => (*classes, *height, *width),
+        _ => {
+            eprintln!("  非预期输出形状");
+            return;
+        }
+    };
+    let pixels = height * width;
+    let mut histogram = vec![0usize; classes];
+    let mut labels = vec![0usize; pixels];
+    for index in 0..pixels {
+        let mut best = 0usize;
+        let mut best_value = f32::MIN;
+        for class in 0..classes {
+            let value = values[class * pixels + index];
+            if value > best_value {
+                best_value = value;
+                best = class;
+            }
+        }
+        labels[index] = best;
+        histogram[best] += 1;
+    }
+    let names = [
+        "background", "skin", "nose", "eye_g", "l_eye", "r_eye", "l_brow", "r_brow", "l_ear",
+        "r_ear", "mouth", "u_lip", "l_lip", "hair", "hat", "ear_r", "neck_l", "neck", "cloth",
+    ];
+    for (class, count) in histogram.iter().enumerate() {
+        if *count > 0 {
+            let name = names.get(class).copied().unwrap_or("?");
+            eprintln!(
+                "  class {class:>2} {name:<10} {:>6.2}%",
+                *count as f32 / pixels as f32 * 100.0
+            );
+        }
+    }
+    if let Some(out_dir) = std::env::var_os("FDXMP_TEST_OUT") {
+        let out_dir = std::path::PathBuf::from(out_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+        let palette: [[u8; 3]; 19] = [
+            [0, 0, 0], [255, 200, 170], [200, 120, 90], [120, 120, 255], [80, 200, 255],
+            [80, 200, 255], [255, 160, 60], [255, 160, 60], [230, 180, 140], [230, 180, 140],
+            [180, 60, 60], [240, 90, 90], [200, 60, 60], [90, 70, 50], [200, 200, 0],
+            [255, 255, 0], [160, 140, 120], [170, 150, 130], [60, 120, 200],
+        ];
+        let buffer: image::ImageBuffer<image::Rgb<u8>, Vec<u8>> =
+            image::ImageBuffer::from_fn(width as u32, height as u32, |x, y| {
+                let label = labels[(y as usize) * width + x as usize].min(18);
+                image::Rgb(palette[label])
+            });
+        let path = out_dir.join("candidate-faceparser-labels.png");
+        let _ = buffer.save(&path);
+        eprintln!("  已导出 {}", path.display());
+    }
+}
+
 /// AI 修图端到端（真实人像）：识别（五官 / 蒙版）→ 一键修图 → 导出前后对照。
 ///
 /// 需要 `FDXMP_TEST_PORTRAIT`；`FDXMP_TEST_OUT` 指定导出目录（可选）。
