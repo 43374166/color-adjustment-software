@@ -912,14 +912,14 @@ fn apply_micro_contrast(image: &mut RgbaImage, params: &EditParams) {
                 }
                 if dehaze > 0.0 {
                     // 去雾：拉黑场 + 提对比 + 提饱和。GPU 在线性域做这一步，
-                    // 这里同样转到线性域算，预览与导出观感一致。
+                    // 这里同样转到线性域算，预览与导出观感一致（系数与 GPU 同公式）。
                     for channel in &mut rgb {
                         let linear = srgb_to_linear(*channel);
-                        let adjusted = ((linear - 0.10 * dehaze) * (1.0 + dehaze * 0.65)).max(0.0);
+                        let adjusted = ((linear - 0.14 * dehaze) * (1.0 + dehaze * 0.85)).max(0.0);
                         *channel = linear_to_srgb_f32(adjusted);
                     }
                     let gray = luminance(rgb);
-                    let boost = 1.0 + dehaze * 0.3;
+                    let boost = 1.0 + dehaze * 0.35;
                     for channel in &mut rgb {
                         *channel = gray + (*channel - gray) * boost;
                     }
@@ -1097,16 +1097,15 @@ fn apply_hsl(rgb: [f32; 3], hsl: &HslParams) -> [f32; 3] {
 
     let visible = smoothstep(0.02, 0.22, saturation);
     let new_hue = (hue + hue_shift * visible * 0.09).rem_euclid(1.0);
-    let new_saturation = (saturation * (1.0 + saturation_shift * visible * 1.15)).clamp(0.0, 1.0);
-    // 明亮度：+ 方向渐进逼近 1（越亮增益越小，不再把脸"漂白"）；
-    // - 方向按比例压暗（与 GPU 同公式）。
+    let base_saturation = (saturation * (1.0 + saturation_shift * visible * 1.15)).clamp(0.0, 1.0);
+    // 明亮度：+ 方向渐进逼近 1（越亮增益越小），并轻微去饱和——皮肤变亮时向
+    // “柔光”走而不是往白场顶；- 方向按比例压暗（与 GPU 同公式）。
     let shift = luminance_shift * visible;
-    let new_value = if shift >= 0.0 {
-        value + shift * (1.0 - value) * 0.55
-    } else {
-        value + shift * value * 0.45
-    };
-    let new_value = new_value.clamp(0.0, 1.0);
+    let lum_pos = shift.max(0.0);
+    let lum_neg = (-shift).max(0.0);
+    let new_saturation = (base_saturation * (1.0 - lum_pos * 0.18)).clamp(0.0, 1.0);
+    let new_value =
+        (value + lum_pos * (1.0 - value.min(1.0)) * 0.38 - lum_neg * value * 0.45).clamp(0.0, 1.0);
     hsv_to_rgb(new_hue, new_saturation, new_value)
 }
 
@@ -1883,6 +1882,37 @@ mod tests {
             (pixel[1] as i32 - pixel[0] as i32).abs() < 40,
             "红色饱和度降低后应更接近灰色：{pixel:?}"
         );
+    }
+
+    #[test]
+    fn hsl_luminance_boost_stays_soft_and_desaturates() {
+        // 皮肤橙中间调：明亮度 +100 应提亮但保留白场余量（不再"漂白"到 ~250+），
+        // 并随提亮轻微去饱和（对齐 Lightroom 的柔光观感，与 GPU 同公式）。
+        let source = RgbaImage::from_pixel(2, 2, Rgba([200, 100, 60, 255]));
+        let mut params = EditParams::default();
+        params.hsl.orange.luminance = 100.0;
+        let out = render_preview_image(&source, &params);
+        let pixel = out.get_pixel(0, 0).0;
+        assert!(pixel[0] > 200, "明亮度 +100 应提亮：{pixel:?}");
+        assert!(pixel[0] < 250, "明亮度 +100 不应顶到白场：{pixel:?}");
+        let spread_before = 200i32 - 60;
+        let spread_after = pixel[0] as i32 - pixel[2] as i32;
+        assert!(
+            spread_after < spread_before,
+            "提亮应伴随轻微去饱和（通道差缩小）：{pixel:?}"
+        );
+    }
+
+    #[test]
+    fn dehaze_positive_punches_contrast() {
+        // 去雾 +100：拉黑场提对比（与 GPU 同公式），中灰应变暗、亮部不应被裁死。
+        let source = RgbaImage::from_pixel(2, 2, Rgba([130, 130, 130, 255]));
+        let mut params = EditParams::default();
+        params.effects.dehaze = 100.0;
+        let out = render_preview_image(&source, &params);
+        let pixel = out.get_pixel(0, 0).0;
+        assert!(pixel[0] < 120, "去雾 +100 应压暗中间调：{pixel:?}");
+        assert!(pixel[0] > 40, "去雾不应把中间调压死：{pixel:?}");
     }
 
     #[test]

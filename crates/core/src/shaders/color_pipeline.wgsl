@@ -295,15 +295,17 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
     if (abs(hue_shift) + abs(sat_scale) + abs(lum_shift) > 0.0001) {
         hsv.x = fract(hsv.x + hue_shift);
         hsv.y = clamp(hsv.y * (1.0 + sat_scale * 1.15), 0.0, 1.0);
-        // 明亮度：+ 方向渐进逼近 1（越亮增益越小，不再把脸"漂白"）；
-        // - 方向按比例压暗。-100 ≈ ×0.55，+100 ≈ 提亮 55% 直到白场。
+        // 明亮度：+ 方向渐进逼近 1（越亮增益越小），并且轻微去饱和——
+        // 皮肤变亮时向"柔光"走而不是往白场顶（+100 最亮只提 38% 余量）。
+        // - 方向按比例压暗（-100 ≈ ×0.55）。
         let lum_pos = max(lum_shift, 0.0);
         let lum_neg = max(-lum_shift, 0.0);
         hsv.z = clamp(
-            hsv.z + lum_pos * (1.0 - min(hsv.z, 1.0)) * 0.55 - lum_neg * hsv.z * 0.45,
+            hsv.z + lum_pos * (1.0 - min(hsv.z, 1.0)) * 0.38 - lum_neg * hsv.z * 0.45,
             0.0,
             4.0
         );
+        hsv.y = clamp(hsv.y * (1.0 - lum_pos * 0.18), 0.0, 1.0);
         let adjusted = hsv_to_rgb(hsv);
         // 显示域参考 → 线性；>1 的余量单独保留后统一还原峰值缩放
         let base = min(adjusted, vec3<f32>(1.0));
@@ -389,9 +391,10 @@ fn pipeline_detail(
     let dehaze = p(12) / 100.0;
     if (dehaze > 0.0001) {
         // 去雾：拉黑场 + 提对比 + 提饱和（正方向）；负方向加"雾"（提黑场、降对比）。
-        c = max((c - vec3<f32>(0.10 * dehaze)) * (1.0 + dehaze * 0.65), vec3<f32>(0.0));
+        // +100 强度按实测再上一档（黑场 0.14 / 对比 ×1.85 / 饱和 ×1.35），对齐 LR 的去雾力度。
+        c = max((c - vec3<f32>(0.14 * dehaze)) * (1.0 + dehaze * 0.85), vec3<f32>(0.0));
         let gray = vec3<f32>(luminance(c));
-        c = gray + (c - gray) * (1.0 + dehaze * 0.3);
+        c = gray + (c - gray) * (1.0 + dehaze * 0.35);
     } else if (dehaze < -0.0001) {
         let veil = -dehaze;
         c = max(c * (1.0 - veil * 0.3) + vec3<f32>(veil * 0.10), vec3<f32>(0.0));
