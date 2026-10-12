@@ -29,6 +29,8 @@ struct ContentView: View {
     @State private var editOrigin: Tab = .device
     /// 进入编辑会话时的照片队列（编辑器内左右滑动切上一张 / 下一张）。
     @State private var editQueue: [PHAsset] = []
+    /// 当前编辑会话所属项目（nil = 设备 / 最近编辑单张：不做左右切换、不显示同步）。
+    @State private var editProject: Project?
 
     var body: some View {
         TabView(selection: $selection) {
@@ -43,6 +45,7 @@ struct ContentView: View {
                     // 编辑会话全屏：隐藏底部三大 Tab，只保留编辑器自身的四个工具。
                     EditorTabView(
                         asset: asset,
+                        project: editProject,
                         onClose: { closeEditor() },
                         onSwipePrev: { stepEditor(by: -1) },
                         onSwipeNext: { stepEditor(by: 1) },
@@ -51,9 +54,14 @@ struct ContentView: View {
                     )
                     .toolbar(.hidden, for: .tabBar)
                 } else {
-                    RecentlyEditedView { asset, queue in
-                        openEditor(asset: asset, queue: queue, origin: .edit)
-                    }
+                    RecentlyEditedView(
+                        onOpen: { asset, queue in
+                            openEditor(asset: asset, queue: queue, origin: .edit)
+                        },
+                        onOpenProject: { project, assets in
+                            openProject(project, assets: assets)
+                        }
+                    )
                     .toolbar(.visible, for: .tabBar)
                 }
             }
@@ -76,26 +84,45 @@ struct ContentView: View {
     }
 
     private var canStepBackward: Bool {
-        guard let index = editIndex else { return false }
+        // 设备 / 最近编辑的单张编辑不做左右切换；项目内可以切项目照片。
+        guard editProject != nil, let index = editIndex else { return false }
         return index > 0
     }
 
     private var canStepForward: Bool {
-        guard let index = editIndex else { return false }
+        guard editProject != nil, let index = editIndex else { return false }
         return index + 1 < editQueue.count
     }
 
     /// 打开编辑会话：带上当前列表（设备页网格 / 列表 / 全屏预览、最近编辑列表）。
     private func openEditor(asset: PHAsset, queue: [PHAsset], origin: Tab) {
-        editAsset = asset
-        editQueue = queue
-        editOrigin = origin
-        selection = .edit
+        withAnimation(.easeInOut(duration: 0.25)) {
+            editAsset = asset
+            editQueue = queue
+            editOrigin = origin
+            editProject = nil
+            selection = .edit
+        }
+    }
+
+    /// 打开项目编辑会话（队列 = 项目内照片，可左右切换 / 一键同步）。
+    private func openProject(_ project: Project, assets: [PHAsset]) {
+        guard let first = assets.first else { return }
+        withAnimation(.easeInOut(duration: 0.25)) {
+            editAsset = first
+            editQueue = assets
+            editOrigin = .edit
+            editProject = project
+            selection = .edit
+        }
     }
 
     private func closeEditor() {
-        editAsset = nil
-        selection = editOrigin
+        withAnimation(.easeInOut(duration: 0.25)) {
+            editAsset = nil
+            editProject = nil
+            selection = editOrigin
+        }
     }
 
     /// 编辑器内滑动切上一张 / 下一张（offset = ±1）。
@@ -103,7 +130,9 @@ struct ContentView: View {
         guard let index = editIndex else { return }
         let target = index + offset
         guard editQueue.indices.contains(target) else { return }
-        editAsset = editQueue[target]
+        withAnimation(.easeInOut(duration: 0.25)) {
+            editAsset = editQueue[target]
+        }
     }
 }
 

@@ -165,16 +165,32 @@ fn dump_model_io() {
         eprintln!("跳过：未找到模型目录");
         return;
     };
-    let registry = ModelRegistry::with_dir(dir);
-    if !ensure_models(&registry) {
-        return;
-    }
+    let registry = ModelRegistry::with_dir(dir.clone());
+    let _ = ensure_models(&registry);
     fdxmp_core::ai::ensure_runtime().expect("ONNX Runtime 初始化失败");
-    for spec in registry.specs() {
-        let path = registry.path_of(spec);
+    // 全部 .onnx（含尚未登记进注册表的候选模型），便于换模型时对齐规格。
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .map(|extension| extension == "onnx")
+                .unwrap_or(false)
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    for path in files {
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
         let mut builder = Session::builder().unwrap();
         let session = builder.commit_from_file(&path).unwrap();
-        eprintln!("== {}（{}）", spec.name, spec.path);
+        eprintln!("== {name}");
         for input in session.inputs() {
             eprintln!("  in  {}", input.name());
         }
@@ -479,6 +495,185 @@ fn onnx_runtime_generates_and_caches_each_mask_kind() {
 
 fn kind_name(kind: &fdxmp_core::params::MaskKind) -> String {
     format!("{kind:?}").replace(['(', ')', '{', '}', ' ', ':', ','], "")
+}
+
+/// AI 修图端到端（真实人像）：识别（五官 / 蒙版）→ 一键修图 → 导出前后对照。
+///
+/// 需要 `FDXMP_TEST_PORTRAIT`；`FDXMP_TEST_OUT` 指定导出目录（可选）。
+#[test]
+fn onnx_retouch_analyze_and_apply_on_real_portrait() {
+    use fdxmp_core::retouch::RetouchParams;
+
+    let Some(portrait_env) = std::env::var_os("FDXMP_TEST_PORTRAIT") else {
+        eprintln!("跳过：未设置 FDXMP_TEST_PORTRAIT");
+        return;
+    };
+    let Some(dir) = model_dir() else {
+        eprintln!("跳过：未找到模型目录");
+        return;
+    };
+    std::env::set_var("FDXMP_MODEL_DIR", &dir);
+    let registry = ModelRegistry::with_dir(dir.clone());
+    if !ensure_models(&registry) {
+        return;
+    }
+    if std::env::var_os("FDXMP_ORT_DLL").is_none() {
+        let dll = dir.join("../onnxruntime.dll");
+        if dll.is_file() {
+            std::env::set_var("FDXMP_ORT_DLL", dll);
+        }
+    }
+    let image = image::open(std::path::PathBuf::from(portrait_env))
+        .expect("打开测试人像失败")
+        .to_rgba8();
+    let scale = 1600.0 / image.width().max(image.height()) as f32;
+    let image = if scale < 1.0 {
+        image::imageops::resize(
+            &image,
+            (image.width() as f32 * scale) as u32,
+            (image.height() as f32 * scale) as u32,
+            image::imageops::FilterType::Triangle,
+        )
+    } else {
+        image
+    };
+
+    let analysis = fdxmp_core::smartmask::runtime::retouch_analyze(&image).expect("识别失败");
+    eprintln!(
+        "识别：faces={} landmarks={} skin={} person={} warnings={:?}",
+        analysis.faces, analysis.landmarks, analysis.skin, analysis.person, analysis.warnings
+    );
+    assert!(analysis.faces >= 1, "真实人像应检出人脸");
+    assert_eq!(analysis.landmarks, 478, "FaceMesh 应输出 478 点");
+    assert!(analysis.skin && analysis.person);
+
+    // 一键修图（默认强度）。
+    let params = RetouchParams {
+        blemish: 60.0,
+        smooth_low: 40.0,
+        smooth_mid: 55.0,
+        smooth_high: 45.0,
+        skin_tone: 50.0,
+        face_slim: 35.0,
+        chin: 20.0,
+        eye_enlarge: 20.0,
+        nose_slim: 15.0,
+        body_slim: 30.0,
+    };
+    let start = std::time::Instant::now();
+    let retouched =
+        fdxmp_core::smartmask::runtime::retouch_apply(&image, &params).expect("修图失败");
+    eprintln!(
+        "修图耗时：{:.2}s（{}×{}）",
+        start.elapsed().as_secs_f32(),
+        image.width(),
+        image.height()
+    );
+    assert_eq!(retouched.dimensions(), image.dimensions());
+    let diff: f32 = retouched
+        .as_raw()
+        .iter()
+        .zip(image.as_raw().iter())
+        .map(|(a, b)| (*a as f32 - *b as f32).abs())
+        .sum::<f32>()
+        / retouched.as_raw().len() as f32;
+    assert!(diff > 1.0, "修图应改变像素（平均差 {diff}）");
+
+    if let Some(out_dir) = std::env::var_os("FDXMP_TEST_OUT") {
+        let out_dir = std::path::PathBuf::from(out_dir);
+        let _ = std::fs::create_dir_all(&out_dir);
+        // JPEG 不支持 RGBA，用 PNG 导出对照图。
+        let _ = image.save(out_dir.join("retouch-before.png"));
+        let _ = retouched.save(out_dir.join("retouch-after.png"));
+        eprintln!(
+            "已导出 {} / {}",
+            out_dir.join("retouch-before.png").display(),
+            out_dir.join("retouch-after.png").display()
+        );
+    }
+    fdxmp_core::masks::clear_ai_raster_cache();
+}
+
+/// 诊断：FaceMesh（468/478 点）候选模型的输出形状与取值范围。
+#[test]
+#[ignore]
+fn probe_facemesh() {
+    use ort::session::Session;
+    use ort::value::Tensor;
+
+    let Some(portrait_env) = std::env::var_os("FDXMP_TEST_PORTRAIT") else {
+        eprintln!("跳过：未设置 FDXMP_TEST_PORTRAIT");
+        return;
+    };
+    let Some(dir) = model_dir() else {
+        eprintln!("跳过：未找到模型目录");
+        return;
+    };
+    std::env::set_var("FDXMP_MODEL_DIR", &dir);
+    if std::env::var_os("FDXMP_ORT_DLL").is_none() {
+        let dll = dir.join("../onnxruntime.dll");
+        if dll.is_file() {
+            std::env::set_var("FDXMP_ORT_DLL", dll);
+        }
+    }
+    fdxmp_core::ai::ensure_runtime().expect("ONNX Runtime 初始化失败");
+    let image = image::open(std::path::PathBuf::from(portrait_env))
+        .expect("打开测试人像失败")
+        .to_rgba8();
+    // 用 SCRFD 检出的第一个人脸做对齐裁剪。
+    let registry = ModelRegistry::with_dir(dir.clone());
+    let stages = OnnxStages::load(&registry).expect("加载模型失败");
+    let faces = stages.detector().detect(&image).expect("人脸检测失败");
+    assert!(!faces.is_empty(), "需要一张有脸的测试照片");
+    let face = &faces[0];
+    let transform =
+        fdxmp_core::smartmask::pipeline::face_alignment(face, (image.width(), image.height()), 256)
+            .unwrap();
+    let crop = fdxmp_core::smartmask::pipeline::warp_image(&image, &transform, 256);
+
+    for file in [
+        "face_landmarks_facemesh_fp32.onnx",
+        "face_landmarks_mediapipe_v2_fp32.onnx",
+    ] {
+        let path = dir.join(file);
+        if !path.is_file() {
+            continue;
+        }
+        let mut builder = Session::builder().unwrap();
+        let mut session = builder.commit_from_file(&path).unwrap();
+        // 布局 NHWC [1,256,256,3]，MediaPipe 归一化 (x-127.5)/127.5 → [-1,1]。
+        let mut data = vec![0.0f32; 256 * 256 * 3];
+        for (index, pixel) in crop.pixels().enumerate() {
+            for channel in 0..3 {
+                data[index * 3 + channel] = (pixel.0[channel] as f32 - 127.5) / 127.5;
+            }
+        }
+        let input_name = session.inputs()[0].name().to_string();
+        let tensor = Tensor::from_array((vec![1usize, 256, 256, 3], data)).unwrap();
+        let outputs = session
+            .run(ort::inputs![input_name.as_str() => tensor])
+            .unwrap();
+        for (name, value) in outputs.iter() {
+            if let Ok((shape, values)) = value.try_extract_tensor::<f32>() {
+                let min = values.iter().copied().fold(f32::MAX, f32::min);
+                let max = values.iter().copied().fold(f32::MIN, f32::max);
+                eprintln!(
+                    "{file} out {name} shape={:?} len={} min={min:.3} max={max:.3}",
+                    shape,
+                    values.len()
+                );
+                if values.len() >= 12 {
+                    eprintln!(
+                        "   pts[0..4] = {:?}",
+                        values[..12.min(values.len())]
+                            .chunks(3)
+                            .map(|c| [c[0], c[1]])
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// 回归：切换图片后（清栅格缓存）重新生成，必须得到新图的蒙版，而不是上一张的。

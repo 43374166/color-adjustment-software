@@ -5,8 +5,14 @@ import SwiftUI
 struct RecentlyEditedView: View {
     /// 打开编辑页：照片 + 整个最近编辑列表（编辑页内可左右滑动切上一张 / 下一张）。
     let onOpen: (PHAsset, [PHAsset]) -> Void
+    /// 打开项目（照片队列 = 项目内照片）。
+    var onOpenProject: (Project, [PHAsset]) -> Void = { _, _ in }
 
     @State private var entries: [RecentEntry] = []
+    @State private var projects: [Project] = []
+    @State private var showPicker = false
+    @State private var renameTarget: Project?
+    @State private var renameText = ""
 
     fileprivate struct RecentEntry: Identifiable {
         let asset: PHAsset
@@ -18,7 +24,7 @@ struct RecentlyEditedView: View {
     var body: some View {
         VStack(spacing: 0) {
             header
-            if entries.isEmpty {
+            if entries.isEmpty && projects.isEmpty {
                 emptyState
             } else {
                 list
@@ -26,6 +32,33 @@ struct RecentlyEditedView: View {
         }
         .background(Color(white: 0.08))
         .onAppear(perform: reload)
+        .sheet(isPresented: $showPicker) {
+            PhotoPickerView { assets in
+                showPicker = false
+                let project = ProjectStore.create(assetIds: assets.map(\.localIdentifier))
+                reload()
+                onOpenProject(project, assets)
+            }
+            .ignoresSafeArea()
+        }
+        .alert("重命名项目", isPresented: renameAlertBinding) {
+            TextField("名称", text: $renameText)
+            Button("取消", role: .cancel) { renameTarget = nil }
+            Button("确定") {
+                if let target = renameTarget {
+                    ProjectStore.rename(id: target.id, name: renameText)
+                    reload()
+                }
+                renameTarget = nil
+            }
+        }
+    }
+
+    private var renameAlertBinding: Binding<Bool> {
+        Binding(
+            get: { renameTarget != nil },
+            set: { if !$0 { renameTarget = nil } }
+        )
     }
 
     private var header: some View {
@@ -38,6 +71,16 @@ struct RecentlyEditedView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            // 新建项目：选本机照片 → 自动创建项目并进入。
+            Button {
+                Haptics.light()
+                showPicker = true
+            } label: {
+                Image(systemName: "plus.circle.fill")
+                    .font(.title3)
+                    .foregroundStyle(Color.accentColor)
+            }
+            .accessibilityLabel("新建项目（选择本机照片）")
         }
         .padding(.horizontal, 16)
         .padding(.top, 14)
@@ -49,6 +92,9 @@ struct RecentlyEditedView: View {
     private var list: some View {
         ScrollView {
             LazyVStack(spacing: 8) {
+                if !projects.isEmpty {
+                    projectsSection
+                }
                 ForEach(entries) { entry in
                     Button {
                         onOpen(entry.asset, entries.map(\.asset))
@@ -68,6 +114,70 @@ struct RecentlyEditedView: View {
             }
             .padding(12)
         }
+    }
+
+    /// 项目列表：只显示项目里添加的那几张照片。
+    private var projectsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("项目")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.leading, 2)
+            ForEach(projects) { project in
+                Button {
+                    let assets = ProjectStore.assets(for: project)
+                    guard !assets.isEmpty else { return }
+                    onOpenProject(project, assets)
+                } label: {
+                    projectRow(project)
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    Button {
+                        renameText = project.name
+                        renameTarget = project
+                    } label: {
+                        Label("重命名", systemImage: "pencil")
+                    }
+                    Button(role: .destructive) {
+                        ProjectStore.remove(id: project.id)
+                        reload()
+                    } label: {
+                        Label("删除项目（照片保留在图库）", systemImage: "trash")
+                    }
+                }
+            }
+        }
+    }
+
+    private func projectRow(_ project: Project) -> some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.accentColor.opacity(0.18))
+                    .frame(width: 52, height: 52)
+                Image(systemName: "rectangle.stack.badge.plus")
+                    .font(.system(size: 18))
+                    .foregroundStyle(Color.accentColor)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                Text(project.name)
+                    .font(.subheadline.weight(.medium))
+                    .lineLimit(1)
+                Text("\(project.assetIds.count) 张照片 · \(Self.formatter.string(from: project.createdAt))")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.white.opacity(0.06))
+        )
     }
 
     private func row(_ entry: RecentEntry) -> some View {
@@ -110,6 +220,7 @@ struct RecentlyEditedView: View {
     }
 
     private func reload() {
+        projects = ProjectStore.load()
         let recent = EditStore.recentEdits(limit: 30)
         let ids = recent.map(\.assetId)
         guard !ids.isEmpty else {

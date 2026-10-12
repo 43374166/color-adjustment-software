@@ -8,6 +8,8 @@ import UIKit
 /// 长按图片看原图；滑块松手记一步历史；导出按当前参数渲染并保存到相册。
 struct EditorTabView: View {
     let asset: PHAsset?
+    /// 当前项目（nil = 设备单张模式：不显示同步、不做左右切换、不自动基础调色）。
+    var project: Project?
     /// 返回回调（退出编辑会话，回到来源页面）。
     var onClose: () -> Void = {}
     /// 未放大时左右滑动切图：上一张 / 下一张（队列与边界由父层提供）。
@@ -72,6 +74,12 @@ struct EditorTabView: View {
         .onAppear {
             // 预热触觉引擎，第一次操作就有反馈。
             Haptics.prepare()
+        }
+        .onAppear {
+            model.configureProject(project)
+        }
+        .onChange(of: project?.id) { _ in
+            model.configureProject(project)
         }
         .onChange(of: asset?.localIdentifier) { _ in
             resetZoom()
@@ -282,6 +290,14 @@ struct EditorTabView: View {
         .animation(.easeInOut(duration: 0.24), value: panelHeight)
         .animation(.easeInOut(duration: 0.24), value: hidesChrome)
         .animation(.easeInOut(duration: 0.24), value: hidesToolBar)
+        // AI 修图：全屏加载动画（识别五官 → 逐项处理）。
+        .overlay {
+            if let stage = model.retouchStage {
+                RetouchProgressOverlay(text: stage)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: model.retouchStage)
     }
 
     @ViewBuilder
@@ -338,7 +354,7 @@ struct EditorTabView: View {
                 Image(systemName: "chevron.backward")
             }
             VStack(alignment: .leading, spacing: 1) {
-                Text(model.assetName)
+                Text(model.project?.name ?? model.assetName)
                     .font(.footnote)
                     .lineLimit(1)
                 HStack(spacing: 6) {
@@ -351,6 +367,30 @@ struct EditorTabView: View {
                 .foregroundStyle(.secondary)
             }
             Spacer()
+            // 项目内：一键同步（调色 / 修图 / 两者）；设备单张编辑不显示。
+            if model.project != nil {
+                Menu {
+                    Button {
+                        model.syncEdits(scope: .all)
+                    } label: {
+                        Label("同步调色 + 修图", systemImage: "square.on.square")
+                    }
+                    Button {
+                        model.syncEdits(scope: .retouchOnly)
+                    } label: {
+                        Label("仅同步修图", systemImage: "wand.and.rays")
+                    }
+                    Button {
+                        model.syncEdits(scope: .colorOnly)
+                    } label: {
+                        Label("仅同步调色", systemImage: "slider.horizontal.3")
+                    }
+                } label: {
+                    Image(systemName: "square.on.square.intersection.dashed")
+                        .foregroundStyle(Color.accentColor)
+                }
+                .accessibilityLabel("同步到项目内照片")
+            }
             Button {
                 guard Date() >= suppressUndoTapUntil else { return }
                 model.undo()
@@ -534,6 +574,9 @@ struct EditorTabView: View {
                                 height: geo.size.height
                             )
                             .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
+                            // 切换照片：新帧淡入（配合 ContentView 的 withAnimation）。
+                            .id(asset?.localIdentifier)
+                            .transition(.opacity)
                     }
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
@@ -547,6 +590,27 @@ struct EditorTabView: View {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+            }
+            // 切图 / 首帧加载：整块盖一层加载动画（老帧不闪、新帧淡入由下方 transition 负责）。
+            if model.isLoading, shownImage != nil {
+                ZStack {
+                    Color.black.opacity(0.35)
+                    VStack(spacing: 10) {
+                        ProgressView()
+                            .tint(.white)
+                        Text("正在加载照片…")
+                            .font(.footnote)
+                            .foregroundStyle(.white.opacity(0.85))
+                    }
+                    .padding(18)
+                    .background(
+                        RoundedRectangle(cornerRadius: 14)
+                            .fill(Color.black.opacity(0.55))
+                    )
+                }
+                .allowsHitTesting(false)
+                .transition(.opacity)
+                .zIndex(20)
             }
             // 放大后的 1:1 区域帧（核心按帧外坐标渲染），按归一化矩形对齐贴上。
             if model.tool != .mask,
@@ -833,6 +897,8 @@ struct EditorTabView: View {
         // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
         // 分类行压矮后，把高度让给上面的参数（滑块）区。
         case .mask: return model.selectedMask == nil ? 150 : 300
+        // 修图：一键修图 + 分组滑杆。
+        case .retouch: return 316
         }
     }
 
@@ -851,6 +917,8 @@ struct EditorTabView: View {
                     editPanel
                 case .mask:
                     MaskPanelView(model: model)
+                case .retouch:
+                    RetouchPanelView(model: model)
                 }
             }
             .frame(height: panelHeight)

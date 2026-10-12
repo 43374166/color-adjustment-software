@@ -39,6 +39,10 @@ download_model face_parsing_quantized.onnx \
 download_model u2netp.onnx \
     "https://hf-mirror.com/BritishWerewolf/U-2-Netp/resolve/main/onnx/model.onnx" \
     309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8
+# AI 修图：MediaPipe FaceMesh v2（478 点关键点，脸部塑形用）
+download_model face_landmarks_mediapipe_v2_fp32.onnx \
+    "https://hf-mirror.com/fernandotonon/QtMeshEditor-facemesh-onnx/resolve/main/face_landmarks.onnx" \
+    d16e5a55e6a480284d468ee32469692464049518c311662ab3956681de31e3e9
 
 # gpu feature：预览走 wgpu（iOS = Metal），失败自动回退 CPU；
 # raw feature：LibRaw（rsraw）解相机 RAW / DNG，工程侧需链接 libc++（见 project.yml）；

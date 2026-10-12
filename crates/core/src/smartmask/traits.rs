@@ -196,6 +196,24 @@ pub trait Stage2PersonMatting: Send + Sync {
     }
 }
 
+/// 第二阶段：人脸 478 点关键点（FaceMesh；修图塑形用）。
+pub trait Stage2FaceLandmarks: Send + Sync {
+    /// 输入对齐后的人脸图，输出归一化（0..1，相对输入图）的 2D 关键点。
+    ///
+    /// MediaPipe FaceMesh v2 = 478 点（前 468 点为面部网格，末尾 10 点为双眼虹膜）。
+    fn landmarks(&self, aligned_face: &Image) -> Result<Vec<[f32; 2]>>;
+
+    /// 人脸置信度（0..1；用于 UI 判断「是否检测到人脸」）。
+    fn confidence(&self, aligned_face: &Image) -> Result<f32> {
+        self.landmarks(aligned_face).map(|_| 1.0)
+    }
+
+    /// 模型版本（参与缓存键）。
+    fn version_id(&self) -> String {
+        "0.0.0".to_string()
+    }
+}
+
 /// 蒙版细化（边缘清理 / 引导滤波 / 形态学）。
 pub trait MaskRefiner: Send + Sync {
     /// 细化（参考图为原图）。

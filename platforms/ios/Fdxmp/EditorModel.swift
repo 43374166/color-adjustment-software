@@ -9,6 +9,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
     case crop = "裁切"
     case edit = "编辑"
     case mask = "蒙版"
+    case retouch = "修图"
 
     var id: String { rawValue }
 
@@ -18,6 +19,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
         case .crop: return "crop"
         case .edit: return "slider.horizontal.3"
         case .mask: return "paintbrush.pointed"
+        case .retouch: return "wand.and.rays"
         }
     }
 }
@@ -259,6 +261,7 @@ final class EditorModel: ObservableObject {
         maskThumbnails = [:]
         smartMaskGenerating.removeAll()
         smartMaskFailed.removeAll()
+        resetRetouchState()
         // 智能蒙版栅格与图像内容绑定：切换图片时清空核心缓存（重新生成 / 重新提交）。
         NativeCore.shared.clearMaskRasters()
         maskInteracting = false
@@ -384,9 +387,15 @@ final class EditorModel: ObservableObject {
         originalImage = original
         // 先显示原图占位，首帧渲染完成后替换为调色结果。
         previewImage = original
+        // 项目内新照片：自动基础调色（不写编辑记录，用户改动后才落盘）。
+        applyAutoBaseToneIfNeeded()
         scheduleRender(immediate: true)
         // 首帧先走 CPU 保证立刻出图；GPU 会话在后台创建，就绪后接管预览渲染。
-        createGpuSession(for: buffer)
+        if let source = renderSource {
+            createGpuSession(for: source)
+        }
+        // 有保存过修图参数的照片：后台重算修图缓冲。
+        prepareRetouchAfterLoad()
     }
 
     /// RAW：后台解一版更精细的缓冲（≤2560）供放大 1:1 / 区域细节复用。
@@ -514,7 +523,7 @@ final class EditorModel: ObservableObject {
 
     /// 用当前照片的小图渲染每个预设的效果（进入预设工具 / 预设库变化时刷新）。
     func refreshPresetThumbnails() {
-        guard let buffer = baseBuffer else { return }
+        guard let buffer = renderSource else { return }
         presetThumbToken &+= 1
         let token = presetThumbToken
         let crop = state.crop
@@ -595,7 +604,7 @@ final class EditorModel: ObservableObject {
 
         // RAW：细节帧同源走 LibRaw 缓冲（避免混入系统渲染的观感差异）。
         if rawData != nil {
-            let source = rawDetailBuffer ?? baseBuffer
+            let source = retouchBuffer ?? rawDetailBuffer ?? baseBuffer
             renderQueue.async { [weak self] in
                 let result = source.flatMap {
                     NativeCore.shared.render(buffer: $0, paramsJson: json)
@@ -626,7 +635,15 @@ final class EditorModel: ObservableObject {
             }
             self.renderQueue.async { [weak self] in
                 let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: maxEdge)
-                let result = buffer.flatMap {
+                // 修图开启时：细节帧先在修图缓冲上算好再上采样（保证与预览一致）。
+                let prepared = buffer.flatMap { buffer -> RgbaBuffer? in
+                    guard let self, self.state.retouch.isActive else { return buffer }
+                    return Self.applyRetouchForExport(
+                        buffer: buffer,
+                        params: self.state.retouch
+                    ) ?? buffer
+                }
+                let result = prepared.flatMap {
                     NativeCore.shared.render(buffer: $0, paramsJson: json)
                 }
                 let output = result.flatMap {
@@ -671,6 +688,8 @@ final class EditorModel: ObservableObject {
     var canRenderRegionDetail: Bool {
         // RAW：区域帧若走系统渲染会与 LibRaw 基础帧观感不一致，先用整帧细节帧。
         guard rawData == nil else { return false }
+        // 修图后：区域帧来自未修图的全分辨率源，会与修图预览不一致，先用整帧细节帧。
+        guard retouchBuffer == nil else { return false }
         let crop = state.crop
         let identity = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
             && crop.rotation == 0
@@ -1529,6 +1548,368 @@ final class EditorModel: ObservableObject {
     /// 正在生成中的智能蒙版 id（UI 显示转圈）。
     @Published private(set) var smartMaskGenerating: Set<String> = []
 
+    // MARK: - 项目（编辑 Tab 的「＋」创建）
+
+    /// 当前项目（nil = 设备单张模式：不显示同步、不做左右切换、不自动基础调色）。
+    @Published private(set) var project: Project?
+
+    /// 绑定 / 解除项目上下文（进入项目编辑 / 回到单张编辑时调用）。
+    func configureProject(_ project: Project?) {
+        self.project = project
+    }
+
+    // MARK: - AI 修图（v1.5.0）
+
+    /// 修图识别结果（一键修图时填充）。
+    @Published private(set) var retouchAnalysis: RetouchAnalysisUi?
+    /// 修图阶段提示（nil = 空闲；非 nil 时显示全屏加载动画）。
+    @Published private(set) var retouchStage: String?
+    /// 是否已有修图结果（UI 显示「已修图」）。
+    @Published private(set) var retouchAppliedReady = false
+
+    /// 修图后的基础缓冲（渲染与展示都用它；nil = 用原图）。
+    private var retouchBuffer: RgbaBuffer?
+    /// 已应用的修图参数（避免重复计算）。
+    private var retouchApplied: RetouchUi?
+    private var retouchWorkInFlight = false
+    private var retouchPending = false
+    private var retouchDebounce: DispatchWorkItem?
+    private var retouchStageTimer: Timer?
+    private var retouchStageIndex = 0
+    private let retouchQueue = DispatchQueue(label: "fdxmp.ios.retouch", qos: .userInitiated)
+
+    /// 一键修图的阶段文案（识别 → 逐项处理，加载动画用）。
+    private let retouchStages = [
+        "正在识别五官…",
+        "去瑕疵…",
+        "磨皮（低 / 中 / 高频）…",
+        "统一肤色…",
+        "脸部塑形…",
+        "身体塑形…",
+    ]
+
+    /// 渲染 / 显示用的当前源图（修图后 = 修图结果，否则原图）。
+    private var renderSource: RgbaBuffer? { retouchBuffer ?? baseBuffer }
+
+    /// 切换照片时重置修图状态（核心按图像指纹自动失效识别结果）。
+    private func resetRetouchState() {
+        retouchStageTimer?.invalidate()
+        retouchStageTimer = nil
+        retouchStage = nil
+        retouchBuffer = nil
+        retouchApplied = nil
+        retouchAppliedReady = false
+        retouchAnalysis = nil
+        retouchWorkInFlight = false
+        retouchPending = false
+    }
+
+    /// 载入完成后：若该图有已保存的修图参数 → 后台重算；否则保持原图。
+    private func prepareRetouchAfterLoad() {
+        guard state.retouch.isActive else {
+            retouchApplied = state.retouch
+            retouchBuffer = nil
+            retouchAppliedReady = false
+            return
+        }
+        // 新图第一次应用修图要重新识别五官：给一段加载动画。
+        startRetouchStages()
+        recomputeRetouch(completion: { self.stopRetouchStages() })
+    }
+
+    /// 一键修图：识别五官（加载动画）→ 应用默认强度。
+    func oneTapRetouch() {
+        guard let buffer = baseBuffer, retouchStage == nil else { return }
+        Haptics.light()
+        startRetouchStages()
+        let source = buffer
+        retouchQueue.async { [weak self] in
+            guard let self else { return }
+            var analysis: RetouchAnalysisUi?
+            if let json = NativeCore.shared.retouchAnalyze(buffer: source) {
+                analysis = RetouchAnalysisUi.from(json: json)
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                self.retouchAnalysis = analysis
+                let params = RetouchUi.autoDefaults(
+                    faces: analysis?.faces ?? 0,
+                    landmarks: analysis?.landmarks ?? 0,
+                    person: analysis?.person ?? true
+                )
+                self.applyEdit("一键修图") { state in
+                    state.retouch = params
+                }
+                self.recomputeRetouch(completion: { self.stopRetouchStages() })
+                if let analysis {
+                    if analysis.faces == 0 {
+                        self.showMessage("未检测到人脸：已跳过脸部修图（磨皮 / 肤色按全图处理）")
+                    } else if !analysis.hasLandmarks {
+                        self.showMessage("五官识别不完整：已跳过脸部塑形")
+                    } else {
+                        self.showMessage("一键修图完成：可切到「编辑」Tab 继续调色")
+                    }
+                }
+            }
+        }
+    }
+
+    /// 滑杆实时调整修图参数（拖动中防抖重算；松手由面板调用 [`recomputeRetouch`] 立即重算）。
+    func updateRetouch(_ transform: (inout RetouchUi) -> Void) {
+        var params = state.retouch
+        transform(&params)
+        state.retouch = params
+        retouchDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.recomputeRetouch()
+        }
+        retouchDebounce = work
+        retouchQueue.asyncAfter(deadline: .now() + 0.35, execute: work)
+    }
+
+    /// 修图参数重置（回到未修图）。
+    func resetRetouch() {
+        guard state.retouch.isActive else { return }
+        applyEdit("重置修图") { state in
+            state.retouch = RetouchUi()
+        }
+        recomputeRetouch()
+    }
+
+    /// 导出 / 细节帧用：在给定分辨率上应用修图。
+    ///
+    /// 超过 4096 长边时先降采样再上采样（保内存；修图主要作用于皮肤，损失可接受）。
+    static func applyRetouchForExport(buffer: RgbaBuffer, params: RetouchUi) -> RgbaBuffer? {
+        guard params.isActive else { return buffer }
+        let longEdge = max(buffer.width, buffer.height)
+        let limit = 4096
+        if longEdge <= limit {
+            return NativeCore.shared.retouchApply(paramsJson: params.jsonString, buffer: buffer)
+        }
+        let scale = Double(limit) / Double(longEdge)
+        let width = max(1, Int((Double(buffer.width) * scale).rounded()))
+        let height = max(1, Int((Double(buffer.height) * scale).rounded()))
+        guard
+            let small = ImageUtil.scaled(buffer: buffer, toWidth: width, toHeight: height),
+            let retouched = NativeCore.shared.retouchApply(
+                paramsJson: params.jsonString,
+                buffer: small
+            )
+        else {
+            return nil
+        }
+        return ImageUtil.scaled(
+            buffer: retouched,
+            toWidth: buffer.width,
+            toHeight: buffer.height
+        )
+    }
+
+    /// 重算修图缓冲（后台；完成后重建 GPU 会话并刷新预览）。
+    func recomputeRetouch(completion: (() -> Void)? = nil) {
+        guard let buffer = baseBuffer else {
+            completion?()
+            return
+        }
+        let params = state.retouch
+        if params == retouchApplied {
+            completion?()
+            return
+        }
+        if retouchWorkInFlight {
+            retouchPending = true
+            completion?()
+            return
+        }
+        retouchWorkInFlight = true
+        let json = params.jsonString
+        retouchQueue.async { [weak self] in
+            guard let self else { return }
+            var output: RgbaBuffer?
+            if !params.isIdentity {
+                output = NativeCore.shared.retouchApply(paramsJson: json, buffer: buffer)
+            }
+            Task { @MainActor in
+                guard let self else { return }
+                self.retouchWorkInFlight = false
+                if params.isIdentity {
+                    self.retouchBuffer = nil
+                    self.retouchAppliedReady = false
+                } else if let output {
+                    self.retouchBuffer = output
+                    self.retouchAppliedReady = true
+                } else if self.message == nil {
+                    self.showMessage("修图失败：\(NativeCore.shared.lastError() ?? "未知原因")")
+                }
+                self.retouchApplied = params
+                // GPU 会话按修图结果重建；CPU 路径下一帧自动走新缓冲。
+                self.clearGpuSession()
+                if let source = self.renderSource {
+                    self.createGpuSession(for: source)
+                }
+                self.scheduleRender(immediate: true)
+                self.scheduleMaskAssetsRefresh(immediate: true)
+                completion?()
+                if self.retouchPending {
+                    self.retouchPending = false
+                    self.recomputeRetouch()
+                }
+            }
+        }
+    }
+
+    /// 启动阶段动画（识别 → 去瑕疵 → 磨皮 → 肤色 → 塑形）。
+    private func startRetouchStages() {
+        retouchStageIndex = 0
+        retouchStage = retouchStages[0]
+        retouchStageTimer?.invalidate()
+        retouchStageTimer = Timer.scheduledTimer(withTimeInterval: 0.65, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            if self.retouchStageIndex + 1 < self.retouchStages.count {
+                self.retouchStageIndex += 1
+                self.retouchStage = self.retouchStages[self.retouchStageIndex]
+            }
+        }
+    }
+
+    private func stopRetouchStages() {
+        retouchStageTimer?.invalidate()
+        retouchStageTimer = nil
+        retouchStage = nil
+    }
+
+    // MARK: - 项目同步 / 基础调色
+
+    /// 同步范围（项目内「同步」菜单）。
+    enum SyncScope {
+        case all
+        case retouchOnly
+        case colorOnly
+    }
+
+    /// 把当前编辑同步到项目内其余照片（返回同步张数）。
+    ///
+    /// 调色 + 修图一起同步；裁切与蒙版几何是每张照片自己的构图 / 笔迹，保持不动。
+    @discardableResult
+    func syncEdits(scope: SyncScope) -> Int {
+        guard let project, let current = asset else { return 0 }
+        var synced = 0
+        for assetId in project.assetIds where assetId != current.localIdentifier {
+            var target: EditState
+            if let json = EditStore.json(assetId: assetId) {
+                target = EditJSON.parse(json)
+            } else {
+                target = EditState()
+            }
+            switch scope {
+            case .all:
+                target.values = state.values
+                target.curves = state.curves
+                target.hsl = state.hsl
+                target.grading = state.grading
+                target.removeChromaticAberration = state.removeChromaticAberration
+                target.profileCorrection = state.profileCorrection
+                target.retouch = state.retouch
+            case .retouchOnly:
+                target.retouch = state.retouch
+            case .colorOnly:
+                target.values = state.values
+                target.curves = state.curves
+                target.hsl = state.hsl
+                target.grading = state.grading
+                target.removeChromaticAberration = state.removeChromaticAberration
+                target.profileCorrection = state.profileCorrection
+            }
+            EditStore.save(
+                assetId: assetId,
+                json: EditJSON.build(state: target, applyCropRect: true)
+            )
+            synced += 1
+        }
+        if synced > 0 {
+            Haptics.medium()
+            showMessage("已同步到项目内 \(synced) 张照片")
+        }
+        return synced
+    }
+
+    /// 项目内、且没有编辑记录的照片：自动做一版「基础调色」，避免原片 / RAW 发灰。
+    private func applyAutoBaseToneIfNeeded() {
+        guard project != nil, let buffer = baseBuffer, let current = asset else { return }
+        guard EditStore.json(assetId: current.localIdentifier) == nil else { return }
+        guard let tone = Self.autoBaseTone(buffer: buffer) else { return }
+        var values = EditorSpec.defaultValues()
+        values["exposure"] = tone.exposure
+        values["temperature"] = tone.temperature
+        values["tint"] = tone.tint
+        values["contrast"] = tone.contrast
+        values["shadows"] = tone.shadows
+        values["blacks"] = tone.blacks
+        values["vibrance"] = tone.vibrance
+        state.values = values
+        presetName = "基础调色"
+        presetRef = nil
+        scheduleRender(immediate: true)
+    }
+
+    /// 从图像统计推一版温和的基础基调（灰度世界白平衡 + 中位亮度曝光）。
+    private static func autoBaseTone(
+        buffer: RgbaBuffer
+    ) -> (
+        exposure: Float,
+        temperature: Float,
+        tint: Float,
+        contrast: Float,
+        shadows: Float,
+        blacks: Float,
+        vibrance: Float
+    )? {
+        guard buffer.width > 8, buffer.height > 8 else { return nil }
+        var sumR = 0.0
+        var sumG = 0.0
+        var sumB = 0.0
+        var samples = 0.0
+        var histogram = [Int](repeating: 0, count: 256)
+        let step = 16
+        var y = 0
+        while y < buffer.height {
+            var x = 0
+            while x < buffer.width {
+                let index = (y * buffer.width + x) * 4
+                let r = Double(buffer.pixels[index]) / 255.0
+                let g = Double(buffer.pixels[index + 1]) / 255.0
+                let b = Double(buffer.pixels[index + 2]) / 255.0
+                sumR += r
+                sumG += g
+                sumB += b
+                let luma = Int((0.299 * r + 0.587 * g + 0.114 * b) * 255.0)
+                histogram[min(max(luma, 0), 255)] += 1
+                samples += 1
+                x += step
+            }
+            y += step
+        }
+        guard samples > 100 else { return nil }
+        let meanR = sumR / samples
+        let meanG = sumG / samples
+        let meanB = sumB / samples
+        let mean = max((meanR + meanG + meanB) / 3.0, 0.02)
+        let half = Int(samples / 2)
+        var seen = 0
+        var median = 0.5
+        for (index, count) in histogram.enumerated() {
+            seen += count
+            if seen >= half {
+                median = Double(index) / 255.0
+                break
+            }
+        }
+        let exposure = Float(min(max(log2(0.45 / max(median, 0.05)), -1.2), 1.2))
+        let temperature = Float(min(max((meanB - meanR) / mean * 90.0, -30), 30))
+        let tint = Float(min(max(((meanR + meanB) / 2.0 - meanG) / mean * 90.0, -25), 25))
+        return (exposure, temperature, tint, 6, 8, -4, 6)
+    }
+
     /// 生成失败的智能蒙版 id → 原因（避免自动重试死循环；可手动「重新生成」）。
     @Published private(set) var smartMaskFailed: [String: String] = [:]
 
@@ -2088,7 +2469,7 @@ final class EditorModel: ObservableObject {
     }
 
     private func scheduleRender(immediate: Bool = false) {
-        guard baseBuffer != nil else { return }
+        guard renderSource != nil else { return }
         // 空闲时立即渲染；正在渲染则记下待渲染，当前帧结束后自动接着渲染。
         // （此前的 140ms 防抖在持续拖动时会一直被重置，导致松手才出图。）
         if renderBusy {
@@ -2099,7 +2480,7 @@ final class EditorModel: ObservableObject {
     }
 
     private func startRender(fallback: Bool = false) {
-        guard let buffer = baseBuffer else { return }
+        guard let buffer = renderSource else { return }
         if renderBusy {
             renderPending = true
             return
@@ -2227,6 +2608,8 @@ final class EditorModel: ObservableObject {
             && !crop.flipHorizontal
             && !crop.flipVertical
         let json = currentJson(applyCropRect: true, usePreview: false)
+        // 修图参数（在主线程快照；导出时按导出分辨率重算）。
+        let retouch = state.retouch
         // 读取原图 EXIF / GPS 等元数据（保留拍摄信息）。
         var metadata: [String: Any]?
         if keepMetadata {
@@ -2248,6 +2631,7 @@ final class EditorModel: ObservableObject {
                 self.finishExport(
                     buffer: buffer,
                     paramsJson: json,
+                    retouch: retouch,
                     identityGeometry: identityGeometry,
                     metadata: metadata,
                     format: format,
@@ -2276,6 +2660,7 @@ final class EditorModel: ObservableObject {
                 self.finishExport(
                     buffer: buffer,
                     paramsJson: json,
+                    retouch: retouch,
                     identityGeometry: identityGeometry,
                     metadata: metadata,
                     format: format,
@@ -2289,11 +2674,17 @@ final class EditorModel: ObservableObject {
     private func finishExport(
         buffer: RgbaBuffer?,
         paramsJson json: String,
+        retouch: RetouchUi,
         identityGeometry: Bool,
         metadata: [String: Any]?,
         format: ExportFormat,
         quality: Double
     ) {
+        // 修图开启：先在解码缓冲上应用修图（按导出分辨率），再走调色渲染。
+        var buffer = buffer
+        if let source = buffer, retouch.isActive {
+            buffer = Self.applyRetouchForExport(buffer: source, params: retouch) ?? source
+        }
         // 大图优先按横向条带分块渲染（每块只跑区域管线，内存峰值明显低于整帧）。
         let renderedBuffer: RgbaBuffer?
         if let buffer, let tiled = renderTiledExport(

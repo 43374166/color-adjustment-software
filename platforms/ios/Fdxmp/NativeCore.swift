@@ -206,6 +206,49 @@ final class NativeCore {
         fdxmp_smartmask_runtime_ready() == 1
     }
 
+    // MARK: - AI 修图（v1.5.0）
+
+    /// 修图识别（一键修图第一步）：五官 478 点 + 皮肤 / 人像蒙版。
+    ///
+    /// 返回解析后的 JSON 字符串（`{faces, landmarks, skin, person, warnings}`）；
+    /// 阻塞调用（数秒），必须在工作线程执行；失败返回 nil（原因见 `lastError()`）。
+    func retouchAnalyze(buffer: RgbaBuffer) -> String? {
+        let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in
+            fdxmp_retouch_analyze(
+                pixels.baseAddress,
+                UInt32(buffer.width),
+                UInt32(buffer.height)
+            )
+        }
+        guard let pointer else { return nil }
+        defer { fdxmp_string_free(pointer) }
+        return String(cString: pointer)
+    }
+
+    /// 修图应用：按 RetouchParams JSON 处理图像，返回新的 RGBA 缓冲。
+    ///
+    /// 阻塞调用（同图第二次起会复用识别结果），必须在工作线程执行。
+    func retouchApply(paramsJson: String, buffer: RgbaBuffer) -> RgbaBuffer? {
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in
+            paramsJson.withCString { params in
+                fdxmp_retouch_apply(
+                    params,
+                    pixels.baseAddress,
+                    UInt32(buffer.width),
+                    UInt32(buffer.height),
+                    &outWidth,
+                    &outHeight,
+                    &outLen
+                )
+            }
+        }
+        guard let result = decodePayload(pointer: pointer, outLen: outLen) else { return nil }
+        return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
+    }
+
     /// 智能蒙版模型清单与状态（JSON；macOS / 桌面端 ONNX 用，iOS 走 Vision）。
     func smartMaskModelsJson() -> String? {
         guard let pointer = fdxmp_smartmask_models_json() else { return nil }

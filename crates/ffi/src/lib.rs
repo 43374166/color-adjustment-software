@@ -827,6 +827,152 @@ const SMARTMASK_MAX_PIXELS: usize = 4096 * 4096;
 /// 智能蒙版返回值：模型不可用 / 该类型不支持 —— 调用方应回退平台实现（如 iOS Vision）。
 pub const FDXMP_SMARTMASK_FALLBACK: i32 = 2;
 
+/// RGBA8 指针 + 尺寸 → 图像（统一做尺寸 / 溢出校验）。
+///
+/// # Safety
+///
+/// `rgba` 至少 `width × height × 4` 字节可读。
+unsafe fn rgba_to_image(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+) -> std::result::Result<image::RgbaImage, String> {
+    let expected = (width as usize)
+        .saturating_mul(height as usize)
+        .saturating_mul(4);
+    if width == 0 || height == 0 || width > 4096 || height > 4096 || rgba.is_null() || expected == 0
+    {
+        return Err(format!("图像尺寸非法：{width}×{height}（单边 ≤ 4096）"));
+    }
+    // SAFETY: 调用方保证至少 expected 字节可读。
+    let buffer = std::slice::from_raw_parts(rgba, expected);
+    image::RgbaImage::from_raw(width, height, buffer.to_vec())
+        .ok_or_else(|| "RGBA 缓冲尺寸不匹配".to_string())
+}
+
+/// AI 修图识别（一键修图第一步）：蒙版 + 478 点五官关键点分析。
+///
+/// 返回 JSON：`{faces, landmarks, skin, person, warnings[]}`（调用方用
+/// `fdxmp_string_free` 释放）；失败返回 NULL（原因见 `fdxmp_last_error_message`）。
+///
+/// # Safety
+///
+/// `rgba` 至少 `width × height × 4` 字节可读。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_retouch_analyze(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+) -> *mut c_char {
+    guard(ptr::null_mut(), || {
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            let image = match rgba_to_image(rgba, width, height) {
+                Ok(image) => image,
+                Err(message) => {
+                    set_last_error(message);
+                    return ptr::null_mut();
+                }
+            };
+            match fdxmp_core::smartmask::runtime::retouch_analyze(&image) {
+                Ok(analysis) => match serde_json::to_string(&analysis) {
+                    Ok(text) => into_c_string(text),
+                    Err(err) => {
+                        set_last_error(format!("序列化识别结果失败：{err}"));
+                        ptr::null_mut()
+                    }
+                },
+                Err(err) => {
+                    set_last_error(err.message().to_string());
+                    ptr::null_mut()
+                }
+            }
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            let _ = (rgba, width, height);
+            set_last_error("当前构建未启用 AI 修图（ai / ai-static）");
+            ptr::null_mut()
+        }
+    })
+}
+
+/// AI 修图应用：按 `params_json`（RetouchParams）处理图像。
+///
+/// 返回与 `fdxmp_render_*` 相同的载荷（8 字节大端宽高 + RGBA8），
+/// 调用方用 `fdxmp_bytes_free(ptr, len)` 释放；失败返回 NULL。
+///
+/// # Safety
+///
+/// `params_json` 必须为合法 C 字符串；`rgba` 至少 `width × height × 4` 字节可读；
+/// `out_width` / `out_height` / `out_len` 为非空可写指针。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_retouch_apply(
+    params_json: *const c_char,
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let params: fdxmp_core::retouch::RetouchParams = match serde_json::from_str(params_json) {
+            Ok(params) => params,
+            Err(err) => {
+                set_last_error(format!("retouch params 解析失败：{err}"));
+                return ptr::null_mut();
+            }
+        };
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            let image = match rgba_to_image(rgba, width, height) {
+                Ok(image) => image,
+                Err(message) => {
+                    set_last_error(message);
+                    return ptr::null_mut();
+                }
+            };
+            match fdxmp_core::smartmask::runtime::retouch_apply(&image, &params) {
+                Ok(output) => {
+                    let mut payload = Vec::with_capacity(8 + output.as_raw().len());
+                    payload.extend_from_slice(&output.width().to_be_bytes());
+                    payload.extend_from_slice(&output.height().to_be_bytes());
+                    payload.extend_from_slice(output.as_raw());
+                    *out_width = output.width();
+                    *out_height = output.height();
+                    let mut boxed = payload.into_boxed_slice();
+                    *out_len = boxed.len();
+                    let pointer = boxed.as_mut_ptr();
+                    std::mem::forget(boxed);
+                    pointer
+                }
+                Err(err) => {
+                    set_last_error(err.message().to_string());
+                    ptr::null_mut()
+                }
+            }
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            let _ = (params, rgba, width, height);
+            set_last_error("当前构建未启用 AI 修图（ai / ai-static）");
+            ptr::null_mut()
+        }
+    })
+}
+
 /// 用随包 ONNX 模型生成智能蒙版（双阶段流水线），并写入共享栅格缓存。
 ///
 /// 返回值：
@@ -1854,7 +2000,7 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         let models = value["models"].as_array().unwrap();
-        assert_eq!(models.len(), 4);
+        assert_eq!(models.len(), 5);
         let tasks: Vec<String> = models
             .iter()
             .map(|model| model["task"].as_str().unwrap().to_string())

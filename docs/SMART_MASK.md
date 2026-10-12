@@ -1,5 +1,8 @@
 # 智能蒙版（v1.4.0）
 
+> v1.5.0 起，蒙版还服务于 **AI 修图**（项目制 / 一键修图 / 同步），见 [AI_RETOUCH.md](AI_RETOUCH.md)；
+> 人脸 478 点关键点（FaceMesh）与修图共用同一套 `ModelSpec` / `OnnxStages`。
+
 日期：2026-10-12
 范围：Rust 核心 `fdxmp-core::smartmask` + Windows（ONNX Runtime）+ iOS（Vision）
 原则：**只做蒙版，不修图**；双阶段、模型可插拔、安全优先，为 AI 修图与自训练预留接口。

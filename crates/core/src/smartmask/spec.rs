@@ -36,6 +36,8 @@ pub enum ModelTask {
     FaceParse,
     /// 第二阶段：人像精细抠图（Alpha）。
     PersonMatting,
+    /// 第二阶段：人脸 478 点关键点（FaceMesh，修图塑形用）。
+    FaceLandmarks,
 }
 
 impl ModelTask {
@@ -46,6 +48,7 @@ impl ModelTask {
             ModelTask::PersonCoarse => "person_coarse",
             ModelTask::FaceParse => "face_parse",
             ModelTask::PersonMatting => "person_matting",
+            ModelTask::FaceLandmarks => "face_landmarks",
         }
     }
 }
@@ -591,6 +594,41 @@ impl ModelRegistry {
                 training_repo: Some("https://github.com/xuebinqin/U-2-Net".to_string()),
                 version: "1.0.0".to_string(),
             },
+            ModelSpec {
+                name: "facemesh-v2".to_string(),
+                task: ModelTask::FaceLandmarks,
+                path: "face_landmarks_mediapipe_v2_fp32.onnx".to_string(),
+                sha256: "d16e5a55e6a480284d468ee32469692464049518c311662ab3956681de31e3e9"
+                    .to_string(),
+                input_size: (256, 256),
+                input_layout: InputLayout::Nhwc,
+                input_color: ColorSpace::Rgb,
+                input_mean: [127.5, 127.5, 127.5],
+                input_std: [127.5, 127.5, 127.5],
+                input_scale: 1.0,
+                output_names: vec![
+                    "Identity".to_string(),
+                    "Identity_1".to_string(),
+                    "Identity_2".to_string(),
+                ],
+                output_shapes: vec![vec![1, 1, 1, 1434], vec![1, 1, 1, 1], vec![1, 1]],
+                postprocess: PostprocessSpec {
+                    activation: Activation::None,
+                    score_threshold: 0.5,
+                    nms_iou: 0.4,
+                    mask_threshold: 0.0,
+                    resize: ResizeMode::Bilinear,
+                },
+                provider: ExecutionProvider::Cpu,
+                precision: Precision::Fp32,
+                license: "Apache-2.0".to_string(),
+                source_url:
+                    "https://hf-mirror.com/fernandotonon/QtMeshEditor-facemesh-onnx/resolve/main/face_landmarks.onnx"
+                        .to_string(),
+                trainable: false,
+                training_repo: Some("https://github.com/google-ai-edge/mediapipe".to_string()),
+                version: "1.0.0".to_string(),
+            },
         ]
     }
 }
@@ -619,7 +657,7 @@ mod tests {
     #[test]
     fn builtin_specs_cover_all_tasks_and_are_consistent() {
         let specs = ModelRegistry::builtin();
-        assert_eq!(specs.len(), 4, "四个任务各一个模型");
+        assert_eq!(specs.len(), 5, "五个任务各一个模型");
         let mut tasks = Vec::new();
         for spec in &specs {
             assert!(!spec.name.is_empty());
@@ -637,6 +675,7 @@ mod tests {
             ModelTask::PersonCoarse,
             ModelTask::FaceParse,
             ModelTask::PersonMatting,
+            ModelTask::FaceLandmarks,
         ] {
             assert!(tasks.contains(&task), "缺少任务 {task:?}");
         }

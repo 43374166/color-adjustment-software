@@ -53,9 +53,14 @@ impl std::fmt::Display for RuntimeError {
     }
 }
 
-/// 全局流水线（懒加载；模型加载失败也会被缓存，避免反复读盘校验）。
-fn pipeline_cell() -> &'static Mutex<Option<Arc<MaskPipeline>>> {
-    static CELL: OnceLock<Mutex<Option<Arc<MaskPipeline>>>> = OnceLock::new();
+/// 全局运行时（懒加载；模型加载失败也会被缓存，避免反复读盘校验）。
+struct Runtime {
+    stages: Arc<crate::smartmask::onnx::OnnxStages>,
+    pipeline: Arc<MaskPipeline>,
+}
+
+fn runtime_cell() -> &'static Mutex<Option<Arc<Runtime>>> {
+    static CELL: OnceLock<Mutex<Option<Arc<Runtime>>>> = OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
 
@@ -66,29 +71,41 @@ pub fn runtime_available() -> bool {
 
 /// 取全局流水线（首次调用加载并校验全部模型）。
 pub fn pipeline() -> std::result::Result<Arc<MaskPipeline>, RuntimeError> {
-    let cell = pipeline_cell();
+    runtime().map(|runtime| runtime.pipeline.clone())
+}
+
+/// 取全局运行时（含 ONNX 各阶段，供关键点等额外模型复用）。
+fn runtime() -> std::result::Result<Arc<Runtime>, RuntimeError> {
+    let cell = runtime_cell();
     {
         let guard = cell
             .lock()
             .map_err(|_| RuntimeError::Failed("智能蒙版运行时锁失效".to_string()))?;
-        if let Some(pipeline) = guard.as_ref() {
-            return Ok(pipeline.clone());
+        if let Some(runtime) = guard.as_ref() {
+            return Ok(runtime.clone());
         }
     }
     let registry = ModelRegistry::new();
     let stages = crate::smartmask::onnx::OnnxStages::load(&registry)
         .map_err(|err| RuntimeError::Unavailable(err.to_string()))?;
-    let pipeline = Arc::new(stages.pipeline());
+    let stages = Arc::new(stages);
+    let runtime = Arc::new(Runtime {
+        pipeline: Arc::new(stages.pipeline()),
+        stages,
+    });
     let mut guard = cell
         .lock()
         .map_err(|_| RuntimeError::Failed("智能蒙版运行时锁失效".to_string()))?;
-    *guard = Some(pipeline.clone());
-    Ok(pipeline)
+    *guard = Some(runtime.clone());
+    Ok(runtime)
 }
 
 /// 清空运行时（测试用；下次调用重新加载模型）。
 pub fn reset_runtime() {
-    if let Ok(mut guard) = pipeline_cell().lock() {
+    if let Ok(mut guard) = runtime_cell().lock() {
+        *guard = None;
+    }
+    if let Ok(mut guard) = retouch_session_cell().lock() {
         *guard = None;
     }
 }
@@ -152,6 +169,182 @@ pub fn generate_into_cache(
 pub fn generate(mask: &MaskParams, image: &Image) -> Result<()> {
     generate_into_cache(mask, image)
         .map_err(|err| crate::error::FdxmpError::Unsupported(err.message().to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// AI 修图（v1.5.0）：识别（蒙版 + 478 点关键点）→ 应用
+// ---------------------------------------------------------------------------
+
+/// 修图识别结果（UI 展示 + 决定可用功能）。
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct RetouchAnalysis {
+    /// 检出的人脸数。
+    pub faces: usize,
+    /// 关键点数量（0 = 无 FaceMesh / 未检出）。
+    pub landmarks: usize,
+    /// 是否拿到皮肤蒙版。
+    pub skin: bool,
+    /// 是否拿到人像蒙版。
+    pub person: bool,
+    /// 提示（无脸 / 无人像等）。
+    pub warnings: Vec<String>,
+}
+
+/// 全局修图会话：最近一次识别结果（蒙版 + 关键点，与图像指纹绑定）。
+struct RetouchSession {
+    fingerprint: u64,
+    size: (u32, u32),
+    masks: crate::retouch::RetouchMasks,
+    analysis: RetouchAnalysis,
+}
+
+fn retouch_session_cell() -> &'static Mutex<Option<RetouchSession>> {
+    static CELL: OnceLock<Mutex<Option<RetouchSession>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// 图像指纹（抽样；与图片内容绑定）。
+fn fingerprint(image: &Image) -> u64 {
+    let raw = image.as_raw();
+    if raw.is_empty() {
+        return 0;
+    }
+    let step = (raw.len() / 1024).max(1);
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut index = 0usize;
+    while index < raw.len() {
+        hash ^= raw[index] as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        index += step;
+    }
+    hash
+}
+
+/// 识别（一键修图的第一步）：跑智能蒙版流水线 + FaceMesh，缓存结果供 [`retouch_apply`] 使用。
+pub fn retouch_analyze(image: &Image) -> std::result::Result<RetouchAnalysis, RuntimeError> {
+    let runtime = runtime()?;
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    let set = runtime
+        .pipeline
+        .run(image)
+        .map_err(|err| RuntimeError::Failed(err.to_string()))?;
+    let mut warnings = Vec::new();
+
+    let mut masks = crate::retouch::RetouchMasks::default();
+    if let Some(skin) = set.get(SmartMaskKind::Skin) {
+        masks.skin = Some(crate::retouch::MaskPlane::from_smart(skin, width, height));
+    } else {
+        warnings.push("未识别到皮肤（磨皮 / 去瑕疵 / 肤色将作用于整张图）".to_string());
+    }
+    if let Some(face) = set.get(SmartMaskKind::Face) {
+        masks.face = Some(crate::retouch::MaskPlane::from_smart(face, width, height));
+    }
+    if let Some(person) = set
+        .get(SmartMaskKind::Portrait)
+        .or_else(|| set.get(SmartMaskKind::Subject))
+    {
+        masks.person = Some(crate::retouch::MaskPlane::from_smart(person, width, height));
+    } else {
+        warnings.push("未识别到人像（身体塑形不可用）".to_string());
+    }
+
+    // FaceMesh：取最大的人脸对齐后跑 478 点，映射回原图坐标。
+    let mut landmark_count = 0usize;
+    if let Some(landmarks_model) = runtime.stages.face_landmarks() {
+        if let Some(face) = set.faces.first() {
+            if let Some(transform) =
+                crate::smartmask::pipeline::face_alignment(face, (width, height), 256)
+            {
+                let crop = crate::smartmask::pipeline::warp_image(image, &transform, 256);
+                match landmarks_model.landmarks(&crop) {
+                    Ok(points) => {
+                        if let Some(inverse) = transform.invert() {
+                            masks.landmarks = points
+                                .iter()
+                                .map(|point| {
+                                    let (x, y) = inverse
+                                        .apply(point[0] as f64 * 256.0, point[1] as f64 * 256.0);
+                                    [
+                                        (x as f32 / width as f32).clamp(0.0, 1.0),
+                                        (y as f32 / height as f32).clamp(0.0, 1.0),
+                                    ]
+                                })
+                                .collect();
+                            landmark_count = masks.landmarks.len();
+                        }
+                    }
+                    Err(err) => warnings.push(format!("五官识别失败：{err}")),
+                }
+            }
+        } else {
+            warnings.push("未检测到人脸（脸部塑形不可用）".to_string());
+        }
+    } else {
+        warnings.push("未随包 FaceMesh 模型（脸部塑形不可用）".to_string());
+    }
+
+    let analysis = RetouchAnalysis {
+        faces: set.faces.len(),
+        landmarks: landmark_count,
+        skin: masks.skin.is_some(),
+        person: masks.person.is_some(),
+        warnings,
+    };
+    let mut guard = retouch_session_cell()
+        .lock()
+        .map_err(|_| RuntimeError::Failed("修图会话锁失效".to_string()))?;
+    *guard = Some(RetouchSession {
+        fingerprint: fingerprint(image),
+        size: (width, height),
+        masks,
+        analysis: analysis.clone(),
+    });
+    Ok(analysis)
+}
+
+/// 应用修图（一键修图的第二步 / 滑杆实时预览）：返回修图后的图像。
+///
+/// 会话缺失或图像变化时会自动先做一次 [`retouch_analyze`]。
+pub fn retouch_apply(
+    image: &Image,
+    params: &crate::retouch::RetouchParams,
+) -> std::result::Result<Image, RuntimeError> {
+    if params.is_identity() {
+        return Ok(image.clone());
+    }
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    let fingerprint = fingerprint(image);
+    let cached = {
+        let guard = retouch_session_cell()
+            .lock()
+            .map_err(|_| RuntimeError::Failed("修图会话锁失效".to_string()))?;
+        guard
+            .as_ref()
+            .filter(|session| session.fingerprint == fingerprint && session.size == (width, height))
+            .map(|session| session.masks.clone())
+    };
+    let masks = match cached {
+        Some(masks) => masks,
+        None => {
+            retouch_analyze(image)?;
+            let guard = retouch_session_cell()
+                .lock()
+                .map_err(|_| RuntimeError::Failed("修图会话锁失效".to_string()))?;
+            guard
+                .as_ref()
+                .map(|session| session.masks.clone())
+                .ok_or_else(|| RuntimeError::Failed("修图识别结果缺失".to_string()))?
+        }
+    };
+    Ok(crate::retouch::apply(image, &masks, params))
+}
+
+/// 最近一次识别结果（无则 `None`）。
+pub fn retouch_analysis() -> Option<RetouchAnalysis> {
+    retouch_session_cell()
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|session| session.analysis.clone()))
 }
 
 #[cfg(test)]

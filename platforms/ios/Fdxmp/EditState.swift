@@ -309,6 +309,124 @@ func clampedCropRect(_ rect: CGRect) -> CGRect {
 
 // MARK: - 蒙版
 
+/// AI 修图参数（与核心 `retouch::RetouchParams` 字段一一对应；0..100 强度）。
+struct RetouchUi: Equatable {
+    var blemish: Float = 0
+    var smoothLow: Float = 0
+    var smoothMid: Float = 0
+    var smoothHigh: Float = 0
+    var skinTone: Float = 0
+    var faceSlim: Float = 0
+    var chin: Float = 0
+    var eyeEnlarge: Float = 0
+    var noseSlim: Float = 0
+    var bodySlim: Float = 0
+
+    /// 完全未修图。
+    var isIdentity: Bool { self == RetouchUi() }
+
+    /// 是否已有任何修图（UI 用来决定显示「一键修图」还是滑杆）。
+    var isActive: Bool { !isIdentity }
+
+    /// JSON 字典（核心字段名）。
+    var jsonObject: [String: Double] {
+        [
+            "blemish": Double(blemish),
+            "smooth_low": Double(smoothLow),
+            "smooth_mid": Double(smoothMid),
+            "smooth_high": Double(smoothHigh),
+            "skin_tone": Double(skinTone),
+            "face_slim": Double(faceSlim),
+            "chin": Double(chin),
+            "eye_enlarge": Double(eyeEnlarge),
+            "nose_slim": Double(noseSlim),
+            "body_slim": Double(bodySlim),
+        ]
+    }
+
+    /// 序列化为核心可读的 JSON（fdxmp_retouch_apply 的 params_json）。
+    var jsonString: String {
+        let object = jsonObject
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: object, options: [.sortedKeys]),
+            let text = String(data: data, encoding: .utf8)
+        else {
+            return "{}"
+        }
+        return text
+    }
+
+    static func from(_ value: Any?) -> RetouchUi {
+        var params = RetouchUi()
+        guard let root = value as? [String: Any] else { return params }
+        func number(_ key: String) -> Float {
+            (root[key] as? NSNumber)?.floatValue ?? 0
+        }
+        params.blemish = number("blemish")
+        params.smoothLow = number("smooth_low")
+        params.smoothMid = number("smooth_mid")
+        params.smoothHigh = number("smooth_high")
+        params.skinTone = number("skin_tone")
+        params.faceSlim = number("face_slim")
+        params.chin = number("chin")
+        params.eyeEnlarge = number("eye_enlarge")
+        params.noseSlim = number("nose_slim")
+        params.bodySlim = number("body_slim")
+        return params
+    }
+
+    /// 一键修图默认强度（按识别结果微调：无脸跳过脸部、无人像跳过瘦身）。
+    static func autoDefaults(faces: Int, landmarks: Int, person: Bool) -> RetouchUi {
+        var params = RetouchUi(
+            blemish: 55,
+            smoothLow: 35,
+            smoothMid: 45,
+            smoothHigh: 35,
+            skinTone: 40
+        )
+        if faces > 0 && landmarks > 200 {
+            params.faceSlim = 30
+            params.chin = 15
+            params.eyeEnlarge = 15
+            params.noseSlim = 12
+        }
+        if person {
+            params.bodySlim = 25
+        }
+        return params
+    }
+}
+
+/// 修图识别结果（核心 `fdxmp_retouch_analyze` 返回的 JSON）。
+struct RetouchAnalysisUi: Equatable {
+    var faces: Int = 0
+    var landmarks: Int = 0
+    var skin: Bool = false
+    var person: Bool = false
+    var warnings: [String] = []
+
+    static func from(json: String) -> RetouchAnalysisUi? {
+        guard
+            let data = json.data(using: .utf8),
+            let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        else {
+            return nil
+        }
+        var analysis = RetouchAnalysisUi()
+        analysis.faces = (root["faces"] as? NSNumber)?.intValue ?? 0
+        analysis.landmarks = (root["landmarks"] as? NSNumber)?.intValue ?? 0
+        analysis.skin = (root["skin"] as? NSNumber)?.boolValue ?? false
+        analysis.person = (root["person"] as? NSNumber)?.boolValue ?? false
+        analysis.warnings = (root["warnings"] as? [String]) ?? []
+        return analysis
+    }
+
+    /// 已识别人脸（五官可用）。
+    var hasFace: Bool { faces > 0 }
+    /// 已有五官关键点（塑形可用）。
+    var hasLandmarks: Bool { landmarks > 200 }
+}
+
 /// 蒙版类型（几何三种：线性渐变 / 径向渐变 / 画笔；v1.4.0 增加智能蒙版）。
 enum MaskKindUi: String, CaseIterable, Identifiable {
     case linear = "线性渐变"
@@ -602,6 +720,8 @@ struct EditState: Equatable {
     var profileCorrection = false
     var crop = CropState()
     var masks: [MaskUi] = []
+    /// AI 修图参数（v1.5.0；修图只改像素，调色走 values / curves 等）。
+    var retouch = RetouchUi()
 }
 
 // MARK: - JSON
@@ -629,6 +749,7 @@ enum EditJSON {
         ]
         root["crop"] = cropJson(state.crop, applyRect: applyCropRect)
         root["masks"] = state.masks.map(maskJson)
+        root["retouch"] = state.retouch.jsonObject
         return serialize(root)
     }
 
@@ -802,6 +923,7 @@ enum EditJSON {
         }
         state.crop = parseCrop(root["crop"])
         state.masks = parseMasks(root["masks"])
+        state.retouch = RetouchUi.from(root["retouch"])
         return state
     }
 

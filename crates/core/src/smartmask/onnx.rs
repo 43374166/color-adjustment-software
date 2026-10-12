@@ -19,7 +19,7 @@ use crate::smartmask::mask::{SmartMask, SmartMaskKind};
 use crate::smartmask::spec::{Activation, ModelRegistry, ModelSpec, ModelTask};
 use crate::smartmask::traits::{
     FaceDetection, FaceParseResult, Image, Stage1FaceDetector, Stage1PersonSegmenter,
-    Stage2FaceParser, Stage2PersonMatting,
+    Stage2FaceLandmarks, Stage2FaceParser, Stage2PersonMatting,
 };
 
 /// 一组加载完成的 ONNX 阶段（四个模型）。
@@ -28,6 +28,7 @@ pub struct OnnxStages {
     segmenter: Arc<ModnetSegmenter>,
     parser: Arc<BiseNetParser>,
     matting: Arc<U2NetMatting>,
+    landmarks: Option<Arc<FaceMeshLandmarks>>,
 }
 
 impl OnnxStages {
@@ -37,11 +38,22 @@ impl OnnxStages {
         let segmenter = ModnetSegmenter::load(registry)?;
         let parser = BiseNetParser::load(registry)?;
         let matting = U2NetMatting::load(registry)?;
+        // 关键点模型可选：缺失（老用户未下载）时不影响蒙版流水线。
+        let landmarks = if registry
+            .spec_for(ModelTask::FaceLandmarks)
+            .map(|spec| registry.path_of(spec).is_file())
+            .unwrap_or(false)
+        {
+            FaceMeshLandmarks::load(registry).ok().map(Arc::new)
+        } else {
+            None
+        };
         Ok(Self {
             detector: Arc::new(detector),
             segmenter: Arc::new(segmenter),
             parser: Arc::new(parser),
             matting: Arc::new(matting),
+            landmarks,
         })
     }
 
@@ -63,6 +75,13 @@ impl OnnxStages {
     /// 第二阶段精细抠图。
     pub fn matting(&self) -> Arc<dyn Stage2PersonMatting> {
         self.matting.clone()
+    }
+
+    /// 第二阶段人脸关键点（可选；未随包时返回 None）。
+    pub fn face_landmarks(&self) -> Option<Arc<dyn Stage2FaceLandmarks>> {
+        self.landmarks
+            .clone()
+            .map(|landmarks| landmarks as Arc<dyn Stage2FaceLandmarks>)
     }
 
     /// 组装完整双阶段流水线（人脸路径 + 人像路径）。
@@ -142,7 +161,7 @@ fn run_session(session: &mut Session, shape: Vec<usize>, data: Vec<f32>) -> Resu
 }
 
 /// 预处理：缩放到规格尺寸 → NCHW f32（`(v·scale − mean) / std`）。
-fn preprocess_nchw(image: &Image, spec: &ModelSpec) -> (Vec<usize>, Vec<f32>) {
+fn preprocess(image: &Image, spec: &ModelSpec) -> (Vec<usize>, Vec<f32>) {
     let (width, height) = (spec.input_size.0.max(1), spec.input_size.1.max(1));
     let resized =
         image::imageops::resize(image, width, height, image::imageops::FilterType::Triangle);
@@ -159,10 +178,20 @@ fn preprocess_nchw(image: &Image, spec: &ModelSpec) -> (Vec<usize>, Vec<f32>) {
             } else {
                 pixel.0[channel]
             };
-            data[channel * pixels + index] = spec.normalize(source as f32, channel);
+            let slot = if matches!(spec.input_layout, crate::smartmask::spec::InputLayout::Nhwc) {
+                index * 3 + channel
+            } else {
+                channel * pixels + index
+            };
+            data[slot] = spec.normalize(source as f32, channel);
         }
     }
-    (vec![1, 3, height as usize, width as usize], data)
+    let shape = if matches!(spec.input_layout, crate::smartmask::spec::InputLayout::Nhwc) {
+        vec![1, height as usize, width as usize, 3]
+    } else {
+        vec![1, 3, height as usize, width as usize]
+    };
+    (shape, data)
 }
 
 /// 单通道平面 → 蒙版（resize 到目标尺寸，clamp 到 0..1）。
@@ -293,7 +322,7 @@ impl ScrfdDetector {
 
 impl Stage1FaceDetector for ScrfdDetector {
     fn detect(&self, image: &Image) -> Result<Vec<FaceDetection>> {
-        let (shape, data) = preprocess_nchw(image, &self.spec);
+        let (shape, data) = preprocess(image, &self.spec);
         let outputs = {
             let mut session = self
                 .session
@@ -367,7 +396,7 @@ impl ModnetSegmenter {
 
 impl Stage1PersonSegmenter for ModnetSegmenter {
     fn segment_coarse(&self, image: &Image) -> Result<SmartMask> {
-        let (shape, data) = preprocess_nchw(image, &self.spec);
+        let (shape, data) = preprocess(image, &self.spec);
         let outputs = {
             let mut session = self
                 .session
@@ -444,7 +473,7 @@ fn face_label_kind(label: usize) -> Option<SmartMaskKind> {
 
 impl Stage2FaceParser for BiseNetParser {
     fn parse(&self, aligned_face: &Image) -> Result<FaceParseResult> {
-        let (shape, data) = preprocess_nchw(aligned_face, &self.spec);
+        let (shape, data) = preprocess(aligned_face, &self.spec);
         let outputs = {
             let mut session = self
                 .session
@@ -556,6 +585,88 @@ pub struct U2NetMatting {
     session: Mutex<Session>,
 }
 
+/// MediaPipe FaceMesh v2（478 点关键点；修图塑形用）。
+///
+/// 输入 256×256 NHWC，归一化 `(x − 127.5) / 127.5`；
+/// `Identity` 输出 478×3（x / y / z，单位 = 输入像素），`Identity_1` 为人脸置信度 logit。
+pub struct FaceMeshLandmarks {
+    spec: ModelSpec,
+    session: Mutex<Session>,
+}
+
+impl FaceMeshLandmarks {
+    /// 加载模型。
+    pub fn load(registry: &ModelRegistry) -> Result<Self> {
+        let (spec, session) = load_session(registry, ModelTask::FaceLandmarks)?;
+        Ok(Self {
+            spec,
+            session: Mutex::new(session),
+        })
+    }
+
+    /// 跑一次推理，返回 `(关键点（输入像素坐标）, 人脸置信度)`。
+    fn run(&self, aligned_face: &Image) -> Result<(Vec<[f32; 2]>, f32)> {
+        let (shape, data) = preprocess(aligned_face, &self.spec);
+        let outputs = {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| FdxmpError::Unsupported("ONNX 会话锁失效".to_string()))?;
+            run_session(&mut session, shape, data)?
+        };
+        let points = outputs
+            .iter()
+            .find(|output| {
+                output.data.len() >= 3 && output.data.len() % 3 == 0 && output.data.len() > 10
+            })
+            .ok_or_else(|| FdxmpError::Unsupported("FaceMesh 没有关键点输出".to_string()))?;
+        let (width, height) = (
+            self.spec.input_size.0.max(1) as f32,
+            self.spec.input_size.1.max(1) as f32,
+        );
+        let landmarks: Vec<[f32; 2]> = points
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|chunk| [(chunk[0] / width), (chunk[1] / height)])
+            .collect();
+        let confidence = outputs
+            .iter()
+            .find(|output| output.data.len() == 1)
+            .map(|output| {
+                let raw = output.data[0];
+                if (0.0..=1.0).contains(&raw) {
+                    raw
+                } else {
+                    1.0 / (1.0 + (-raw).exp())
+                }
+            })
+            .unwrap_or(1.0);
+        Ok((landmarks, confidence))
+    }
+}
+
+impl Stage2FaceLandmarks for FaceMeshLandmarks {
+    fn landmarks(&self, aligned_face: &Image) -> Result<Vec<[f32; 2]>> {
+        let (landmarks, confidence) = self.run(aligned_face)?;
+        if confidence < self.spec.postprocess.score_threshold {
+            return Err(FdxmpError::Unsupported(
+                "FaceMesh：未检测到人脸".to_string(),
+            ));
+        }
+        Ok(landmarks)
+    }
+
+    fn confidence(&self, aligned_face: &Image) -> Result<f32> {
+        self.run(aligned_face).map(|(_, confidence)| confidence)
+    }
+
+    fn version_id(&self) -> String {
+        format!("facemesh/{}", self.spec.version)
+    }
+}
+
 impl U2NetMatting {
     /// 加载模型。
     pub fn load(registry: &ModelRegistry) -> Result<Self> {
@@ -569,7 +680,7 @@ impl U2NetMatting {
 
 impl Stage2PersonMatting for U2NetMatting {
     fn matting_fine(&self, crop: &Image) -> Result<SmartMask> {
-        let (shape, data) = preprocess_nchw(crop, &self.spec);
+        let (shape, data) = preprocess(crop, &self.spec);
         let outputs = {
             let mut session = self
                 .session

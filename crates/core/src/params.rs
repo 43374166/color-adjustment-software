@@ -35,6 +35,8 @@ pub struct EditParams {
     pub transform: TransformParams,
     /// 裁剪。
     pub crop: CropParams,
+    /// AI 修图（v1.5.0：去瑕疵 / 磨皮 / 肤色 / 塑形；与调色互不影响）。
+    pub retouch: crate::retouch::RetouchParams,
     /// 蒙版列表（局部调整）。
     pub masks: Vec<MaskParams>,
 }
@@ -53,6 +55,7 @@ impl Default for EditParams {
             lens: LensParams::default(),
             transform: TransformParams::default(),
             crop: CropParams::default(),
+            retouch: crate::retouch::RetouchParams::default(),
             masks: Vec::new(),
         }
     }

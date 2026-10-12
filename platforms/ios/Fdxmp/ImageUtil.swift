@@ -31,6 +31,53 @@ struct RgbaBuffer {
 
 /// UIImage ⇄ RGBA8 转换（sRGB、premultipliedLast、byteOrder32Big）。
 enum ImageUtil {
+    /// 把 RGBA8 缓冲重绘到指定尺寸（硬件插值；同尺寸直接返回）。
+    static func scaled(buffer: RgbaBuffer, toWidth width: Int, toHeight height: Int) -> RgbaBuffer? {
+        guard width > 0, height > 0, buffer.width > 0, buffer.height > 0 else { return nil }
+        if width == buffer.width && height == buffer.height {
+            return buffer
+        }
+        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB) ?? CGColorSpaceCreateDeviceRGB()
+        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
+            | CGBitmapInfo.byteOrder32Big.rawValue
+        var pixels = [UInt8](repeating: 0, count: width * height * 4)
+        var ok = false
+        pixels.withUnsafeMutableBytes { raw in
+            guard
+                let context = CGContext(
+                    data: raw.baseAddress,
+                    width: width,
+                    height: height,
+                    bitsPerComponent: 8,
+                    bytesPerRow: width * 4,
+                    space: colorSpace,
+                    bitmapInfo: bitmapInfo
+                )
+            else { return }
+            context.interpolationQuality = .high
+            let data = Data(buffer.pixels)
+            guard
+                let provider = CGDataProvider(data: data as CFData),
+                let image = CGImage(
+                    width: buffer.width,
+                    height: buffer.height,
+                    bitsPerComponent: 8,
+                    bitsPerPixel: 32,
+                    bytesPerRow: buffer.width * 4,
+                    space: colorSpace,
+                    bitmapInfo: CGBitmapInfo(rawValue: bitmapInfo),
+                    provider: provider,
+                    decode: nil,
+                    shouldInterpolate: true,
+                    intent: .defaultIntent
+                )
+            else { return }
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            ok = true
+        }
+        return ok ? RgbaBuffer(pixels: pixels, width: width, height: height) : nil
+    }
+
     /// 把 UIImage 规范化（方向 / 尺寸）并取出 RGBA8 像素。
     static func rgbaBuffer(from image: UIImage, maxEdge: Int) -> RgbaBuffer? {
         let normalized = redraw(image, maxEdge: maxEdge)

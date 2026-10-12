@@ -26,6 +26,7 @@ pub mod params;
 pub mod pipeline;
 pub mod preset;
 pub mod preview;
+pub mod retouch;
 pub mod smartmask;
 pub mod white_balance;
 

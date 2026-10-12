@@ -189,6 +189,26 @@ int32_t fdxmp_smartmask_generate(const char *params_json,
 /* 随包 ONNX 模型是否可用：1 = 就绪，0 = 不可用。 */
 int32_t fdxmp_smartmask_runtime_ready(void);
 
+/* ---- AI 修图（v1.5.0）----
+ *
+ * 一键修图：识别（五官 478 点 + 皮肤 / 人像蒙版）→ 应用（去瑕疵 / 低中高频磨皮 /
+ * 统一肤色 / 脸部塑形 / 身体塑形）。修图只改像素，不参与调色管线。
+ */
+
+/* 识别：返回 JSON {"faces", "landmarks", "skin", "person", "warnings"}；
+ * 用 fdxmp_string_free 释放；失败返回 NULL。 */
+char *fdxmp_retouch_analyze(const uint8_t *rgba, uint32_t width, uint32_t height);
+
+/* 应用修图：params_json 为 RetouchParams JSON（见核心 retouch::RetouchParams）；
+ * 返回 8 字节大端宽高 + RGBA8，用 fdxmp_bytes_free(ptr, len) 释放；失败返回 NULL。 */
+uint8_t *fdxmp_retouch_apply(const char *params_json,
+                             const uint8_t *rgba,
+                             uint32_t width,
+                             uint32_t height,
+                             uint32_t *out_width,
+                             uint32_t *out_height,
+                             size_t *out_len);
+
 /* ---- GPU 预览会话（Metal / DX12 / Vulkan；iOS 以 `--features gpu` 构建启用）----
  *
  * 移动端实时预览：源图只上传一次，参数变化时重渲染并回读 RGBA8。
