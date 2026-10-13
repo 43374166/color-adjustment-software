@@ -1578,6 +1578,7 @@ final class EditorModel: ObservableObject {
     private var retouchDebounce: DispatchWorkItem?
     private var retouchStageTimer: Timer?
     private var retouchStageIndex = 0
+    private var retouchPresetToken = 0
     private let retouchQueue = DispatchQueue(label: "fdxmp.ios.retouch", qos: .userInitiated)
 
     /// 一键修图的阶段文案（识别 → 逐项处理，加载动画用）。
@@ -1601,8 +1602,8 @@ final class EditorModel: ObservableObject {
 
     /// 修图子模式：美颜（预设 + 参数）/ 污点修复 / 液化。
     enum RetouchModeUi: String, CaseIterable, Identifiable {
-        case beauty = "美颜"
-        case spot = "污点"
+        case beauty = "预设"
+        case spot = "修复"
         case liquify = "液化"
 
         var id: String { rawValue }
@@ -1613,6 +1614,12 @@ final class EditorModel: ObservableObject {
     @Published var brushRadius: Float = 6
     /// 笔刷强度（1..100）。
     @Published var brushStrength: Float = 70
+    /// 修图预设面板：当前分类。
+    @Published var retouchPresetCategory: RetouchPresetCategory = .hot
+    /// 修图预设缩略图（预设 id → 小图；核心实时渲染）。
+    @Published private(set) var retouchPresetThumbnails: [String: UIImage] = [:]
+    /// 工作台切换动画文案（修图 ⇄ 调色，nil = 空闲）。
+    @Published private(set) var workbenchStage: String?
 
     struct HealSpot: Equatable {
         var x: Float
@@ -1813,6 +1820,7 @@ final class EditorModel: ObservableObject {
         healBuffer = nil
         liquifyBuffer = nil
         manualWorkStage = nil
+        retouchPresetThumbnails = [:]
     }
 
     /// 载入完成后：若该图有已保存的修图参数 → 后台重算；否则保持原图。
@@ -1888,13 +1896,99 @@ final class EditorModel: ObservableObject {
 
     /// 应用手动美颜预设（一键美颜）：设置参数并立即重算。
     func applyRetouchPreset(_ preset: RetouchPresetUi) {
-        guard manualWorkStage == nil else { return }
+        guard manualWorkStage == nil, workbenchStage == nil else { return }
         Haptics.light()
-        applyEdit("美颜·\(preset.rawValue)") { state in
-            state.retouch = preset.params
+        applyEdit("预设·\(preset.name)") { state in
+            state.retouch = preset.retouch
+            if preset.id == RetouchPresetUi.original.id {
+                // "原图（没有修图）"：修图与调色一起复位。
+                state.values = EditorSpec.defaultValues()
+            } else if !preset.color.isEmpty {
+                for (key, value) in preset.color {
+                    state.values[key] = value
+                }
+            }
         }
-        manualWorkStage = "应用美颜预设（\(preset.rawValue)）…"
+        manualWorkStage = "应用预设（\(preset.name)）…"
         recomputeRetouch(completion: { self.manualWorkStage = nil }, force: true)
+    }
+
+    /// 修图预设缩略图（后台核心渲染：小图先修图、再过该预设的调色）。
+    func refreshRetouchPresetThumbnails() {
+        guard let buffer = baseBuffer else { return }
+        let small = ImageUtil.downscaled(buffer: buffer, maxEdge: 240) ?? buffer
+        let presets = [RetouchPresetUi.original] + RetouchPresetUi.catalog
+        retouchPresetToken &+= 1
+        let token = retouchPresetToken
+        maskAssetQueue.async { [weak self] in
+            var thumbs: [String: UIImage] = [:]
+            for preset in presets {
+                let source: RgbaBuffer
+                if preset.retouch.isActive {
+                    guard
+                        let retouched = NativeCore.shared.retouchApply(
+                            paramsJson: preset.retouch.jsonString,
+                            buffer: small
+                        )
+                    else {
+                        continue
+                    }
+                    source = retouched
+                } else {
+                    source = small
+                }
+                var presetState = EditState()
+                for (key, value) in preset.color {
+                    presetState.values[key] = value
+                }
+                let json = EditJSON.build(state: presetState, applyCropRect: false)
+                guard
+                    let result = NativeCore.shared.render(buffer: source, paramsJson: json),
+                    let image = ImageUtil.image(
+                        from: RgbaBuffer(
+                            pixels: result.pixels,
+                            width: result.width,
+                            height: result.height
+                        )
+                    )
+                else {
+                    continue
+                }
+                thumbs[preset.id] = image
+            }
+            Task { @MainActor in
+                guard let self, self.retouchPresetToken == token else { return }
+                guard !thumbs.isEmpty else { return }
+                self.retouchPresetThumbnails = thumbs
+            }
+        }
+    }
+
+    /// 工作台切换（修图 ⇄ 调色）：带加载动画；进入修图时先把修图缓冲算好。
+    func switchWorkbench() {
+        guard workbenchStage == nil else { return }
+        if tool == .retouch {
+            selectTool(.edit)
+            return
+        }
+        Haptics.tick()
+        workbenchStage = "正在进入修图工作台…"
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self else { return }
+            self.selectTool(.retouch)
+            let needsWork = self.state.retouch.isActive
+                || self.healBuffer != nil
+                || self.liquifyBuffer != nil
+            if needsWork {
+                self.recomputeRetouch(completion: {
+                    self.workbenchStage = nil
+                    self.refreshRetouchPresetThumbnails()
+                }, force: true)
+            } else {
+                self.workbenchStage = nil
+                self.refreshRetouchPresetThumbnails()
+            }
+        }
     }
 
     /// 导出 / 细节帧用：在给定分辨率上应用修图。
@@ -2001,10 +2095,12 @@ final class EditorModel: ObservableObject {
     // MARK: - 项目同步 / 基础调色
 
     /// 同步范围（项目内「同步」菜单）。
-    enum SyncScope {
-        case all
-        case retouchOnly
-        case colorOnly
+    enum SyncScope: String, CaseIterable, Identifiable {
+        case all = "调色 + 修图"
+        case retouchOnly = "仅修图"
+        case colorOnly = "仅调色"
+
+        var id: String { rawValue }
     }
 
     /// 把当前编辑同步到项目内其余照片（返回同步张数）。
@@ -2013,8 +2109,16 @@ final class EditorModel: ObservableObject {
     @discardableResult
     func syncEdits(scope: SyncScope) -> Int {
         guard let project, let current = asset else { return 0 }
+        let targets = project.assetIds.filter { $0 != current.localIdentifier }
+        return syncEdits(scope: scope, to: targets)
+    }
+
+    /// 把当前编辑同步到指定照片（底部弹框里的多选同步）。
+    @discardableResult
+    func syncEdits(scope: SyncScope, to assetIds: [String]) -> Int {
+        guard let current = asset else { return 0 }
         var synced = 0
-        for assetId in project.assetIds where assetId != current.localIdentifier {
+        for assetId in assetIds where assetId != current.localIdentifier {
             var target: EditState
             if let json = EditStore.json(assetId: assetId) {
                 target = EditJSON.parse(json)
@@ -2888,6 +2992,104 @@ final class EditorModel: ObservableObject {
                 )
             }
         }
+    }
+
+    /// 多选导出（底部弹框里选择照片）：当前张用当前状态，其余用各自保存的编辑记录。
+    func exportAssets(_ assets: [PHAsset]) {
+        guard !assets.isEmpty, !isExporting else { return }
+        isExporting = true
+        exportProgress = 0.02
+        exportShareURL = nil
+        message = nil
+        let format = EditorLimits.exportFormat
+        let quality = EditorLimits.exportQuality
+        let keepMetadata = EditorLimits.exportKeepMetadata
+        let currentId = asset?.localIdentifier
+        let currentJson = currentJson(applyCropRect: true, usePreview: false)
+        let currentRetouch = state.retouch
+        let total = assets.count
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            var exported = 0
+            for (index, item) in assets.enumerated() {
+                defer {
+                    let progress = 0.05 + 0.9 * Double(index + 1) / Double(total)
+                    Task { @MainActor in self.exportProgress = progress }
+                }
+                let id = item.localIdentifier
+                let isCurrent = id == currentId
+                let saved = isCurrent ? nil : EditStore.json(assetId: id)
+                let savedState = saved.map(EditJSON.parse) ?? EditState()
+                let json = isCurrent
+                    ? currentJson
+                    : EditJSON.build(state: savedState, applyCropRect: false)
+                let retouch = isCurrent ? currentRetouch : savedState.retouch
+                let targetEdge = max(item.pixelWidth, item.pixelHeight)
+                guard let image = Self.decodeAsset(item, maxEdge: targetEdge) else { continue }
+                guard let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: targetEdge) else {
+                    continue
+                }
+                var source = buffer
+                if retouch.isActive {
+                    source = Self.applyRetouchForExport(buffer: buffer, params: retouch) ?? buffer
+                }
+                guard
+                    let result = NativeCore.shared.render(buffer: source, paramsJson: json),
+                    let output = ImageUtil.image(
+                        from: RgbaBuffer(
+                            pixels: result.pixels,
+                            width: result.width,
+                            height: result.height
+                        )
+                    )
+                else {
+                    continue
+                }
+                let metadata = keepMetadata ? Self.loadExportMetadata(asset: item) : nil
+                guard
+                    let url = Self.writeExportFile(
+                        image: output,
+                        format: format,
+                        quality: quality,
+                        metadata: metadata
+                    )
+                else {
+                    continue
+                }
+                exported += 1
+                Task { @MainActor in self.saveToLibrary(fileURL: url) }
+            }
+            Task { @MainActor in
+                self.isExporting = false
+                self.exportProgress = nil
+                self.showMessage(
+                    exported == total
+                        ? "已导出 \(exported) 张到 fdxmp 相簿"
+                        : "导出完成：\(exported)/\(total) 张（部分失败）"
+                )
+            }
+        }
+    }
+
+    /// 同步解码一张照片（后台线程用；系统解码路径）。
+    private static func decodeAsset(_ item: PHAsset, maxEdge: Int) -> UIImage? {
+        let options = PHImageRequestOptions()
+        options.isSynchronous = true
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .exact
+        options.isNetworkAccessAllowed = true
+        options.version = .current
+        let target = CGSize(width: maxEdge, height: maxEdge)
+        var output: UIImage?
+        PHImageManager.default().requestImage(
+            for: item,
+            targetSize: target,
+            contentMode: .aspectFit,
+            options: options
+        ) { image, _ in
+            output = image
+        }
+        return output
     }
 
     /// 导出第二阶段（在渲染线程调用）：条带分块渲染 → 编码 → 存相册。

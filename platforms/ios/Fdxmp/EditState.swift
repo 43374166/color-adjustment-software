@@ -427,65 +427,164 @@ struct RetouchAnalysisUi: Equatable {
     var hasLandmarks: Bool { landmarks > 200 }
 }
 
-/// 手动美颜预设（"一键美颜"）：一键把修图参数设成对应风格。
-enum RetouchPresetUi: String, CaseIterable, Identifiable {
-    case natural = "自然"
-    case refined = "精致"
+/// 修图预设分类（预设面板顶部的分类）。
+enum RetouchPresetCategory: String, CaseIterable, Identifiable {
+    case hot = "热门"
+    case portrait = "人像"
+    case film = "胶片"
     case texture = "质感"
-    case clean = "清透"
 
     var id: String { rawValue }
+}
 
-    /// 参数组合（0..100）。
-    var params: RetouchUi {
-        switch self {
-        case .natural:
-            // 轻度：保留皮肤质感，适合日常。
-            return RetouchUi(
-                blemish: 40,
-                smoothLow: 25,
-                smoothMid: 35,
-                smoothHigh: 25,
-                skinTone: 30
-            )
-        case .refined:
-            // 精致：磨皮与塑形都上（接近"一键美颜"默认）。
-            return RetouchUi(
-                blemish: 60,
-                smoothLow: 40,
-                smoothMid: 52,
-                smoothHigh: 40,
-                skinTone: 45,
-                faceSlim: 30,
-                chin: 15,
-                eyeEnlarge: 15,
-                noseSlim: 12,
-                bodySlim: 20
-            )
-        case .texture:
-            // 质感：少磨中频、保留毛孔纹理（摄影师向）。
-            return RetouchUi(
-                blemish: 50,
-                smoothLow: 30,
-                smoothMid: 22,
-                smoothHigh: 18,
-                skinTone: 35,
-                faceSlim: 12
-            )
-        case .clean:
-            // 清透：肤色统一为主，提亮干净。
-            return RetouchUi(
-                blemish: 55,
-                smoothLow: 35,
-                smoothMid: 40,
-                smoothHigh: 30,
-                skinTone: 60,
-                faceSlim: 18,
-                chin: 8,
-                eyeEnlarge: 10,
-                noseSlim: 8
-            )
-        }
+/// 修图预设（预设面板的一张卡：修图参数 + 配套调色；缩略图由核心实时渲染）。
+struct RetouchPresetUi: Identifiable, Equatable {
+    let id: String
+    /// 卡片名称（写真 / 原生肌 / 奶油肌 …）。
+    let name: String
+    let category: RetouchPresetCategory
+    /// 修图参数。
+    let retouch: RetouchUi
+    /// 配套调色（与 EditorSpec 滑块同 key；空 = 只修图不调色）。
+    let color: [String: Float]
+
+    /// 原图（没有修图）：清空修图 + 调色。
+    static let original = RetouchPresetUi(
+        id: "original",
+        name: "原图",
+        category: .hot,
+        retouch: RetouchUi(),
+        color: [:]
+    )
+
+    /// 预设目录。
+    static let catalog: [RetouchPresetUi] = [
+        // 热门
+        RetouchPresetUi(
+            id: "hot-xiezhen",
+            name: "写真",
+            category: .hot,
+            retouch: RetouchUi(
+                blemish: 60, smoothLow: 40, smoothMid: 50, smoothHigh: 38, skinTone: 45,
+                faceSlim: 28, chin: 14, eyeEnlarge: 14, noseSlim: 10, bodySlim: 15
+            ),
+            color: ["exposure": 0.15, "contrast": 8, "vibrance": 10, "shadows": 8, "temperature": 4]
+        ),
+        RetouchPresetUi(
+            id: "hot-naiyouji",
+            name: "奶油肌",
+            category: .hot,
+            retouch: RetouchUi(
+                blemish: 65, smoothLow: 50, smoothMid: 62, smoothHigh: 48, skinTone: 60,
+                faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 8
+            ),
+            color: ["exposure": 0.35, "contrast": -4, "vibrance": 8, "shadows": 14, "temperature": 6, "blacks": 6]
+        ),
+        RetouchPresetUi(
+            id: "hot-baiyueguang",
+            name: "白月光",
+            category: .hot,
+            retouch: RetouchUi(
+                blemish: 55, smoothLow: 45, smoothMid: 55, smoothHigh: 42, skinTone: 70,
+                faceSlim: 18, chin: 8, eyeEnlarge: 12, noseSlim: 8
+            ),
+            color: ["exposure": 0.45, "contrast": 4, "vibrance": 6, "saturation": -6, "temperature": -4, "highlights": -12]
+        ),
+        // 人像
+        RetouchPresetUi(
+            id: "portrait-yuanshengji",
+            name: "原生肌",
+            category: .portrait,
+            retouch: RetouchUi(
+                blemish: 45, smoothLow: 28, smoothMid: 30, smoothHigh: 22, skinTone: 35,
+                faceSlim: 10
+            ),
+            color: ["exposure": 0.1, "contrast": 3, "vibrance": 6, "shadows": 6]
+        ),
+        RetouchPresetUi(
+            id: "portrait-ziranguang",
+            name: "自然光",
+            category: .portrait,
+            retouch: RetouchUi(
+                blemish: 50, smoothLow: 35, smoothMid: 42, smoothHigh: 32, skinTone: 42,
+                faceSlim: 20, chin: 10, eyeEnlarge: 10
+            ),
+            color: ["exposure": 0.25, "contrast": 6, "highlights": -10, "shadows": 12, "vibrance": 8]
+        ),
+        RetouchPresetUi(
+            id: "portrait-rouguang",
+            name: "柔光",
+            category: .portrait,
+            retouch: RetouchUi(
+                blemish: 55, smoothLow: 42, smoothMid: 48, smoothHigh: 36, skinTone: 48,
+                faceSlim: 24, chin: 12, eyeEnlarge: 12, noseSlim: 8
+            ),
+            color: ["exposure": 0.3, "contrast": -6, "highlights": -18, "shadows": 16, "vibrance": 6, "temperature": 5]
+        ),
+        // 胶片
+        RetouchPresetUi(
+            id: "film-jiaopian",
+            name: "胶片",
+            category: .film,
+            retouch: RetouchUi(
+                blemish: 45, smoothLow: 25, smoothMid: 30, smoothHigh: 20, skinTone: 35
+            ),
+            color: ["contrast": 10, "vibrance": -6, "saturation": -10, "grain": 25, "temperature": 6, "shadows": 10]
+        ),
+        RetouchPresetUi(
+            id: "film-gangfeng",
+            name: "港风",
+            category: .film,
+            retouch: RetouchUi(
+                blemish: 40, smoothLow: 22, smoothMid: 28, smoothHigh: 18, skinTone: 40,
+                faceSlim: 15
+            ),
+            color: ["contrast": 14, "saturation": -6, "vibrance": -4, "temperature": 10, "tint": -6, "grain": 30, "shadows": 8]
+        ),
+        RetouchPresetUi(
+            id: "film-fugu",
+            name: "复古",
+            category: .film,
+            retouch: RetouchUi(
+                blemish: 40, smoothLow: 20, smoothMid: 26, smoothHigh: 18, skinTone: 38
+            ),
+            color: ["contrast": 8, "saturation": -14, "temperature": 12, "grain": 35, "blacks": 10, "highlights": -8]
+        ),
+        // 质感
+        RetouchPresetUi(
+            id: "texture-zazhi",
+            name: "杂志",
+            category: .texture,
+            retouch: RetouchUi(
+                blemish: 55, smoothLow: 30, smoothMid: 24, smoothHigh: 16, skinTone: 40,
+                faceSlim: 18, chin: 8, eyeEnlarge: 8
+            ),
+            color: ["contrast": 12, "clarity": 12, "vibrance": 4, "shadows": -6, "highlights": -10]
+        ),
+        RetouchPresetUi(
+            id: "texture-lengdiao",
+            name: "冷调",
+            category: .texture,
+            retouch: RetouchUi(
+                blemish: 50, smoothLow: 28, smoothMid: 26, smoothHigh: 18, skinTone: 45
+            ),
+            color: ["contrast": 10, "temperature": -12, "tint": -4, "vibrance": 6, "blacks": -6]
+        ),
+        RetouchPresetUi(
+            id: "texture-yingdiao",
+            name: "硬调",
+            category: .texture,
+            retouch: RetouchUi(
+                blemish: 60, smoothLow: 32, smoothMid: 20, smoothHigh: 12, skinTone: 40,
+                faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 10
+            ),
+            color: ["contrast": 18, "clarity": 16, "vibrance": -4, "saturation": -6, "shadows": -10]
+        ),
+    ]
+
+    /// 某分类下的预设（原图永远排第一）。
+    static func presets(in category: RetouchPresetCategory) -> [RetouchPresetUi] {
+        catalog.filter { $0.category == category }
     }
 }
 

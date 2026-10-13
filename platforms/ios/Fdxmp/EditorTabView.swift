@@ -13,6 +13,8 @@ struct EditorTabView: View {
     /// 相册式左右滑动的邻居预览（设备 / 项目队列里的前一张 / 后一张）。
     var prevAsset: PHAsset?
     var nextAsset: PHAsset?
+    /// 当前编辑会话的完整照片队列（导出 / 同步弹框里选择照片用）。
+    var queue: [PHAsset] = []
     /// 返回回调（退出编辑会话，回到来源页面）。
     var onClose: () -> Void = {}
     /// 未放大时左右滑动切图：上一张 / 下一张（队列与边界由父层提供）。
@@ -63,6 +65,10 @@ struct EditorTabView: View {
     @State private var swipeAnimating = false
     /// 相邻照片的低清预览（滑动手感像系统图库）。
     @State private var neighborImages: [String: UIImage] = [:]
+    /// 底部弹框（••• 更多 / 导出 / 同步）。
+    @State private var activeSheet: EditorSheetKind?
+    @State private var sheetSelection: Set<String> = []
+    @State private var sheetSyncScope: EditorModel.SyncScope = .all
 
     @Environment(\.displayScale) private var displayScale
 
@@ -99,6 +105,13 @@ struct EditorTabView: View {
         }
         .onChange(of: prevAsset?.localIdentifier) { _ in prefetchNeighbors() }
         .onChange(of: nextAsset?.localIdentifier) { _ in prefetchNeighbors() }
+        // 底部弹框：••• → 导出 / 同步（都带照片多选）→ 重置。
+        .sheet(item: $activeSheet) { sheet in
+            sheetContent(sheet)
+                .presentationDetents(sheet == .more ? [.height(300)] : [.medium, .large])
+                .presentationDragIndicator(.hidden)
+                .preferredColorScheme(.dark)
+        }
         .onChange(of: model.tool) { _ in
             resetZoom()
             model.clearDetailPreview()
@@ -206,21 +219,27 @@ struct EditorTabView: View {
 
     /// 预取相邻照片的低清预览（相册式滑动时随手指滑入）。
     private func prefetchNeighbors() {
-        for neighbor in [prevAsset, nextAsset].compactMap({ $0 }) {
+        prefetch(assets: [prevAsset, nextAsset].compactMap { $0 })
+    }
+
+    /// 预取指定照片的高清预览（2048；相邻张在拖动开始时也会补拉，保证切换丝滑）。
+    private func prefetch(assets: [PHAsset]) {
+        for neighbor in assets {
             let id = neighbor.localIdentifier
             if neighborImages[id] != nil { continue }
             let options = PHImageRequestOptions()
-            options.deliveryMode = .fastFormat
-            options.resizeMode = .fast
+            // 高质量预览：fastFormat 会返回很糊的图，滑动时观感差（用户反馈）。
+            options.deliveryMode = .highQualityFormat
+            options.resizeMode = .exact
             options.isNetworkAccessAllowed = true
-            let target = CGSize(width: 1024, height: 1024)
+            let target = CGSize(width: 2048, height: 2048)
             PHImageManager.default().requestImage(
                 for: neighbor,
                 targetSize: target,
                 contentMode: .aspectFit,
                 options: options
             ) { image, _ in
-                guard let image else { return }
+                guard let image, image.size.width >= 320 else { return }
                 DispatchQueue.main.async {
                     neighborImages[id] = image
                     if neighborImages.count > 8 {
@@ -233,6 +252,70 @@ struct EditorTabView: View {
                     }
                 }
             }
+        }
+    }
+
+    /// 底部弹框内容。
+    @ViewBuilder
+    private func sheetContent(_ sheet: EditorSheetKind) -> some View {
+        switch sheet {
+        case .more:
+            EditorMoreSheet(
+                canSync: queue.count > 1,
+                onExport: {
+                    activeSheet = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        sheetSelection = asset.map { [$0.localIdentifier] }.map(Set.init) ?? []
+                        activeSheet = .export
+                    }
+                },
+                onSync: {
+                    activeSheet = nil
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        let targets = queue
+                            .map(\.localIdentifier)
+                            .filter { $0 != asset?.localIdentifier }
+                        sheetSelection = Set(targets)
+                        sheetSyncScope = .all
+                        activeSheet = .sync
+                    }
+                },
+                onReset: {
+                    activeSheet = nil
+                    model.resetAll()
+                }
+            )
+        case .export:
+            PhotoSelectionSheet(
+                title: "导出",
+                confirmTitle: "导出所选照片",
+                assets: queue.isEmpty ? [asset].compactMap { $0 } : queue,
+                currentAssetId: asset?.localIdentifier,
+                syncScope: nil,
+                selection: $sheetSelection,
+                onConfirm: { ids in
+                    activeSheet = nil
+                    let selected = queue.isEmpty
+                        ? [asset].compactMap { $0 }
+                        : queue.filter { ids.contains($0.localIdentifier) }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        model.exportAssets(selected)
+                    }
+                }
+            )
+        case .sync:
+            PhotoSelectionSheet(
+                title: "同步到项目照片",
+                confirmTitle: "同步到所选照片",
+                assets: queue,
+                currentAssetId: asset?.localIdentifier,
+                syncScope: $sheetSyncScope,
+                selection: $sheetSelection,
+                onConfirm: { ids in
+                    activeSheet = nil
+                    model.syncEdits(scope: sheetSyncScope, to: ids)
+                }
+            )
         }
     }
 
@@ -294,7 +377,7 @@ struct EditorTabView: View {
         GeometryReader { geo in
             // 竖屏调色：面板浮在整图上（图片不被挤小）；蒙版 / 裁切 / 横屏保持推挤布局。
             let overlayPanel = geo.size.height > geo.size.width
-                && (model.tool == .presets || model.tool == .edit)
+                && (model.tool == .presets || model.tool == .edit || model.tool == .retouch)
             Group {
                 if overlayPanel {
                     ZStack(alignment: .top) {
@@ -336,12 +419,12 @@ struct EditorTabView: View {
         .animation(.easeInOut(duration: 0.24), value: hidesToolBar)
         // AI 修图：全屏加载动画（识别五官 → 逐项处理）。
         .overlay {
-            if let stage = model.retouchStage {
+            if let stage = model.retouchStage ?? model.workbenchStage {
                 RetouchProgressOverlay(text: stage)
                     .transition(.opacity)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: model.retouchStage)
+        .animation(.easeInOut(duration: 0.2), value: model.retouchStage ?? model.workbenchStage)
     }
 
     @ViewBuilder
@@ -368,9 +451,10 @@ struct EditorTabView: View {
             || hslFocused
     }
 
-    /// 预设工具下隐藏底部工具条（顶部栏保留，列表占满下方空间）。
+    /// 预设 / 修图下隐藏底部工具条：修图是独立工作台（子页签在面板里），
+    /// 不再需要底部那排工具；预设列表占满下方空间。
     private var hidesToolBar: Bool {
-        hidesChrome || model.tool == .presets
+        hidesChrome || model.tool == .presets || model.tool == .retouch
     }
 
     private var emptyState: some View {
@@ -411,14 +495,9 @@ struct EditorTabView: View {
                 .foregroundStyle(.secondary)
             }
             Spacer()
-            // 修图 / 调色一键切换。
+            // 修图 / 调色一键切换（带工作台加载动画）。
             Button {
-                Haptics.tick()
-                if model.tool == .retouch {
-                    model.selectTool(.edit)
-                } else {
-                    model.selectTool(.retouch)
-                }
+                model.switchWorkbench()
             } label: {
                 HStack(spacing: 4) {
                     Image(systemName: model.tool == .retouch ? "wand.and.rays" : "slider.horizontal.3")
@@ -434,42 +513,6 @@ struct EditorTabView: View {
                 .foregroundStyle(Color.accentColor)
             }
             .accessibilityLabel("切换修图 / 调色")
-            // 更多：导出 / 同步 / 重置。
-            Menu {
-                Button {
-                    model.export()
-                } label: {
-                    Label("导出", systemImage: "square.and.arrow.up")
-                }
-                if model.project != nil {
-                    Divider()
-                    Button {
-                        model.syncEdits(scope: .all)
-                    } label: {
-                        Label("同步到项目照片（调色 + 修图）", systemImage: "square.on.square")
-                    }
-                    Button {
-                        model.syncEdits(scope: .retouchOnly)
-                    } label: {
-                        Label("仅同步修图", systemImage: "wand.and.rays")
-                    }
-                    Button {
-                        model.syncEdits(scope: .colorOnly)
-                    } label: {
-                        Label("仅同步调色", systemImage: "slider.horizontal.3")
-                    }
-                }
-                Divider()
-                Button(role: .destructive) {
-                    model.resetAll()
-                } label: {
-                    Label("重置全部编辑", systemImage: "arrow.counterclockwise")
-                }
-            } label: {
-                Image(systemName: "ellipsis.circle")
-                    .font(.body)
-            }
-            .accessibilityLabel("更多（导出 / 同步 / 重置）")
             Button {
                 guard Date() >= suppressUndoTapUntil else { return }
                 model.undo()
@@ -518,6 +561,17 @@ struct EditorTabView: View {
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(Color.accentColor)
             }
+            // 最右边：••• 更多（从下往上弹框：导出 / 同步 / 重置）。
+            Button {
+                Haptics.light()
+                sheetSelection = asset.map { [$0.localIdentifier] }.map(Set.init) ?? []
+                activeSheet = .more
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.body.weight(.semibold))
+                    .frame(width: 30, height: 26)
+            }
+            .accessibilityLabel("更多（导出 / 同步 / 重置）")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -543,6 +597,13 @@ struct EditorTabView: View {
             return detail
         }
         return model.previewImage
+    }
+
+    /// 新照片的预取预览（切换瞬间先顶上，渲染好再替换——切换不再"先糊后清"）。
+    private var placeholderImage: UIImage? {
+        guard model.previewImage == nil else { return nil }
+        guard let asset else { return nil }
+        return neighborImages[asset.localIdentifier]
     }
 
     private var overlayEnabled: Bool {
@@ -643,7 +704,7 @@ struct EditorTabView: View {
                             .foregroundStyle(.white)
                     )
                     .position(x: geo.size.width * split, y: geo.size.height / 2)
-            } else if shownImage != nil || model.zeroCopyActive {
+            } else if shownImage != nil || model.zeroCopyActive || placeholderImage != nil {
                 // 预览画面：Metal 图层常驻（零拷贝上屏用，未激活时透明不挡 Image），
                 // 回读画面盖在上面（零拷贝生效 / 看原图 / 对比模式下隐藏）。
                 let fitted = fittedRect(imageSize: previewImageSize, in: geo.size)
@@ -655,7 +716,7 @@ struct EditorTabView: View {
                     .frame(width: fitted.width, height: fitted.height)
                     .position(x: fitted.midX, y: fitted.midY)
                     .opacity(metalActive ? 1 : 0)
-                    if !metalActive, let image = shownImage {
+                    if !metalActive, let image = shownImage ?? placeholderImage {
                         Image(uiImage: image)
                             .resizable()
                             .scaledToFit()
@@ -684,22 +745,22 @@ struct EditorTabView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            // 切图 / 首帧加载：整块盖一层加载动画（老帧不闪、新帧淡入由下方 transition 负责）。
-            if model.isLoading, shownImage != nil {
-                ZStack {
-                    Color.black.opacity(0.35)
-                    VStack(spacing: 10) {
+            // 切图 / 首帧加载：只在顶部显示小胶囊，不遮挡画面（原图不再被压暗发糊）。
+            if model.isLoading {
+                VStack {
+                    HStack(spacing: 8) {
                         ProgressView()
+                            .controlSize(.mini)
                             .tint(.white)
                         Text("正在加载照片…")
-                            .font(.footnote)
+                            .font(.caption2)
                             .foregroundStyle(.white.opacity(0.85))
                     }
-                    .padding(18)
-                    .background(
-                        RoundedRectangle(cornerRadius: 14)
-                            .fill(Color.black.opacity(0.55))
-                    )
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 6)
+                    .background(Capsule().fill(Color.black.opacity(0.55)))
+                    .padding(.top, 10)
+                    Spacer()
                 }
                 .allowsHitTesting(false)
                 .transition(.opacity)
@@ -768,7 +829,11 @@ struct EditorTabView: View {
                         Spacer()
                         if model.tool != .crop && model.tool != .mask {
                             HistogramOverlay(data: model.histogram)
-                                .frame(width: 132, height: 76)
+                                // 直方图加长：屏幕宽度的 2/3。
+                                .frame(
+                                    width: max(220, geo.size.width * 2 / 3),
+                                    height: 92
+                                )
                         }
                     }
                     Spacer()
@@ -1056,8 +1121,8 @@ struct EditorTabView: View {
         // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
         // 分类行压矮后，把高度让给上面的参数（滑块）区。
         case .mask: return model.selectedMask == nil ? 150 : 300
-        // 修图：一键修图 + 分组滑杆。
-        case .retouch: return 316
+        // 修图工作台：矮一些，把画面留给手动修图（预设 / 修复 / 液化）。
+        case .retouch: return 246
         }
     }
 
@@ -1092,12 +1157,21 @@ struct EditorTabView: View {
         .frame(maxWidth: .infinity)
         // 真透明（不是毛玻璃）：后面露一点照片，方便对比调色效果；
         // 拖动滑块时连底色一起隐掉，只留滑块和画面（Lightroom 做法）。
-        .background(Color(white: 0.07).opacity(model.draggingSlider == nil ? 0.78 : 0))
+        // 修图工作台再透一些（竖图铺满屏幕，面板浮在上面）。
+        .background(
+            Color(white: 0.07)
+                .opacity(
+                    model.draggingSlider != nil
+                        ? 0
+                        : (model.tool == .retouch ? 0.5 : 0.78)
+                )
+        )
     }
 
     private var toolBar: some View {
         HStack(spacing: 0) {
-            ForEach(EditorTool.allCases) { tool in
+            // 修图不占底部工具位（由顶部的「修图 / 调色」切换进入独立工作台）。
+            ForEach(EditorTool.allCases.filter { $0 != .retouch }) { tool in
                 Button {
                     if model.tool != tool {
                         Haptics.tick()

@@ -48,6 +48,7 @@ struct ContentView: View {
                         project: editProject,
                         prevAsset: neighborAsset(offset: -1),
                         nextAsset: neighborAsset(offset: 1),
+                        queue: editQueue,
                         onClose: { closeEditor() },
                         onSwipePrev: { stepEditor(by: -1) },
                         onSwipeNext: { stepEditor(by: 1) },

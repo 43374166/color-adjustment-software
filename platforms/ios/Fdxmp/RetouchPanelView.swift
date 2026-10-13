@@ -199,38 +199,105 @@ struct RetouchPanelView: View {
     private var beautyContent: some View {
         VStack(spacing: 0) {
             oneTapRow
-            presetsRow
+            presetsBrowser
             sliders
         }
     }
 
-    private var presetsRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(RetouchPresetUi.allCases) { preset in
-                    Button {
-                        model.applyRetouchPreset(preset)
-                    } label: {
-                        Text(preset.rawValue)
-                            .font(.caption.weight(.medium))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(
-                                Capsule().fill(Color.white.opacity(0.10))
-                            )
-                            .overlay(
-                                Capsule().stroke(Color.white.opacity(0.12))
-                            )
-                            .foregroundStyle(.white)
+    /// 预设浏览器：上部分类（热门 / 人像 / 胶片 / 质感），下面一排卡片
+    /// （原图在前，后面是当前分类的预设；图片 + 名称）。
+    private var presetsBrowser: some View {
+        VStack(spacing: 6) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(RetouchPresetCategory.allCases) { category in
+                        Button {
+                            Haptics.tick()
+                            model.retouchPresetCategory = category
+                        } label: {
+                            Text(category.rawValue)
+                                .font(
+                                    .caption.weight(
+                                        model.retouchPresetCategory == category
+                                            ? .semibold : .regular
+                                    )
+                                )
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(
+                                    Capsule().fill(
+                                        model.retouchPresetCategory == category
+                                            ? Color.accentColor.opacity(0.24)
+                                            : Color.white.opacity(0.08)
+                                    )
+                                )
+                                .foregroundStyle(
+                                    model.retouchPresetCategory == category
+                                        ? Color.accentColor
+                                        : Color.white.opacity(0.8)
+                                )
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
+                .padding(.horizontal, 14)
             }
-            .padding(.horizontal, 14)
-            .padding(.bottom, 4)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    presetCard(RetouchPresetUi.original)
+                    ForEach(RetouchPresetUi.presets(in: model.retouchPresetCategory)) { preset in
+                        presetCard(preset)
+                    }
+                }
+                .padding(.horizontal, 14)
+                .padding(.bottom, 2)
+            }
+        }
+        .onAppear {
+            if model.retouchPresetThumbnails.isEmpty {
+                model.refreshRetouchPresetThumbnails()
+            }
         }
         .opacity(model.draggingSlider == nil ? 1 : 0)
         .allowsHitTesting(model.draggingSlider == nil)
+    }
+
+    /// 预设卡片：图片（核心实时渲染）+ 名称。
+    private func presetCard(_ preset: RetouchPresetUi) -> some View {
+        let selected = model.state.retouch == preset.retouch
+            && (preset.id == RetouchPresetUi.original.id ? model.state.retouch.isIdentity : true)
+        return Button {
+            model.applyRetouchPreset(preset)
+        } label: {
+            VStack(spacing: 4) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.white.opacity(0.06))
+                        .frame(width: 64, height: 64)
+                    if let thumb = model.retouchPresetThumbnails[preset.id] {
+                        Image(uiImage: thumb)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 64, height: 64)
+                            .clipShape(RoundedRectangle(cornerRadius: 8))
+                    } else {
+                        ProgressView()
+                            .controlSize(.mini)
+                    }
+                }
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8)
+                        .stroke(
+                            selected ? Color.accentColor : Color.white.opacity(0.08),
+                            lineWidth: selected ? 2 : 1
+                        )
+                )
+                Text(preset.name)
+                    .font(.system(size: 10))
+                    .foregroundStyle(selected ? Color.accentColor : Color.white.opacity(0.8))
+            }
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - 笔刷（污点 / 液化）

@@ -274,6 +274,9 @@ struct RecentlyEditedView: View {
 
     private func reload() {
         projects = ProjectStore.load()
+        // 项目里的照片挂在项目下面（展开可见），不再出现在「最近编辑」顶层——
+        // 避免"项目内编辑的照片和项目同级"的显示。
+        let projectAssetIds = Set(projects.flatMap(\.assetIds))
         let recent = EditStore.recentEdits(limit: 30)
         let ids = recent.map(\.assetId)
         guard !ids.isEmpty else {
@@ -287,6 +290,7 @@ struct RecentlyEditedView: View {
         }
         entries = recent.compactMap { item in
             guard let asset = assets[item.assetId] else { return nil }
+            guard !projectAssetIds.contains(item.assetId) else { return nil }
             return RecentEntry(asset: asset, date: item.date)
         }
     }
@@ -299,7 +303,7 @@ struct RecentlyEditedView: View {
 }
 
 /// 最近编辑列表的缩略图（不依赖设备页的 PhotoLibraryModel）。
-private struct RecentThumbnail: View {
+struct RecentThumbnail: View {
     let asset: PHAsset
 
     @State private var image: UIImage?
