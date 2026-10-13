@@ -1319,6 +1319,22 @@ final class EditorModel: ObservableObject {
         maskInteracting = false
         presetName = "原片"
         presetRef = EditorSpec.presets.first?.ref
+        // 全部重置 = 调色 + 修图（含手动污点 / 液化）一起回到原图。
+        activeRetouchPreset = nil
+        retouchStrength = 0
+        healSpots.removeAll()
+        liquifyStrokes.removeAll()
+        healBuffer = nil
+        liquifyBuffer = nil
+        retouchApplied = nil
+        retouchBuffer = nil
+        retouchAppliedReady = false
+        clearGpuSession()
+        if let source = renderSource {
+            createGpuSession(for: source)
+        }
+        scheduleRender(immediate: true)
+        scheduleMaskAssetsRefresh(immediate: true)
     }
 
     // MARK: - 曲线
@@ -1616,6 +1632,10 @@ final class EditorModel: ObservableObject {
     @Published var brushStrength: Float = 70
     /// 修图预设面板：当前分类。
     @Published var retouchPresetCategory: RetouchPresetCategory = .hot
+    /// 当前选中的修图预设（nil = 未选 / 原图）。
+    @Published private(set) var activeRetouchPreset: RetouchPresetUi?
+    /// 预设强度 0..100（0 = 原图，100 = 预设原样）——就是"一键修图"的强度。
+    @Published var retouchStrength: Float = 0
     /// 修图预设缩略图（预设 id → 小图；核心实时渲染）。
     @Published private(set) var retouchPresetThumbnails: [String: UIImage] = [:]
     /// 工作台切换动画文案（修图 ⇄ 调色，nil = 空闲）。
@@ -1894,23 +1914,63 @@ final class EditorModel: ObservableObject {
         recomputeRetouch()
     }
 
-    /// 应用手动美颜预设（一键美颜）：设置参数并立即重算。
+    /// 应用修图预设（= 一键修图：修图参数 + 配套调色；"原图" = 清空）。
     func applyRetouchPreset(_ preset: RetouchPresetUi) {
         guard manualWorkStage == nil, workbenchStage == nil else { return }
         Haptics.light()
+        if preset.id == RetouchPresetUi.original.id {
+            activeRetouchPreset = nil
+            retouchStrength = 0
+            applyEdit("预设·原图") { state in
+                state.retouch = RetouchUi()
+                state.values = EditorSpec.defaultValues()
+            }
+            recomputeRetouch(force: true)
+            return
+        }
+        activeRetouchPreset = preset
+        retouchStrength = 100
         applyEdit("预设·\(preset.name)") { state in
             state.retouch = preset.retouch
-            if preset.id == RetouchPresetUi.original.id {
-                // "原图（没有修图）"：修图与调色一起复位。
-                state.values = EditorSpec.defaultValues()
-            } else if !preset.color.isEmpty {
-                for (key, value) in preset.color {
-                    state.values[key] = value
-                }
+            var values = EditorSpec.defaultValues()
+            for (key, value) in preset.color {
+                values[key] = value
             }
+            state.values = values
         }
-        manualWorkStage = "应用预设（\(preset.name)）…"
-        recomputeRetouch(completion: { self.manualWorkStage = nil }, force: true)
+        // 首次要识别五官（加载动画），之后是纯参数重算。
+        startRetouchStages()
+        recomputeRetouch(completion: { self.stopRetouchStages() }, force: true)
+    }
+
+    /// 预设强度（拖动实时；0 = 原图，100 = 预设原样）——即"一键修图"的强度。
+    func updateRetouchStrength(_ value: Float) {
+        retouchStrength = value
+        guard let preset = activeRetouchPreset else { return }
+        let scale = value / 100
+        var params = preset.retouch
+        params.blemish *= scale
+        params.smoothLow *= scale
+        params.smoothMid *= scale
+        params.smoothHigh *= scale
+        params.skinTone *= scale
+        params.faceSlim *= scale
+        params.chin *= scale
+        params.eyeEnlarge *= scale
+        params.noseSlim *= scale
+        params.bodySlim *= scale
+        state.retouch = params
+        var values = EditorSpec.defaultValues()
+        for (key, presetValue) in preset.color {
+            values[key] = presetValue * scale
+        }
+        state.values = values
+        retouchDebounce?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.recomputeRetouch(force: true)
+        }
+        retouchDebounce = work
+        retouchQueue.asyncAfter(deadline: .now() + 0.35, execute: work)
     }
 
     /// 修图预设缩略图（后台核心渲染：小图先修图、再过该预设的调色）。
@@ -1967,11 +2027,17 @@ final class EditorModel: ObservableObject {
     /// 工作台切换（修图 ⇄ 调色）：带加载动画；进入修图时先把修图缓冲算好。
     func switchWorkbench() {
         guard workbenchStage == nil else { return }
+        Haptics.tick()
         if tool == .retouch {
-            selectTool(.edit)
+            // 返回调色工作台：同样先给一段加载动画（修图结果留在缓冲区，切回即用）。
+            workbenchStage = "正在返回调色工作台…"
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                guard let self else { return }
+                self.selectTool(.edit)
+                self.workbenchStage = nil
+            }
             return
         }
-        Haptics.tick()
         workbenchStage = "正在进入修图工作台…"
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
             guard let self else { return }

@@ -230,7 +230,9 @@ struct EditorTabView: View {
             let options = PHImageRequestOptions()
             // 高质量预览：fastFormat 会返回很糊的图，滑动时观感差（用户反馈）。
             options.deliveryMode = .highQualityFormat
-            options.resizeMode = .exact
+            // 关键：.exact 会把照片压成正方形（比例被改，滑动时看着"被放大/变形"），
+            // 用 .fast 保持原始比例、只按目标尺寸等比缩放。
+            options.resizeMode = .fast
             options.isNetworkAccessAllowed = true
             let target = CGSize(width: 2048, height: 2048)
             PHImageManager.default().requestImage(
@@ -419,12 +421,26 @@ struct EditorTabView: View {
         .animation(.easeInOut(duration: 0.24), value: hidesToolBar)
         // AI 修图：全屏加载动画（识别五官 → 逐项处理）。
         .overlay {
-            if let stage = model.retouchStage ?? model.workbenchStage {
+            if let stage = activeOverlayStage {
                 RetouchProgressOverlay(text: stage)
                     .transition(.opacity)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: model.retouchStage ?? model.workbenchStage)
+        .animation(.easeInOut(duration: 0.2), value: activeOverlayStage)
+    }
+
+    /// 全屏加载文案：修图阶段 / 工作台切换 / 调色下的 AI 识别（智能蒙版）。
+    private var activeOverlayStage: String? {
+        if let stage = model.retouchStage {
+            return stage
+        }
+        if let stage = model.workbenchStage {
+            return stage
+        }
+        if !model.smartMaskGenerating.isEmpty {
+            return "AI 识别中（智能蒙版）…"
+        }
+        return nil
     }
 
     @ViewBuilder
@@ -606,6 +622,17 @@ struct EditorTabView: View {
         return neighborImages[asset.localIdentifier]
     }
 
+    /// 单张照片图层：按**这张图自己的比例**做 aspect-fit + 上移（横向滑动时
+    /// 每张照片的姿态和它加载完成后完全一致，不会因为尺寸取错而错位/变形）。
+    private func photoLayer(_ image: UIImage, in size: CGSize) -> some View {
+        let fitted = fittedRect(imageSize: image.size, in: size)
+        return Image(uiImage: image)
+            .resizable()
+            .scaledToFit()
+            .frame(width: max(fitted.width, 1), height: max(fitted.height, 1))
+            .position(x: fitted.midX, y: fitted.midY)
+    }
+
     private var overlayEnabled: Bool {
         model.tool != .crop && model.tool != .mask
     }
@@ -656,11 +683,7 @@ struct EditorTabView: View {
                let prev = prevAsset,
                let image = neighborImages[prev.localIdentifier]
             {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: geo.size.width, height: geo.size.height)
-                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
+                photoLayer(image, in: geo.size)
                     .offset(x: swipeOffset - geo.size.width)
                     .allowsHitTesting(false)
             }
@@ -668,11 +691,7 @@ struct EditorTabView: View {
                let next = nextAsset,
                let image = neighborImages[next.localIdentifier]
             {
-                Image(uiImage: image)
-                    .resizable()
-                    .scaledToFit()
-                    .frame(width: geo.size.width, height: geo.size.height)
-                    .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
+                photoLayer(image, in: geo.size)
                     .offset(x: swipeOffset + geo.size.width)
                     .allowsHitTesting(false)
             }
@@ -717,16 +736,8 @@ struct EditorTabView: View {
                     .position(x: fitted.midX, y: fitted.midY)
                     .opacity(metalActive ? 1 : 0)
                     if !metalActive, let image = shownImage ?? placeholderImage {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            // 和 fittedRect / 叠加层几何一致：竖图被高度撑满；
-                            // 横图 / 方图整体偏上（顶距 = 剩余空间的 1/3）。
-                            .frame(
-                                width: geo.size.width,
-                                height: geo.size.height
-                            )
-                            .offset(y: -fittedLift(imageSize: previewImageSize, viewSize: geo.size))
+                        // 和 fittedRect / 叠加层几何一致；按图片自身比例定位（切换不错位）。
+                        photoLayer(image, in: geo.size)
                             // 切换照片：新帧淡入（配合 ContentView 的 withAnimation）。
                             .id(asset?.localIdentifier)
                             .transition(.opacity)
