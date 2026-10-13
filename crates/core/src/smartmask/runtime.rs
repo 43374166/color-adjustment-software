@@ -486,13 +486,26 @@ pub fn retouch_analyze(image: &Image) -> std::result::Result<RetouchAnalysis, Ru
     });
 
     // 恢复加权（面部蒙版 ∩ 对齐覆盖，羽化）：GFPGAN 回贴的融合权重。
+    //
+    // 注意坐标方向：`FacePlan.map` 是**正向**仿射（原图像素 → 对齐空间），
+    // 计算某像素在 512 画布里的位置必须用它本身（用逆变换会整体错位、
+    // 大多数几何下直接落在画布外 → 增强静默失效）。
     let restore_weight = face_plan.as_ref().and_then(|plan| {
         let face = masks.face.as_ref()?;
+        // 面部蒙版羽化收窄（0.8%、上限 12px）：GFPGAN 在 512 画布里会重绘脸部
+        // 之外的内容，羽化过宽会把「重绘的头发 / 背景」带进轮廓外，形成糊边。
         let softened = crate::retouch::feather(
             face,
-            (width.min(height) as f32 * 0.02).clamp(2.0, 24.0),
+            (width.min(height) as f32 * 0.008).clamp(2.0, 12.0),
         );
-        let inverse = plan.map.invert()?;
+        // 小脸保护：人脸在图中太小时（< 120px），GFPGAN 生成细节有限，
+        // 降低混合比例避免「换脸感 / 糊脸」。
+        let face_px = set
+            .faces
+            .first()
+            .map(|face| (face.bbox[2] - face.bbox[0]) * width as f32)
+            .unwrap_or(0.0);
+        let face_scale = (face_px / 120.0).clamp(0.5, 1.0);
         let align = plan.align_size as f32;
         let margin = 20.0f32;
         let mut data = vec![0.0f32; (width as usize) * (height as usize)];
@@ -502,13 +515,12 @@ pub fn retouch_analyze(image: &Image) -> std::result::Result<RetouchAnalysis, Ru
                 if face_weight <= 0.001 {
                     continue;
                 }
-                let (u, v) = inverse.apply(x as f64 + 0.5, y as f64 + 0.5);
-                if u < 0.0 || v < 0.0 || u >= align as f64 || v >= align as f64 {
+                let Some((u, v)) = aligned_point(plan, x as f32, y as f32) else {
                     continue;
-                }
-                let (u, v) = (u as f32, v as f32);
+                };
                 let edge = (u.min(v).min(align - u).min(align - v) / margin).min(1.0);
-                data[(y as usize) * (width as usize) + (x as usize)] = face_weight * edge;
+                data[(y as usize) * (width as usize) + (x as usize)] =
+                    face_weight * edge * face_scale;
             }
         }
         Some(crate::retouch::MaskPlane {
@@ -661,7 +673,20 @@ pub fn retouch_apply(
     Ok(output)
 }
 
-/// 取 / 计算 GFPGAN 恢复缓存（整图；含对齐人脸恢复 + 逆映射回贴）。
+/// 图像像素 → 对齐空间坐标（越界返回 `None`）。
+///
+/// [`FacePlan::map`] 为正向仿射（原图像素 → 对齐空间）；回贴 / 覆盖判断都走这里，
+/// 防止坐标方向写错导致增强静默失效。
+fn aligned_point(plan: &FacePlan, x: f32, y: f32) -> Option<(f32, f32)> {
+    let (u, v) = plan.map.apply(x as f64 + 0.5, y as f64 + 0.5);
+    let align = plan.align_size as f64;
+    if u < 0.0 || v < 0.0 || u >= align || v >= align {
+        return None;
+    }
+    Some((u as f32, v as f32))
+}
+
+/// 取 / 计算 GFPGAN 恢复缓存（整图；含对齐人脸恢复 + 正向映射回贴 + 轻度锐化）。
 fn ensure_restore_cache(
     runtime: &Arc<Runtime>,
     image: &Image,
@@ -683,15 +708,11 @@ fn ensure_restore_cache(
             }
         }
     }
-    // 对齐裁剪 → 恢复 → 逆映射回贴。
+    // 对齐裁剪 → 恢复 → 正向映射回贴。
     let crop = crate::smartmask::pipeline::warp_image(image, &plan.map, plan.align_size);
     let restored = restorer
         .restore(&crop)
         .map_err(|err| RuntimeError::Failed(format!("GFPGAN 恢复失败：{err}")))?;
-    let Some(inverse) = plan.map.invert() else {
-        return Ok(None);
-    };
-    let align = plan.align_size as f32;
     let (width, height) = (image.width().max(1), image.height().max(1));
     let mut out = image.clone();
     for y in 0..height {
@@ -699,17 +720,43 @@ fn ensure_restore_cache(
             if weight.get(x, y) <= 0.001 {
                 continue;
             }
-            let (u, v) = inverse.apply(x as f64 + 0.5, y as f64 + 0.5);
-            if u < 0.0 || v < 0.0 || u >= align as f64 || v >= align as f64 {
+            let Some((u, v)) = aligned_point(plan, x as f32, y as f32) else {
                 continue;
-            }
+            };
             let pixel = crate::smartmask::pipeline::sample_rgba(
                 &restored,
-                u as f32 - 0.5,
-                v as f32 - 0.5,
+                u - 0.5,
+                v - 0.5,
             );
             let base = out.get_pixel(x, y).0;
             out.put_pixel(x, y, image::Rgba([pixel[0], pixel[1], pixel[2], base[3]]));
+        }
+    }
+    // 细节回植 + 轻度锐化：GFPGAN 在 512 对齐空间重绘，回贴到原分辨率时会损失
+    // 高频（毛孔 / 虹膜 / 发丝），直接混入会显得比原图更「糊」。这里：
+    // 1) 先对恢复结果做轻度锐化，补回被降采样抹掉的边缘；
+    // 2) 再把原图的高频纹理按 45% 加回，保住真实质感，避免「换脸感」。
+    let base_fine = image::imageops::blur(image, 1.2);
+    let blurred = image::imageops::blur(&out, 1.0);
+    for y in 0..height {
+        for x in 0..width {
+            let w = weight.get(x, y);
+            if w <= 0.001 {
+                continue;
+            }
+            let sharp = out.get_pixel(x, y).0;
+            let soft = blurred.get_pixel(x, y).0;
+            let base = image.get_pixel(x, y).0;
+            let base_soft = base_fine.get_pixel(x, y).0;
+            let mut pixel = [0u8; 4];
+            for (channel, value) in pixel.iter_mut().enumerate().take(3) {
+                let sharpen = (sharp[channel] as f32 - soft[channel] as f32) * 0.5 * w;
+                let texture = (base[channel] as f32 - base_soft[channel] as f32) * 0.45 * w;
+                let merged = sharp[channel] as f32 + sharpen + texture;
+                *value = merged.round().clamp(0.0, 255.0) as u8;
+            }
+            pixel[3] = sharp[3];
+            out.put_pixel(x, y, image::Rgba(pixel));
         }
     }
     let cache = Arc::new(out);
@@ -913,5 +960,42 @@ mod tests {
         let image = image::RgbaImage::new(4, 4);
         let error = generate_into_cache(&mask, &image).unwrap_err();
         assert!(error.should_fallback());
+    }
+
+    #[test]
+    fn face_plan_maps_image_to_aligned_forward() {
+        // 坐标方向回归：`FacePlan.map` 是正向仿射（原图像素 → 对齐空间），
+        // 回贴采样必须用它本身——用逆映射会整体错位、大多数几何下静默失效。
+        let face = crate::smartmask::traits::FaceDetection {
+            bbox: [0.3, 0.2, 0.7, 0.8],
+            landmarks: [
+                [0.42, 0.40], // 左眼
+                [0.58, 0.40], // 右眼
+                [0.50, 0.50], // 鼻尖
+                [0.44, 0.60], // 左嘴角
+                [0.56, 0.60], // 右嘴角
+            ],
+            confidence: 0.99,
+        };
+        let (width, height) = (1000u32, 1400u32);
+        let map =
+            crate::smartmask::pipeline::face_alignment(&face, (width, height), 512).unwrap();
+        let plan = FacePlan {
+            map,
+            align_size: 512,
+        };
+        for point in face.landmarks {
+            let x = point[0] * width as f32;
+            let y = point[1] * height as f32;
+            let (u, v) = aligned_point(&plan, x, y).expect("关键点应落在对齐画布内");
+            assert!((0.0..512.0).contains(&u) && (0.0..512.0).contains(&v));
+            if point[1] < 0.45 {
+                assert!(v < 300.0, "眼睛在对齐空间应偏上（v={v}）");
+            } else {
+                assert!(v > 300.0, "鼻尖 / 嘴角在对齐空间应偏下（v={v}）");
+            }
+        }
+        // 远离人脸的原图像素不应落在画布内。
+        assert!(aligned_point(&plan, 50.0, 50.0).is_none());
     }
 }

@@ -382,21 +382,21 @@ struct RetouchUi: Equatable {
     /// 一键修图默认强度（按识别结果微调：无脸跳过脸部、无人像跳过瘦身）。
     static func autoDefaults(faces: Int, landmarks: Int, person: Bool) -> RetouchUi {
         var params = RetouchUi(
-            blemish: 55,
-            smoothLow: 35,
-            smoothMid: 45,
-            smoothHigh: 35,
-            skinTone: 40,
-            restore: faces > 0 ? 40 : 0
+            blemish: 45,
+            smoothLow: 26,
+            smoothMid: 28,
+            smoothHigh: 18,
+            skinTone: 25,
+            restore: faces > 0 ? 35 : 0
         )
         if faces > 0 && landmarks > 200 {
-            params.faceSlim = 30
-            params.chin = 15
-            params.eyeEnlarge = 15
-            params.noseSlim = 12
+            params.faceSlim = 22
+            params.chin = 10
+            params.eyeEnlarge = 10
+            params.noseSlim = 8
         }
         if person {
-            params.bodySlim = 25
+            params.bodySlim = 20
         }
         return params
     }
@@ -485,8 +485,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "写真",
             category: .hot,
             retouch: RetouchUi(
-                blemish: 60, smoothLow: 40, smoothMid: 50, smoothHigh: 38, skinTone: 45,
-                restore: 45, faceSlim: 28, chin: 14, eyeEnlarge: 14, noseSlim: 10, bodySlim: 15
+                blemish: 55, smoothLow: 30, smoothMid: 32, smoothHigh: 22, skinTone: 28,
+                restore: 40, faceSlim: 24, chin: 12, eyeEnlarge: 12, noseSlim: 8, bodySlim: 12
             ),
             color: ["exposure": 0.15, "contrast": 8, "vibrance": 10, "shadows": 8, "temperature": 4]
         ),
@@ -495,8 +495,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "奶油肌",
             category: .hot,
             retouch: RetouchUi(
-                blemish: 65, smoothLow: 50, smoothMid: 62, smoothHigh: 48, skinTone: 60,
-                restore: 35, faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 8
+                blemish: 60, smoothLow: 40, smoothMid: 46, smoothHigh: 30, skinTone: 40,
+                restore: 35, faceSlim: 16, chin: 8, eyeEnlarge: 8, noseSlim: 8
             ),
             color: ["exposure": 0.35, "contrast": -4, "vibrance": 8, "shadows": 14, "temperature": 6, "blacks": 6]
         ),
@@ -505,8 +505,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "白月光",
             category: .hot,
             retouch: RetouchUi(
-                blemish: 55, smoothLow: 45, smoothMid: 55, smoothHigh: 42, skinTone: 70,
-                restore: 45, faceSlim: 18, chin: 8, eyeEnlarge: 12, noseSlim: 8
+                blemish: 50, smoothLow: 32, smoothMid: 36, smoothHigh: 24, skinTone: 44,
+                restore: 40, faceSlim: 14, chin: 8, eyeEnlarge: 10, noseSlim: 8
             ),
             color: ["exposure": 0.45, "contrast": 4, "vibrance": 6, "saturation": -6, "temperature": -4, "highlights": -12]
         ),
@@ -516,8 +516,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "原生肌",
             category: .portrait,
             retouch: RetouchUi(
-                blemish: 45, smoothLow: 28, smoothMid: 30, smoothHigh: 22, skinTone: 35,
-                restore: 30, faceSlim: 10
+                blemish: 40, smoothLow: 20, smoothMid: 20, smoothHigh: 14, skinTone: 22,
+                restore: 25, faceSlim: 10
             ),
             color: ["exposure": 0.1, "contrast": 3, "vibrance": 6, "shadows": 6]
         ),
@@ -526,8 +526,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "自然光",
             category: .portrait,
             retouch: RetouchUi(
-                blemish: 50, smoothLow: 35, smoothMid: 42, smoothHigh: 32, skinTone: 42,
-                restore: 35, faceSlim: 20, chin: 10, eyeEnlarge: 10
+                blemish: 45, smoothLow: 24, smoothMid: 26, smoothHigh: 18, skinTone: 26,
+                restore: 30, faceSlim: 16, chin: 8, eyeEnlarge: 10
             ),
             color: ["exposure": 0.25, "contrast": 6, "highlights": -10, "shadows": 12, "vibrance": 8]
         ),
@@ -536,8 +536,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "柔光",
             category: .portrait,
             retouch: RetouchUi(
-                blemish: 55, smoothLow: 42, smoothMid: 48, smoothHigh: 36, skinTone: 48,
-                restore: 30, faceSlim: 24, chin: 12, eyeEnlarge: 12, noseSlim: 8
+                blemish: 50, smoothLow: 28, smoothMid: 30, smoothHigh: 22, skinTone: 30,
+                restore: 30, faceSlim: 18, chin: 10, eyeEnlarge: 10, noseSlim: 8
             ),
             color: ["exposure": 0.3, "contrast": -6, "highlights": -18, "shadows": 16, "vibrance": 6, "temperature": 5]
         ),
@@ -547,7 +547,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "胶片",
             category: .film,
             retouch: RetouchUi(
-                blemish: 45, smoothLow: 25, smoothMid: 30, smoothHigh: 20, skinTone: 35
+                blemish: 40, smoothLow: 18, smoothMid: 20, smoothHigh: 12, skinTone: 22
             ),
             color: ["contrast": 10, "vibrance": -6, "saturation": -10, "grain": 25, "temperature": 6, "shadows": 10]
         ),
@@ -556,8 +556,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "港风",
             category: .film,
             retouch: RetouchUi(
-                blemish: 40, smoothLow: 22, smoothMid: 28, smoothHigh: 18, skinTone: 40,
-                restore: 20, faceSlim: 15
+                blemish: 40, smoothLow: 16, smoothMid: 18, smoothHigh: 12, skinTone: 26,
+                restore: 25, faceSlim: 12
             ),
             color: ["contrast": 14, "saturation": -6, "vibrance": -4, "temperature": 10, "tint": -6, "grain": 30, "shadows": 8]
         ),
@@ -566,7 +566,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "复古",
             category: .film,
             retouch: RetouchUi(
-                blemish: 40, smoothLow: 20, smoothMid: 26, smoothHigh: 18, skinTone: 38
+                blemish: 36, smoothLow: 14, smoothMid: 16, smoothHigh: 10, skinTone: 24
             ),
             color: ["contrast": 8, "saturation": -14, "temperature": 12, "grain": 35, "blacks": 10, "highlights": -8]
         ),
@@ -576,8 +576,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "杂志",
             category: .texture,
             retouch: RetouchUi(
-                blemish: 55, smoothLow: 30, smoothMid: 24, smoothHigh: 16, skinTone: 40,
-                restore: 35, faceSlim: 18, chin: 8, eyeEnlarge: 8
+                blemish: 50, smoothLow: 22, smoothMid: 16, smoothHigh: 10, skinTone: 26,
+                restore: 30, faceSlim: 14, chin: 8, eyeEnlarge: 8
             ),
             color: ["contrast": 12, "clarity": 12, "vibrance": 4, "shadows": -6, "highlights": -10]
         ),
@@ -586,7 +586,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "冷调",
             category: .texture,
             retouch: RetouchUi(
-                blemish: 50, smoothLow: 28, smoothMid: 26, smoothHigh: 18, skinTone: 45
+                blemish: 45, smoothLow: 20, smoothMid: 18, smoothHigh: 12, skinTone: 26,
+                restore: 20
             ),
             color: ["contrast": 10, "temperature": -12, "tint": -4, "vibrance": 6, "blacks": -6]
         ),
@@ -595,8 +596,8 @@ struct RetouchPresetUi: Identifiable, Equatable {
             name: "硬调",
             category: .texture,
             retouch: RetouchUi(
-                blemish: 60, smoothLow: 32, smoothMid: 20, smoothHigh: 12, skinTone: 40,
-                restore: 30, faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 10
+                blemish: 55, smoothLow: 24, smoothMid: 12, smoothHigh: 8, skinTone: 26,
+                restore: 30, faceSlim: 16, chin: 8, eyeEnlarge: 8, noseSlim: 8
             ),
             color: ["contrast": 18, "clarity": 16, "vibrance": -4, "saturation": -6, "shadows": -10]
         ),

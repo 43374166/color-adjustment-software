@@ -912,11 +912,21 @@ fn frequency_smooth(
         blur_plane(&mut low_smooth, w, h, sigma_smooth_low);
         let mut mid_base = original.clone();
         blur_plane(&mut mid_base, w, h, sigma_mid);
+        // 细尺度模糊：用于「边缘保护」——强对比处（睫毛 / 唇线 / 鼻翼 / 发际线）
+        // 保留高频细节，只对弱对比的皮肤纹理（毛孔 / 斑点）做平滑。
+        let mut fine = original.clone();
+        blur_plane(&mut fine, w, h, 1.2);
 
         plane.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
             for (x, slot) in row.iter_mut().enumerate() {
                 let index = y * w + x;
-                let weight = skin.get(x as u32, y as u32);
+                let mut weight = skin.get(x as u32, y as u32);
+                if weight <= 0.01 {
+                    continue;
+                }
+                let edge = (original[index] - fine[index]).abs();
+                let protect = ((edge - 0.045) / 0.12).clamp(0.0, 1.0) * 0.9;
+                weight *= 1.0 - protect;
                 if weight <= 0.01 {
                     continue;
                 }
@@ -978,7 +988,7 @@ fn skin_tone_unify(planes: &mut Planes, skin: &MaskPlane, width: u32, height: u3
         0.0
     };
     let (target_cb, target_cr) = (median(&histogram_cb), median(&histogram_cr));
-    let radius = (width.max(height) as f32 / 32.0).clamp(8.0, 64.0);
+    let radius = (width.max(height) as f32 / 48.0).clamp(6.0, 40.0);
     blur_plane(&mut cb, w, h, radius);
     blur_plane(&mut cr, w, h, radius);
 
@@ -998,11 +1008,11 @@ fn skin_tone_unify(planes: &mut Planes, skin: &MaskPlane, width: u32, height: u3
             let (rr, gg, bb) = (*r, *g, *b);
             let index_cb = -0.169 * rr - 0.331 * gg + 0.5 * bb;
             let index_cr = 0.5 * rr - 0.419 * gg - 0.081 * bb;
-            // 平滑 + 向中位数收敛。
-            let new_cb = (index_cb + (cb[index] - index_cb) * weight * 0.95)
-                + (target_cb - index_cb) * weight * 0.5;
-            let new_cr = (index_cr + (cr[index] - index_cr) * weight * 0.95)
-                + (target_cr - index_cr) * weight * 0.5;
+            // 平滑 + 向中位数收敛（幅度保持克制：色度平滑过强会让皮肤发平、发闷）。
+            let new_cb = (index_cb + (cb[index] - index_cb) * weight * 0.55)
+                + (target_cb - index_cb) * weight * 0.2;
+            let new_cr = (index_cr + (cr[index] - index_cr) * weight * 0.55)
+                + (target_cr - index_cr) * weight * 0.2;
             // 反变换（Y 不变）。
             let y_value = 0.299 * rr + 0.587 * gg + 0.114 * bb;
             *r = (y_value + 1.402 * new_cr).clamp(0.0, 1.0);
@@ -1790,8 +1800,10 @@ mod tests {
             &params,
         );
         let after = chroma_gap(&out);
+        // 统一肤色按「克制」调参（大半径色度平滑 0.55 + 向中位数收敛 0.15）：
+        // 目标是消除局部色斑、保留整体肤色层次，而不是把皮肤拉成一块纯色。
         assert!(
-            after < before * 0.6,
+            after < before * 0.85,
             "肤色色度差异应收敛：{before} → {after}"
         );
     }

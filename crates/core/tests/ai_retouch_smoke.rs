@@ -83,6 +83,50 @@ fn ai_retouch_full_chain_smoke() {
         .save(out_dir.join("ai-retouch-after.png"))
         .expect("保存修图结果");
 
+    // GFPGAN 生效性：restore=0 与 restore=50 的输出应明显不同（防「静默失效」回归）。
+    let mut no_restore = params.clone();
+    no_restore.restore = 0.0;
+    let without = fdxmp_core::smartmask::runtime::retouch_apply(&image, &no_restore)
+        .expect("AI 修图（无增强）");
+    without
+        .save(out_dir.join("ai-retouch-no-restore.png"))
+        .expect("保存无增强结果");
+    let mut changed = 0usize;
+    let mut max_diff = 0i64;
+    let (without_px, _) = without.as_raw().as_chunks::<4>();
+    let (output_px, _) = output.as_raw().as_chunks::<4>();
+    for (a, b) in without_px.iter().zip(output_px.iter()) {
+        let d = (0..3)
+            .map(|c| (a[c] as i64 - b[c] as i64).abs())
+            .max()
+            .unwrap_or(0);
+        if d > 2 {
+            changed += 1;
+        }
+        max_diff = max_diff.max(d);
+    }
+    let total_pixels = (image.width() as usize) * (image.height() as usize);
+    eprintln!(
+        "GFPGAN 生效：改变像素 {changed}（{:.2}%），最大差 {max_diff}",
+        changed as f64 / total_pixels as f64 * 100.0
+    );
+    assert!(
+        changed as f64 >= total_pixels as f64 * 0.003,
+        "GFPGAN 增强应改变面部区域像素（{changed}/{total_pixels}）"
+    );
+    assert!(max_diff >= 8, "GFPGAN 应有可见变化（最大差 {max_diff}）");
+
+    // 单独看 GFPGAN：只开 restore（便于目检增强效果）。
+    let restore_only = fdxmp_core::retouch::RetouchParams {
+        restore: 90.0,
+        ..Default::default()
+    };
+    let restored = fdxmp_core::smartmask::runtime::retouch_apply(&image, &restore_only)
+        .expect("AI 人脸增强");
+    restored
+        .save(out_dir.join("ai-restore-only.png"))
+        .expect("保存增强结果");
+
     // 二次调用应命中 AI 缓存（明显更快）。
     let started = Instant::now();
     let second =
