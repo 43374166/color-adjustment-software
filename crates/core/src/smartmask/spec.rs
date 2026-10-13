@@ -38,6 +38,12 @@ pub enum ModelTask {
     PersonMatting,
     /// 第二阶段：人脸 478 点关键点（FaceMesh，修图塑形用）。
     FaceLandmarks,
+    /// AI 修图：图像重绘 / 修复（LaMa；瑕疵区域修复用）。
+    Inpaint,
+    /// AI 修图：人脸恢复增强（GFPGAN；清晰度 / 五官精修用）。
+    FaceRestore,
+    /// AI 修图：超分放大（Real-ESRGAN；导出高清增强用）。
+    SuperRes,
 }
 
 impl ModelTask {
@@ -49,6 +55,9 @@ impl ModelTask {
             ModelTask::FaceParse => "face_parse",
             ModelTask::PersonMatting => "person_matting",
             ModelTask::FaceLandmarks => "face_landmarks",
+            ModelTask::Inpaint => "inpaint",
+            ModelTask::FaceRestore => "face_restore",
+            ModelTask::SuperRes => "super_res",
         }
     }
 }
@@ -666,6 +675,105 @@ impl ModelRegistry {
                 training_repo: Some("https://github.com/google-ai-edge/mediapipe".to_string()),
                 version: "1.0.0".to_string(),
             },
+            ModelSpec {
+                name: "lama-fp32".to_string(),
+                task: ModelTask::Inpaint,
+                path: "inpaint_lama_fp32.onnx".to_string(),
+                sha256: "1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6"
+                    .to_string(),
+                input_size: (512, 512),
+                input_layout: InputLayout::Nchw,
+                input_color: ColorSpace::Rgb,
+                // Carve 导出：图像输入 [0,1]（x/255），输出 0..255 float。
+                input_mean: [0.0, 0.0, 0.0],
+                input_std: [1.0, 1.0, 1.0],
+                input_scale: 1.0 / 255.0,
+                output_names: vec!["output".to_string()],
+                output_shapes: vec![vec![1, 3, 512, 512]],
+                postprocess: PostprocessSpec {
+                    activation: Activation::None,
+                    score_threshold: 0.5,
+                    nms_iou: 0.4,
+                    mask_threshold: 0.0,
+                    resize: ResizeMode::Bilinear,
+                    ..PostprocessSpec::default()
+                },
+                provider: ExecutionProvider::Cpu,
+                precision: Precision::Fp32,
+                license: "Apache-2.0".to_string(),
+                source_url:
+                    "https://hf-mirror.com/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx"
+                        .to_string(),
+                trainable: true,
+                training_repo: Some("https://github.com/advimman/lama".to_string()),
+                version: "1.0.0".to_string(),
+            },
+            ModelSpec {
+                name: "gfpgan-v1.4-fp32".to_string(),
+                task: ModelTask::FaceRestore,
+                path: "face_restore_gfpgan14_fp32.onnx".to_string(),
+                sha256: "cd7311b8d9e13cdb1e208b12363182da58c7bf45e26d1aa67bbeac4751aae92e"
+                    .to_string(),
+                input_size: (512, 512),
+                input_layout: InputLayout::Nchw,
+                input_color: ColorSpace::Rgb,
+                // GFPGAN v1.4：输入 / 输出都在 [-1,1]（(x - 127.5) / 127.5）。
+                input_mean: [127.5, 127.5, 127.5],
+                input_std: [127.5, 127.5, 127.5],
+                input_scale: 1.0,
+                output_names: vec!["1288".to_string()],
+                output_shapes: vec![vec![1, 3, 512, 512]],
+                postprocess: PostprocessSpec {
+                    activation: Activation::None,
+                    score_threshold: 0.5,
+                    nms_iou: 0.4,
+                    mask_threshold: 0.0,
+                    resize: ResizeMode::Bilinear,
+                    ..PostprocessSpec::default()
+                },
+                provider: ExecutionProvider::Cpu,
+                precision: Precision::Fp32,
+                license: "MIT（权重 Apache-2.0）".to_string(),
+                source_url:
+                    "https://hf-mirror.com/Meeperomi/GFPGANv1.4-onnx/resolve/main/GFPGANv1.4.onnx"
+                        .to_string(),
+                trainable: true,
+                training_repo: Some("https://github.com/TencentARC/GFPGAN".to_string()),
+                version: "1.0.0".to_string(),
+            },
+            ModelSpec {
+                name: "realesrgan-x4v3-compact-fp32".to_string(),
+                task: ModelTask::SuperRes,
+                path: "superres_realesrgan_x4v3_fp32.onnx".to_string(),
+                sha256: "572e44f2040bcbca2cbdc661ccf8e720199d338088fe114d7eacdf8867e737d9"
+                    .to_string(),
+                input_size: (0, 0),
+                input_layout: InputLayout::Nchw,
+                input_color: ColorSpace::Rgb,
+                // 输入 [0,1]（x/255），输出 [0,1]（x4，动态尺寸，分块推理）。
+                input_mean: [0.0, 0.0, 0.0],
+                input_std: [1.0, 1.0, 1.0],
+                input_scale: 1.0 / 255.0,
+                output_names: vec!["upscaled_image".to_string()],
+                output_shapes: vec![vec![1, 3, -1, -1]],
+                postprocess: PostprocessSpec {
+                    activation: Activation::None,
+                    score_threshold: 0.5,
+                    nms_iou: 0.4,
+                    mask_threshold: 0.0,
+                    resize: ResizeMode::Bilinear,
+                    ..PostprocessSpec::default()
+                },
+                provider: ExecutionProvider::Cpu,
+                precision: Precision::Fp32,
+                license: "BSD-3-Clause".to_string(),
+                source_url:
+                    "https://hf-mirror.com/TheGuy444/Real-ESRGAN-ONNX/resolve/4c80f3da1a8a85f0757a9e7f79e08d0307220eb5/onnx/model.onnx"
+                        .to_string(),
+                trainable: false,
+                training_repo: Some("https://github.com/xinntao/Real-ESRGAN".to_string()),
+                version: "1.0.0".to_string(),
+            },
         ]
     }
 }
@@ -694,12 +802,15 @@ mod tests {
     #[test]
     fn builtin_specs_cover_all_tasks_and_are_consistent() {
         let specs = ModelRegistry::builtin();
-        assert_eq!(specs.len(), 5, "五个任务各一个模型");
+        assert_eq!(specs.len(), 8, "八个任务各一个模型");
         let mut tasks = Vec::new();
         for spec in &specs {
             assert!(!spec.name.is_empty());
             assert!(spec.path.ends_with(".onnx"));
-            assert!(spec.input_size.0 > 0 && spec.input_size.1 > 0);
+            // 超分模型输入尺寸动态（分块推理），其余模型固定输入尺寸。
+            if spec.task != ModelTask::SuperRes {
+                assert!(spec.input_size.0 > 0 && spec.input_size.1 > 0);
+            }
             assert!(spec.input_std.iter().all(|value| *value > 0.0));
             assert!(!spec.license.is_empty(), "{} 缺少许可证", spec.name);
             assert!(!spec.source_url.is_empty());
@@ -713,6 +824,9 @@ mod tests {
             ModelTask::FaceParse,
             ModelTask::PersonMatting,
             ModelTask::FaceLandmarks,
+            ModelTask::Inpaint,
+            ModelTask::FaceRestore,
+            ModelTask::SuperRes,
         ] {
             assert!(tasks.contains(&task), "缺少任务 {task:?}");
         }

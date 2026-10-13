@@ -83,6 +83,8 @@ struct PhotoSelectionSheet: View {
     let currentAssetId: String?
     /// 同步时显示范围选择（导出传 nil）。
     let syncScope: Binding<EditorModel.SyncScope>?
+    /// 导出时显示「高清增强」开关（同步传 nil）。
+    var enhance: Binding<Bool>? = nil
     @Binding var selection: Set<String>
     let onConfirm: ([String]) -> Void
 
@@ -119,6 +121,32 @@ struct PhotoSelectionSheet: View {
                 .pickerStyle(.segmented)
                 .padding(.horizontal, 16)
                 .padding(.bottom, 8)
+            }
+            if let enhance {
+                Button {
+                    Haptics.tick()
+                    enhance.wrappedValue.toggle()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: enhance.wrappedValue ? "checkmark.square.fill" : "square")
+                            .foregroundStyle(
+                                enhance.wrappedValue
+                                    ? Color.accentColor
+                                    : Color.white.opacity(0.4)
+                            )
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("高清增强（×2 超分）")
+                                .font(.footnote)
+                            Text("Real-ESRGAN 提升细节；耗时较长，大图建议关闭")
+                                .font(.caption2)
+                                .foregroundStyle(Color.white.opacity(0.45))
+                        }
+                        Spacer()
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.bottom, 8)
+                }
+                .buttonStyle(.plain)
             }
             ScrollView {
                 LazyVStack(spacing: 6) {

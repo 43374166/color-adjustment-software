@@ -998,6 +998,7 @@ fn onnx_retouch_analyze_and_apply_on_real_portrait() {
         smooth_mid: 55.0,
         smooth_high: 45.0,
         skin_tone: 50.0,
+        restore: 45.0,
         face_slim: 35.0,
         chin: 20.0,
         eye_enlarge: 20.0,

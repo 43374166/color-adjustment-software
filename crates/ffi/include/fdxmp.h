@@ -241,6 +241,38 @@ uint8_t *fdxmp_liquify_apply(const uint8_t *rgba,
                              uint32_t *out_height,
                              size_t *out_len);
 
+/* ---- AI 修图模型（v1.6.0：LaMa 修复 / GFPGAN 增强 / Real-ESRGAN 超分）----
+ *
+ * 模型缺失时对应能力自动退化为经典算法 / 跳过，不影响其它功能。
+ */
+
+/* 提交平台姿态（iOS Vision：人脸关键点 + 身体关节），绑定图像指纹（换图自动失效）。
+ * pose_json 形如
+ *   {"face":{"contour":[[x,y],...],"left_eye":[...],"left_pupil":[x,y],...},
+ *    "body":{"left_shoulder":[x,y,c],...}}
+ * 坐标归一化 0..1（原点左上）。返回 0 = 成功。 */
+int32_t fdxmp_retouch_submit_pose(const uint8_t *rgba,
+                                  uint32_t width,
+                                  uint32_t height,
+                                  const char *pose_json);
+
+/* AI 修图进度文本（阶段名；空串 = 空闲）。字符串用 fdxmp_string_free 释放。 */
+char *fdxmp_retouch_progress(void);
+
+/* AI 修图模型是否就绪（LaMa / GFPGAN / Real-ESRGAN 任一可用）：1 = 就绪。 */
+int32_t fdxmp_retouch_ai_ready(void);
+
+/* 导出增强：Real-ESRGAN 超分（分块推理；输入单边 ≤ 4096，输出 ≤ 64 MP）。
+ * target_max_edge = 目标最长边（0 = 4 倍；倍率 = target / 原最长边，上限 4×）。
+ * 返回 8 字节大端宽高 + RGBA8，用 fdxmp_bytes_free(ptr, len) 释放；失败返回 NULL。 */
+uint8_t *fdxmp_retouch_upscale(const uint8_t *rgba,
+                               uint32_t width,
+                               uint32_t height,
+                               uint32_t target_max_edge,
+                               uint32_t *out_width,
+                               uint32_t *out_height,
+                               size_t *out_len);
+
 /* ---- GPU 预览会话（Metal / DX12 / Vulkan；iOS 以 `--features gpu` 构建启用）----
  *
  * 移动端实时预览：源图只上传一次，参数变化时重渲染并回读 RGBA8。

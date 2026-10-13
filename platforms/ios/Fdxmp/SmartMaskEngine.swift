@@ -113,6 +113,92 @@ enum SmartMaskEngine {
 
     // MARK: - 人脸关键点（面部 / 皮肤 / 五官）
 
+    /// 平台姿态 JSON（AI 修图塑形用）：Vision 人脸关键点 + 身体 19 关节。
+    ///
+    /// 坐标统一转成「归一化 0..1、原点左上」（Vision 原点在左下），与核心约定一致。
+    /// 没有检测到人脸 / 身体时对应字段为 null；两者都没有返回 nil。
+    static func platformPoseJson(cgImage: CGImage) -> String? {
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+        var faceJson: [String: Any] = [:]
+        var bodyJson: [String: Any] = [:]
+
+        // 人脸关键点（取最大的一张脸）。
+        let faceRequest = VNDetectFaceLandmarksRequest()
+        if (try? handler.perform([faceRequest])) != nil,
+           let face = faceRequest.results?
+               .filter({ $0.landmarks != nil })
+               .max(by: { area($0.boundingBox) < area($1.boundingBox) }),
+           let landmarks = face.landmarks
+        {
+            let box = face.boundingBox
+            // Vision 关键点坐标是「人脸框内归一化 + 原点左下」→ 全图归一化 + 原点左上。
+            func convert(_ points: [CGPoint]) -> [[Double]] {
+                points.map { point in
+                    let x = box.origin.x + point.x * box.width
+                    let y = 1 - (box.origin.y + point.y * box.height)
+                    return [Double(x), Double(y)]
+                }
+            }
+            if let contour = landmarks.faceContour?.normalizedPoints, !contour.isEmpty {
+                faceJson["contour"] = convert(contour)
+            }
+            if let left = landmarks.leftEye?.normalizedPoints, !left.isEmpty {
+                faceJson["left_eye"] = convert(left)
+            }
+            if let right = landmarks.rightEye?.normalizedPoints, !right.isEmpty {
+                faceJson["right_eye"] = convert(right)
+            }
+            if let nose = landmarks.nose?.normalizedPoints, !nose.isEmpty {
+                faceJson["nose"] = convert(nose)
+            }
+            if let pupil = landmarks.leftPupil?.normalizedPoints.first {
+                faceJson["left_pupil"] = convert([pupil]).first
+            }
+            if let pupil = landmarks.rightPupil?.normalizedPoints.first {
+                faceJson["right_pupil"] = convert([pupil]).first
+            }
+        }
+
+        // 身体关节（最多两人取最高置信度的一张）。
+        let bodyRequest = VNDetectHumanBodyPoseRequest()
+        if (try? handler.perform([bodyRequest])) != nil,
+           let observation = bodyRequest.results?.first {
+            let joints: [(String, VNHumanBodyPoseObservation.JointName)] = [
+                ("neck", .neck),
+                ("left_shoulder", .leftShoulder),
+                ("right_shoulder", .rightShoulder),
+                ("left_hip", .leftHip),
+                ("right_hip", .rightHip),
+                ("left_knee", .leftKnee),
+                ("right_knee", .rightKnee),
+                ("left_ankle", .leftAnkle),
+                ("right_ankle", .rightAnkle),
+            ]
+            for (name, joint) in joints {
+                guard let point = try? observation.recognizedPoint(joint) else { continue }
+                guard point.confidence >= 0.3 else { continue }
+                let x = Double(point.location.x)
+                let y = Double(1 - point.location.y)
+                bodyJson[name] = [x, y, Double(point.confidence)]
+            }
+        }
+
+        var root: [String: Any] = [:]
+        if !faceJson.isEmpty {
+            root["face"] = faceJson
+        }
+        if !bodyJson.isEmpty {
+            root["body"] = bodyJson
+        }
+        guard !root.isEmpty else { return nil }
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: root, options: [.sortedKeys])
+        else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
+    }
+
     /// 人像分割 α → f32 平面（供核心「平台人像蒙版」用；MODNet 不随包时补位）。
     ///
     /// 与 `personMask` 同一条 Vision 路径，但直接返回平面数据（不经过多边形/位图）。

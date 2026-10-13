@@ -12,7 +12,7 @@ android {
         minSdk = 26
         targetSdk = 35
         versionCode = 42
-        versionName = "1.5.3"
+        versionName = "1.6.0"
         ndk {
             // Rust 桥接产物（cargo ndk 生成）
             abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
@@ -39,7 +39,7 @@ android {
     }
 
     composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.34"
+        kotlinCompilerExtensionVersion = "1.6.04"
     }
 
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")

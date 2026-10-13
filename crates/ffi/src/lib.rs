@@ -1155,6 +1155,142 @@ pub unsafe extern "C" fn fdxmp_liquify_apply(
     })
 }
 
+/// 提交平台姿态（iOS Vision）：人脸关键点 + 身体关节，绑定图像指纹（换图自动失效）。
+///
+/// `pose_json` 形如
+/// `{"face":{"contour":[[x,y],…],"left_eye":[[x,y],…],…},"body":{"left_shoulder":[x,y,c],…}}`，
+/// 坐标为归一化 0..1（原点左上）。返回 [`FDXMP_OK`] / [`FDXMP_ERR`]。
+///
+/// # Safety
+///
+/// `pose_json` 必须为合法 C 字符串；`rgba` 至少 `width × height × 4` 字节可读。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_retouch_submit_pose(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    pose_json: *const c_char,
+) -> i32 {
+    guard(FDXMP_ERR, || {
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            let pose_json = match cstr_to_str(pose_json, "pose_json") {
+                Ok(value) => value,
+                Err(message) => {
+                    set_last_error(message);
+                    return FDXMP_ERR;
+                }
+            };
+            let image = match rgba_to_image(rgba, width, height) {
+                Ok(image) => image,
+                Err(message) => {
+                    set_last_error(message);
+                    return FDXMP_ERR;
+                }
+            };
+            match fdxmp_core::smartmask::runtime::submit_platform_pose(&image, pose_json) {
+                Ok(()) => FDXMP_OK,
+                Err(err) => {
+                    set_last_error(err.message().to_string());
+                    FDXMP_ERR
+                }
+            }
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            let _ = (rgba, width, height, pose_json);
+            set_last_error("当前构建未启用 AI 修图（ai / ai-static）");
+            FDXMP_ERR
+        }
+    })
+}
+
+/// AI 修图进度文本（阶段名；空串 = 空闲）。UI 在修图任务运行期间轮询显示加载文案。
+///
+/// 返回的字符串用 `fdxmp_string_free` 释放；失败返回 NULL。
+#[no_mangle]
+pub extern "C" fn fdxmp_retouch_progress() -> *mut c_char {
+    guard(ptr::null_mut(), || {
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            into_c_string(fdxmp_core::smartmask::runtime::retouch_progress())
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            into_c_string(String::new())
+        }
+    })
+}
+
+/// AI 修图模型是否就绪（LaMa / GFPGAN / Real-ESRGAN 任一可用 → 1）。
+#[no_mangle]
+pub extern "C" fn fdxmp_retouch_ai_ready() -> i32 {
+    guard(0, || {
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            if fdxmp_core::smartmask::runtime::ai_retouch_ready() {
+                1
+            } else {
+                0
+            }
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            0
+        }
+    })
+}
+
+/// 导出增强：Real-ESRGAN 超分（分块推理；输入单边 ≤ 4096，输出 ≤ 64 MP）。
+///
+/// `target_max_edge` = 目标最长边（0 = 4 倍输出；倍率 = target / 原最长边，上限 4×）。
+///
+/// 返回放大后的图像载荷（8 字节大端宽高 + RGBA8，用 `fdxmp_bytes_free` 释放）。
+///
+/// # Safety
+///
+/// `rgba` 至少 `width × height × 4` 字节可读；`out_*` 非空可写。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_retouch_upscale(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    target_max_edge: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let image = match rgba_to_image(rgba, width, height) {
+            Ok(image) => image,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        #[cfg(any(feature = "ai", feature = "ai-static"))]
+        {
+            match fdxmp_core::smartmask::runtime::retouch_upscale(&image, target_max_edge) {
+                Ok(output) => image_to_payload(&output, out_width, out_height, out_len),
+                Err(err) => {
+                    set_last_error(err.message().to_string());
+                    ptr::null_mut()
+                }
+            }
+        }
+        #[cfg(not(any(feature = "ai", feature = "ai-static")))]
+        {
+            let _ = (image, target_max_edge);
+            set_last_error("当前构建未启用 AI 修图（ai / ai-static）");
+            ptr::null_mut()
+        }
+    })
+}
+
 /// 用随包 ONNX 模型生成智能蒙版（双阶段流水线），并写入共享栅格缓存。
 ///
 /// 返回值：
@@ -2046,7 +2182,7 @@ mod tests {
             fdxmp_bytes_free(empty, out_len);
 
             // 2) 提交 4×4 基础栅格（8×8 请求会重采样）。
-            let weights = vec![0.6f32; 16];
+            let weights = [0.6f32; 16];
             assert_eq!(
                 fdxmp_mask_raster_submit(
                     params.as_ptr(),
@@ -2182,7 +2318,7 @@ mod tests {
         };
         let value: serde_json::Value = serde_json::from_str(&text).unwrap();
         let models = value["models"].as_array().unwrap();
-        assert_eq!(models.len(), 5);
+        assert_eq!(models.len(), 8);
         let tasks: Vec<String> = models
             .iter()
             .map(|model| model["task"].as_str().unwrap().to_string())
@@ -2192,13 +2328,49 @@ mod tests {
             "person_coarse",
             "face_parse",
             "person_matting",
+            "face_landmarks",
+            "inpaint",
+            "face_restore",
+            "super_res",
         ] {
             assert!(tasks.contains(&task.to_string()), "缺少任务 {task}");
         }
         for model in models {
             assert!(model["hash_state"].is_string());
-            assert!(model["license"].as_str().unwrap().len() > 0);
+            assert!(!model["license"].as_str().unwrap().is_empty());
         }
+    }
+
+    #[test]
+    fn retouch_ai_helpers_are_wired() {
+        // 进度：空闲时也是合法（可释放）的字符串。
+        let pointer = fdxmp_retouch_progress();
+        assert!(!pointer.is_null());
+        // SAFETY: 返回的是本库分配的 C 字符串。
+        unsafe { fdxmp_string_free(pointer) };
+
+        // 姿态 JSON 非法 → 错误路径（返回 -1，不崩溃）。
+        let json = CString::new("{not json").unwrap();
+        let rgba = [0u8; 8 * 8 * 4];
+        let code = unsafe { fdxmp_retouch_submit_pose(rgba.as_ptr(), 8, 8, json.as_ptr()) };
+        assert_eq!(code, FDXMP_ERR);
+
+        // 超分：未随包模型（或未启用 ai）→ NULL。
+        let mut width = 0u32;
+        let mut height = 0u32;
+        let mut len = 0usize;
+        let out = unsafe {
+            fdxmp_retouch_upscale(
+                rgba.as_ptr(),
+                8,
+                8,
+                0,
+                &mut width,
+                &mut height,
+                &mut len,
+            )
+        };
+        assert!(out.is_null());
     }
 
     #[test]

@@ -316,6 +316,8 @@ struct RetouchUi: Equatable {
     var smoothMid: Float = 0
     var smoothHigh: Float = 0
     var skinTone: Float = 0
+    /// 增强（GFPGAN 人脸恢复 / 五官精修；0..100，需 AI 模型）。
+    var restore: Float = 0
     var faceSlim: Float = 0
     var chin: Float = 0
     var eyeEnlarge: Float = 0
@@ -336,6 +338,7 @@ struct RetouchUi: Equatable {
             "smooth_mid": Double(smoothMid),
             "smooth_high": Double(smoothHigh),
             "skin_tone": Double(skinTone),
+            "restore": Double(restore),
             "face_slim": Double(faceSlim),
             "chin": Double(chin),
             "eye_enlarge": Double(eyeEnlarge),
@@ -367,6 +370,7 @@ struct RetouchUi: Equatable {
         params.smoothMid = number("smooth_mid")
         params.smoothHigh = number("smooth_high")
         params.skinTone = number("skin_tone")
+        params.restore = number("restore")
         params.faceSlim = number("face_slim")
         params.chin = number("chin")
         params.eyeEnlarge = number("eye_enlarge")
@@ -382,7 +386,8 @@ struct RetouchUi: Equatable {
             smoothLow: 35,
             smoothMid: 45,
             smoothHigh: 35,
-            skinTone: 40
+            skinTone: 40,
+            restore: faces > 0 ? 40 : 0
         )
         if faces > 0 && landmarks > 200 {
             params.faceSlim = 30
@@ -403,6 +408,16 @@ struct RetouchAnalysisUi: Equatable {
     var landmarks: Int = 0
     var skin: Bool = false
     var person: Bool = false
+    /// 检测到的瑕疵区域数（AI 修复）。
+    var blemishes: Int = 0
+    /// AI 瑕疵修复模型（LaMa）可用。
+    var aiRepair: Bool = false
+    /// AI 人脸增强模型（GFPGAN）可用。
+    var aiRestore: Bool = false
+    /// AI 超分模型（Real-ESRGAN）可用。
+    var aiSuperres: Bool = false
+    /// 拿到平台姿态（Vision；身体 / 脸部塑形可用）。
+    var pose: Bool = false
     var warnings: [String] = []
 
     static func from(json: String) -> RetouchAnalysisUi? {
@@ -417,6 +432,11 @@ struct RetouchAnalysisUi: Equatable {
         analysis.landmarks = (root["landmarks"] as? NSNumber)?.intValue ?? 0
         analysis.skin = (root["skin"] as? NSNumber)?.boolValue ?? false
         analysis.person = (root["person"] as? NSNumber)?.boolValue ?? false
+        analysis.blemishes = (root["blemishes"] as? NSNumber)?.intValue ?? 0
+        analysis.aiRepair = (root["ai_repair"] as? NSNumber)?.boolValue ?? false
+        analysis.aiRestore = (root["ai_restore"] as? NSNumber)?.boolValue ?? false
+        analysis.aiSuperres = (root["ai_superres"] as? NSNumber)?.boolValue ?? false
+        analysis.pose = (root["pose"] as? NSNumber)?.boolValue ?? false
         analysis.warnings = (root["warnings"] as? [String]) ?? []
         return analysis
     }
@@ -466,7 +486,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .hot,
             retouch: RetouchUi(
                 blemish: 60, smoothLow: 40, smoothMid: 50, smoothHigh: 38, skinTone: 45,
-                faceSlim: 28, chin: 14, eyeEnlarge: 14, noseSlim: 10, bodySlim: 15
+                restore: 45, faceSlim: 28, chin: 14, eyeEnlarge: 14, noseSlim: 10, bodySlim: 15
             ),
             color: ["exposure": 0.15, "contrast": 8, "vibrance": 10, "shadows": 8, "temperature": 4]
         ),
@@ -476,7 +496,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .hot,
             retouch: RetouchUi(
                 blemish: 65, smoothLow: 50, smoothMid: 62, smoothHigh: 48, skinTone: 60,
-                faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 8
+                restore: 35, faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 8
             ),
             color: ["exposure": 0.35, "contrast": -4, "vibrance": 8, "shadows": 14, "temperature": 6, "blacks": 6]
         ),
@@ -486,7 +506,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .hot,
             retouch: RetouchUi(
                 blemish: 55, smoothLow: 45, smoothMid: 55, smoothHigh: 42, skinTone: 70,
-                faceSlim: 18, chin: 8, eyeEnlarge: 12, noseSlim: 8
+                restore: 45, faceSlim: 18, chin: 8, eyeEnlarge: 12, noseSlim: 8
             ),
             color: ["exposure": 0.45, "contrast": 4, "vibrance": 6, "saturation": -6, "temperature": -4, "highlights": -12]
         ),
@@ -497,7 +517,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .portrait,
             retouch: RetouchUi(
                 blemish: 45, smoothLow: 28, smoothMid: 30, smoothHigh: 22, skinTone: 35,
-                faceSlim: 10
+                restore: 30, faceSlim: 10
             ),
             color: ["exposure": 0.1, "contrast": 3, "vibrance": 6, "shadows": 6]
         ),
@@ -507,7 +527,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .portrait,
             retouch: RetouchUi(
                 blemish: 50, smoothLow: 35, smoothMid: 42, smoothHigh: 32, skinTone: 42,
-                faceSlim: 20, chin: 10, eyeEnlarge: 10
+                restore: 35, faceSlim: 20, chin: 10, eyeEnlarge: 10
             ),
             color: ["exposure": 0.25, "contrast": 6, "highlights": -10, "shadows": 12, "vibrance": 8]
         ),
@@ -517,7 +537,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .portrait,
             retouch: RetouchUi(
                 blemish: 55, smoothLow: 42, smoothMid: 48, smoothHigh: 36, skinTone: 48,
-                faceSlim: 24, chin: 12, eyeEnlarge: 12, noseSlim: 8
+                restore: 30, faceSlim: 24, chin: 12, eyeEnlarge: 12, noseSlim: 8
             ),
             color: ["exposure": 0.3, "contrast": -6, "highlights": -18, "shadows": 16, "vibrance": 6, "temperature": 5]
         ),
@@ -537,7 +557,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .film,
             retouch: RetouchUi(
                 blemish: 40, smoothLow: 22, smoothMid: 28, smoothHigh: 18, skinTone: 40,
-                faceSlim: 15
+                restore: 20, faceSlim: 15
             ),
             color: ["contrast": 14, "saturation": -6, "vibrance": -4, "temperature": 10, "tint": -6, "grain": 30, "shadows": 8]
         ),
@@ -557,7 +577,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .texture,
             retouch: RetouchUi(
                 blemish: 55, smoothLow: 30, smoothMid: 24, smoothHigh: 16, skinTone: 40,
-                faceSlim: 18, chin: 8, eyeEnlarge: 8
+                restore: 35, faceSlim: 18, chin: 8, eyeEnlarge: 8
             ),
             color: ["contrast": 12, "clarity": 12, "vibrance": 4, "shadows": -6, "highlights": -10]
         ),
@@ -576,7 +596,7 @@ struct RetouchPresetUi: Identifiable, Equatable {
             category: .texture,
             retouch: RetouchUi(
                 blemish: 60, smoothLow: 32, smoothMid: 20, smoothHigh: 12, skinTone: 40,
-                faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 10
+                restore: 30, faceSlim: 20, chin: 10, eyeEnlarge: 10, noseSlim: 10
             ),
             color: ["contrast": 18, "clarity": 16, "vibrance": -4, "saturation": -6, "shadows": -10]
         ),

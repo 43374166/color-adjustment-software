@@ -267,6 +267,53 @@ final class NativeCore {
         return code == 0
     }
 
+    /// 提交平台姿态（Vision 人脸关键点 + 身体关节；身体 / 脸部塑形用）。
+    ///
+    /// `poseJson` 坐标归一化 0..1（原点左上）；与图像指纹绑定，换图自动失效。
+    @discardableResult
+    func retouchSubmitPose(buffer: RgbaBuffer, poseJson: String) -> Bool {
+        let code = poseJson.withCString { pose in
+            buffer.pixels.withUnsafeBufferPointer { pixels in
+                fdxmp_retouch_submit_pose(
+                    pixels.baseAddress,
+                    UInt32(buffer.width),
+                    UInt32(buffer.height),
+                    pose
+                )
+            }
+        }
+        return code == 0
+    }
+
+    /// AI 修图进度文本（阶段名；空串 = 空闲）。UI 修图期间轮询显示加载文案。
+    func retouchProgress() -> String {
+        guard let pointer = fdxmp_retouch_progress() else { return "" }
+        defer { fdxmp_string_free(pointer) }
+        return String(cString: pointer)
+    }
+
+    /// 导出增强：Real-ESRGAN 超分（`targetMaxEdge` = 目标最长边；0 = 4 倍）。
+    ///
+    /// 阻塞调用（数秒～数十秒），必须在工作线程执行；失败返回 nil（原因见 `lastError()`）。
+    func retouchUpscale(buffer: RgbaBuffer, targetMaxEdge: Int) -> RgbaBuffer? {
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in
+            fdxmp_retouch_upscale(
+                pixels.baseAddress,
+                UInt32(buffer.width),
+                UInt32(buffer.height),
+                UInt32(max(targetMaxEdge, 0)),
+                &outWidth,
+                &outHeight,
+                &outLen
+            )
+        }
+        guard let result = decodePayload(pointer: pointer, outLen: outLen) else { return nil }
+        return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
+    }
+
     /// 污点修复（手动祛痘笔）：x / y 归一化、radius 像素；返回修好的缓冲。
     func healApply(
         buffer: RgbaBuffer,

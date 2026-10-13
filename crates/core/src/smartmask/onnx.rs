@@ -29,6 +29,9 @@ pub struct OnnxStages {
     parser: Arc<BiseNetParser>,
     matting: Option<Arc<U2NetMatting>>,
     landmarks: Option<Arc<FaceMeshLandmarks>>,
+    inpaint: Option<Arc<crate::smartmask::onnx_retouch::LamaInpainter>>,
+    restore: Option<Arc<crate::smartmask::onnx_retouch::GfpganRestorer>>,
+    superres: Option<Arc<crate::smartmask::onnx_retouch::EsrganUpscaler>>,
 }
 
 impl OnnxStages {
@@ -64,12 +67,49 @@ impl OnnxStages {
         } else {
             None
         };
+        // AI 修图模型可选（LaMa / GFPGAN / Real-ESRGAN）：缺失时退经典算法 / 跳过该阶段。
+        let inpaint = if available(ModelTask::Inpaint) {
+            match crate::smartmask::onnx_retouch::LamaInpainter::load(registry) {
+                Ok(loader) => Some(Arc::new(loader)),
+                Err(err) => {
+                    eprintln!("[smartmask] LaMa 修复模型加载失败（{err}），退经典去瑕疵");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let restore = if available(ModelTask::FaceRestore) {
+            match crate::smartmask::onnx_retouch::GfpganRestorer::load(registry) {
+                Ok(restorer) => Some(Arc::new(restorer)),
+                Err(err) => {
+                    eprintln!("[smartmask] GFPGAN 人脸恢复模型加载失败（{err}），跳过增强");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let superres = if available(ModelTask::SuperRes) {
+            match crate::smartmask::onnx_retouch::EsrganUpscaler::load(registry) {
+                Ok(upscaler) => Some(Arc::new(upscaler)),
+                Err(err) => {
+                    eprintln!("[smartmask] Real-ESRGAN 超分模型加载失败（{err}），导出增强不可用");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         Ok(Self {
             detector: Arc::new(detector),
             segmenter,
             parser: Arc::new(parser),
             matting,
             landmarks,
+            inpaint,
+            restore,
+            superres,
         })
     }
 
@@ -104,6 +144,27 @@ impl OnnxStages {
             .map(|landmarks| landmarks as Arc<dyn Stage2FaceLandmarks>)
     }
 
+    /// AI 修复（LaMa；可选）。
+    pub fn inpainter(&self) -> Option<Arc<dyn crate::smartmask::traits::StageInpaint>> {
+        self.inpaint
+            .clone()
+            .map(|loader| loader as Arc<dyn crate::smartmask::traits::StageInpaint>)
+    }
+
+    /// AI 人脸恢复（GFPGAN；可选）。
+    pub fn restorer(&self) -> Option<Arc<dyn crate::smartmask::traits::StageFaceRestore>> {
+        self.restore
+            .clone()
+            .map(|restorer| restorer as Arc<dyn crate::smartmask::traits::StageFaceRestore>)
+    }
+
+    /// AI 超分（Real-ESRGAN；可选）。
+    pub fn superresolver(&self) -> Option<Arc<dyn crate::smartmask::traits::StageSuperRes>> {
+        self.superres
+            .clone()
+            .map(|upscaler| upscaler as Arc<dyn crate::smartmask::traits::StageSuperRes>)
+    }
+
     /// 组装完整双阶段流水线（人脸路径 + 人像路径）。
     pub fn pipeline(&self) -> crate::smartmask::pipeline::MaskPipeline {
         crate::smartmask::pipeline::MaskPipeline::new(
@@ -118,7 +179,10 @@ impl OnnxStages {
 }
 
 /// 加载会话（校验模型存在与哈希，初始化 ONNX Runtime）。
-fn load_session(registry: &ModelRegistry, task: ModelTask) -> Result<(ModelSpec, Session)> {
+pub(crate) fn load_session(
+    registry: &ModelRegistry,
+    task: ModelTask,
+) -> Result<(ModelSpec, Session)> {
     let spec = registry
         .spec_for(task)
         .cloned()

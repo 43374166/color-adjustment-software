@@ -1597,14 +1597,14 @@ final class EditorModel: ObservableObject {
     private var retouchPresetToken = 0
     private let retouchQueue = DispatchQueue(label: "fdxmp.ios.retouch", qos: .userInitiated)
 
-    /// 一键修图的阶段文案（识别 → 逐项处理，加载动画用）。
+    /// 一键修图的阶段文案（核心 AI 进度不可用时的兜底轮播；加载动画用）。
     private let retouchStages = [
         "正在识别五官…",
-        "去瑕疵…",
-        "磨皮（低 / 中 / 高频）…",
-        "统一肤色…",
-        "脸部塑形…",
-        "身体塑形…",
+        "AI 修复瑕疵…",
+        "皮肤美化…",
+        "肤色统一…",
+        "五官精修…",
+        "脸部 / 身体塑形…",
     ]
 
     // MARK: 手动工具（污点修复 / 液化）
@@ -1800,21 +1800,24 @@ final class EditorModel: ObservableObject {
         return text
     }
 
-    /// 准备 Vision 人像蒙版（MODNet 不随包；提交给核心供修图 / 身体塑形使用）。
+    /// 准备 Vision 平台数据（MODNet 不随包）：
+    /// 人像蒙版 α + 人脸 / 身体关键点（姿态），提交给核心供修图 / 塑形使用。
     private func prepareVisionPersonMask() {
         guard let buffer = baseBuffer else { return }
         guard let cgImage = SmartMaskEngine.makeCGImage(buffer: buffer) else { return }
         retouchQueue.async { [weak self] in
             guard let self else { return }
-            guard let plane = SmartMaskEngine.personMaskPlane(cgImage: cgImage, buffer: buffer) else {
-                return
+            if let plane = SmartMaskEngine.personMaskPlane(cgImage: cgImage, buffer: buffer) {
+                _ = NativeCore.shared.retouchSubmitPersonMask(
+                    buffer: buffer,
+                    plane: plane.data,
+                    planeWidth: plane.width,
+                    planeHeight: plane.height
+                )
             }
-            _ = NativeCore.shared.retouchSubmitPersonMask(
-                buffer: buffer,
-                plane: plane.data,
-                planeWidth: plane.width,
-                planeHeight: plane.height
-            )
+            if let pose = SmartMaskEngine.platformPoseJson(cgImage: cgImage) {
+                _ = NativeCore.shared.retouchSubmitPose(buffer: buffer, poseJson: pose)
+            }
             _ = self
         }
     }
@@ -1954,6 +1957,7 @@ final class EditorModel: ObservableObject {
         params.smoothMid *= scale
         params.smoothHigh *= scale
         params.skinTone *= scale
+        params.restore *= scale
         params.faceSlim *= scale
         params.chin *= scale
         params.eyeEnlarge *= scale
@@ -2139,12 +2143,20 @@ final class EditorModel: ObservableObject {
     }
 
     /// 启动阶段动画（识别 → 去瑕疵 → 磨皮 → 肤色 → 塑形）。
+    ///
+    /// 优先显示核心实时进度（`fdxmp_retouch_progress`：AI 人脸增强 / AI 修复瑕疵 / …），
+    /// 核心空闲时轮播兜底文案。
     private func startRetouchStages() {
         retouchStageIndex = 0
         retouchStage = retouchStages[0]
         retouchStageTimer?.invalidate()
-        retouchStageTimer = Timer.scheduledTimer(withTimeInterval: 0.65, repeats: true) { [weak self] _ in
+        retouchStageTimer = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
             guard let self else { return }
+            let progress = NativeCore.shared.retouchProgress()
+            if !progress.isEmpty {
+                self.retouchStage = progress
+                return
+            }
             if self.retouchStageIndex + 1 < self.retouchStages.count {
                 self.retouchStageIndex += 1
                 self.retouchStage = self.retouchStages[self.retouchStageIndex]
@@ -3061,7 +3073,9 @@ final class EditorModel: ObservableObject {
     }
 
     /// 多选导出（底部弹框里选择照片）：当前张用当前状态，其余用各自保存的编辑记录。
-    func exportAssets(_ assets: [PHAsset]) {
+    ///
+    /// `enhance` = 高清增强（Real-ESRGAN ×2 超分，输出 ≤ 6144；失败自动退回原尺寸）。
+    func exportAssets(_ assets: [PHAsset], enhance: Bool = false) {
         guard !assets.isEmpty, !isExporting else { return }
         isExporting = true
         exportProgress = 0.02
@@ -3099,18 +3113,21 @@ final class EditorModel: ObservableObject {
                 if retouch.isActive {
                     source = Self.applyRetouchForExport(buffer: buffer, params: retouch) ?? buffer
                 }
-                guard
-                    let result = NativeCore.shared.render(buffer: source, paramsJson: json),
-                    let output = ImageUtil.image(
-                        from: RgbaBuffer(
-                            pixels: result.pixels,
-                            width: result.width,
-                            height: result.height
-                        )
-                    )
-                else {
+                guard let result = NativeCore.shared.render(buffer: source, paramsJson: json) else {
                     continue
                 }
+                var rendered = RgbaBuffer(
+                    pixels: result.pixels,
+                    width: result.width,
+                    height: result.height
+                )
+                if enhance {
+                    Task { @MainActor in self.exportProgress = max(self.exportProgress ?? 0, 0.4) }
+                    if let enhanced = Self.enhancedExportBuffer(rendered) {
+                        rendered = enhanced
+                    }
+                }
+                guard let output = ImageUtil.image(from: rendered) else { continue }
                 let metadata = keepMetadata ? Self.loadExportMetadata(asset: item) : nil
                 guard
                     let url = Self.writeExportFile(
@@ -3135,6 +3152,16 @@ final class EditorModel: ObservableObject {
                 )
             }
         }
+    }
+
+    /// 导出增强（Real-ESRGAN ×2 超分；输出最长边 ≤ 6144）。
+    ///
+    /// 输入超限（> 4096）或模型不可用时返回 nil，调用方退回原缓冲。
+    static func enhancedExportBuffer(_ buffer: RgbaBuffer) -> RgbaBuffer? {
+        let maxEdge = max(buffer.width, buffer.height)
+        guard maxEdge > 0, maxEdge <= 4096 else { return nil }
+        let target = min(max(maxEdge * 2, 2048), 6144)
+        return NativeCore.shared.retouchUpscale(buffer: buffer, targetMaxEdge: target)
     }
 
     /// 同步解码一张照片（后台线程用；系统解码路径）。

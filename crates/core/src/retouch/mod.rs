@@ -5,10 +5,12 @@
 //! | 功能 | 做法 |
 //! | --- | --- |
 //! | 去瑕疵 | 皮肤蒙版内的高频负向异常（痘印 / 斑点）软阈值收敛，保留毛孔 |
+//! | AI 修复 | 瑕疵区域（[`detect_blemishes`]）交给 LaMa 局部重绘（模型缺失时退经典去瑕疵） |
 //! | 低/中/高频磨皮 | 三级频率分离（低频 = 光影 / 肤色不均，中频 = 纹理，高频 = 噪点），逐带按强度衰减 |
 //! | 统一肤色 | 色度（Cb / Cr）大半径平滑 + 向肤色中位数收敛 |
-//! | 脸部塑形 | FaceMesh 关键点驱动的局部变形（瘦脸 / 下巴 / 大眼 / 瘦鼻） |
-//! | 身体塑形 | 人像蒙版轮廓驱动的腰腹收形 |
+//! | 增强 | GFPGAN 对齐人脸恢复（清晰度 / 五官精修），按面部蒙版羽化融合（模型缺失时跳过） |
+//! | 脸部塑形 | FaceMesh 关键点驱动的局部变形（瘦脸 / 下巴 / 大眼 / 瘦鼻；缺失时用 iOS Vision 关键点） |
+//! | 身体塑形 | iOS Vision 姿态关节（肩 → 髋）驱动的腰腹收形；缺失时退化为人像蒙版轮廓 |
 //!
 //! 蒙版与关键点由智能蒙版模块提供（[`crate::smartmask`]）；本模块只消费，
 //! 不依赖任何模型，可在没有 `ai` feature 的环境里用合成蒙版单独测试。
@@ -30,6 +32,8 @@ pub struct RetouchParams {
     pub smooth_high: f32,
     /// 统一肤色。
     pub skin_tone: f32,
+    /// 增强（GFPGAN 人脸恢复 / 五官精修；0..100，需 AI 模型，缺失时忽略）。
+    pub restore: f32,
     /// 瘦脸（下颌收窄）。
     pub face_slim: f32,
     /// 下巴（拉长 / 收窄）。
@@ -50,6 +54,7 @@ impl Default for RetouchParams {
             smooth_mid: 0.0,
             smooth_high: 0.0,
             skin_tone: 0.0,
+            restore: 0.0,
             face_slim: 0.0,
             chin: 0.0,
             eye_enlarge: 0.0,
@@ -72,6 +77,11 @@ impl RetouchParams {
             || self.smooth_mid > 0.0
             || self.smooth_high > 0.0
             || self.skin_tone > 0.0
+    }
+
+    /// 是否请求 AI 人脸恢复增强。
+    pub fn has_restore(&self) -> bool {
+        self.restore > 0.0
     }
 
     /// 是否包含塑形（几何变形）。
@@ -131,6 +141,216 @@ pub struct RetouchMasks {
     pub person: Option<MaskPlane>,
     /// 脸部关键点（归一化原图坐标；MediaPipe FaceMesh 478 点）。
     pub landmarks: Vec<[f32; 2]>,
+    /// 平台身体姿态（iOS Vision 19 关节；身体塑形优先用）。
+    pub pose: Option<BodyPose>,
+    /// 平台人脸关键点（iOS Vision 76 点；FaceMesh 缺失时的塑形回退）。
+    pub vision_face: Option<VisionFace>,
+}
+
+/// 平台身体姿态（归一化坐标 0..1，原点左上；来自 iOS Vision 身体姿态估计）。
+///
+/// 只保留塑形需要的关节；每个关节带置信度（低于阈值的关节会被忽略）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BodyPose {
+    /// 颈部（Vision 的 neck 关节）。
+    pub neck: Option<[f32; 3]>,
+    /// 左肩。
+    pub left_shoulder: Option<[f32; 3]>,
+    /// 右肩。
+    pub right_shoulder: Option<[f32; 3]>,
+    /// 左髋。
+    pub left_hip: Option<[f32; 3]>,
+    /// 右髋。
+    pub right_hip: Option<[f32; 3]>,
+    /// 左膝。
+    pub left_knee: Option<[f32; 3]>,
+    /// 右膝。
+    pub right_knee: Option<[f32; 3]>,
+    /// 左脚踝。
+    pub left_ankle: Option<[f32; 3]>,
+    /// 右脚踝。
+    pub right_ankle: Option<[f32; 3]>,
+}
+
+impl BodyPose {
+    /// 关节是否可用（置信度 ≥ 0.3）。
+    fn joint(value: Option<[f32; 3]>) -> Option<(f32, f32)> {
+        value
+            .filter(|joint| joint[2] >= 0.3)
+            .map(|joint| (joint[0], joint[1]))
+    }
+
+    /// 是否具备躯干关节（肩 + 髋），可用于姿态塑形。
+    pub fn has_torso(&self) -> bool {
+        let shoulder = Self::joint(self.left_shoulder).is_some()
+            && Self::joint(self.right_shoulder).is_some();
+        let hip = Self::joint(self.left_hip).is_some() && Self::joint(self.right_hip).is_some();
+        shoulder && hip
+    }
+}
+
+/// 平台人脸关键点（归一化原图坐标；iOS Vision `VNFaceLandmarks2D` 的子集）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisionFace {
+    /// 左眼轮廓（若千点）。
+    pub left_eye: Vec<[f32; 2]>,
+    /// 右眼轮廓。
+    pub right_eye: Vec<[f32; 2]>,
+    /// 左瞳孔中心。
+    pub left_pupil: Option<[f32; 2]>,
+    /// 右瞳孔中心。
+    pub right_pupil: Option<[f32; 2]>,
+    /// 鼻子区域（若千点）。
+    pub nose: Vec<[f32; 2]>,
+    /// 面部轮廓（若千点）。
+    pub contour: Vec<[f32; 2]>,
+}
+
+impl VisionFace {
+    /// 是否包含可用于塑形的点。
+    pub fn usable(&self) -> bool {
+        self.contour.len() >= 5 || !self.left_eye.is_empty() || !self.right_eye.is_empty()
+    }
+
+    /// Vision 关键点驱动的脸部塑形（FaceMesh 缺失时回退）。
+    fn warp(
+        &self,
+        px: f32,
+        py: f32,
+        params: &RetouchParams,
+        width: u32,
+        height: u32,
+    ) -> (f32, f32) {
+        let (w, h) = (width as f32, height as f32);
+        let to_px = |point: [f32; 2]| (point[0] * w, point[1] * h);
+        let mut sx = px;
+        let mut sy = py;
+
+        let contour: Vec<(f32, f32)> = self.contour.iter().map(|point| to_px(*point)).collect();
+        if contour.len() >= 5 {
+            let (min_x, max_x) = contour.iter().fold(
+                (f32::MAX, f32::MIN),
+                |acc, point| (acc.0.min(point.0), acc.1.max(point.0)),
+            );
+            let (min_y, max_y) = contour.iter().fold(
+                (f32::MAX, f32::MIN),
+                |acc, point| (acc.0.min(point.1), acc.1.max(point.1)),
+            );
+            let center_x = (min_x + max_x) / 2.0;
+            let half_width = ((max_x - min_x) / 2.0).max(1.0);
+            let face_height = (max_y - min_y).max(1.0);
+
+            // 瘦脸：两颊向中轴收拢。
+            if params.face_slim > 0.0 {
+                let strength = (params.face_slim / 100.0).clamp(0.0, 1.0) * 0.28;
+                let cheek_y = min_y + face_height * 0.62;
+                for side in [-1.0f32, 1.0] {
+                    let center = (center_x + side * half_width * 0.72, cheek_y);
+                    let (nx, ny) = pull_toward_axis(
+                        sx,
+                        sy,
+                        center,
+                        center_x,
+                        half_width * 0.9,
+                        strength,
+                        face_height * 0.5,
+                    );
+                    sx = nx;
+                    sy = ny;
+                }
+            }
+            // 下巴：轮廓最下方的点。
+            if params.chin > 0.0 {
+                let chin = contour
+                    .iter()
+                    .copied()
+                    .fold((center_x, max_y), |acc, point| {
+                        if point.1 > acc.1 {
+                            point
+                        } else {
+                            acc
+                        }
+                    });
+                let strength = (params.chin / 100.0).clamp(0.0, 1.0);
+                let radius = face_height * 0.35;
+                let dx = px - chin.0;
+                let dy = py - chin.1;
+                let distance = (dx * dx + dy * dy).sqrt();
+                if distance < radius {
+                    let falloff = (1.0 - (distance / radius).powi(2)).powi(2);
+                    sy -= strength * falloff * face_height * 0.06;
+                    sx -= (px - center_x) * strength * falloff * 0.18;
+                }
+            }
+        }
+
+        // 大眼：瞳孔中心 + 眼睛轮廓。
+        if params.eye_enlarge > 0.0 {
+            let strength = (params.eye_enlarge / 100.0).clamp(0.0, 1.0) * 0.30;
+            for (pupil, eye) in [
+                (self.left_pupil, &self.left_eye),
+                (self.right_pupil, &self.right_eye),
+            ] {
+                let Some(center) = pupil.map(to_px).or_else(|| {
+                    if eye.is_empty() {
+                        None
+                    } else {
+                        let sum = eye.iter().fold((0.0f32, 0.0f32), |acc, point| {
+                            let (x, y) = to_px(*point);
+                            (acc.0 + x, acc.1 + y)
+                        });
+                        Some((sum.0 / eye.len() as f32, sum.1 / eye.len() as f32))
+                    }
+                }) else {
+                    continue;
+                };
+                let extent = eye
+                    .iter()
+                    .map(|point| to_px(*point).0)
+                    .fold((f32::MAX, f32::MIN), |acc, x| {
+                        (acc.0.min(x), acc.1.max(x))
+                    });
+                let half = if extent.0 <= extent.1 {
+                    ((extent.1 - extent.0) / 2.0).max(4.0)
+                } else {
+                    8.0
+                };
+                let (nx, ny) = magnify(sx, sy, center, half * 1.15, strength);
+                sx = nx;
+                sy = ny;
+            }
+        }
+
+        // 瘦鼻：鼻区左右极值向中心收拢。
+        if params.nose_slim > 0.0 && self.nose.len() >= 2 {
+            let points: Vec<(f32, f32)> = self.nose.iter().map(|point| to_px(*point)).collect();
+            let (min_x, max_x) = points.iter().fold(
+                (f32::MAX, f32::MIN),
+                |acc, point| (acc.0.min(point.0), acc.1.max(point.0)),
+            );
+            let nose_center_x = (min_x + max_x) / 2.0;
+            let nose_width = (max_x - min_x).max(1.0);
+            let nose_y = points.iter().map(|point| point.1).sum::<f32>() / points.len() as f32;
+            let strength = (params.nose_slim / 100.0).clamp(0.0, 1.0) * 0.22;
+            for side in [-1.0f32, 1.0] {
+                let center = (nose_center_x + side * nose_width * 0.5, nose_y);
+                let (nx, ny) = pull_toward_axis(
+                    sx,
+                    sy,
+                    center,
+                    nose_center_x,
+                    nose_width * 0.9,
+                    strength,
+                    nose_width * 1.2,
+                );
+                sx = nx;
+                sy = ny;
+            }
+        }
+        (sx, sy)
+    }
 }
 
 /// MediaPipe FaceMesh（478 点）常用下标。
@@ -212,7 +432,18 @@ pub fn warp(
         .person
         .as_ref()
         .map(|plane| BodyProfile::build(&plane_to_size(plane, width, height)));
+    // 平台姿态（Vision）：优先用关节驱动的腰腹收形；缺失时退回轮廓剖面。
+    let pose_slim = masks
+        .pose
+        .as_ref()
+        .filter(|pose| pose.has_torso())
+        .and_then(|pose| PoseSlim::build(pose, width as f32, height as f32));
+    let person_plane = masks
+        .person
+        .as_ref()
+        .map(|plane| plane_to_size(plane, width, height));
     let landmarks = &masks.landmarks;
+    let vision_face = masks.vision_face.as_ref().filter(|face| face.usable());
 
     let mut rows: Vec<Vec<u8>> = (0..height as usize)
         .into_par_iter()
@@ -224,15 +455,28 @@ pub fn warp(
 
                 // 身体（腰腹收形，先做；脸部在其后微调）。
                 if params.body_slim > 0.0 {
-                    if let Some(body) = body.as_ref() {
+                    if let Some(pose) = pose_slim.as_ref() {
+                        let mask_weight = person_plane
+                            .as_ref()
+                            .map(|plane| plane.get(x as u32, y as u32))
+                            .unwrap_or(1.0);
+                        let (nx, ny) =
+                            slim_body_pose(px, py, pose, params.body_slim, mask_weight);
+                        px = nx;
+                        py = ny;
+                    } else if let Some(body) = body.as_ref() {
                         let (nx, ny) = slim_body(px, py, body, params.body_slim);
                         px = nx;
                         py = ny;
                     }
                 }
-                // 脸部塑形（基于关键点）。
+                // 脸部塑形（基于关键点；FaceMesh 优先，iOS Vision 关键点回退）。
                 if !landmarks.is_empty() {
                     let (nx, ny) = warp_face(px, py, landmarks, params, width, height);
+                    px = nx;
+                    py = ny;
+                } else if let Some(face) = vision_face {
+                    let (nx, ny) = face.warp(px, py, params, width, height);
                     px = nx;
                     py = ny;
                 }
@@ -420,6 +664,218 @@ fn blemish_pass(planes: &mut Planes, skin: &MaskPlane, width: u32, height: u32, 
             planes.g[index] = (planes.g[index] + correction).clamp(0.0, 1.0);
             planes.b[index] = (planes.b[index] + correction).clamp(0.0, 1.0);
         }
+    }
+}
+
+/// 瑕疵修复计划（AI 修复用）：合并后的区域框 + 全图软权重（已羽化）。
+#[derive(Debug, Clone)]
+pub struct BlemishPlan {
+    /// 合并后的瑕疵区域（像素 bbox `[x, y, w, h]`，按面积降序；≤ [`BLEMISH_MAX_REGIONS`]）。
+    pub regions: Vec<[u32; 4]>,
+    /// 全图软权重（0..1，尺寸 = 原图）。
+    pub weight: MaskPlane,
+}
+
+/// 单张图最多修复的瑕疵区域数（防止整图重绘）。
+pub const BLEMISH_MAX_REGIONS: usize = 12;
+
+impl BlemishPlan {
+    /// 是否没有可修复区域。
+    pub fn is_empty(&self) -> bool {
+        self.regions.is_empty()
+    }
+}
+
+/// 检测瑕疵（皮肤内比周围暗的斑点 / 痘印 / 色素异常），生成 AI 修复计划。
+///
+/// 检测与经典 [`blemish_pass`] 同源（亮度高频负异常），但输出为「区域 + 软权重」，
+/// 交给 LaMa 局部重绘；皮肤蒙版缺失时退化为全图检测。
+pub fn detect_blemishes(image: &image::RgbaImage, skin: Option<&MaskPlane>) -> BlemishPlan {
+    let (width, height) = (image.width().max(1), image.height().max(1));
+    let (w, h) = (width as usize, height as usize);
+    let empty = BlemishPlan {
+        regions: Vec::new(),
+        weight: MaskPlane {
+            width,
+            height,
+            data: vec![0.0; w * h],
+        },
+    };
+    if w < 16 || h < 16 {
+        return empty;
+    }
+    let skin_plane = skin
+        .map(|plane| plane_to_size(plane, width, height))
+        .unwrap_or_else(|| MaskPlane {
+            width,
+            height,
+            data: vec![1.0; w * h],
+        });
+
+    // 亮度高频负异常（比周围暗的斑点）。
+    let luma: Vec<f32> = image
+        .pixels()
+        .map(|pixel| {
+            0.299 * pixel.0[0] as f32 / 255.0
+                + 0.587 * pixel.0[1] as f32 / 255.0
+                + 0.114 * pixel.0[2] as f32 / 255.0
+        })
+        .collect();
+    let mut base = luma.clone();
+    let radius = (width.min(height) as f32 / 400.0).clamp(2.0, 6.0);
+    blur_plane(&mut base, w, h, radius);
+    let threshold = 0.030f32;
+
+    // 4×4 网格标记（足够小，保留小痘印；同时把连通域计算量降 16 倍）。
+    let cell = 4usize;
+    let gw = w.div_ceil(cell);
+    let gh = h.div_ceil(cell);
+    let mut counts = vec![0u16; gw * gh];
+    for y in 0..h {
+        for x in 0..w {
+            let index = y * w + x;
+            if luma[index] - base[index] >= -threshold {
+                continue;
+            }
+            if skin_plane.get(x as u32, y as u32) < 0.35 {
+                continue;
+            }
+            counts[(y / cell) * gw + (x / cell)] =
+                counts[(y / cell) * gw + (x / cell)].saturating_add(1);
+        }
+    }
+
+    // 连通域（BFS on grid）。
+    let mut labels = vec![0u32; gw * gh];
+    let mut regions: Vec<[u32; 4]> = Vec::new();
+    let mut stack: Vec<usize> = Vec::new();
+    let mut next_label = 1u32;
+    for start in 0..gw * gh {
+        if counts[start] < 2 || labels[start] != 0 {
+            continue;
+        }
+        let label = next_label;
+        next_label += 1;
+        labels[start] = label;
+        stack.push(start);
+        let (mut min_x, mut min_y, mut max_x, mut max_y) =
+            (usize::MAX, usize::MAX, 0usize, 0usize);
+        while let Some(index) = stack.pop() {
+            let gx = index % gw;
+            let gy = index / gw;
+            min_x = min_x.min(gx);
+            min_y = min_y.min(gy);
+            max_x = max_x.max(gx);
+            max_y = max_y.max(gy);
+            let neighbors = [
+                (gx.wrapping_sub(1), gy),
+                (gx + 1, gy),
+                (gx, gy.wrapping_sub(1)),
+                (gx, gy + 1),
+            ];
+            for (nx, ny) in neighbors {
+                if nx >= gw || ny >= gh {
+                    continue;
+                }
+                let nindex = ny * gw + nx;
+                if counts[nindex] >= 2 && labels[nindex] == 0 {
+                    labels[nindex] = label;
+                    stack.push(nindex);
+                }
+            }
+        }
+        // 像素级 bbox + 面积过滤（太大 = 阴影 / 妆面，不是瑕疵）。
+        let x0 = (min_x * cell).min(w.saturating_sub(1));
+        let y0 = (min_y * cell).min(h.saturating_sub(1));
+        let x1 = ((max_x + 1) * cell).min(w);
+        let y1 = ((max_y + 1) * cell).min(h);
+        let region_w = (x1 - x0) as u32;
+        let region_h = (y1 - y0) as u32;
+        let area = (region_w as usize) * (region_h as usize);
+        let max_area = w * h * 2 / 100;
+        if area < 14 || area > max_area {
+            continue;
+        }
+        if region_w > width / 3 || region_h > height / 3 {
+            continue;
+        }
+        regions.push([x0 as u32, y0 as u32, region_w, region_h]);
+    }
+    if regions.is_empty() {
+        return empty;
+    }
+
+    // 外扩 + 合并（相邻瑕疵共享一次重绘）。
+    let margin = (width.min(height) as f32 / 150.0).clamp(4.0, 16.0) as u32;
+    let mut expanded: Vec<[u32; 4]> = regions
+        .into_iter()
+        .map(|region| {
+            let x = region[0].saturating_sub(margin);
+            let y = region[1].saturating_sub(margin);
+            let w = (region[2] + margin * 2).min(width - x);
+            let h = (region[3] + margin * 2).min(height - y);
+            [x, y, w, h]
+        })
+        .collect();
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'outer: for i in 0..expanded.len() {
+            for j in (i + 1)..expanded.len() {
+                let a = expanded[i];
+                let b = expanded[j];
+                let overlap = a[0] <= b[0] + b[2]
+                    && b[0] <= a[0] + a[2]
+                    && a[1] <= b[1] + b[3]
+                    && b[1] <= a[1] + a[3];
+                if overlap {
+                    let x = a[0].min(b[0]);
+                    let y = a[1].min(b[1]);
+                    let x1 = (a[0] + a[2]).max(b[0] + b[2]);
+                    let y1 = (a[1] + a[3]).max(b[1] + b[3]);
+                    expanded[i] = [x, y, x1 - x, y1 - y];
+                    expanded.remove(j);
+                    merged = true;
+                    break 'outer;
+                }
+            }
+        }
+    }
+    // 按面积降序截断。
+    expanded.sort_by_key(|region| std::cmp::Reverse(region[2] * region[3]));
+    expanded.truncate(BLEMISH_MAX_REGIONS);
+
+    // 软权重：椭圆径向羽化 ∩ 皮肤蒙版。
+    let mut weight = vec![0.0f32; w * h];
+    for region in &expanded {
+        let [x, y, rw, rh] = *region;
+        let cx = x as f32 + rw as f32 / 2.0;
+        let cy = y as f32 + rh as f32 / 2.0;
+        let rx = (rw as f32 / 2.0).max(1.0);
+        let ry = (rh as f32 / 2.0).max(1.0);
+        for py in y..(y + rh).min(height) {
+            for px in x..(x + rw).min(width) {
+                let dx = (px as f32 + 0.5 - cx) / rx;
+                let dy = (py as f32 + 0.5 - cy) / ry;
+                let d2 = dx * dx + dy * dy;
+                if d2 >= 1.0 {
+                    continue;
+                }
+                let value = (1.0 - d2).powf(0.7);
+                let skin_value = skin_plane.get(px, py);
+                let index = (py as usize) * w + (px as usize);
+                weight[index] = weight[index].max(value * skin_value.clamp(0.0, 1.0));
+            }
+        }
+    }
+    blur_plane(&mut weight, w, h, 2.0);
+    BlemishPlan {
+        regions: expanded,
+        weight: MaskPlane {
+            width,
+            height,
+            data: weight,
+        },
     }
 }
 
@@ -847,6 +1303,105 @@ fn slim_body(px: f32, py: f32, body: &BodyProfile, strength: f32) -> (f32, f32) 
     (px + (px - center) * amount, py)
 }
 
+/// 姿态驱动的人体收形（Vision 关节）：肩 → 髋 的躯干带，腰部最明显。
+struct PoseSlim {
+    /// 躯干上端（颈部 / 双肩中点，像素）。
+    top: (f32, f32),
+    /// 躯干下端（双髋中点，像素）。
+    bottom: (f32, f32),
+    /// 肩半宽。
+    top_half: f32,
+    /// 髋半宽。
+    bottom_half: f32,
+}
+
+impl PoseSlim {
+    /// 由归一化关节构建（要求肩 + 髋均可用）。
+    fn build(pose: &BodyPose, width: f32, height: f32) -> Option<Self> {
+        let to_px = |joint: (f32, f32)| (joint.0 * width, joint.1 * height);
+        let left_shoulder = BodyPose::joint(pose.left_shoulder).map(to_px)?;
+        let right_shoulder = BodyPose::joint(pose.right_shoulder).map(to_px)?;
+        let left_hip = BodyPose::joint(pose.left_hip).map(to_px)?;
+        let right_hip = BodyPose::joint(pose.right_hip).map(to_px)?;
+        let shoulder_mid = (
+            (left_shoulder.0 + right_shoulder.0) / 2.0,
+            (left_shoulder.1 + right_shoulder.1) / 2.0,
+        );
+        let hip_mid = (
+            (left_hip.0 + right_hip.0) / 2.0,
+            (left_hip.1 + right_hip.1) / 2.0,
+        );
+        // 上端取颈部（若有）：让「上胸 → 腰」的过渡更自然。
+        let top = BodyPose::joint(pose.neck)
+            .map(to_px)
+            .map(|neck| (neck.0 * 0.35 + shoulder_mid.0 * 0.65, neck.1 * 0.5 + shoulder_mid.1 * 0.5))
+            .unwrap_or(shoulder_mid);
+        let torso_height = (hip_mid.1 - top.1).abs();
+        if torso_height < 12.0 {
+            return None;
+        }
+        let top_half = ((left_shoulder.0 - right_shoulder.0).abs() / 2.0).max(4.0);
+        let bottom_half = ((left_hip.0 - right_hip.0).abs() / 2.0).max(4.0);
+        Some(Self {
+            top,
+            bottom: hip_mid,
+            top_half,
+            bottom_half,
+        })
+    }
+}
+
+/// 姿态驱动的腰腹收形：像素位置沿躯干轴（肩中点 → 髋中点）收拢，
+/// 腰段权重最大，横向以 `person` 蒙版权重渐隐（背景不受影响）。
+fn slim_body_pose(
+    px: f32,
+    py: f32,
+    pose: &PoseSlim,
+    strength: f32,
+    mask_weight: f32,
+) -> (f32, f32) {
+    let strength = (strength / 100.0).clamp(0.0, 1.0);
+    let mask_weight = mask_weight.clamp(0.0, 1.0);
+    if strength <= 0.0 || mask_weight <= 0.05 {
+        return (px, py);
+    }
+    let length = (pose.bottom.1 - pose.top.1).max(1.0);
+    let t = (py - pose.top.1) / length;
+    if !(-0.12..=1.28).contains(&t) {
+        return (px, py);
+    }
+    // 躯干带权重：腰部（t≈0.55）最大，两端平滑归零。
+    let band = {
+        let gaussian = (-((t - 0.55) / 0.34).powi(2)).exp();
+        let edge = if t < 0.0 {
+            (1.0 + t / 0.12).clamp(0.0, 1.0)
+        } else if t > 1.0 {
+            (1.0 - (t - 1.0) / 0.28).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        gaussian * edge
+    };
+    if band <= 0.01 {
+        return (px, py);
+    }
+    let clamped = t.clamp(0.0, 1.0);
+    let axis_x = pose.top.0 + (pose.bottom.0 - pose.top.0) * clamped;
+    let half = (pose.top_half + (pose.bottom_half - pose.top_half) * clamped).max(4.0);
+    let u = (px - axis_x).abs() / half;
+    if u >= 1.45 {
+        return (px, py);
+    }
+    // 横向权重：中轴 0（保住脊柱内容）→ 躯干边缘最大 → 边缘外归零。
+    let lateral = if u <= 1.0 {
+        u
+    } else {
+        (1.0 - (u - 1.0) / 0.45).clamp(0.0, 1.0)
+    };
+    let amount = strength * band * lateral * lateral * 0.30 * mask_weight;
+    (px + (px - axis_x) * amount, py)
+}
+
 /// 柔化蒙版边界（盒式模糊 + clamp）。
 fn soften_mask(plane: &MaskPlane, radius: f32) -> MaskPlane {
     let mut data = plane.data.clone();
@@ -1024,6 +1579,57 @@ pub fn liquify(image: &image::RgbaImage, strokes: &[LiquifyStroke]) -> image::Rg
         .collect();
     let flat: Vec<u8> = rows.into_iter().flatten().collect();
     image::RgbaImage::from_raw(width, height, flat).unwrap_or_else(|| image.clone())
+}
+
+// ---------------------------------------------------------------------------
+// AI 修图混合工具（runtime / FFI 复用）
+// ---------------------------------------------------------------------------
+
+/// 蒙版羽化（盒式模糊 + clamp；`radius` 单位像素）。
+pub fn feather(plane: &MaskPlane, radius: f32) -> MaskPlane {
+    soften_mask(plane, radius)
+}
+
+/// 按权重把 `target` 混入 `base`：`base = base·(1−w·amount) + target·w·amount`。
+///
+/// `weight` 与图像同尺寸（0..1）；`amount` 为整体强度（0..1）。尺寸不一致时按
+/// `weight` 采样（最近邻），越界权重视为 0。
+pub fn blend_weighted(
+    base: &mut image::RgbaImage,
+    target: &image::RgbaImage,
+    weight: &MaskPlane,
+    amount: f32,
+) {
+    let amount = amount.clamp(0.0, 1.0);
+    if amount <= 0.0 {
+        return;
+    }
+    let (width, height) = (base.width().max(1), base.height().max(1));
+    for y in 0..height {
+        for x in 0..width {
+            let w = if weight.width == width && weight.height == height {
+                weight.get(x, y)
+            } else {
+                let sx = (x as u64 * weight.width as u64 / width as u64) as u32;
+                let sy = (y as u64 * weight.height as u64 / height as u64) as u32;
+                weight.get(sx, sy)
+            };
+            let alpha = (w.clamp(0.0, 1.0) * amount).clamp(0.0, 1.0);
+            if alpha <= 0.001 {
+                continue;
+            }
+            let base_pixel = base.get_pixel(x, y).0;
+            let target_pixel = target.get_pixel(x, y).0;
+            let mut pixel = [0u8; 4];
+            for channel in 0..3 {
+                let blended = base_pixel[channel] as f32 * (1.0 - alpha)
+                    + target_pixel[channel] as f32 * alpha;
+                pixel[channel] = blended.round().clamp(0.0, 255.0) as u8;
+            }
+            pixel[3] = base_pixel[3];
+            base.put_pixel(x, y, image::Rgba(pixel));
+        }
+    }
 }
 
 #[cfg(test)]

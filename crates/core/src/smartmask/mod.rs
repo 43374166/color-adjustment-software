@@ -30,6 +30,9 @@ pub mod traits;
 pub mod onnx;
 
 #[cfg(any(feature = "ai", feature = "ai-static"))]
+pub mod onnx_retouch;
+
+#[cfg(any(feature = "ai", feature = "ai-static"))]
 pub mod runtime;
 
 pub use mask::{MaskMorphology, PolygonMask, SmartMask, SmartMaskKind};
@@ -43,5 +46,6 @@ pub use spec::{
 pub use traits::{
     FaceDetection, FaceParseResult, MaskConsumer, MaskOrDetection, MaskRefiner, PlaneTensor,
     Postprocess, Preprocess, RetouchEngine, Stage1FaceDetector, Stage1PersonSegmenter,
-    Stage2FaceParser, Stage2PersonMatting,
+    Stage2FaceLandmarks, Stage2FaceParser, Stage2PersonMatting, StageFaceRestore, StageInpaint,
+    StageSuperRes,
 };

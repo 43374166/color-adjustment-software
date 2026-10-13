@@ -69,6 +69,7 @@ struct EditorTabView: View {
     @State private var activeSheet: EditorSheetKind?
     @State private var sheetSelection: Set<String> = []
     @State private var sheetSyncScope: EditorModel.SyncScope = .all
+    @State private var sheetEnhanceExport = false
 
     @Environment(\.displayScale) private var displayScale
 
@@ -294,14 +295,16 @@ struct EditorTabView: View {
                 assets: queue.isEmpty ? [asset].compactMap { $0 } : queue,
                 currentAssetId: asset?.localIdentifier,
                 syncScope: nil,
+                enhance: $sheetEnhanceExport,
                 selection: $sheetSelection,
                 onConfirm: { ids in
                     activeSheet = nil
                     let selected = queue.isEmpty
                         ? [asset].compactMap { $0 }
                         : queue.filter { ids.contains($0.localIdentifier) }
+                    let enhance = sheetEnhanceExport
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
-                        model.exportAssets(selected)
+                        model.exportAssets(selected, enhance: enhance)
                     }
                 }
             )

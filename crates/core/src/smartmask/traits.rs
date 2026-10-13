@@ -225,6 +225,50 @@ pub trait MaskRefiner: Send + Sync {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AI 修图阶段（v1.6.0）：修复 / 恢复 / 超分 —— 均为可选模型，缺失时调用方走经典算法
+// ---------------------------------------------------------------------------
+
+/// AI 修复（LaMa）：对 `mask` 权重 > 0 的区域重绘，返回与输入同尺寸的结果。
+pub trait StageInpaint: Send + Sync {
+    /// `image` 与 `mask` 同尺寸；`mask` 为 0..1 软权重（已羽化 / 膨胀）。
+    fn inpaint(&self, image: &Image, mask: &crate::retouch::MaskPlane) -> Result<Image>;
+
+    /// 模型版本（参与缓存键）。
+    fn version_id(&self) -> String {
+        "0.0.0".to_string()
+    }
+}
+
+/// AI 人脸恢复（GFPGAN）：输入对齐后人脸（任意尺寸，内部缩放到模型输入），
+/// 返回与输入同尺寸的恢复结果。
+pub trait StageFaceRestore: Send + Sync {
+    /// 恢复一张对齐人脸。
+    fn restore(&self, aligned_face: &Image) -> Result<Image>;
+
+    /// 模型版本（参与缓存键）。
+    fn version_id(&self) -> String {
+        "0.0.0".to_string()
+    }
+}
+
+/// AI 超分（Real-ESRGAN）：4 倍放大（内部按块推理，支持任意尺寸）。
+pub trait StageSuperRes: Send + Sync {
+    /// 放大 4 倍。
+    fn upscale(&self, image: &Image) -> Result<Image>;
+
+    /// 按倍率放大（1..4；默认实现退回 4 倍放大，供不支持逐块缩放的后端使用）。
+    fn upscale_scaled(&self, image: &Image, scale: f32) -> Result<Image> {
+        let _ = scale;
+        self.upscale(image)
+    }
+
+    /// 模型版本（参与缓存键）。
+    fn version_id(&self) -> String {
+        "0.0.0".to_string()
+    }
+}
+
 /// 蒙版消费方：修图流程之外的消费接口（导出、统计、预览等）。
 pub trait MaskConsumer {
     /// 接收一张图的全部蒙版。
