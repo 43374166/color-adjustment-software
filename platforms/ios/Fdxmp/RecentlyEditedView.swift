@@ -37,9 +37,10 @@ struct RecentlyEditedView: View {
         .sheet(isPresented: $showPicker) {
             PhotoPickerView { assets in
                 showPicker = false
+                guard let first = assets.first else { return }
                 let project = ProjectStore.create(assetIds: assets.map(\.localIdentifier))
                 reload()
-                onOpenProject(project, assets)
+                onOpenProject(project, assets, first)
             }
             .ignoresSafeArea()
         }
