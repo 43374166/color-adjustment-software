@@ -1989,9 +1989,13 @@ final class EditorModel: ObservableObject {
             for preset in presets {
                 let source: RgbaBuffer
                 if preset.retouch.isActive {
+                    // 缩略图只跑轻量经典修图（240px 下 AI 修复 / 增强不可见，且会显著拖慢渲染）。
+                    var thumbParams = preset.retouch
+                    thumbParams.restore = 0
+                    thumbParams.blemish = 0
                     guard
                         let retouched = NativeCore.shared.retouchApply(
-                            paramsJson: preset.retouch.jsonString,
+                            paramsJson: thumbParams.jsonString,
                             buffer: small
                         )
                     else {
