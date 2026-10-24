@@ -14,6 +14,7 @@
 pub mod ai;
 pub mod cache;
 pub mod color;
+pub mod color_engine;
 pub mod decode;
 pub mod error;
 pub mod export;
@@ -28,6 +29,7 @@ pub mod preset;
 pub mod preview;
 pub mod retouch;
 pub mod smartmask;
+pub mod tone;
 pub mod white_balance;
 
 #[cfg(feature = "gpu")]

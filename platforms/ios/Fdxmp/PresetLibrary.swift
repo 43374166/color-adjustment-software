@@ -38,6 +38,14 @@ struct UserPreset: Identifiable, Equatable {
     var curves: [String: [[Float]]]
     /// 参数曲线：highlights / midtones / shadows / highlights_split / midtones_split。
     var parametric: [String: Float]
+    /// 相机校准（red_hue / red_sat / green_hue / green_sat / blue_hue / blue_sat / shadows_tint）。
+    var calibration: [String: Float] = [:]
+    /// 黑白模式（与 8 色带混色一起属于「颜色」分组）。
+    var blackWhite: Bool = false
+    /// 黑白混色：色带 key → 值。
+    var bwMix: [String: Float] = [:]
+    /// 点颜色样本（每个样本一个字典：lum / chroma / hue / hue_shift / …）。
+    var pointColors: [[String: Float]] = []
 
     /// 列表 / 缩略图用的稳定引用。
     var ref: String { "u:" + id }
@@ -91,6 +99,41 @@ struct UserPreset: Identifiable, Equatable {
                 "midtones_split": state.curves.parametric.midtonesSplit,
             ]
         }
+        // 相机校准 / 黑白 / 点颜色：都属于「颜色」分组（v1.7 新增面板）。
+        var calibration: [String: Float] = [:]
+        var blackWhite = false
+        var bwMix: [String: Float] = [:]
+        var pointColors: [[String: Float]] = []
+        if sections.contains(.color) {
+            calibration = [
+                "red_hue": state.calibration.redHue,
+                "red_sat": state.calibration.redSat,
+                "green_hue": state.calibration.greenHue,
+                "green_sat": state.calibration.greenSat,
+                "blue_hue": state.calibration.blueHue,
+                "blue_sat": state.calibration.blueSat,
+                "shadows_tint": state.calibration.shadowsTint,
+            ]
+            blackWhite = state.blackWhite
+            for kind in HslBandKind.allCases {
+                bwMix[kind.key] = state.bwMix[kind]
+            }
+            pointColors = state.pointColors.map { sample in
+                [
+                    "lum": sample.lum,
+                    "chroma": sample.chroma,
+                    "hue": sample.hue,
+                    "hue_shift": sample.hueShift,
+                    "sat_shift": sample.satShift,
+                    "lum_shift": sample.lumShift,
+                    "variance": sample.variance,
+                    "range": sample.range,
+                    "hue_range": sample.hueRange,
+                    "sat_range": sample.satRange,
+                    "lum_range": sample.lumRange,
+                ]
+            }
+        }
         return UserPreset(
             id: UUID().uuidString,
             name: name,
@@ -101,7 +144,11 @@ struct UserPreset: Identifiable, Equatable {
             hsl: hsl,
             grading: grading,
             curves: curves,
-            parametric: parametric
+            parametric: parametric,
+            calibration: calibration,
+            blackWhite: blackWhite,
+            bwMix: bwMix,
+            pointColors: pointColors
         )
     }
 
@@ -127,6 +174,54 @@ struct UserPreset: Identifiable, Equatable {
         if included.contains(.hsl) { state.hsl = decodedHsl }
         if included.contains(.grading) { state.grading = decodedGrading }
         if included.contains(.curves) { state.curves = decodedCurves }
+        // 相机校准 / 黑白 / 点颜色与「颜色」分组一起应用。
+        if included.contains(.color) {
+            state.calibration = decodedCalibration
+            state.blackWhite = blackWhite
+            state.bwMix = decodedBwMix
+            state.pointColors = decodedPointColors
+        }
+    }
+
+    /// 解码相机校准快照。
+    private var decodedCalibration: CalibrationState {
+        var result = CalibrationState()
+        result.redHue = calibration["red_hue"] ?? 0
+        result.redSat = calibration["red_sat"] ?? 0
+        result.greenHue = calibration["green_hue"] ?? 0
+        result.greenSat = calibration["green_sat"] ?? 0
+        result.blueHue = calibration["blue_hue"] ?? 0
+        result.blueSat = calibration["blue_sat"] ?? 0
+        result.shadowsTint = calibration["shadows_tint"] ?? 0
+        return result
+    }
+
+    private var decodedBwMix: BwMixState {
+        var result = BwMixState()
+        for kind in HslBandKind.allCases {
+            if let value = bwMix[kind.key] {
+                result[kind] = value
+            }
+        }
+        return result
+    }
+
+    private var decodedPointColors: [PointColorSample] {
+        pointColors.prefix(pointColorSampleLimit).map { raw in
+            PointColorSample(
+                lum: raw["lum"] ?? 0.5,
+                chroma: raw["chroma"] ?? 0.1,
+                hue: raw["hue"] ?? 0,
+                hueShift: raw["hue_shift"] ?? 0,
+                satShift: raw["sat_shift"] ?? 0,
+                lumShift: raw["lum_shift"] ?? 0,
+                variance: raw["variance"] ?? 0,
+                range: raw["range"] ?? 50,
+                hueRange: raw["hue_range"] ?? 50,
+                satRange: raw["sat_range"] ?? 50,
+                lumRange: raw["lum_range"] ?? 50
+            )
+        }
     }
 
     private func applyValues(to state: inout EditState, category: EditCategory) {
@@ -235,6 +330,11 @@ enum PresetLibraryCoding {
             let grading: [String: [Double]] = preset.grading.mapValues { zone in
                 zone.map { Double($0) }
             }
+            let calibration: [String: Double] = preset.calibration.mapValues { Double($0) }
+            let bwMix: [String: Double] = preset.bwMix.mapValues { Double($0) }
+            let pointColors: [[String: Double]] = preset.pointColors.map { sample in
+                sample.mapValues { Double($0) }
+            }
             var item: [String: Any] = [
                 "id": preset.id,
                 "name": preset.name,
@@ -247,6 +347,10 @@ enum PresetLibraryCoding {
             if !curves.isEmpty { item["curves"] = curves }
             if !hsl.isEmpty { item["hsl"] = hsl }
             if !grading.isEmpty { item["grading"] = grading }
+            if !calibration.isEmpty { item["calibration"] = calibration }
+            if preset.blackWhite { item["black_white"] = true }
+            if !bwMix.isEmpty { item["bw_mix"] = bwMix }
+            if !pointColors.isEmpty { item["point_colors"] = pointColors }
             return item
         }
         return jsonString(list)
@@ -307,6 +411,13 @@ enum PresetLibraryCoding {
                     curves[key] = rows.map { floats($0) }
                 }
             }
+            let calibration = floatDict(item["calibration"])
+            let blackWhite = item["black_white"] as? Bool ?? false
+            let bwMix = floatDict(item["bw_mix"])
+            var pointColors: [[String: Float]] = []
+            if let raw = item["point_colors"] as? [[String: Any]] {
+                pointColors = raw.map { floatDict($0) }
+            }
             return UserPreset(
                 id: id,
                 name: name,
@@ -317,7 +428,11 @@ enum PresetLibraryCoding {
                 hsl: hsl,
                 grading: grading,
                 curves: curves,
-                parametric: parametric
+                parametric: parametric,
+                calibration: calibration,
+                blackWhite: blackWhite,
+                bwMix: bwMix,
+                pointColors: pointColors
             )
         }
     }

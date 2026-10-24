@@ -1,0 +1,20 @@
+fdxmp
+Copyright (c) fdxmp contributors
+
+本产品包含改编自以下第三方项目的代码：
+
+1. LightCraft (https://github.com/storytold/lightcraft)
+   Copyright (c) LightCraft contributors
+   许可：MIT OR Apache-2.0（本项目按 MIT 条款使用）
+   改编范围：crates/color 的调色算子结构（crates/pipeline/src/colorops.rs、
+   crates/pipeline/src/tone.rs）、色彩科学基座（crates/color 的矩阵 / 色适应 / 色温 /
+   传递函数 / 样条）与相机校准矩阵构造，见 crates/color/README.md。
+
+2. 公开标准与公开论文（非代码来源，仅数学依据）：
+   IEC 61966-2-1（sRGB）、SMPTE ST 2084（PQ）、ITU-R BT.2100（HLG）、
+   CIE 色度学与 Bradford 色适应、Kim et al. 2002（普朗克轨迹近似）、
+   Björn Ottosson（OkLab / OkLCh）、Fritsch–Carlson（单调三次插值）。
+
+3. darktable (https://github.com/darktable-org/darktable)
+   本项目未复制 darktable 的任何代码或数据文件（其许可为 GPLv3，与本项目 MIT 不兼容）。
+   仅在算法方向与模块划分上参考，实现按公开资料重写，见 docs/COLOR_ENGINE_PLAN.md。

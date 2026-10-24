@@ -37,6 +37,19 @@ final class NativeCore {
         return String(cString: message)
     }
 
+    /// 8bit sRGB → OkLCh（L、C、色相弧度）。
+    ///
+    /// "点颜色"取色器用：结果直接就是 `PointColorSample` 的 `lum` / `chroma` / `hue`，
+    /// 与调色段共用核心的同一套矩阵（失败返回 nil）。
+    func oklch(r: UInt8, g: UInt8, b: UInt8) -> (l: Float, c: Float, h: Float)? {
+        var out: [Float] = [0, 0, 0]
+        let code = out.withUnsafeMutableBufferPointer { buffer -> Int32 in
+            fdxmp_color_oklch_from_srgb8(r, g, b, buffer.baseAddress)
+        }
+        guard code == 0 else { return nil }
+        return (out[0], out[1], out[2])
+    }
+
     /// 对内存 RGBA8 图像应用 `EditParams` JSON，返回渲染后的像素。
     ///
     /// 阻塞调用，必须在工作线程执行；失败返回 nil（原因见 `lastError()`）。

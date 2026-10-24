@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/core",
+    "crates/color",
     "crates/ffi",
     "crates/cli",
     "crates/win_ui",
@@ -20,6 +21,7 @@ authors = ["fdxmp contributors"]
 [workspace.dependencies]
 # 内部 crate
 fdxmp-core = { path = "crates/core", version = "1.6.1" }
+fdxmp-color = { path = "crates/color", version = "1.6.1" }
 
 # 序列化与归档（技术选型：serde + serde_json + zip）
 serde = { version = "1.0.229", features = ["derive"] }

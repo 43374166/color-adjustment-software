@@ -29,11 +29,17 @@ use crate::params::{eval_curve, EditParams, MaskParams, ToneCurve};
 /// 源图编号（用于判断渲染目标是否需要重建）。
 static SOURCE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// 标量参数数量（与 WGSL `Params.v` 对齐，27 个 vec4）。
-pub const PARAM_FLOATS: usize = 108;
+/// 标量参数数量（与 WGSL `Params.v` 对齐，49 个 vec4；见文件末尾的 [`slot`] 表）。
+pub const PARAM_FLOATS: usize = 196;
 
 /// 曲线 LUT 条目数。
 pub const CURVE_ENTRIES: usize = 256;
+
+/// 电影曲线 LUT 的 `vec4` 数（4 × 1024 = 4096 项，与 `fdxmp_color::tone::LUT_N` 一致）。
+pub const TONE_ENTRIES: usize = 1024;
+
+/// 电影曲线 LUT 的 float 数。
+pub const TONE_LUT_FLOATS: usize = TONE_ENTRIES * 4;
 
 /// 模糊半径（像素，9~13 抽头）。
 pub const BLUR_RADIUS: f32 = 4.0;
@@ -159,11 +165,41 @@ pub mod slot {
     pub const VIGNETTE_FEATHER: usize = 106;
     /// 暗角中点 0..=100（越小压暗范围越向中心扩展）。
     pub const VIGNETTE_MIDPOINT: usize = 107;
+
+    /// 8 色带中心（OkLCh 色相，弧度；108..115，CPU 侧换算好，GPU 不做 HSV→OkLCh）。
+    pub const BAND_HUES: usize = 108;
+    /// 黑白模式开关（> 0.5 = 黑白）。
+    pub const BW_ENABLE: usize = 116;
+    /// 黑白混色（8 带，-100..=100；117..124）。
+    pub const BW_MIX: usize = 117;
+    /// 相机校准启用开关（> 0.5）。
+    pub const CALIB_ENABLE: usize = 125;
+    /// 校准基色矩阵（行主序 3×3；126..134）。
+    pub const CALIB_MATRIX: usize = 126;
+    /// 校准阴影色调（-1..=1）。
+    pub const CALIB_TINT: usize = 135;
+    /// 点颜色样本数（0..=4）。
+    pub const POINT_COUNT: usize = 136;
+    /// 点颜色样本起始下标（每个 [`fdxmp_color::ops::POINT_WORDS`] 个 float；137..176）。
+    pub const POINT_START: usize = 137;
+    /// 分级色轮向量（阴影 / 中间调 / 高光 / 全局 各 `(a, b, lum)`；177..188）。
+    pub const GRADE_VEC: usize = 177;
+    /// 分级分区中心（OkLab 明度）。
+    pub const GRADE_M: usize = 189;
+    /// 分级过渡宽度。
+    pub const GRADE_WIDTH: usize = 190;
+    /// 肤色色相（OkLCh 弧度；自然饱和度的保护中心）。
+    pub const SKIN_HUE: usize = 191;
+    /// 调色段是否有内容（0 = 整段跳过；由 CPU 侧的统一实现判断）。
+    pub const COLOR_ACTIVE: usize = 192;
+
+    /// 色调段是否有内容（0 = 整段跳过；对比度 / 高光 / 阴影 / 白色 / 黑色全为 0 时）。
+    pub const TONE_ACTIVE: usize = 193;
 }
 
-/// 把 `EditParams` 打成 uniform 数组（100 + 1024 floats）。
+/// 把 `EditParams` 打成 uniform 数组（[`PARAM_FLOATS`] + 1024 floats）。
 pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
-    let mut data = vec![0.0f32; PARAM_FLOATS + CURVE_ENTRIES * 4];
+    let mut data = vec![0.0f32; PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS];
     let light = &params.light;
     let color = &params.color;
     let effects = &params.effects;
@@ -246,6 +282,8 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
     data[slot::WIDTH] = width as f32;
     data[slot::HEIGHT] = height as f32;
     data[slot::MASK_MODE] = 0.0;
+    // 调色段（8 色带中心 / 黑白 / 校准 / 点颜色 / 分级向量）：与 CPU `ColorStage` 同一份参数。
+    crate::color_engine::pack_color_slots(&mut data, params);
     pack_geometry(&mut data, &crate::geometry::IDENTITY, false);
     data[slot::DETAIL_BLUR] = 0.0;
     data[slot::MASK_SCALE_X] = 1.0;
@@ -267,6 +305,14 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
         data[curve_base + index * 4 + 3] = 1.0;
     }
 
+    // 电影曲线 LUT（色调段：对比度 / 白色 / 黑色），与 CPU `ToneStage` 同一张表。
+    let tone_lut_base = curve_base + CURVE_ENTRIES * 4;
+    let tone = crate::tone::ToneStage::from_params(params);
+    for (index, value) in tone.lut().iter().enumerate() {
+        data[tone_lut_base + index] = *value;
+    }
+    data[slot::TONE_ACTIVE] = if tone.is_identity() { 0.0 } else { 1.0 };
+
     data
 }
 
@@ -281,12 +327,31 @@ pub fn pack_geometry(data: &mut [f32], matrix: &Mat3, active: bool) {
     data[slot::GEOMETRY_ACTIVE] = if active { 1.0 } else { 0.0 };
 }
 
-/// 单条曲线的 256 项 LUT（线性插值，严格过控制点）。
+/// 单条曲线的 256 项 LUT（单调三次插值，严格过控制点）。
+///
+/// 插值由 `fdxmp-color` 的 [`fdxmp_color::MonotoneCurve`] 提供（与 CPU 路径、预设导入同一实现）；
+/// 控制点退化（少于两个点 / x 不递增）时回退到 [`crate::params::eval_curve`]。
 pub fn build_curve_lut(curve: &ToneCurve) -> [f32; CURVE_ENTRIES] {
     let mut lut = [0.0f32; CURVE_ENTRIES];
-    for (index, value) in lut.iter_mut().enumerate() {
-        let x = index as f32 / (CURVE_ENTRIES - 1) as f32;
-        *value = eval_curve(&curve.points, x);
+    let points: Vec<(f64, f64)> = curve
+        .points
+        .iter()
+        .map(|point| (point.x as f64, point.y as f64))
+        .collect();
+    match fdxmp_color::MonotoneCurve::new(&points) {
+        Some(spline) => {
+            let (first, last) = (points[0].0, points[points.len() - 1].0);
+            for (index, value) in lut.iter_mut().enumerate() {
+                let x = index as f64 / (CURVE_ENTRIES - 1) as f64;
+                *value = spline.eval(x.clamp(first, last)).clamp(0.0, 1.0) as f32;
+            }
+        }
+        None => {
+            for (index, value) in lut.iter_mut().enumerate() {
+                let x = index as f32 / (CURVE_ENTRIES - 1) as f32;
+                *value = eval_curve(&curve.points, x);
+            }
+        }
     }
     lut
 }
@@ -572,7 +637,8 @@ impl ColorPipeline {
 
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fdxmp-params"),
-            size: ((PARAM_FLOATS + CURVE_ENTRIES * 4) * std::mem::size_of::<f32>()) as u64,
+            size: ((PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS)
+                * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -2382,6 +2448,9 @@ fn needs_big_blur(params: &EditParams) -> bool {
         || params.detail.sharpen.amount > 0.0
         || params.detail.noise.luminance > 0.0
         || params.detail.noise.color > 0.0
+        // 高光 / 阴影的权重取自大模糊基底层（色调段的一部分）。
+        || params.light.highlights.abs() > 0.0
+        || params.light.shadows.abs() > 0.0
 }
 
 /// 全局 + 任一蒙版是否需要小半径模糊（叠加显示打包 `DETAIL_BLUR` 用）。
@@ -2531,13 +2600,23 @@ mod tests {
         };
 
         let packed = pack_params(&params, 800, 600);
-        assert_eq!(packed.len(), PARAM_FLOATS + CURVE_ENTRIES * 4);
+        assert_eq!(
+            packed.len(),
+            PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS
+        );
         assert_eq!(packed[slot::EXPOSURE], 1.25);
         assert_eq!(packed[slot::SATURATION], -30.0);
         assert_eq!(packed[slot::HSL_START + 5 * 3], 40.0);
         assert_eq!(packed[slot::GRADING_START], 200.0);
         assert_eq!(packed[slot::WIDTH], 800.0);
         assert_eq!(packed[slot::MASK_MODE], 0.0);
+        // 色调段：LUT 尺寸必须与色彩引擎一致（4096 项 = 1024 个 vec4），
+        // 中性参数下整段关闭（0）、曲线是恒等（首尾与中段都对得上）。
+        assert_eq!(TONE_LUT_FLOATS, fdxmp_color::tone::LUT_N);
+        assert_eq!(packed[slot::TONE_ACTIVE], 0.0);
+        let tone_base = PARAM_FLOATS + CURVE_ENTRIES * 4;
+        assert!(packed[tone_base] < 0.001, "{}", packed[tone_base]);
+        assert!((packed[tone_base + fdxmp_color::tone::LUT_N - 1] - 1.0).abs() < 0.02);
     }
 
     #[test]

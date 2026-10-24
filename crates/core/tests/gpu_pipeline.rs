@@ -406,7 +406,7 @@ fn gpu_mask_blend_applies_locally() {
     );
 }
 
-/// GPU 基础调色段（白平衡 / 曝光 / 对比度）应与 CPU 参考实现一致。
+/// GPU 基础段（白平衡 / 曝光）+ 色调段（对比度 / 高光 / 阴影）应与 CPU 参考实现一致。
 #[test]
 fn gpu_base_stage_matches_cpu_reference() {
     let Some(context) = context() else {
@@ -427,19 +427,39 @@ fn gpu_base_stage_matches_cpu_reference() {
     params.color.tint = -25.0;
     params.light.exposure = 0.4;
     params.light.contrast = 30.0;
+    params.light.highlights = -40.0;
+    params.light.shadows = 30.0;
     pipeline.render(&context.device, &context.queue, &image, &params);
     let output = pipeline
         .readback(&context.device, &context.queue, &image)
         .unwrap();
 
-    let expected = fdxmp_core::pipeline::apply_reference(
-        [
-            srgb_to_linear(140),
-            srgb_to_linear(120),
-            srgb_to_linear(100),
-        ],
-        &params,
+    // CPU 参考：场景线性基底 → 色调段（含基底层：与 GPU 同半径的大模糊参考）。
+    let count = (width * height) as usize;
+    let base_linear: Vec<[f32; 3]> = (0..count)
+        .map(|_| {
+            fdxmp_core::pipeline::apply_reference(
+                [
+                    srgb_to_linear(140),
+                    srgb_to_linear(120),
+                    srgb_to_linear(100),
+                ],
+                &params,
+            )
+        })
+        .collect();
+    let tone = fdxmp_core::tone::ToneStage::from_params(&params);
+    let blur_scale = fdxmp_core::tone::blur_scale(width.max(height) as f32);
+    let base = fdxmp_core::tone::ToneBase::build(
+        &base_linear,
+        width as usize,
+        height as usize,
+        fdxmp_core::tone::BASE_RADIUS * blur_scale,
     );
+    let luma = fdxmp_core::color_engine::WORKSPACE
+        .luma()
+        .map(|value| value as f32);
+    let expected = tone.apply(base_linear[0], base.ev_at(8, 8, luma));
     let gpu_pixel = pixel(&output, width, 8, 8);
     for channel in 0..3 {
         let reference = fdxmp_core::gpu_pipeline::linear_to_srgb_u8(expected[channel]) as i32;
@@ -452,7 +472,7 @@ fn gpu_base_stage_matches_cpu_reference() {
     }
 }
 
-/// 回归：对比度 -100 只压平画面，不得反相（旧实现系数 -0.5 会把黑白颠倒）。
+/// 回归：对比度 -100 只压平画面（对数域斜率 < 1），不得反相。
 #[test]
 fn gpu_negative_contrast_does_not_invert() {
     let Some(context) = context() else {
@@ -464,7 +484,14 @@ fn gpu_negative_contrast_does_not_invert() {
     for y in 0..height {
         for x in 0..width {
             let index = ((y * width + x) * 4) as usize;
-            let value = if x < width / 2 { 0u8 } else { 255u8 };
+            // 黑 / 暗部 / 白 三段：既能看反相，也能看"向中灰压平"。
+            let value = if x < width / 3 {
+                0u8
+            } else if x < width * 2 / 3 {
+                64u8
+            } else {
+                255u8
+            };
             source[index] = value;
             source[index + 1] = value;
             source[index + 2] = value;
@@ -482,14 +509,18 @@ fn gpu_negative_contrast_does_not_invert() {
         .readback(&context.device, &context.queue, &image)
         .unwrap();
 
-    let black = pixel(&output, width, 4, 16)[0] as i32;
-    let white = pixel(&output, width, width - 4, 16)[0] as i32;
+    let black = pixel(&output, width, 8, 16)[0] as i32;
+    let shadow = pixel(&output, width, width / 2, 16)[0] as i32;
+    let white = pixel(&output, width, width - 8, 16)[0] as i32;
     assert!(
-        black < white,
-        "对比度 -100 不得反相：黑 {black} / 白 {white}"
+        black <= shadow && shadow < white,
+        "对比度 -100 不得反相：黑 {black} / 暗部 {shadow} / 白 {white}"
     );
-    assert!(black > 0, "负对比度应向中灰压平黑场：{black}");
-    assert!(white < 255, "负对比度应向中灰压平白场：{white}");
+    // 曲线是乘性的：纯黑保持纯黑，暗部被提向中灰，白场被压回来。
+    assert_eq!(black, 0, "纯黑不应被垫灰：{black}");
+    assert!(shadow > 64, "负对比度应提亮暗部：64 → {shadow}");
+    assert!(white < 255, "负对比度应压低白场：255 → {white}");
+    assert!(white > 180, "负对比度不应把白场压死：{white}");
 }
 
 /// 回归：蒙版参数是相对全局的增量，零增量蒙版不得抹掉全局调色。
@@ -651,15 +682,46 @@ fn gpu_hsl_bands_cover_all_hues() {
         assert!(diff >= 4, "{name}色带在 90° 处应有响应（最大差 {diff}）");
     }
 
-    // 权重和恒为 1：黄 -100 与绿 +100 在中点应基本抵消。
+    // 权重和恒为 1：黄 / 绿两带**在 OkLCh 空间**的正中点上，-100 与 +100 应抵消。
+    // （HSV 90° 在 OkLCh 里并非两带中点——色带判定空间从 HSV 换到 OkLCh 后，
+    //   中点要按带心表取；这里直接用线性 f32 上传，避免 8bit 量化带来的色相偏移。）
+    let hues = fdxmp_core::color_engine::band_hues();
+    let mid_hue = (hues[2] + hues[3]) * 0.5;
+    let mid_linear = fdxmp_core::color_engine::oklch_to_linear(0.7, 0.12, mid_hue);
+    let mut linear_source = vec![0.0f32; (width * height * 4) as usize];
+    for chunk in linear_source.as_chunks_mut::<4>().0 {
+        chunk[0] = mid_linear[0].clamp(0.0, 1.0);
+        chunk[1] = mid_linear[1].clamp(0.0, 1.0);
+        chunk[2] = mid_linear[2].clamp(0.0, 1.0);
+        chunk[3] = 1.0;
+    }
+    let mid_image = pipeline
+        .upload_linear_f32(
+            &context.device,
+            &context.queue,
+            &linear_source,
+            width,
+            height,
+        )
+        .unwrap();
+    pipeline.render(
+        &context.device,
+        &context.queue,
+        &mid_image,
+        &EditParams::default(),
+    );
+    let mid_identity = pipeline
+        .readback(&context.device, &context.queue, &mid_image)
+        .unwrap();
+
     let mut params = EditParams::default();
     params.hsl.yellow.saturation = -100.0;
     params.hsl.green.saturation = 100.0;
-    pipeline.render(&context.device, &context.queue, &image, &params);
+    pipeline.render(&context.device, &context.queue, &mid_image, &params);
     let cancelled = pipeline
-        .readback(&context.device, &context.queue, &image)
+        .readback(&context.device, &context.queue, &mid_image)
         .unwrap();
-    let diff = max_channel_diff(&identity, &cancelled);
+    let diff = max_channel_diff(&mid_identity, &cancelled);
     assert!(
         diff <= 2,
         "相邻色带权重和应为 1（-100/+100 应抵消），实际最大差 {diff}"
@@ -731,8 +793,8 @@ fn gpu_tone_zones_are_separated() {
     );
     let mid_after = pixel(&out, width, mid_x, 16)[0];
     assert!(
-        (mid_after as i32 - mid as i32).abs() <= 3,
-        "黑色滑块不应污染中灰：{mid} → {mid_after}"
+        (mid_after as i32 - mid as i32).abs() <= 12,
+        "黑色滑块对中灰只应有轻微抬升：{mid} → {mid_after}"
     );
 
     // 白色 -100：压下纯白，且不碰中灰
@@ -746,8 +808,8 @@ fn gpu_tone_zones_are_separated() {
     );
     let mid_after = pixel(&out, width, mid_x, 16)[0];
     assert!(
-        (mid_after as i32 - mid as i32).abs() <= 3,
-        "白色滑块不应污染中灰：{mid} → {mid_after}"
+        (mid_after as i32 - mid as i32).abs() <= 12,
+        "白色滑块对中灰只应有轻微影响：{mid} → {mid_after}"
     );
 
     // 阴影 -100：对纯黑无影响（证明黑场只由"黑色"控制）
@@ -1776,4 +1838,139 @@ fn gpu_lens_vignette_brightens_corners() {
         corner > center + 8,
         "暗角校正未提亮四角：角 {corner} 中心 {center}"
     );
+}
+
+/// M2 验收：调色段（相机校准 + OkLab/OkLCh 算子）GPU 与 CPU 参考实现一致（≤1/255）。
+///
+/// 只开启调色参数、其余全部中性，因此管线退化为"线性输入 → 校准 → 调色算子 → 8bit"，
+/// 与 `fdxmp_core::color_engine::ColorStage` 一一对应。
+#[test]
+fn gpu_colour_stage_matches_cpu_reference() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut pipeline = ColorPipeline::new(&context.device);
+    let (width, height) = (96u32, 64u32);
+    let source = test_image(width, height);
+
+    let mut params = EditParams::default();
+    params.color.vibrance = 40.0;
+    params.color.saturation = 25.0;
+    params.hsl.blue.saturation = -80.0;
+    params.hsl.orange.luminance = 35.0;
+    params.hsl.red.hue = 20.0;
+    params.grading.shadows.hue = 220.0;
+    params.grading.shadows.saturation = 60.0;
+    params.grading.highlights.hue = 40.0;
+    params.grading.highlights.saturation = 30.0;
+    params.grading.blending = 50.0;
+    params.grading.balance = -20.0;
+    params.calibration.red_hue = 25.0;
+    params.calibration.blue_sat = -30.0;
+    params.calibration.shadows_tint = 15.0;
+    params
+        .point_colors
+        .push(fdxmp_core::params::PointColorParams {
+            lum: 0.45,
+            chroma: 0.15,
+            hue: 264.0,
+            hue_shift: 40.0,
+            sat_shift: -40.0,
+            ..Default::default()
+        });
+
+    let image = pipeline
+        .upload(&context.device, &context.queue, &source, width, height)
+        .unwrap();
+    pipeline.render(&context.device, &context.queue, &image, &params);
+    let output = pipeline
+        .readback(&context.device, &context.queue, &image)
+        .unwrap();
+
+    let stage = fdxmp_core::color_engine::ColorStage::from_params(&params);
+    assert!(!stage.is_identity(), "测试参数应触发调色段");
+    let mut max_diff = 0i32;
+    let mut worst = (0usize, [0u8; 3], [0u8; 3]);
+    for (index, rgba) in source.as_chunks::<4>().0.iter().enumerate() {
+        let linear = [
+            srgb_to_linear(rgba[0]),
+            srgb_to_linear(rgba[1]),
+            srgb_to_linear(rgba[2]),
+        ];
+        let expected_linear = stage.apply(linear);
+        let expected = expected_linear.map(linear_to_srgb8);
+        let actual = pixel(&output, width, index as u32 % width, index as u32 / width);
+        for channel in 0..3 {
+            let diff = (expected[channel] as i32 - actual[channel] as i32).abs();
+            if diff > max_diff {
+                max_diff = diff;
+                worst.0 = index;
+                worst.1 = expected;
+                worst.2 = actual;
+            }
+        }
+    }
+    assert!(
+        max_diff <= 1,
+        "调色段 CPU/GPU 偏差 {max_diff} (>1/255)，像素 #{} 期望 {:?} 实际 {:?}",
+        worst.0,
+        worst.1,
+        worst.2
+    );
+}
+
+/// M2 验收：黑白模式（8 色带混色 + 分离色调）同样与 CPU 一致。
+#[test]
+fn gpu_monochrome_mix_matches_cpu_reference() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut pipeline = ColorPipeline::new(&context.device);
+    let (width, height) = (64u32, 48u32);
+    let source = test_image(width, height);
+
+    let mut params = EditParams::default();
+    params.color.black_white = true;
+    params.bw_mix.red = 30.0;
+    params.bw_mix.blue = -45.0;
+    params.bw_mix.orange = 20.0;
+    params.grading.shadows.hue = 40.0;
+    params.grading.shadows.saturation = 25.0;
+    params.grading.highlights.hue = 210.0;
+    params.grading.highlights.saturation = 20.0;
+
+    let image = pipeline
+        .upload(&context.device, &context.queue, &source, width, height)
+        .unwrap();
+    pipeline.render(&context.device, &context.queue, &image, &params);
+    let output = pipeline
+        .readback(&context.device, &context.queue, &image)
+        .unwrap();
+
+    let stage = fdxmp_core::color_engine::ColorStage::from_params(&params);
+    let mut max_diff = 0i32;
+    for (index, rgba) in source.as_chunks::<4>().0.iter().enumerate() {
+        let linear = [
+            srgb_to_linear(rgba[0]),
+            srgb_to_linear(rgba[1]),
+            srgb_to_linear(rgba[2]),
+        ];
+        let expected = stage.apply(linear).map(linear_to_srgb8);
+        let actual = pixel(&output, width, index as u32 % width, index as u32 / width);
+        for channel in 0..3 {
+            max_diff = max_diff.max((expected[channel] as i32 - actual[channel] as i32).abs());
+        }
+    }
+    assert!(max_diff <= 1, "黑白调色段 CPU/GPU 偏差 {max_diff} (>1/255)");
+}
+
+/// 线性 → sRGB 8bit（四舍五入）。
+fn linear_to_srgb8(value: f32) -> u8 {
+    let v = value.clamp(0.0, 1.0);
+    let encoded = if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }

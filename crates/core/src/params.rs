@@ -27,6 +27,12 @@ pub struct EditParams {
     pub hsl: HslParams,
     /// 颜色分级。
     pub grading: ColorGradingParams,
+    /// 相机校准（Calibration 面板：三基色色相 / 饱和度 + 阴影色调）。
+    pub calibration: CalibrationParams,
+    /// 黑白混色（8 色带，仅在黑白模式下生效）。
+    pub bw_mix: BwMixParams,
+    /// 点颜色采样（Point Color，最多 4 个，与 GPU uniform 槽位一致）。
+    pub point_colors: Vec<PointColorParams>,
     /// 细节（锐化 / 降噪）。
     pub detail: DetailParams,
     /// 镜头校正。
@@ -51,6 +57,9 @@ impl Default for EditParams {
             curves: CurveParams::default(),
             hsl: HslParams::default(),
             grading: ColorGradingParams::default(),
+            calibration: CalibrationParams::default(),
+            bw_mix: BwMixParams::default(),
+            point_colors: Vec::new(),
             detail: DetailParams::default(),
             lens: LensParams::default(),
             transform: TransformParams::default(),
@@ -86,6 +95,9 @@ pub struct ColorParams {
     /// 色温，-100..=100（相对值：0 = 5500K；暖端 1 单位 = 90K、冷端 23K，
     /// 与 XMP 导入的开尔文映射共用同一换算，见 `white_balance` 模块）。
     pub temperature: f32,
+    /// 黑白模式：打开后按 `bw_mix` 的 8 色带权重转单色（Lightroom 的 B&W 处理方式），
+    /// 色相 / 饱和度混色与点颜色在该模式下不生效。
+    pub black_white: bool,
     /// 色调，-100..=100（正 = 洋红，负 = 绿色）。
     pub tint: f32,
     /// 自然饱和度，-100..=100。
@@ -451,6 +463,158 @@ pub struct ColorGradingParams {
     pub blending: f32,
     /// 平衡，-100..=100。
     pub balance: f32,
+}
+
+/// 相机校准（Lightroom 的 Calibration 面板）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CalibrationParams {
+    /// 红原色色相，-100..=100。
+    pub red_hue: f32,
+    /// 红原色饱和度，-100..=100。
+    pub red_sat: f32,
+    /// 绿原色色相，-100..=100。
+    pub green_hue: f32,
+    /// 绿原色饱和度，-100..=100。
+    pub green_sat: f32,
+    /// 蓝原色色相，-100..=100。
+    pub blue_hue: f32,
+    /// 蓝原色饱和度，-100..=100。
+    pub blue_sat: f32,
+    /// 阴影色调，-100..=100（正 = 洋红，负 = 绿）。
+    pub shadows_tint: f32,
+}
+
+impl CalibrationParams {
+    /// 是否全部为默认值（默认时 GPU / CPU 都跳过校准段）。
+    pub fn is_identity(&self) -> bool {
+        self.red_hue == 0.0
+            && self.red_sat == 0.0
+            && self.green_hue == 0.0
+            && self.green_sat == 0.0
+            && self.blue_hue == 0.0
+            && self.blue_sat == 0.0
+            && self.shadows_tint == 0.0
+    }
+
+    /// 转成色彩引擎的校准参数。
+    pub fn to_engine(&self) -> fdxmp_color::Calibration {
+        fdxmp_color::Calibration {
+            red_hue: self.red_hue as f64,
+            red_sat: self.red_sat as f64,
+            green_hue: self.green_hue as f64,
+            green_sat: self.green_sat as f64,
+            blue_hue: self.blue_hue as f64,
+            blue_sat: self.blue_sat as f64,
+            shadows_tint: self.shadows_tint as f64,
+        }
+    }
+}
+
+/// 黑白混色（8 色带，-100..=100；正值提亮该色相）。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct BwMixParams {
+    /// 红。
+    pub red: f32,
+    /// 橙。
+    pub orange: f32,
+    /// 黄。
+    pub yellow: f32,
+    /// 绿。
+    pub green: f32,
+    /// 青。
+    pub aqua: f32,
+    /// 蓝。
+    pub blue: f32,
+    /// 紫。
+    pub purple: f32,
+    /// 洋红。
+    pub magenta: f32,
+}
+
+impl BwMixParams {
+    /// 按 [`ColorBand`] 读取。
+    pub fn band(&self, band: ColorBand) -> f32 {
+        match band {
+            ColorBand::Red => self.red,
+            ColorBand::Orange => self.orange,
+            ColorBand::Yellow => self.yellow,
+            ColorBand::Green => self.green,
+            ColorBand::Aqua => self.aqua,
+            ColorBand::Blue => self.blue,
+            ColorBand::Purple => self.purple,
+            ColorBand::Magenta => self.magenta,
+        }
+    }
+
+    /// 是否全部为默认值。
+    pub fn is_neutral(&self) -> bool {
+        ColorBand::ALL.iter().all(|band| self.band(*band) == 0.0)
+    }
+
+    /// 按带序展开成数组。
+    pub fn bands(&self) -> [f32; 8] {
+        ColorBand::ALL.map(|band| self.band(band))
+    }
+}
+
+/// 点颜色采样（Point Color）。
+///
+/// 颜色字段（`lum` / `chroma` / `hue`）在选中时由取样写入，是 OkLab 值；
+/// 其余是调整量与范围，语义与 LightCraft / Lightroom 的点颜色一致。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct PointColorParams {
+    /// 采样点的 OkLab 明度。
+    pub lum: f32,
+    /// 采样点的 OkLab 彩度。
+    pub chroma: f32,
+    /// 采样点的 OkLab 色相（度）。
+    pub hue: f32,
+    /// 色相偏移，-100..=100。
+    pub hue_shift: f32,
+    /// 饱和度偏移，-100..=100。
+    pub sat_shift: f32,
+    /// 明度偏移，-100..=100。
+    pub lum_shift: f32,
+    /// 向采样点压缩（负）/ 扩散（正），-100..=100。
+    pub variance: f32,
+    /// 总范围，0..=100。
+    pub range: f32,
+    /// 色相范围，0..=100。
+    pub hue_range: f32,
+    /// 饱和度范围，0..=100。
+    pub sat_range: f32,
+    /// 明度范围，0..=100。
+    pub lum_range: f32,
+}
+
+impl PointColorParams {
+    /// 是否中性（不影响画面）。
+    pub fn is_neutral(&self) -> bool {
+        self.hue_shift == 0.0
+            && self.sat_shift == 0.0
+            && self.lum_shift == 0.0
+            && self.variance == 0.0
+    }
+
+    /// 转成色彩引擎的采样结构。
+    pub fn to_engine(&self) -> fdxmp_color::PointColor {
+        fdxmp_color::PointColor {
+            lum: self.lum as f64,
+            chroma: self.chroma as f64,
+            hue: self.hue as f64,
+            hue_shift: self.hue_shift as f64,
+            sat_shift: self.sat_shift as f64,
+            lum_shift: self.lum_shift as f64,
+            variance: self.variance as f64,
+            range: self.range as f64,
+            hue_range: self.hue_range as f64,
+            sat_range: self.sat_range as f64,
+            lum_range: self.lum_range as f64,
+        }
+    }
 }
 
 /// 锐化。

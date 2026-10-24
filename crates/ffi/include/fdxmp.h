@@ -31,6 +31,17 @@ char *fdxmp_last_error_message(void);
 void fdxmp_string_free(char *ptr);
 void fdxmp_bytes_free(uint8_t *ptr, size_t len);
 
+/* ---- 色彩工具 ---- */
+
+/**
+ * 8bit sRGB → OkLCh（与调色段同一套矩阵）。
+ *
+ * "点颜色"取色器用：结果直接写入 PointColorParams 的 lum / chroma / hue 字段
+ * （hue 为弧度）。out 指向至少 3 个 float 的可写数组。
+ * 返回 FDXMP_OK / FDXMP_ERR。
+ */
+int32_t fdxmp_color_oklch_from_srgb8(uint8_t r, uint8_t g, uint8_t b, float *out);
+
 /* ---- 引擎 ---- */
 
 void *fdxmp_engine_new(void);

@@ -112,6 +112,26 @@ pub extern "C" fn fdxmp_version() -> *const c_char {
     version_cstring().as_ptr()
 }
 
+/// 8bit sRGB → OkLCh（`out` 指向至少 3 个 float：L、C、色相弧度）。
+///
+/// "点颜色"取色器用：样本直接是 `PointColorParams` 的 `lum` / `chroma` / `hue`，
+/// 与调色段共用同一套色彩矩阵（四端一致）。
+///
+/// # Safety
+///
+/// `out` 必须指向可写、长度 ≥ 3 的 `float` 数组；为 NULL 时返回错误。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_color_oklch_from_srgb8(r: u8, g: u8, b: u8, out: *mut f32) -> i32 {
+    if out.is_null() {
+        set_last_error("参数 `out` 为空指针");
+        return FDXMP_ERR;
+    }
+    let lch = fdxmp_core::color_engine::oklch_from_srgb8(r, g, b);
+    // SAFETY: 调用方保证 out 指向 ≥3 个 float 的可写数组（见函数文档）。
+    std::ptr::copy_nonoverlapping(lch.as_ptr(), out, 3);
+    FDXMP_OK
+}
+
 /// 返回最近一次错误的 UTF-8 消息（调用方用 `fdxmp_string_free` 释放）；无错误返回 NULL。
 #[no_mangle]
 pub extern "C" fn fdxmp_last_error_message() -> *mut c_char {
@@ -2360,15 +2380,7 @@ mod tests {
         let mut height = 0u32;
         let mut len = 0usize;
         let out = unsafe {
-            fdxmp_retouch_upscale(
-                rgba.as_ptr(),
-                8,
-                8,
-                0,
-                &mut width,
-                &mut height,
-                &mut len,
-            )
+            fdxmp_retouch_upscale(rgba.as_ptr(), 8, 8, 0, &mut width, &mut height, &mut len)
         };
         assert!(out.is_null());
     }

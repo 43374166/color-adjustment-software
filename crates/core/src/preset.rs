@@ -15,7 +15,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::error::{FdxmpError, Result};
-use crate::params::EditParams;
+use crate::params::{ColorBand, EditParams};
 
 /// 预设格式版本，写入 `schema_version` 字段。
 pub const PRESET_SCHEMA_VERSION: u32 = 1;
@@ -171,8 +171,8 @@ impl PresetFile {
     /// 导入 Lightroom XMP 预设。
     ///
     /// 解析 `crs:` 属性（Lightroom 经典版 / Camera Raw 的 XMP 预设），
-    /// 映射到本项目的参数模型。支持主滑块与常用细节参数；
-    /// 曲线 / HSL / 颜色分级的 XMP 序列化格式复杂，暂不导入（记录在导入报告里）。
+    /// 映射到本项目的参数模型：主滑块、细节、HSL 八色带、颜色分级 / 分离色调、
+    /// 相机校准与黑白混色；点颜色与曲线（`ToneCurvePV2012` 的序列化格式复杂）暂不导入。
     pub fn from_lightroom_xmp(xmp: &str) -> Result<Self> {
         let mut params = EditParams::default();
         let mut imported = 0usize;
@@ -216,7 +216,7 @@ impl PresetFile {
                 "ColorNoiseReductionSmoothness" => {
                     set(&mut params.detail.noise.color_smoothness, number)
                 }
-                _ => false,
+                _ => apply_xmp_extended(&mut params, target, number),
             };
             if applied {
                 imported += 1;
@@ -241,6 +241,117 @@ impl PresetFile {
 fn set(target: &mut f32, value: f32) -> bool {
     *target = value;
     true
+}
+
+/// Lightroom 的 8 个色带名 → 本项目的 [`ColorBand`]。
+const XMP_BANDS: [(&str, ColorBand); 8] = [
+    ("Red", ColorBand::Red),
+    ("Orange", ColorBand::Orange),
+    ("Yellow", ColorBand::Yellow),
+    ("Green", ColorBand::Green),
+    ("Aqua", ColorBand::Aqua),
+    ("Blue", ColorBand::Blue),
+    ("Purple", ColorBand::Purple),
+    ("Magenta", ColorBand::Magenta),
+];
+
+/// 扩展字段：HSL 八色带、颜色分级 / 分离色调、相机校准、黑白。
+///
+/// 命名与 Lightroom 的 `crs:` 字段一致（`HueAdjustment<Band>`、`SaturationAdjustment<Band>`、
+/// `LuminanceAdjustment<Band>`、`ColorGrade*`、`SplitToning*`、
+/// `RedHue` / `RedSaturation` 等、`GrayMixer<Band>`、`ConvertToGrayscale`）。
+fn apply_xmp_extended(params: &mut EditParams, target: &str, number: f32) -> bool {
+    // HSL：前缀 + 色带名。
+    for (prefix, field) in [
+        ("HueAdjustment", 0u8),
+        ("SaturationAdjustment", 1),
+        ("LuminanceAdjustment", 2),
+    ] {
+        if let Some(rest) = target.strip_prefix(prefix) {
+            if let Some((_, band)) = XMP_BANDS.iter().find(|(name, _)| *name == rest) {
+                let hsl = params.hsl.band_mut(*band);
+                match field {
+                    0 => hsl.hue = number,
+                    1 => hsl.saturation = number,
+                    _ => hsl.luminance = number,
+                }
+                return true;
+            }
+        }
+    }
+
+    // 颜色分级（2018 之后的分裂色调字段）与旧的分离色调字段。
+    let grading = match target {
+        "ColorGradeShadowHue" | "SplitToningShadowHue" => Some((0u8, 0u8)),
+        "ColorGradeShadowSat" | "SplitToningShadowSaturation" => Some((0, 1)),
+        "ColorGradeShadowLum" => Some((0, 2)),
+        "ColorGradeMidtoneHue" => Some((1, 0)),
+        "ColorGradeMidtoneSat" => Some((1, 1)),
+        "ColorGradeMidtoneLum" => Some((1, 2)),
+        "ColorGradeHighlightHue" | "SplitToningHighlightHue" => Some((2, 0)),
+        "ColorGradeHighlightSat" | "SplitToningHighlightSaturation" => Some((2, 1)),
+        "ColorGradeHighlightLum" => Some((2, 2)),
+        _ => None,
+    };
+    if let Some((zone, field)) = grading {
+        let wheel = match zone {
+            0 => &mut params.grading.shadows,
+            1 => &mut params.grading.midtones,
+            _ => &mut params.grading.highlights,
+        };
+        match field {
+            0 => wheel.hue = number.rem_euclid(360.0),
+            1 => wheel.saturation = number.clamp(0.0, 100.0),
+            _ => wheel.luminance = number,
+        }
+        return true;
+    }
+    match target {
+        "ColorGradeBlending" | "SplitToningBalance" => {
+            params.grading.blending = number;
+            return true;
+        }
+        "ColorGradeBalance" => {
+            params.grading.balance = number;
+            return true;
+        }
+        _ => {}
+    }
+
+    // 相机校准。
+    match target {
+        "RedHue" => return set(&mut params.calibration.red_hue, number),
+        "RedSaturation" => return set(&mut params.calibration.red_sat, number),
+        "GreenHue" => return set(&mut params.calibration.green_hue, number),
+        "GreenSaturation" => return set(&mut params.calibration.green_sat, number),
+        "BlueHue" => return set(&mut params.calibration.blue_hue, number),
+        "BlueSaturation" => return set(&mut params.calibration.blue_sat, number),
+        "ShadowTint" => return set(&mut params.calibration.shadows_tint, number),
+        _ => {}
+    }
+
+    // 黑白：转换开关与 8 色带混色。
+    if target == "ConvertToGrayscale" {
+        params.color.black_white = number > 0.5;
+        return true;
+    }
+    if let Some(rest) = target.strip_prefix("GrayMixer") {
+        if let Some((_, band)) = XMP_BANDS.iter().find(|(name, _)| *name == rest) {
+            let slot = match band {
+                ColorBand::Red => &mut params.bw_mix.red,
+                ColorBand::Orange => &mut params.bw_mix.orange,
+                ColorBand::Yellow => &mut params.bw_mix.yellow,
+                ColorBand::Green => &mut params.bw_mix.green,
+                ColorBand::Aqua => &mut params.bw_mix.aqua,
+                ColorBand::Blue => &mut params.bw_mix.blue,
+                ColorBand::Purple => &mut params.bw_mix.purple,
+                ColorBand::Magenta => &mut params.bw_mix.magenta,
+            };
+            *slot = number;
+            return true;
+        }
+    }
+    false
 }
 
 /// Lightroom 色温（开尔文）→ 相对值（5500K 为 0）。

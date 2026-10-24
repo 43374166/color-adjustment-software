@@ -821,6 +821,20 @@ struct EditorTabView: View {
                     pan: pan
                 )
             }
+            // 点颜色取色：点按画布取样（几何与蒙版 / 修图同源）。
+            if model.tool == .edit,
+               model.category == .color,
+               model.colorTab == .pointColor,
+               model.pointSampling
+            {
+                PointColorTouchLayer(
+                    model: model,
+                    imageSize: previewImageSize,
+                    viewSize: geo.size,
+                    zoom: zoom,
+                    pan: pan
+                )
+            }
             // 曲线：正方形透明编辑区直接叠在图片上（无背景板）。
             if model.tool == .edit && model.category == .curves {
                 CurveOverlay(model: model, viewSize: geo.size) { active in
@@ -1303,6 +1317,12 @@ struct EditorTabView: View {
             hslPanel
         } else if model.category == .color, model.colorTab == .grading {
             gradingPanel
+        } else if model.category == .color, model.colorTab == .pointColor {
+            pointColorPanel
+        } else if model.category == .color, model.colorTab == .calibration {
+            calibrationPanel
+        } else if model.category == .color, model.colorTab == .blackWhite {
+            blackWhitePanel
         } else if model.category == .optics {
             opticsPanel
         } else {
@@ -1426,7 +1446,9 @@ struct EditorTabView: View {
         selected: Int,
         onSelect: @escaping (Int) -> Void
     ) -> some View {
-        HStack(spacing: 26) {
+        // 颜色分类现在有 6 个子页：标签多于 4 个时收紧间距，小屏也放得下。
+        let spacing: CGFloat = labels.count > 4 ? 15 : 26
+        return HStack(spacing: spacing) {
             Spacer(minLength: 0)
             ForEach(Array(labels.enumerated()), id: \.offset) { index, label in
                 Button {
@@ -1745,6 +1767,309 @@ struct EditorTabView: View {
         }
     }
 
+    // MARK: - 点颜色（取色 + 范围调整，最多 4 个样本）
+
+    /// 当前选中的样本下标（样本数变化后自动收敛到有效范围）。
+    private var pointColorSelectedIndex: Int {
+        min(model.pointColorIndex, max(model.state.pointColors.count - 1, 0))
+    }
+
+    private var pointColorPanel: some View {
+        VStack(spacing: 0) {
+            if model.state.blackWhite {
+                Text("黑白模式下点颜色不参与合成：先关掉「黑白」，或改用黑白面板的色带混色。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(Color.orange.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 8)
+            }
+            pointColorToolbar
+            if model.state.pointColors.isEmpty {
+                VStack(spacing: 6) {
+                    Image(systemName: "eyedropper.halffull")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                    Text(
+                        model.pointSampling
+                            ? "点一下照片上想要调整的颜色"
+                            : "点「取色」后在照片上点一下要调整的颜色"
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 22)
+                Spacer(minLength: 0)
+            } else {
+                pointColorSliders
+            }
+        }
+    }
+
+    private var pointColorToolbar: some View {
+        VStack(spacing: 8) {
+            HStack(spacing: 10) {
+                Button {
+                    Haptics.tick()
+                    model.pointSampling.toggle()
+                } label: {
+                    Label(
+                        model.pointSampling ? "取色中…" : "取色",
+                        systemImage: "eyedropper"
+                    )
+                    .font(.caption)
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(
+                        Capsule().fill(
+                            model.pointSampling
+                                ? Color.accentColor.opacity(0.35)
+                                : Color.white.opacity(0.08)
+                        )
+                    )
+                }
+                .buttonStyle(.plain)
+                Button {
+                    Haptics.tick()
+                    model.addPointColorSample()
+                    model.pointSampling = true
+                } label: {
+                    Label("新增", systemImage: "plus.circle")
+                        .font(.caption)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(Capsule().fill(Color.white.opacity(0.08)))
+                }
+                .buttonStyle(.plain)
+                .disabled(model.state.pointColors.count >= pointColorSampleLimit)
+                .opacity(
+                    model.state.pointColors.count >= pointColorSampleLimit ? 0.4 : 1
+                )
+                Spacer(minLength: 0)
+                if !model.state.pointColors.isEmpty {
+                    Button {
+                        Haptics.light()
+                        model.clearPointColors()
+                    } label: {
+                        Text("清空")
+                            .font(.caption)
+                            .foregroundStyle(Color.white.opacity(0.65))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 14)
+            if !model.state.pointColors.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(
+                            Array(model.state.pointColors.enumerated()),
+                            id: \.element.id
+                        ) { index, sample in
+                            Button {
+                                Haptics.tick()
+                                model.pointColorIndex = index
+                                model.pointSampling = true
+                            } label: {
+                                Circle()
+                                    .fill(
+                                        Color(
+                                            red: sample.swatch.r,
+                                            green: sample.swatch.g,
+                                            blue: sample.swatch.b
+                                        )
+                                    )
+                                    .frame(width: 24, height: 24)
+                                    .overlay(
+                                        Circle().stroke(
+                                            index == pointColorSelectedIndex
+                                                ? Color.white
+                                                : Color.white.opacity(0.25),
+                                            lineWidth: index == pointColorSelectedIndex ? 2 : 1
+                                        )
+                                    )
+                            }
+                            .buttonStyle(.plain)
+                            .contextMenu {
+                                Button(role: .destructive) {
+                                    model.removePointColor(index: index)
+                                } label: {
+                                    Label("删除样本", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 14)
+                }
+            }
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 4)
+    }
+
+    private var pointColorSliders: some View {
+        let index = pointColorSelectedIndex
+        let sample = model.state.pointColors.indices.contains(index)
+            ? model.state.pointColors[index]
+            : PointColorSample()
+        return ScrollView {
+            VStack(spacing: 0) {
+                pointColorSlider("色相偏移", sample.hueShift, -100...100) { $0.hueShift = $1 }
+                pointColorSlider("饱和度偏移", sample.satShift, -100...100) { $0.satShift = $1 }
+                pointColorSlider("明亮度偏移", sample.lumShift, -100...100) { $0.lumShift = $1 }
+                pointColorSlider("变体", sample.variance, -100...100) { $0.variance = $1 }
+                pointColorSlider("范围", sample.range, 0...100) { $0.range = $1 }
+                pointColorSlider("色相范围", sample.hueRange, 0...100) { $0.hueRange = $1 }
+                pointColorSlider("饱和度范围", sample.satRange, 0...100) { $0.satRange = $1 }
+                pointColorSlider("明亮度范围", sample.lumRange, 0...100) { $0.lumRange = $1 }
+            }
+        }
+        .scrollDisabled(model.draggingSlider != nil)
+    }
+
+    private func pointColorSlider(
+        _ label: String,
+        _ value: Float,
+        _ range: ClosedRange<Float>,
+        set: @escaping (inout PointColorSample, Float) -> Void
+    ) -> some View {
+        let index = pointColorSelectedIndex
+        return ValueSliderRow(
+            label: label,
+            value: value,
+            range: range,
+            onBegin: { model.beginEdit() },
+            onChange: { newValue in
+                model.updatePointColor(index: index, commit: false) { sample in
+                    set(&sample, newValue)
+                }
+            },
+            onCommit: { model.commitEdit() }
+        )
+        .opacity(model.sliderVisible(label) ? 1 : 0)
+        .allowsHitTesting(model.sliderVisible(label))
+    }
+
+    // MARK: - 相机校准
+
+    private var calibrationPanel: some View {
+        let calibration = model.state.calibration
+        return ScrollView {
+            VStack(spacing: 0) {
+                calibrationSlider("红原色色相", calibration.redHue) { $0.redHue = $1 }
+                calibrationSlider("红原色饱和度", calibration.redSat) { $0.redSat = $1 }
+                calibrationSlider("绿原色色相", calibration.greenHue) { $0.greenHue = $1 }
+                calibrationSlider("绿原色饱和度", calibration.greenSat) { $0.greenSat = $1 }
+                calibrationSlider("蓝原色色相", calibration.blueHue) { $0.blueHue = $1 }
+                calibrationSlider("蓝原色饱和度", calibration.blueSat) { $0.blueSat = $1 }
+                ValueSliderRow(
+                    label: "阴影色调",
+                    value: calibration.shadowsTint,
+                    range: -100...100,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.calibration
+                        updated.shadowsTint = value
+                        model.updateCalibration(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() },
+                    trackColors: [Color(red: 0.25, green: 0.75, blue: 0.35), Color(white: 0.5), Color(red: 0.85, green: 0.35, blue: 0.75)]
+                )
+                .opacity(model.sliderVisible("阴影色调") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("阴影色调"))
+                Text("校准改变相机三原色的色相与饱和度（在场景线性空间生效），是「像相机 / 像 Lightroom」的调色起点；阴影色调做整体微调。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 6)
+            }
+        }
+        .scrollDisabled(model.draggingSlider != nil)
+    }
+
+    private func calibrationSlider(
+        _ label: String,
+        _ value: Float,
+        set: @escaping (inout CalibrationState, Float) -> Void
+    ) -> some View {
+        ValueSliderRow(
+            label: label,
+            value: value,
+            range: -100...100,
+            onBegin: { model.beginEdit() },
+            onChange: { newValue in
+                var updated = model.state.calibration
+                set(&updated, newValue)
+                model.updateCalibration(updated, commit: false)
+            },
+            onCommit: { model.commitEdit() }
+        )
+        .opacity(model.sliderVisible(label) ? 1 : 0)
+        .allowsHitTesting(model.sliderVisible(label))
+    }
+
+    // MARK: - 黑白
+
+    private var blackWhitePanel: some View {
+        let tint = model.bwBand.tint
+        return VStack(spacing: 0) {
+            opticsToggle(
+                title: "黑白",
+                hint: "打开后按下面的色带权重转单色；HSL / 点颜色 / 饱和度不参与合成",
+                isOn: Binding(
+                    get: { model.state.blackWhite },
+                    set: { enabled in
+                        Haptics.tick()
+                        model.applyEdit(enabled ? "黑白" : "彩色") { state in
+                            state.blackWhite = enabled
+                        }
+                    }
+                )
+            )
+            HStack(spacing: 8) {
+                HslBandDots(selected: model.bwBand) { kind in
+                    model.bwBand = kind
+                }
+                Text(model.bwBand.rawValue)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(width: 24, alignment: .trailing)
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
+            ValueSliderRow(
+                label: "明亮度",
+                value: model.state.bwMix[model.bwBand],
+                range: -100...100,
+                onBegin: { model.beginEdit() },
+                onChange: { value in
+                    model.updateBwMix(model.bwBand, value, commit: false)
+                },
+                onCommit: { model.commitEdit() },
+                trackColors: [
+                    Color(white: 0.12),
+                    Color(red: tint.r, green: tint.g, blue: tint.b),
+                    Color(white: 1.0),
+                ]
+            )
+            .disabled(!model.state.blackWhite)
+            .opacity(
+                model.sliderVisible("明亮度") ? (model.state.blackWhite ? 1 : 0.4) : 0
+            )
+            .allowsHitTesting(model.sliderVisible("明亮度"))
+            Text("正值提亮该色相（例如蓝 +：天空更亮），负值压暗。黑白关闭时此面板不生效。")
+                .font(.system(size: 10))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 18)
+                .padding(.top, 6)
+            Spacer(minLength: 0)
+        }
+    }
+
     // MARK: - 光学（删除色差 / 启用镜头校正）
 
     private var opticsPanel: some View {
@@ -1903,6 +2228,47 @@ struct EditorTabView: View {
 }
 
 /// 拖动滑块时的顶部数值浮层（沉浸模式下显示）。
+/// 点颜色取色层：点按画布取样（几何与蒙版 / 修图层一致：aspect-fit + 上移 + 缩放 / 平移）。
+private struct PointColorTouchLayer: View {
+    @ObservedObject var model: EditorModel
+    let imageSize: CGSize
+    let viewSize: CGSize
+    let zoom: CGFloat
+    let pan: CGSize
+
+    var body: some View {
+        GeometryReader { _ in
+            ZStack {
+                Color.clear.contentShape(Rectangle())
+                Image(systemName: "eyedropper")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.65))
+                    .padding(6)
+                    .background(Circle().fill(Color.black.opacity(0.35)))
+                    .position(x: viewSize.width - 26, y: 26)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(width: viewSize.width, height: viewSize.height)
+        .gesture(
+            DragGesture(minimumDistance: 0)
+                .onEnded { value in
+                    let geometry = MaskCanvasGeometry(
+                        imageSize: imageSize,
+                        viewSize: viewSize,
+                        zoom: zoom,
+                        pan: pan
+                    )
+                    let normalized = geometry.normalized(value.location)
+                    guard (0...1).contains(normalized.x), (0...1).contains(normalized.y) else {
+                        return
+                    }
+                    model.samplePointColor(at: normalized)
+                }
+        )
+    }
+}
+
 private struct SliderValueHud: View {
     let label: String
     let text: String

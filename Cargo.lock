@@ -1367,12 +1367,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "fdxmp-color"
+version = "1.6.1"
+
+[[package]]
 name = "fdxmp-core"
 version = "1.6.1"
 dependencies = [
  "ab_glyph",
  "bytemuck",
  "criterion",
+ "fdxmp-color",
  "flate2",
  "image",
  "lcms2",

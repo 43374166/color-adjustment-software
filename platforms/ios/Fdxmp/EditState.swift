@@ -213,6 +213,103 @@ struct GradingState: Equatable {
     }
 }
 
+// MARK: - 相机校准 / 黑白混色 / 点颜色（v1.7 调色面板）
+
+/// 相机校准（与 Rust `CalibrationParams` 一一对应，-100..100）。
+struct CalibrationState: Equatable {
+    var redHue: Float = 0
+    var redSat: Float = 0
+    var greenHue: Float = 0
+    var greenSat: Float = 0
+    var blueHue: Float = 0
+    var blueSat: Float = 0
+    /// 阴影色调：-100 绿 ↔ +100 洋红。
+    var shadowsTint: Float = 0
+
+    var isNeutral: Bool {
+        redHue == 0 && redSat == 0 && greenHue == 0 && greenSat == 0
+            && blueHue == 0 && blueSat == 0 && shadowsTint == 0
+    }
+}
+
+/// 黑白混色（8 色带，-100..100；正值提亮该色相）。
+struct BwMixState: Equatable {
+    var bands: [HslBandKind: Float] = BwMixState.defaultBands()
+
+    static func defaultBands() -> [HslBandKind: Float] {
+        var bands: [HslBandKind: Float] = [:]
+        for kind in HslBandKind.allCases {
+            bands[kind] = 0
+        }
+        return bands
+    }
+
+    subscript(kind: HslBandKind) -> Float {
+        get { bands[kind] ?? 0 }
+        set { bands[kind] = newValue }
+    }
+
+    var isNeutral: Bool {
+        HslBandKind.allCases.allSatisfy { self[$0] == 0 }
+    }
+
+    mutating func reset() {
+        self = BwMixState()
+    }
+}
+
+/// 点颜色样本上限（与 Rust `color_engine::POINT_SAMPLES`、GPU uniform 槽位一致）。
+let pointColorSampleLimit = 4
+
+/// 点颜色样本（与 Rust `PointColorParams` 一一对应）。
+///
+/// `lum` / `chroma` / `hue` 是取色时由核心算出的 OkLCh（hue 为度），
+/// 其余是调整量与范围。
+struct PointColorSample: Equatable, Identifiable {
+    var id = UUID()
+    var lum: Float = 0.5
+    var chroma: Float = 0.1
+    var hue: Float = 0
+    var hueShift: Float = 0
+    var satShift: Float = 0
+    var lumShift: Float = 0
+    var variance: Float = 0
+    var range: Float = 50
+    var hueRange: Float = 50
+    var satRange: Float = 50
+    var lumRange: Float = 50
+
+    var isNeutral: Bool {
+        hueShift == 0 && satShift == 0 && lumShift == 0 && variance == 0
+    }
+
+    /// 样本色块（sRGB 0..1，仅用于 UI 展示）。
+    var swatch: (r: Double, g: Double, b: Double) {
+        // 由 OkLCh 近似回 sRGB 只需 UI 观感：直接用色相 + 彩度给一个可辨识的颜色。
+        let radians = Double(hue) * .pi / 180
+        let c = Double(min(max(chroma, 0.04), 0.3))
+        let l = Double(min(max(lum, 0.05), 0.98))
+        let a = c * cos(radians)
+        let b2 = c * sin(radians)
+        // OkLab → 线性 sRGB（与核心一致的公开矩阵）。
+        let lms = [
+            l + 0.3963377774 * a + 0.2158037573 * b2,
+            l - 0.1055613458 * a - 0.0638541728 * b2,
+            l - 0.0894841775 * a - 1.2914855480 * b2,
+        ].map { $0 * $0 * $0 }
+        let linear = [
+            4.0767416621 * lms[0] - 3.3077115913 * lms[1] + 0.2309699292 * lms[2],
+            -1.2684380046 * lms[0] + 2.6097574011 * lms[1] - 0.3413193965 * lms[2],
+            -0.0041960863 * lms[0] - 0.7034186147 * lms[1] + 1.7076147010 * lms[2],
+        ]
+        func encode(_ value: Double) -> Double {
+            let v = min(max(value, 0), 1)
+            return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1 / 2.4) - 0.055
+        }
+        return (encode(linear[0]), encode(linear[1]), encode(linear[2]))
+    }
+}
+
 // MARK: - 裁切 / 变换
 
 /// 裁切比例。
@@ -896,6 +993,15 @@ struct EditState: Equatable {
     var curves = CurveState()
     var hsl = HslState()
     var grading = GradingState()
+    /// 黑白模式（与 Rust `color.black_white` 对应）：打开后 8 色带混色生效，
+    /// HSL / 点颜色 / 饱和度不再参与。
+    var blackWhite = false
+    /// 相机校准。
+    var calibration = CalibrationState()
+    /// 黑白混色（仅黑白模式生效）。
+    var bwMix = BwMixState()
+    /// 点颜色样本（最多 4 个进 GPU）。
+    var pointColors: [PointColorSample] = []
     /// 光学：删除色差（固定强度横向色差校正）。
     var removeChromaticAberration = false
     /// 光学：启用配置文件校正（核心内置档案：畸变 -0.06）。
@@ -915,7 +1021,7 @@ enum EditJSON {
     static func build(state: EditState, applyCropRect: Bool) -> String {
         var root: [String: Any] = ["version": 1]
         root["light"] = group(state.values, "light")
-        root["color"] = group(state.values, "color")
+        root["color"] = colorJson(state)
         root["effects"] = group(state.values, "effects")
         root["detail"] = [
             "sharpen": group(state.values, "detail.sharpen"),
@@ -924,6 +1030,9 @@ enum EditJSON {
         root["curves"] = curvesJson(state.curves)
         root["hsl"] = hslJson(state.hsl)
         root["grading"] = gradingJson(state.grading)
+        root["calibration"] = calibrationJson(state.calibration)
+        root["bw_mix"] = bwMixJson(state.bwMix)
+        root["point_colors"] = state.pointColors.map(pointColorJson)
         root["lens"] = [
             "profile_correction": state.profileCorrection,
             "chromatic_aberration": state.removeChromaticAberration ? 25.0 : 0.0,
@@ -943,6 +1052,49 @@ enum EditJSON {
             result[spec.key] = (Double(raw) * 1000).rounded() / 1000
         }
         return result
+    }
+
+    /// 颜色组：基础滑块 + 黑白模式开关（与 Rust `ColorParams` 对齐）。
+    private static func colorJson(_ state: EditState) -> [String: Any] {
+        var color = group(state.values, "color")
+        color["black_white"] = state.blackWhite
+        return color
+    }
+
+    private static func calibrationJson(_ calibration: CalibrationState) -> [String: Any] {
+        [
+            "red_hue": Double(calibration.redHue),
+            "red_sat": Double(calibration.redSat),
+            "green_hue": Double(calibration.greenHue),
+            "green_sat": Double(calibration.greenSat),
+            "blue_hue": Double(calibration.blueHue),
+            "blue_sat": Double(calibration.blueSat),
+            "shadows_tint": Double(calibration.shadowsTint),
+        ]
+    }
+
+    private static func bwMixJson(_ mix: BwMixState) -> [String: Any] {
+        var result: [String: Any] = [:]
+        for kind in HslBandKind.allCases {
+            result[kind.key] = Double(mix[kind])
+        }
+        return result
+    }
+
+    private static func pointColorJson(_ sample: PointColorSample) -> [String: Any] {
+        [
+            "lum": Double(sample.lum),
+            "chroma": Double(sample.chroma),
+            "hue": Double(sample.hue),
+            "hue_shift": Double(sample.hueShift),
+            "sat_shift": Double(sample.satShift),
+            "lum_shift": Double(sample.lumShift),
+            "variance": Double(sample.variance),
+            "range": Double(sample.range),
+            "hue_range": Double(sample.hueRange),
+            "sat_range": Double(sample.satRange),
+            "lum_range": Double(sample.lumRange),
+        ]
     }
 
     private static func curvesJson(_ curves: CurveState) -> [String: Any] {
@@ -1098,6 +1250,10 @@ enum EditJSON {
         state.curves = parseCurves(root["curves"])
         state.hsl = parseHsl(root["hsl"])
         state.grading = parseGrading(root["grading"])
+        state.blackWhite = (root["color"] as? [String: Any])?["black_white"] as? Bool ?? false
+        state.calibration = parseCalibration(root["calibration"])
+        state.bwMix = parseBwMix(root["bw_mix"])
+        state.pointColors = parsePointColors(root["point_colors"])
         if let lens = root["lens"] as? [String: Any] {
             state.profileCorrection = (lens["profile_correction"] as? Bool) ?? false
             let ca = (lens["chromatic_aberration"] as? NSNumber)?.floatValue ?? 0
@@ -1190,6 +1346,57 @@ enum EditJSON {
         grading.blending = (root["blending"] as? NSNumber)?.floatValue ?? 50
         grading.balance = (root["balance"] as? NSNumber)?.floatValue ?? 0
         return grading
+    }
+
+    private static func parseCalibration(_ value: Any?) -> CalibrationState {
+        var calibration = CalibrationState()
+        guard let root = value as? [String: Any] else { return calibration }
+        func number(_ key: String, _ fallback: Float) -> Float {
+            (root[key] as? NSNumber)?.floatValue ?? fallback
+        }
+        calibration.redHue = number("red_hue", 0)
+        calibration.redSat = number("red_sat", 0)
+        calibration.greenHue = number("green_hue", 0)
+        calibration.greenSat = number("green_sat", 0)
+        calibration.blueHue = number("blue_hue", 0)
+        calibration.blueSat = number("blue_sat", 0)
+        calibration.shadowsTint = number("shadows_tint", 0)
+        return calibration
+    }
+
+    private static func parseBwMix(_ value: Any?) -> BwMixState {
+        var mix = BwMixState()
+        guard let root = value as? [String: Any] else { return mix }
+        for kind in HslBandKind.allCases {
+            if let number = root[kind.key] as? NSNumber {
+                mix[kind] = number.floatValue
+            }
+        }
+        return mix
+    }
+
+    private static func parsePointColors(_ value: Any?) -> [PointColorSample] {
+        guard let list = value as? [[String: Any]] else { return [] }
+        return list.compactMap { item in
+            func number(_ key: String, _ fallback: Float) -> Float {
+                (item[key] as? NSNumber)?.floatValue ?? fallback
+            }
+            // 老版本 / 异常数据：没有采样点的记录直接丢弃。
+            guard item["hue"] != nil || item["chroma"] != nil else { return nil }
+            return PointColorSample(
+                lum: number("lum", 0.5),
+                chroma: number("chroma", 0.1),
+                hue: number("hue", 0),
+                hueShift: number("hue_shift", 0),
+                satShift: number("sat_shift", 0),
+                lumShift: number("lum_shift", 0),
+                variance: number("variance", 0),
+                range: number("range", 50),
+                hueRange: number("hue_range", 50),
+                satRange: number("sat_range", 50),
+                lumRange: number("lum_range", 50)
+            )
+        }
     }
 
     private static func parseCrop(_ value: Any?) -> CropState {

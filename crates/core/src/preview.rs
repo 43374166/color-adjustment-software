@@ -14,8 +14,8 @@ use rayon::prelude::*;
 
 use crate::error::{FdxmpError, Result};
 use crate::params::{
-    eval_curve, ColorGradingParams, CropParams, CurveParams, DetailParams, EditParams, HslParams,
-    LensParams, LightParams, ParametricCurve, ToneCurve,
+    eval_curve, CropParams, CurveParams, DetailParams, EditParams, LensParams, ParametricCurve,
+    ToneCurve,
 };
 
 /// CPU 预览渲染结果：尺寸 + RGBA8 像素（行优先）。
@@ -454,27 +454,75 @@ pub fn render_preview_image_at(
     let full_height = origin.full_height.max(1) as f32;
     let effects = &params.effects;
     let curves = CurveLuts::new(&params.curves);
+    let color_stage = crate::color_engine::ColorStage::from_params(params);
     let mut out = source.clone();
 
-    // 第一遍：逐像素颜色（基础 → 分区 → 曲线 → 饱和度 → HSL → 分级）。
+    // 第 0 遍：场景线性基底（白平衡 → 相机校准 → 曝光）。基底层与色调段都基于它。
+    let width = source.width() as usize;
+    let height = source.height() as usize;
+    let luma = crate::color_engine::WORKSPACE
+        .luma()
+        .map(|value| value as f32);
+    let mut base_linear = vec![[0.0f32; 3]; width * height];
+    {
+        let pixels: &[u8] = &out;
+        base_linear
+            .par_chunks_mut(width.max(1))
+            .enumerate()
+            .for_each(|(y, row)| {
+                for (x, value) in row.iter_mut().enumerate() {
+                    let offset = (y * width + x) * 4;
+                    let linear = [
+                        srgb8_to_linear(pixels[offset]),
+                        srgb8_to_linear(pixels[offset + 1]),
+                        srgb8_to_linear(pixels[offset + 2]),
+                    ];
+                    *value = crate::pipeline::apply_reference(linear, params);
+                }
+            });
+    }
+
+    // 色调段（局部基底层 → 胶片色调映射 → 色域映射）。
+    // 基底层用与 GPU 大模糊相同的半径（大半径模糊后的场景亮度，不是像素自身亮度），
+    // 小面积高光不会被顺手压暗——这是"无光晕"的关键。
+    let tone = crate::tone::ToneStage::from_params(params);
+    let tone_base = if tone.is_identity() {
+        None
+    } else {
+        let scale = crate::tone::blur_scale(width.max(height) as f32);
+        Some(crate::tone::ToneBase::build(
+            &base_linear,
+            width,
+            height,
+            crate::tone::BASE_RADIUS * scale,
+        ))
+    };
+
+    // 第一遍：逐像素颜色（色调段 → 分区曲线 → 饱和度 → HSL → 分级）。
     // 像素之间相互独立，按 4 字节像素并行处理（移动端 CPU 预览约 2–4× 提速）。
     {
         let pixels: &mut [u8] = &mut out;
-        pixels.par_chunks_mut(4).for_each(|pixel| {
-            let [r, g, b, a] = [pixel[0], pixel[1], pixel[2], pixel[3]];
-            let linear = [srgb8_to_linear(r), srgb8_to_linear(g), srgb8_to_linear(b)];
-            let base = crate::pipeline::apply_reference(linear, params);
-            let mut rgb = [
-                linear_to_srgb_f32(base[0]),
-                linear_to_srgb_f32(base[1]),
-                linear_to_srgb_f32(base[2]),
-            ];
-            rgb = adjust_pixel(rgb, params, &curves);
-            pixel[0] = to_u8(rgb[0]);
-            pixel[1] = to_u8(rgb[1]);
-            pixel[2] = to_u8(rgb[2]);
-            pixel[3] = a;
-        });
+        pixels
+            .par_chunks_mut(4)
+            .enumerate()
+            .for_each(|(index, pixel)| {
+                let (x, y) = (index % width, index / width);
+                let base = base_linear[index];
+                let base_ev = match &tone_base {
+                    Some(plane) => plane.ev_at(x, y, luma),
+                    None => 0.0,
+                };
+                let toned = tone.apply(base, base_ev);
+                let mut rgb = [
+                    linear_to_srgb_f32(toned[0]),
+                    linear_to_srgb_f32(toned[1]),
+                    linear_to_srgb_f32(toned[2]),
+                ];
+                rgb = adjust_pixel(rgb, &curves, &color_stage);
+                pixel[0] = to_u8(rgb[0]);
+                pixel[1] = to_u8(rgb[1]);
+                pixel[2] = to_u8(rgb[2]);
+            });
     }
 
     // 第二遍：纹理 / 清晰度 / 去雾（需要模糊参考；和 GPU `pipeline_detail` 同序同强度）。
@@ -600,6 +648,7 @@ fn compose_masks(
             Some(MaskContext {
                 raster,
                 curves: CurveLuts::new(&mask.adjustments.curves),
+                color_stage: crate::color_engine::ColorStage::from_params(&mask.adjustments),
                 params: (*mask.adjustments).clone(),
             })
         })
@@ -627,7 +676,12 @@ fn compose_masks(
                     let weight =
                         sample_raster(&context.raster, x_abs, y_abs, full_width, full_height);
                     if weight > 0.001 {
-                        let adjusted = adjust_with_reference(rgb, &context.params, &context.curves);
+                        let adjusted = adjust_with_reference(
+                            rgb,
+                            &context.params,
+                            &context.curves,
+                            &context.color_stage,
+                        );
                         for channel in 0..3 {
                             rgb[channel] += (adjusted[channel] - rgb[channel]) * weight;
                         }
@@ -869,11 +923,18 @@ fn sample_raster(
 struct MaskContext {
     raster: crate::masks::MaskRaster,
     curves: CurveLuts,
+    /// 该蒙版的调色段（构建一次，逐像素复用；与 GPU / `fdxmp-color` 同一份数学）。
+    color_stage: crate::color_engine::ColorStage,
     params: EditParams,
 }
 
 /// 单像素调色：分区色调 → 曲线 → 饱和度 / 自然饱和度（局部调整复用）。
-fn adjust_with_reference(rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [f32; 3] {
+fn adjust_with_reference(
+    rgb: [f32; 3],
+    params: &EditParams,
+    curves: &CurveLuts,
+    color_stage: &crate::color_engine::ColorStage,
+) -> [f32; 3] {
     // 局部调整同样包含白平衡 / 曝光 / 对比度（参考实现）。
     let linear = [
         srgb8_to_linear(to_u8(rgb[0])),
@@ -887,41 +948,36 @@ fn adjust_with_reference(rgb: [f32; 3], params: &EditParams, curves: &CurveLuts)
             f32::from(linear_to_srgb8(base[1])) / 255.0,
             f32::from(linear_to_srgb8(base[2])) / 255.0,
         ],
-        params,
         curves,
+        color_stage,
     )
 }
 
-fn adjust_pixel(mut rgb: [f32; 3], params: &EditParams, curves: &CurveLuts) -> [f32; 3] {
-    let light = &params.light;
-    let color = &params.color;
-
-    // 分区色调（高光 / 阴影 / 白色 / 黑色）：显示空间分区位移，与着色器同公式。
-    rgb = apply_tone_zones(rgb, light);
-
+fn adjust_pixel(
+    mut rgb: [f32; 3],
+    curves: &CurveLuts,
+    color_stage: &crate::color_engine::ColorStage,
+) -> [f32; 3] {
     // 曲线：参数曲线 → RGB → 单通道。
     rgb = curves.apply(rgb);
 
-    // 饱和度 / 自然饱和度。
-    let luminance_now = luminance(rgb);
-    let max = rgb[0].max(rgb[1]).max(rgb[2]);
-    let min = rgb[0].min(rgb[1]).min(rgb[2]);
-    let pixel_saturation = if max <= f32::EPSILON {
-        0.0
-    } else {
-        ((max - min) / max).clamp(0.0, 1.0)
-    };
-    let saturation_factor = 1.0 + color.saturation / 100.0 * 1.25;
-    let vibrance_factor = 1.0 + (color.vibrance / 100.0) * (1.0 - pixel_saturation) * 1.35;
-    let factor = saturation_factor * vibrance_factor;
-    for channel in &mut rgb {
-        *channel = luminance_now + (*channel - luminance_now) * factor;
+    // 调色段（自然饱和度 / 饱和度 → 8 色带混色 → 点颜色 → 黑白 → 颜色分级）：
+    // 与 GPU `pipeline_colour_ops`、`fdxmp-color::ops::ColorOps` 同一份数学（OkLab / OkLCh）。
+    if !color_stage.is_identity() {
+        let linear = [
+            srgb_to_linear(rgb[0]),
+            srgb_to_linear(rgb[1]),
+            srgb_to_linear(rgb[2]),
+        ];
+        let out = color_stage.apply_color(linear);
+        rgb = [
+            linear_to_srgb_f32(out[0]).clamp(0.0, 1.0),
+            linear_to_srgb_f32(out[1]).clamp(0.0, 1.0),
+            linear_to_srgb_f32(out[2]).clamp(0.0, 1.0),
+        ];
     }
 
-    // HSL 八色带。
-    rgb = apply_hsl(rgb, &params.hsl);
-    // 颜色分级（阴影 / 中间调 / 高光）。
-    apply_grading(rgb, &params.grading)
+    rgb
 }
 
 /// 纹理 / 清晰度 / 去雾（显示空间；模糊参考取自当前调色结果）。
@@ -1054,167 +1110,6 @@ fn apply_effects(
 
 fn luminance(rgb: [f32; 3]) -> f32 {
     0.2126 * rgb[0] + 0.7152 * rgb[1] + 0.0722 * rgb[2]
-}
-
-/// 分区色调（显示空间 sRGB，与着色器 `pipeline_base` 同公式）：
-///
-/// - 高光 / 阴影：按显示亮度的平滑分区权重，做「向白 / 黑渐进」的有界位移
-///   （端点锚定、不裁切，暗部不会被压死）；
-/// - 白色 / 黑色：白点 / 黑点位移，只动顶部 / 底部（中灰不受影响），
-///   允许端点轻微裁切——这是"白点 / 黑点"的语义；
-/// - 四条第曲线互不挤压、各自单调。
-fn apply_tone_zones(rgb: [f32; 3], light: &LightParams) -> [f32; 3] {
-    let h = (light.highlights / 100.0).clamp(-1.0, 1.0);
-    let sh = (light.shadows / 100.0).clamp(-1.0, 1.0);
-    let wv = (light.whites / 100.0).clamp(-1.0, 1.0);
-    let bl = (light.blacks / 100.0).clamp(-1.0, 1.0);
-    if h == 0.0 && sh == 0.0 && wv == 0.0 && bl == 0.0 {
-        return rgb;
-    }
-    let luma = luminance(rgb);
-    // 分区权重（显示亮度）：高光只动上部、阴影只动深暗部、白 / 黑只动端点。
-    let w_hi = smoothstep(0.45, 0.85, luma);
-    // 阴影掩膜集中在深暗部（0.03→0.33 淡出；对照实测 LR 阴影 +100 的提升也集中在这一段）。
-    let w_sh = 1.0 - smoothstep(0.03, 0.33, luma);
-    let w_wh = smoothstep(0.60, 0.95, luma);
-    let w_bl = 1.0 - smoothstep(0.05, 0.40, luma);
-    // 阴影：曝光式乘性增益（+100 深暗部 ≈ +2EV，-100 ≈ -1.2EV）——乘性 → 纯黑保持
-    // 纯黑、通道比例不变；旧实现是显示域加法，把纯黑垫成 ~42/255 的灰（发灰根因）。
-    let sh_k = if sh >= 0.0 { 2.0 } else { 1.2 };
-    let shadow_gain = (sh * sh_k * w_sh).exp2();
-    let mut out = [0.0f32; 3];
-    for (index, channel) in rgb.iter().enumerate() {
-        let s = linear_to_srgb_f32(srgb_to_linear(*channel) * shadow_gain);
-        let mut value = s;
-        if h > 0.0 {
-            // 向白渐进：白场不动，越亮位移越小。
-            value += h * w_hi * (1.0 - s).max(0.0) * 0.55;
-        } else if h < 0.0 {
-            // 向中灰回收：纯白略微保留（顶部 0.85 以上渐收，保证单调）。
-            let shape = (s - 0.5).max(0.0) * (1.0 - 0.55 * smoothstep(0.85, 1.0, s));
-            value += h * w_hi * shape * 0.55;
-        }
-        // 白点 / 黑点：端点位移（±100 → ±0.13）。
-        value += (wv * w_wh + bl * w_bl) * 0.13;
-        out[index] = value.clamp(0.0, 1.0);
-    }
-    out
-}
-
-/// HSL 八色带中心（色相圈 0..1）。
-const HSL_BAND_CENTERS: [f32; 8] = [
-    0.0,
-    30.0 / 360.0,
-    60.0 / 360.0,
-    120.0 / 360.0,
-    180.0 / 360.0,
-    240.0 / 360.0,
-    280.0 / 360.0,
-    320.0 / 360.0,
-];
-
-/// HSL：按色相把 8 个色带的调整平滑混合后应用。
-fn apply_hsl(rgb: [f32; 3], hsl: &HslParams) -> [f32; 3] {
-    let bands = [
-        &hsl.red,
-        &hsl.orange,
-        &hsl.yellow,
-        &hsl.green,
-        &hsl.aqua,
-        &hsl.blue,
-        &hsl.purple,
-        &hsl.magenta,
-    ];
-    if bands
-        .iter()
-        .all(|band| band.hue == 0.0 && band.saturation == 0.0 && band.luminance == 0.0)
-    {
-        return rgb;
-    }
-    let (hue, saturation, value) = rgb_to_hsv(rgb);
-    if saturation <= 0.02 {
-        return rgb;
-    }
-
-    const RADIUS: f32 = 0.10;
-    let mut hue_shift = 0.0f32;
-    let mut saturation_shift = 0.0f32;
-    let mut luminance_shift = 0.0f32;
-    let mut weight_total = 0.0f32;
-    for (index, center) in HSL_BAND_CENTERS.iter().enumerate() {
-        let mut distance = (hue - center).abs();
-        if distance > 0.5 {
-            distance = 1.0 - distance;
-        }
-        let weight = (1.0 - distance / RADIUS).max(0.0);
-        if weight > 0.0 {
-            let band = bands[index];
-            hue_shift += band.hue / 100.0 * weight;
-            saturation_shift += band.saturation / 100.0 * weight;
-            luminance_shift += band.luminance / 100.0 * weight;
-            weight_total += weight;
-        }
-    }
-    if weight_total <= 0.0 {
-        return rgb;
-    }
-    hue_shift /= weight_total;
-    saturation_shift /= weight_total;
-    luminance_shift /= weight_total;
-
-    let visible = smoothstep(0.02, 0.22, saturation);
-    let new_hue = (hue + hue_shift * visible * 0.09).rem_euclid(1.0);
-    let base_saturation = (saturation * (1.0 + saturation_shift * visible * 1.15)).clamp(0.0, 1.0);
-    // 明亮度：+ 方向渐进逼近 1（越亮增益越小），并轻微去饱和——皮肤变亮时向
-    // “柔光”走而不是往白场顶；- 方向按比例压暗（与 GPU 同公式）。
-    let shift = luminance_shift * visible;
-    let lum_pos = shift.max(0.0);
-    let lum_neg = (-shift).max(0.0);
-    let new_saturation = (base_saturation * (1.0 - lum_pos * 0.18)).clamp(0.0, 1.0);
-    let new_value =
-        (value + lum_pos * (1.0 - value.min(1.0)) * 0.38 - lum_neg * value * 0.45).clamp(0.0, 1.0);
-    hsv_to_rgb(new_hue, new_saturation, new_value)
-}
-
-/// 颜色分级：阴影 / 中间调 / 高光三个区域的色相、饱和度、明亮度。
-fn apply_grading(rgb: [f32; 3], grading: &ColorGradingParams) -> [f32; 3] {
-    let zones = [&grading.shadows, &grading.midtones, &grading.highlights];
-    if zones
-        .iter()
-        .all(|zone| zone.saturation <= 0.01 && zone.luminance == 0.0)
-    {
-        return rgb;
-    }
-    let luma = luminance(rgb);
-    let balanced = (luma + grading.balance / 100.0 * 0.15).clamp(0.0, 1.0);
-    let blend = (grading.blending / 100.0).clamp(0.0, 1.0);
-    let exponent = 1.0 + blend * 1.5;
-    let weights = [
-        (1.0 - smoothstep(0.0, 0.55, balanced)).powf(exponent),
-        (1.0 - (balanced - 0.5).abs() * 2.0).max(0.0).powf(exponent),
-        smoothstep(0.45, 1.0, balanced).powf(exponent),
-    ];
-
-    let mut out = rgb;
-    for (zone, weight) in zones.iter().zip(weights) {
-        if weight <= 0.001 {
-            continue;
-        }
-        let strength = (zone.saturation / 100.0).clamp(0.0, 1.0) * weight;
-        if strength > 0.0 {
-            let tint = hsv_to_rgb((zone.hue / 360.0).rem_euclid(1.0), 1.0, 1.0);
-            for channel in 0..3 {
-                out[channel] += (tint[channel] - out[channel]) * strength * 0.5;
-            }
-        }
-        if zone.luminance != 0.0 {
-            let factor = 1.0 + (zone.luminance / 100.0) * weight * 0.25;
-            for channel in &mut out {
-                *channel *= factor;
-            }
-        }
-    }
-    out
 }
 
 /// 细节：USM 锐化 + 亮度 / 颜色降噪（颜色管线之后、效果之前）。
@@ -1352,44 +1247,6 @@ fn blur_rgb(image: &RgbaImage, radius: u32) -> Vec<[f32; 3]> {
         }
     }
     out
-}
-
-fn rgb_to_hsv(rgb: [f32; 3]) -> (f32, f32, f32) {
-    let max = rgb[0].max(rgb[1]).max(rgb[2]);
-    let min = rgb[0].min(rgb[1]).min(rgb[2]);
-    let delta = max - min;
-    let hue = if delta <= f32::EPSILON {
-        0.0
-    } else if max == rgb[0] {
-        ((rgb[1] - rgb[2]) / delta).rem_euclid(6.0) / 6.0
-    } else if max == rgb[1] {
-        (((rgb[2] - rgb[0]) / delta) + 2.0) / 6.0
-    } else {
-        (((rgb[0] - rgb[1]) / delta) + 4.0) / 6.0
-    };
-    let saturation = if max <= f32::EPSILON {
-        0.0
-    } else {
-        delta / max
-    };
-    (hue.rem_euclid(1.0), saturation, max)
-}
-
-fn hsv_to_rgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
-    let h = hue.rem_euclid(1.0) * 6.0;
-    let index = h.floor();
-    let fraction = h - index;
-    let p = value * (1.0 - saturation);
-    let q = value * (1.0 - saturation * fraction);
-    let t = value * (1.0 - saturation * (1.0 - fraction));
-    match index as i32 % 6 {
-        0 => [value, t, p],
-        1 => [q, value, p],
-        2 => [p, value, t],
-        3 => [p, q, value],
-        4 => [t, p, value],
-        _ => [value, p, q],
-    }
 }
 
 fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
@@ -2099,179 +1956,6 @@ mod tests {
         // 色差为 0（单位变换）保持原样。
         let identity = apply_lens(&source, &LensParams::default());
         assert_eq!(identity.get_pixel(3, 8).0, before);
-    }
-
-    #[test]
-    fn tone_zones_anchor_endpoints() {
-        // 高光 / 阴影端点锚定（不裁切）；白点 / 黑点按语义允许端点位移。
-        let light = LightParams {
-            highlights: 100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([1.0, 1.0, 1.0], &light);
-        assert!((out[0] - 1.0).abs() < 1e-4, "高光 +100 不应裁白：{out:?}");
-
-        let light = LightParams {
-            highlights: -100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([0.0, 0.0, 0.0], &light);
-        assert!(out[0].abs() < 1e-5, "高光 -100 不应抬黑：{out:?}");
-
-        let light = LightParams {
-            whites: -100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([1.0, 1.0, 1.0], &light);
-        assert!(
-            (out[0] - 0.87).abs() < 0.02,
-            "白色 -100 应回收白点：{out:?}"
-        );
-
-        let light = LightParams {
-            blacks: -100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([0.02, 0.02, 0.02], &light);
-        assert!(out[0] < 0.02, "黑色 -100 应下压黑点：{out:?}");
-    }
-
-    #[test]
-    fn tone_zones_do_not_bleed_into_midtones() {
-        let mid = [0.5, 0.5, 0.5];
-        for light in [
-            LightParams {
-                highlights: 100.0,
-                ..Default::default()
-            },
-            LightParams {
-                shadows: 100.0,
-                ..Default::default()
-            },
-            LightParams {
-                whites: 100.0,
-                ..Default::default()
-            },
-            LightParams {
-                blacks: -100.0,
-                ..Default::default()
-            },
-        ] {
-            let out = apply_tone_zones(mid, &light);
-            assert!(
-                (out[0] - 0.5).abs() < 0.02,
-                "中灰不应被分区控制波及：{light:?} → {out:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn tone_zones_lightroom_strength() {
-        // 目标（对齐 Lightroom 实拍实测）：阴影 +100（0.13 输入）≈ 0.23（LR 实测 ≈ +0.09）；
-        // 高光 +100 ≈ 0.86；高光 -100 ≈ 0.71；白色 -100（纯白）≈ 0.87。
-        let light = LightParams {
-            shadows: 100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([0.13, 0.13, 0.13], &light);
-        assert!((out[0] - 0.23).abs() < 0.03, "阴影 +100 ≈0.23：{out:?}");
-
-        let light = LightParams {
-            highlights: 100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([0.75, 0.75, 0.75], &light);
-        assert!((out[0] - 0.86).abs() < 0.03, "高光 +100 ≈0.86：{out:?}");
-
-        let light = LightParams {
-            highlights: -100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([0.90, 0.90, 0.90], &light);
-        assert!((out[0] - 0.71).abs() < 0.05, "高光 -100 ≈0.71：{out:?}");
-    }
-
-    #[test]
-    fn tone_shadows_keep_black_black() {
-        // 阴影 +100 是"曝光式提亮"：纯黑仍为纯黑、深暗部保持很暗（旧实现把纯黑垫成 ~0.165 灰）。
-        let light = LightParams {
-            shadows: 100.0,
-            ..Default::default()
-        };
-        let out = apply_tone_zones([0.0, 0.0, 0.0], &light);
-        assert!(out[0].abs() < 1e-6, "阴影 +100 不应抬起纯黑：{out:?}");
-        let out = apply_tone_zones([0.02, 0.02, 0.02], &light);
-        assert!(out[0] < 0.08, "阴影 +100 后 0.02 仍应很暗：{out:?}");
-        // 暗部确实被提亮（比如 0.05 → 明显更亮）。
-        let dark = apply_tone_zones([0.05, 0.05, 0.05], &light);
-        assert!(dark[0] > 0.10, "阴影 +100 应提亮暗部：{dark:?}");
-        // 亮部 / 中调不动。
-        let mid = apply_tone_zones([0.5, 0.5, 0.5], &light);
-        assert!((mid[0] - 0.5).abs() < 0.01, "中调不应被阴影波及：{mid:?}");
-    }
-
-    #[test]
-    fn tone_shadows_preserve_color() {
-        // 乘性提亮：暗色（深蓝）通道比例在**线性域**保持不变，不会变成中性灰。
-        let light = LightParams {
-            shadows: 100.0,
-            ..Default::default()
-        };
-        let before = [0.06f32, 0.08, 0.10];
-        let out = apply_tone_zones(before, &light);
-        for index in 0..3 {
-            assert!(out[index] > before[index], "暗色应被提亮：{out:?}");
-        }
-        let linear = |v: f32| srgb_to_linear(v);
-        let ratio_before = linear(before[0]) / linear(before[1]);
-        let ratio_after = linear(out[0]) / linear(out[1]);
-        assert!(
-            (ratio_after - ratio_before).abs() < 1e-3,
-            "提亮后线性域通道比例应保持：{ratio_before} → {ratio_after}"
-        );
-    }
-
-    #[test]
-    fn tone_zones_are_monotonic() {
-        let controls = [
-            LightParams {
-                highlights: 100.0,
-                ..Default::default()
-            },
-            LightParams {
-                highlights: -100.0,
-                ..Default::default()
-            },
-            LightParams {
-                shadows: 100.0,
-                ..Default::default()
-            },
-            LightParams {
-                shadows: -100.0,
-                ..Default::default()
-            },
-            LightParams {
-                whites: 100.0,
-                ..Default::default()
-            },
-            LightParams {
-                blacks: -100.0,
-                ..Default::default()
-            },
-        ];
-        for light in controls {
-            let mut previous = -1.0f32;
-            for step in 0..=100 {
-                let s = step as f32 / 100.0;
-                let out = apply_tone_zones([s, s, s], &light);
-                assert!(
-                    out[0] >= previous - 1e-5,
-                    "分区曲线应单调：{light:?} 在 {s} 处下降（{previous} → {}）",
-                    out[0]
-                );
-                previous = out[0];
-            }
-        }
     }
 
     /// 性能排查（默认忽略）：`cargo test --release -p fdxmp-core --lib -- --ignored --nocapture bench_pipeline`

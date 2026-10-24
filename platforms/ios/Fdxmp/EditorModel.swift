@@ -29,6 +29,9 @@ enum ColorTab: String, CaseIterable, Identifiable {
     case base = "颜色"
     case hsl = "HSL"
     case grading = "分级"
+    case pointColor = "点颜色"
+    case calibration = "校准"
+    case blackWhite = "黑白"
 
     var id: String { rawValue }
 }
@@ -94,6 +97,8 @@ final class EditorModel: ObservableObject {
     // MARK: 渲染与照片
 
     @Published private(set) var previewImage: UIImage?
+    /// 最近一帧预览的像素缓冲（取色器用；零拷贝 GPU 上屏时不更新）。
+    @Published private(set) var previewPixels: RgbaBuffer?
     @Published private(set) var originalImage: UIImage?
     @Published var showOriginal = false
     @Published private(set) var histogram: HistogramData?
@@ -134,6 +139,12 @@ final class EditorModel: ObservableObject {
     @Published var curveChannel: CurveChannel = .rgb
     @Published var gradingZone: GradingZoneKind = .highlights
     @Published var hslBand: HslBandKind = .red
+    /// 黑白混色面板当前选中的色带。
+    @Published var bwBand: HslBandKind = .red
+    /// 点颜色：当前选中的样本下标。
+    @Published var pointColorIndex: Int = 0
+    /// 点颜色：取色模式（画布点按取样）。
+    @Published var pointSampling = false
     @Published var selectedMaskId: String?
     /// 是否叠加显示当前蒙版（红色半透明覆盖）。
     @Published var maskOverlayVisible = true
@@ -247,6 +258,7 @@ final class EditorModel: ObservableObject {
         }
         self.asset = asset
         previewImage = nil
+        previewPixels = nil
         originalImage = nil
         histogram = nil
         baseBuffer = nil
@@ -1116,6 +1128,32 @@ final class EditorModel: ObservableObject {
         grading.balance = base.grading.balance
             + (target.grading.balance - base.grading.balance) * t
         updated.grading = grading
+        // 相机校准按比例插值；黑白开关与点颜色样本按 50% 切换（与曲线同一策略）。
+        var calibration = updated.calibration
+        calibration.redHue = base.calibration.redHue
+            + (target.calibration.redHue - base.calibration.redHue) * t
+        calibration.redSat = base.calibration.redSat
+            + (target.calibration.redSat - base.calibration.redSat) * t
+        calibration.greenHue = base.calibration.greenHue
+            + (target.calibration.greenHue - base.calibration.greenHue) * t
+        calibration.greenSat = base.calibration.greenSat
+            + (target.calibration.greenSat - base.calibration.greenSat) * t
+        calibration.blueHue = base.calibration.blueHue
+            + (target.calibration.blueHue - base.calibration.blueHue) * t
+        calibration.blueSat = base.calibration.blueSat
+            + (target.calibration.blueSat - base.calibration.blueSat) * t
+        calibration.shadowsTint = base.calibration.shadowsTint
+            + (target.calibration.shadowsTint - base.calibration.shadowsTint) * t
+        updated.calibration = calibration
+        var bwMix = updated.bwMix
+        for kind in HslBandKind.allCases {
+            let from = base.bwMix[kind]
+            let to = target.bwMix[kind]
+            bwMix[kind] = from + (to - from) * t
+        }
+        updated.bwMix = bwMix
+        updated.blackWhite = t < 0.5 ? base.blackWhite : target.blackWhite
+        updated.pointColors = t < 0.5 ? base.pointColors : target.pointColors
         updated.curves = t < 0.5 ? base.curves : target.curves
         state = updated
         touchEdit()
@@ -1395,6 +1433,127 @@ final class EditorModel: ObservableObject {
         } else {
             touchEdit()
         }
+    }
+
+    // MARK: - 相机校准 / 黑白混色 / 点颜色
+
+    /// 相机校准（七项一起改，面板按字段调用）。
+    func updateCalibration(_ value: CalibrationState, commit: Bool) {
+        beginEdit()
+        pendingLabel = "校准"
+        state.calibration = value
+        if commit {
+            commitEdit()
+        } else {
+            touchEdit()
+        }
+    }
+
+    /// 黑白混色（单色带）。
+    func updateBwMix(_ kind: HslBandKind, _ value: Float, commit: Bool) {
+        beginEdit()
+        pendingLabel = "黑白混色 · \(kind.rawValue)"
+        state.bwMix[kind] = value
+        if commit {
+            commitEdit()
+        } else {
+            touchEdit()
+        }
+    }
+
+    /// 点颜色：新增一个待取样的样本并选中它。
+    func addPointColorSample() {
+        guard state.pointColors.count < pointColorSampleLimit else {
+            message = "最多 \(pointColorSampleLimit) 个点颜色样本"
+            return
+        }
+        beginEdit()
+        pendingLabel = "新增点颜色"
+        state.pointColors.append(PointColorSample())
+        pointColorIndex = state.pointColors.count - 1
+        commitEdit()
+    }
+
+    /// 点颜色：修改第 `index` 个样本。
+    func updatePointColor(
+        index: Int,
+        commit: Bool,
+        _ mutate: (inout PointColorSample) -> Void
+    ) {
+        guard state.pointColors.indices.contains(index) else { return }
+        beginEdit()
+        pendingLabel = "点颜色"
+        var sample = state.pointColors[index]
+        mutate(&sample)
+        state.pointColors[index] = sample
+        if commit {
+            commitEdit()
+        } else {
+            touchEdit()
+        }
+    }
+
+    /// 点颜色：删除一个样本。
+    func removePointColor(index: Int) {
+        guard state.pointColors.indices.contains(index) else { return }
+        beginEdit()
+        pendingLabel = "删除点颜色"
+        state.pointColors.remove(at: index)
+        pointColorIndex = min(pointColorIndex, max(state.pointColors.count - 1, 0))
+        commitEdit()
+    }
+
+    /// 点颜色：清空全部样本。
+    func clearPointColors() {
+        guard !state.pointColors.isEmpty else { return }
+        beginEdit()
+        pendingLabel = "清空点颜色"
+        state.pointColors.removeAll()
+        pointColorIndex = 0
+        commitEdit()
+    }
+
+    /// 取色：把画布归一化坐标处的像素转成 OkLCh 写进样本（无样本时新建，最多 4 个）。
+    ///
+    /// 采样源是最近一帧 CPU 预览（`previewPixels`）；GPU 零拷贝上屏时不读回像素，
+    /// 此时提示用户等一帧即可。
+    @discardableResult
+    func samplePointColor(at normalized: CGPoint) -> Bool {
+        guard let pixels = previewPixels, pixels.width > 0, pixels.height > 0 else {
+            message = "预览尚未就绪，请稍后取色"
+            return false
+        }
+        let x = min(max(Int((normalized.x * CGFloat(pixels.width)).rounded(.down)), 0), pixels.width - 1)
+        let y = min(max(Int((normalized.y * CGFloat(pixels.height)).rounded(.down)), 0), pixels.height - 1)
+        let offset = (y * pixels.width + x) * 4
+        guard offset + 2 < pixels.pixels.count else { return false }
+        let r = pixels.pixels[offset]
+        let g = pixels.pixels[offset + 1]
+        let b = pixels.pixels[offset + 2]
+        guard let lch = NativeCore.shared.oklch(r: r, g: g, b: b) else {
+            message = NativeCore.shared.lastError() ?? "取色失败"
+            return false
+        }
+
+        beginEdit()
+        pendingLabel = "点颜色取色"
+        if state.pointColors.isEmpty {
+            var sample = PointColorSample()
+            sample.lum = lch.l
+            sample.chroma = lch.c
+            sample.hue = lch.h * 180 / .pi
+            state.pointColors.append(sample)
+            pointColorIndex = 0
+        } else {
+            let index = min(pointColorIndex, state.pointColors.count - 1)
+            state.pointColors[index].lum = lch.l
+            state.pointColors[index].chroma = lch.c
+            state.pointColors[index].hue = lch.h * 180 / .pi
+            pointColorIndex = index
+        }
+        commitEdit()
+        Haptics.tick()
+        return true
     }
 
     func updateGradingMix(blending: Float, balance: Float, commit: Bool) {
@@ -2942,12 +3101,16 @@ final class EditorModel: ObservableObject {
                     from: RgbaBuffer(pixels: $0.pixels, width: $0.width, height: $0.height)
                 )
             }
+            let pixels = result.map {
+                RgbaBuffer(pixels: $0.pixels, width: $0.width, height: $0.height)
+            }
             Task { @MainActor in
                 guard let self else { return }
                 self.renderBusy = false
                 self.isRendering = false
                 if let image, let histogram {
                     self.previewImage = image
+                    self.previewPixels = pixels
                     self.histogram = histogram
                     self.previewOutputSize = outputSize
                     self.renderMillis = millis

@@ -1,0 +1,12 @@
+[package]
+name = "fdxmp-color"
+description = "fdxmp 色彩科学核心：色彩空间 / 白平衡 / 感知空间 / 曲线 / 调色算子（纯 Rust，无平台依赖）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
