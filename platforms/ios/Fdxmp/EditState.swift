@@ -1056,7 +1056,10 @@ enum EditJSON {
 
     /// 颜色组：基础滑块 + 黑白模式开关（与 Rust `ColorParams` 对齐）。
     private static func colorJson(_ state: EditState) -> [String: Any] {
-        var color = group(state.values, "color")
+        var color: [String: Any] = [:]
+        for (key, value) in group(state.values, "color") {
+            color[key] = value
+        }
         color["black_white"] = state.blackWhite
         return color
     }
