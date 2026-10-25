@@ -13,8 +13,40 @@ use fdxmp_color::{ColorOps, Grading, Hsl, Mixer, Wheel, SRGB};
 
 use crate::params::{ColorBand, EditParams};
 
-/// 工作空间：与 `color_pipeline.wgsl` 一致（线性 sRGB / Rec.709）。
+/// 工作空间：暂时保持线性 sRGB；Rec.2020 切换需要同时改 CPU/GPU 边界。
 pub const WORKSPACE: fdxmp_color::RgbSpace = SRGB;
+
+/// sRGB 线性 → Rec.2020 线性（D65）。
+pub const SRGB_TO_REC2020: fdxmp_color::Mat3 = fdxmp_color::Mat3([
+    [0.627_403_9, 0.329_283_0, 0.043_313_1],
+    [0.069_097_3, 0.919_540_4, 0.011_362_3],
+    [0.016_391_4, 0.088_013_3, 0.895_595_3],
+]);
+
+/// Rec.2020 线性 → sRGB 线性（D65）。
+pub const REC2020_TO_SRGB: fdxmp_color::Mat3 = fdxmp_color::Mat3([
+    [1.660_491_0, -0.587_641_1, -0.072_849_9],
+    [-0.124_550_5, 1.132_899_9, -0.008_349_4],
+    [-0.018_150_8, -0.100_578_9, 1.118_729_7],
+]);
+
+/// sRGB 线性 → 工作空间。
+pub fn srgb_linear_to_workspace(rgb: [f32; 3]) -> [f32; 3] {
+    if WORKSPACE == fdxmp_color::REC2020 {
+        SRGB_TO_REC2020.apply_f32(rgb)
+    } else {
+        rgb
+    }
+}
+
+/// 工作空间 → sRGB 线性。
+pub fn workspace_to_srgb_linear(rgb: [f32; 3]) -> [f32; 3] {
+    if WORKSPACE == fdxmp_color::REC2020 {
+        REC2020_TO_SRGB.apply_f32(rgb)
+    } else {
+        rgb
+    }
+}
 
 /// GPU 支持的点颜色样本数（与 `slot::POINT_START` 后的槽位一致）。
 pub const POINT_SAMPLES: usize = 4;
@@ -431,6 +463,16 @@ mod tests {
         // 黑白模式下无论校准怎么改，输出都是单色（分级未开启）。
         let out = stage.apply([0.2, 0.35, 0.6]);
         assert!((out[0] - out[2]).abs() < 0.02, "{out:?}");
+    }
+
+    #[test]
+    fn srgb_rec2020_conversion_roundtrips() {
+        let input = [0.2, 0.4, 0.7];
+        let rec2020 = SRGB_TO_REC2020.apply_f32(input);
+        let back = REC2020_TO_SRGB.apply_f32(rec2020);
+        for (a, b) in input.iter().zip(back) {
+            assert!((a - b).abs() < 1e-5, "{input:?} -> {back:?}");
+        }
     }
 
     #[test]
