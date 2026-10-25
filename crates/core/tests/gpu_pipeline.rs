@@ -1897,7 +1897,7 @@ fn gpu_colour_stage_matches_cpu_reference() {
             srgb_to_linear(rgba[1]),
             srgb_to_linear(rgba[2]),
         ];
-        let expected_linear = stage.apply(linear);
+        let expected_linear = stage.apply_display(linear);
         let expected = expected_linear.map(linear_to_srgb8);
         let actual = pixel(&output, width, index as u32 % width, index as u32 / width);
         for channel in 0..3 {
@@ -1955,13 +1955,146 @@ fn gpu_monochrome_mix_matches_cpu_reference() {
             srgb_to_linear(rgba[1]),
             srgb_to_linear(rgba[2]),
         ];
-        let expected = stage.apply(linear).map(linear_to_srgb8);
+        let expected = stage.apply_display(linear).map(linear_to_srgb8);
         let actual = pixel(&output, width, index as u32 % width, index as u32 / width);
         for channel in 0..3 {
             max_diff = max_diff.max((expected[channel] as i32 - actual[channel] as i32).abs());
         }
     }
     assert!(max_diff <= 1, "黑白调色段 CPU/GPU 偏差 {max_diff} (>1/255)");
+}
+
+/// 调色段极端值验收：饱和度 / HSL / 分级 / 点颜色 / 校准同时拉到端点，
+/// GPU 的显示域色域映射必须与 CPU `ColorStage::apply_display` 一致。
+#[test]
+fn gpu_colour_stage_extremes_match_cpu_reference() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut pipeline = ColorPipeline::new(&context.device);
+    let (width, height) = (96u32, 64u32);
+    let source = test_image(width, height);
+
+    let mut params = EditParams::default();
+    params.color.saturation = 100.0;
+    params.color.vibrance = 100.0;
+    params.hsl.red.luminance = 100.0;
+    params.hsl.blue.luminance = -100.0;
+    params.hsl.green.saturation = -100.0;
+    params.grading.shadows = fdxmp_core::params::GradingZone {
+        hue: 220.0,
+        saturation: 100.0,
+        luminance: 100.0,
+    };
+    params.grading.midtones = fdxmp_core::params::GradingZone {
+        hue: 40.0,
+        saturation: 100.0,
+        luminance: -100.0,
+    };
+    params.grading.highlights = fdxmp_core::params::GradingZone {
+        hue: 300.0,
+        saturation: 100.0,
+        luminance: 100.0,
+    };
+    params.grading.blending = 100.0;
+    params.grading.balance = 100.0;
+    params.calibration.red_hue = 100.0;
+    params.calibration.red_sat = 100.0;
+    params.calibration.green_hue = -100.0;
+    params.calibration.green_sat = 100.0;
+    params.calibration.blue_hue = 100.0;
+    params.calibration.blue_sat = -100.0;
+    params.calibration.shadows_tint = 100.0;
+    params
+        .point_colors
+        .push(fdxmp_core::params::PointColorParams {
+            lum: 0.0,
+            chroma: 0.0,
+            hue: 0.0,
+            hue_shift: 100.0,
+            sat_shift: 100.0,
+            lum_shift: -100.0,
+            variance: 100.0,
+            range: 100.0,
+            hue_range: 100.0,
+            sat_range: 100.0,
+            lum_range: 100.0,
+        });
+
+    let image = pipeline
+        .upload(&context.device, &context.queue, &source, width, height)
+        .unwrap();
+    pipeline.render(&context.device, &context.queue, &image, &params);
+    let output = pipeline
+        .readback(&context.device, &context.queue, &image)
+        .unwrap();
+
+    let stage = fdxmp_core::color_engine::ColorStage::from_params(&params);
+    let mut max_diff = 0i32;
+    let mut worst = (0usize, [0u8; 3], [0u8; 3]);
+    for (index, rgba) in source.as_chunks::<4>().0.iter().enumerate() {
+        let linear = [
+            srgb_to_linear(rgba[0]),
+            srgb_to_linear(rgba[1]),
+            srgb_to_linear(rgba[2]),
+        ];
+        let expected = stage.apply_display(linear).map(linear_to_srgb8);
+        let actual = pixel(&output, width, index as u32 % width, index as u32 / width);
+        for channel in 0..3 {
+            let diff = (expected[channel] as i32 - actual[channel] as i32).abs();
+            if diff > max_diff {
+                max_diff = diff;
+                worst = (index, expected, actual);
+            }
+        }
+    }
+    assert!(
+        max_diff <= 2,
+        "极端调色 CPU/GPU 偏差 {max_diff} (>2/255)，像素 #{} 期望 {:?} 实际 {:?}",
+        worst.0,
+        worst.1,
+        worst.2
+    );
+}
+
+/// 曲线单独使用时，GPU 的显示段出口（曲线 + 色域映射）必须与 CPU 预览一致。
+#[test]
+fn gpu_curve_only_matches_cpu_preview() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut pipeline = ColorPipeline::new(&context.device);
+    let (width, height) = (96u32, 64u32);
+    let source = test_image(width, height);
+    let image = pipeline
+        .upload(&context.device, &context.queue, &source, width, height)
+        .unwrap();
+
+    let mut params = EditParams::default();
+    params.curves.rgb.points = vec![
+        CurvePoint { x: 0.0, y: 0.0 },
+        CurvePoint { x: 0.35, y: 0.55 },
+        CurvePoint { x: 1.0, y: 1.0 },
+    ];
+    pipeline.render(&context.device, &context.queue, &image, &params);
+    let output = pipeline
+        .readback(&context.device, &context.queue, &image)
+        .unwrap();
+
+    let cpu_source = RawImage::from_raw(width, height, source).unwrap();
+    let cpu = fdxmp_core::preview::render_preview_image(&cpu_source, &params);
+    let cpu = cpu.into_raw();
+    let mut max_diff = 0i32;
+    for (index, rgba) in cpu.as_chunks::<4>().0.iter().enumerate() {
+        let actual = pixel(&output, width, index as u32 % width, index as u32 / width);
+        for channel in 0..3 {
+            max_diff = max_diff.max((rgba[channel] as i32 - actual[channel] as i32).abs());
+        }
+    }
+    assert!(
+        max_diff <= 2,
+        "曲线单独使用时 CPU/GPU 偏差 {max_diff} (>2/255)"
+    );
 }
 
 /// 线性 → sRGB 8bit（四舍五入）。

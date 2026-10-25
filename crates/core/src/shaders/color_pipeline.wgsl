@@ -226,7 +226,12 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
         if (dl_pos > 0.0) {
             chroma = chroma * max(1.0 - 1.2 * dl_pos, 0.0);
         }
-        l = l + lum_shift * chroma_weight * sqrt(max(l, 0.05));
+        // 纯黑 / 纯白不因 HSL 明亮度被抬灰或压灰；L 必须留在 [0,1]，
+        // 否则 OkLab → RGB 会出现负通道（滑块 -100 的“反相”观感）。
+        let l_weight = smoothstep(0.0, 0.05, l);
+        l = l + lum_shift * chroma_weight * l_weight * sqrt(max(l, 0.05));
+        l = clamp(l, 0.0, 1.0);
+        chroma = max(chroma, 0.0);
     }
 
     // 点颜色：软范围（色相 / 彩度 / 明度）内的加权调整，最多 4 个样本。
@@ -257,6 +262,10 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
             chroma = chroma + weight * pvar * (chroma - pc);
             chroma = max(chroma * (1.0 + weight * psat), 0.0);
             l = l + weight * (pvar * (l - pl) + pdl);
+            // 点颜色极值同样可能把 L 推出 [0,1]；夹住后不会出现负通道。
+            l = clamp(l, 0.0, 1.0);
+            chroma = max(chroma, 0.0);
+            hue = wrap_pi(hue);
         }
     }
 
@@ -275,10 +284,11 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
     if (saturation != 0.0) {
         chroma = chroma * max(1.0 + saturation, 0.0);
     }
+    chroma = max(chroma, 0.0);
 
     // 黑白：按 8 色带权重把彩度转成明度，输出单色（之后的分级即为"分离色调"）。
     if (p(116) > 0.5) {
-        l = max(l + bw_mix * min(chroma / 0.2, 1.0) * 0.25, 0.0);
+        l = clamp(l + bw_mix * min(chroma / 0.2, 1.0) * 0.25, 0.0, 1.0);
         chroma = 0.0;
     }
 
@@ -296,6 +306,8 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
         lab.z = lab.z + p(178u + zone * 3u) * wt;
         lab.x = lab.x + p(179u + zone * 3u) * wt;
     }
+    // 分级亮度 ±100 不能把 L 推成负数 / 超过白点。
+    lab.x = clamp(lab.x, 0.0, 1.0);
     return linear_from_oklab(lab);
 }
 
@@ -418,6 +430,66 @@ fn gamut_map(rgb: vec3<f32>) -> vec3<f32> {
     return clamp(mapped * (y0 / y1), vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
+/// 感知空间色域映射：OkLCh 中固定 L / h，只压缩 C，直到进入 0..1。
+///
+/// 与 CPU `gamut::map_to_gamut_oklch` 同一算法；只用于显示段出口，
+/// 避免 `饱和度 +100` 的红色因 RGB 朝亮度缩放而偏橙。
+fn gamut_map_oklch(rgb: vec3<f32>) -> vec3<f32> {
+    if (all(rgb >= vec3<f32>(0.0)) && all(rgb <= vec3<f32>(1.0))) {
+        return rgb;
+    }
+    let lch = oklab_to_lch(oklab_from_linear(rgb));
+    let l = clamp(lch.x, 0.0, 1.0);
+    let c = max(lch.y, 0.0);
+    if (c <= 1e-7) {
+        return clamp(
+            linear_from_oklab(lch_to_oklab(vec3<f32>(l, 0.0, lch.z))),
+            vec3<f32>(0.0),
+            vec3<f32>(1.0)
+        );
+    }
+    var lo = 0.0;
+    var hi = c;
+    for (var i = 0; i < 12; i = i + 1) {
+        let mid = (lo + hi) * 0.5;
+        let trial = linear_from_oklab(lch_to_oklab(vec3<f32>(l, mid, lch.z)));
+        if (all(trial >= vec3<f32>(0.0)) && all(trial <= vec3<f32>(1.0))) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let knee = lo * 0.85;
+    let range = max(lo - knee, 1e-7);
+    let t = clamp((c - knee) / range, 0.0, 1.0);
+    let soft = t - 0.15 * t * (1.0 - t);
+    var c_out = c;
+    if (c > knee) {
+        if (c > lo) {
+            c_out = lo;
+        } else {
+            c_out = knee + range * soft;
+        }
+    }
+    return clamp(
+        linear_from_oklab(lch_to_oklab(vec3<f32>(l, c_out, lch.z))),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0)
+    );
+}
+
+/// 高光去饱和：L 进入 0.72..1.0 后只降 C，不动 L/h。
+fn highlight_desaturate(rgb: vec3<f32>) -> vec3<f32> {
+    let lch = oklab_to_lch(oklab_from_linear(rgb));
+    if (lch.x <= 0.85 || lch.y <= 0.08) {
+        return rgb;
+    }
+    let t = clamp((lch.x - 0.85) / 0.15, 0.0, 1.0);
+    let smooth_t = t * t * (3.0 - 2.0 * t);
+    let factor = 1.0 - 0.35 * smooth_t;
+    return linear_from_oklab(lch_to_oklab(vec3<f32>(lch.x, lch.y * factor, lch.z)));
+}
+
 /// 色调段：局部色调（高光 / 阴影，权重取自基底层）→ 电影曲线 → 色域映射。
 ///
 /// `base_ev` 是基底层（大模糊参考）在像素处相对中灰的场景 EV——
@@ -491,7 +563,8 @@ fn pipeline_display_ops(input_color: vec3<f32>) -> vec3<f32> {
         c = pipeline_colour_ops(c);
     }
 
-    return c;
+    // 显示域出口：先高光去饱和，再做 OkLCh 保色相压缩，避免高饱和高光硬切。
+    return gamut_map_oklch(highlight_desaturate(c));
 }
 
 /// 细节链路：纹理 / 清晰度 / 去雾 / 锐化 / 降噪 / 暗角 / 颗粒。

@@ -3,8 +3,11 @@
 //! ```text
 //! fdxmp-cli version
 //! fdxmp-cli probe <image>
+//! fdxmp-cli dcp-info <profile.dcp>
 //! fdxmp-cli decode <image> [--preview]
 //! fdxmp-cli render <in> <out.png> [--exposure 1.0 --saturation -30 ...]   # 需要 gpu feature
+//! fdxmp-cli render-cpu <in> <out.png> [--exposure 1.0 ...]               # 无 GPU，CPU 预览路径
+//! fdxmp-cli preview <in> <out.jpg>                                      # 提取 RAW 内嵌 JPEG / 解码预览
 //! fdxmp-cli preset-new <out.fdxmp> <name> [author]
 //! fdxmp-cli preset-info <preset.fdxmp>
 //! fdxmp-cli cache-size <dir>
@@ -46,6 +49,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{json}");
             Ok(())
         }
+        "dcp-info" => dcp_info_command(rest),
         "decode" => {
             let path = rest.first().ok_or_else(usage)?;
             let preview = rest.iter().any(|arg| arg == "--preview");
@@ -68,6 +72,13 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("耗时：{} ms", decoded.elapsed_ms);
             if let Some(metadata) = &decoded.metadata {
                 println!("元数据：{}", metadata.summary());
+                let white_balance = metadata.white_balance_summary();
+                if !white_balance.is_empty() {
+                    println!("白平衡：{white_balance}");
+                }
+                if let Some(bias) = metadata.exposure_bias_ev {
+                    println!("曝光补偿：{bias:+.2} EV");
+                }
                 if let Some(captured) = &metadata.captured_at {
                     println!("拍摄时间：{captured}");
                 }
@@ -75,6 +86,8 @@ fn run(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         "render" => render_command(rest),
+        "render-cpu" => render_cpu_command(rest),
+        "preview" => preview_command(rest),
         "preset-builtins" => {
             let dir = rest
                 .first()
@@ -139,13 +152,141 @@ fn usage() -> String {
     "用法：
   fdxmp-cli version
   fdxmp-cli probe <image>
+  fdxmp-cli dcp-info <profile.dcp>
   fdxmp-cli decode <image> [--preview]
   fdxmp-cli render <in> <out.png> [--exposure 1.0 --contrast 20 --saturation -30 ...]
+  fdxmp-cli render-cpu <in> <out.png> [--exposure 1.0 --contrast 20 --saturation -30 ...] [--camera-profile profile.json]
+  fdxmp-cli preview <in> <out.jpg>
   fdxmp-cli preset-new <out.fdxmp> <name> [author]
   fdxmp-cli preset-info <preset.fdxmp>
   fdxmp-cli cache-size <dir>
   fdxmp-cli cache-clear <dir>"
         .to_string()
+}
+
+/// 打印 DCP 关键字段（用于验证解析器，不参与渲染）。
+fn dcp_info_command(args: &[String]) -> Result<(), String> {
+    let path = args.first().ok_or_else(usage)?;
+    let profile = fdxmp_core::dcp::DcpProfile::open(path).map_err(|err| err.to_string())?;
+    println!("{}", profile.summary());
+    if let Some(matrix) = profile.color_matrix1 {
+        println!("ColorMatrix1:");
+        for row in matrix {
+            println!("  {row:?}");
+        }
+    }
+    if let Some(matrix) = profile.forward_matrix1 {
+        println!("ForwardMatrix1:");
+        for row in matrix {
+            println!("  {row:?}");
+        }
+    }
+    println!("ToneCurve points: {}", profile.tone_curve.len());
+    if let Some(camera) = profile.to_camera_profile() {
+        println!("CameraProfile matrix (camera -> linear sRGB):");
+        for row in camera.matrix {
+            println!("  {row:?}");
+        }
+    }
+    Ok(())
+}
+
+/// 提取 RAW 内嵌 JPEG 预览（或普通图片的解码结果），用于相机色彩基线。
+fn preview_command(args: &[String]) -> Result<(), String> {
+    let input = args.first().ok_or_else(usage)?;
+    let output = args.get(1).ok_or_else(usage)?;
+    let decoded = fdxmp_core::decode::decode_preview(input).map_err(|err| err.to_string())?;
+    decoded.pixels.save(output).map_err(|err| err.to_string())?;
+    println!(
+        "已提取 {}×{} 预览 → {}（{}）",
+        decoded.width,
+        decoded.height,
+        output,
+        decoded.source.label_zh()
+    );
+    Ok(())
+}
+
+/// 阶段 0/1：CPU 预览路径渲染（无 GPU 也能跑，用于 Lightroom ΔE 基线）。
+fn render_cpu_command(args: &[String]) -> Result<(), String> {
+    let input = args.first().ok_or_else(usage)?;
+    let output = args.get(1).ok_or_else(usage)?;
+
+    let mut params = EditParams::default();
+    let mut profile_path: Option<&String> = None;
+    let mut index = 2;
+    while index + 1 < args.len() {
+        let key = args[index].trim_start_matches("--");
+        if key == "camera-profile" {
+            profile_path = Some(&args[index + 1]);
+            index += 2;
+            continue;
+        }
+        let value: f32 = args[index + 1]
+            .parse()
+            .map_err(|_| format!("参数 {} 需要数字，得到 {}", key, args[index + 1]))?;
+        apply_slider(&mut params, key, value).ok_or_else(|| format!("未知参数 `--{key}`"))?;
+        index += 2;
+    }
+
+    let decoded = fdxmp_core::decode::decode(input).map_err(|err| err.to_string())?;
+    let started = std::time::Instant::now();
+    let proxy = match profile_path {
+        Some(path) => {
+            let profile = load_camera_profile(path)?;
+            let linear = decoded.display_proxy_linear(2048);
+            let mut encoded = image::RgbaImage::new(linear.width(), linear.height());
+            for (dst, src) in encoded.pixels_mut().zip(linear.pixels()) {
+                let out = profile.apply([src.0[0], src.0[1], src.0[2]]);
+                dst.0 = [
+                    linear_to_srgb_u8(out[0]),
+                    linear_to_srgb_u8(out[1]),
+                    linear_to_srgb_u8(out[2]),
+                    255,
+                ];
+            }
+            encoded
+        }
+        None => decoded.display_proxy(2048),
+    };
+    let rendered = fdxmp_core::preview::render_preview_image(&proxy, &params);
+    rendered.save(output).map_err(|err| err.to_string())?;
+    println!(
+        "已渲染 {}×{} → {}（CPU，耗时 {:.1} ms，camera-profile={}）",
+        rendered.width(),
+        rendered.height(),
+        output,
+        started.elapsed().as_secs_f64() * 1000.0,
+        profile_path.map_or("none".to_string(), |p| p.clone())
+    );
+    Ok(())
+}
+
+#[derive(serde::Deserialize)]
+struct CameraProfileJson {
+    matrix: [[f32; 3]; 3],
+    bias: [f32; 3],
+    curve: [[f32; 4]; 3],
+}
+
+fn load_camera_profile(path: &str) -> Result<fdxmp_color::CameraProfile, String> {
+    let data = std::fs::read_to_string(path).map_err(|err| err.to_string())?;
+    let parsed: CameraProfileJson = serde_json::from_str(&data).map_err(|err| err.to_string())?;
+    Ok(fdxmp_color::CameraProfile {
+        matrix: parsed.matrix,
+        bias: parsed.bias,
+        curve: parsed.curve,
+    })
+}
+
+fn linear_to_srgb_u8(value: f32) -> u8 {
+    let x = value.clamp(0.0, 1.0);
+    let encoded = if x <= 0.003_130_8 {
+        x * 12.92
+    } else {
+        1.055 * x.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0 + 0.5) as u8
 }
 
 /// 阶段 2：headless GPU 渲染（验证色彩管线 / 生成对比图）。
@@ -214,7 +355,6 @@ fn render_command(_args: &[String]) -> Result<(), String> {
 }
 
 /// 命令行参数 → 调色参数。
-#[cfg(feature = "gpu")]
 fn apply_slider(params: &mut fdxmp_core::params::EditParams, key: &str, value: f32) -> Option<()> {
     use fdxmp_core::params::SliderId;
     let slider = match key {

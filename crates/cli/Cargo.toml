@@ -1,6 +1,6 @@
 [package]
 name = "fdxmp-cli"
-description = "fdxmp 命令行测试工具"
+description = "fdxmp command-line test tool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -23,5 +23,7 @@ full = ["gpu", "raw", "heif"]
 
 [dependencies]
 fdxmp-core.workspace = true
+fdxmp-color.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 image.workspace = true

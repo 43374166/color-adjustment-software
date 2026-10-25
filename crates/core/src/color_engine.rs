@@ -52,6 +52,20 @@ pub struct ColorStage {
     shadow_tint: f32,
 }
 
+/// 高光去饱和：亮度进入 0.72..1.0 后逐步降低彩度，避免高饱和高光硬切。
+///
+/// 在 OkLCh 中只改 C，不动 L/h；与 GPU `highlight_desaturate` 同算法。
+fn highlight_desaturate(rgb: [f32; 3]) -> [f32; 3] {
+    let [l, c, h] = fdxmp_color::lab_to_lch(fdxmp_color::oklab_from_rgb(&WORKSPACE, rgb));
+    if l <= 0.85 || c <= 0.08 {
+        return rgb;
+    }
+    let t = ((l - 0.85) / 0.15).clamp(0.0, 1.0);
+    let t = t * t * (3.0 - 2.0 * t);
+    let factor = 1.0 - 0.35 * t;
+    fdxmp_color::rgb_from_oklab(&WORKSPACE, fdxmp_color::lch_to_lab([l, c * factor, h]))
+}
+
 impl ColorStage {
     /// 从编辑参数构建。
     pub fn from_params(params: &EditParams) -> Self {
@@ -139,9 +153,28 @@ impl ColorStage {
         self.ops.apply(rgb)
     }
 
-    /// 校准 + 色彩算子（测试与导出用；GPU 里两段分别在不同位置应用）。
+    /// 显示域出口：把调色后的线性 RGB 软映射回 [0,1]（保色相去饱和）。
+    ///
+    /// 调色算子本身允许超出显示色域（宽色域余量 / 高饱和），但 CPU 预览与导出
+    /// 在 sRGB 编码前必须做一次与 GPU `gamut_map` 相同的映射，否则 `饱和度 +100`
+    /// 或极值分级会被逐通道硬裁剪，出现色相跳变 / 死色块。
+    pub fn map_display_gamut(rgb: [f32; 3]) -> [f32; 3] {
+        // NaN / Inf 不能进入色域映射：直接落到黑，避免整帧被 NaN 污染。
+        if !rgb.iter().all(|value| value.is_finite()) {
+            return [0.0; 3];
+        }
+        let softened = highlight_desaturate(rgb);
+        fdxmp_color::gamut::map_to_gamut_oklch(softened, WORKSPACE).0
+    }
+
+    /// 校准 + 色彩算子（CPU 数学参考；不含显示色域映射）。
     pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
         self.apply_color(self.apply_calibration(rgb))
+    }
+
+    /// 校准 + 色彩算子 + 显示色域映射：与 GPU `pipeline_display_ops` 的最终输出一致。
+    pub fn apply_display(&self, rgb: [f32; 3]) -> [f32; 3] {
+        Self::map_display_gamut(self.apply(rgb))
     }
 }
 
@@ -398,5 +431,23 @@ mod tests {
         // 黑白模式下无论校准怎么改，输出都是单色（分级未开启）。
         let out = stage.apply([0.2, 0.35, 0.6]);
         assert!((out[0] - out[2]).abs() < 0.02, "{out:?}");
+    }
+
+    #[test]
+    fn highlight_desaturate_reduces_only_high_lightness_chroma() {
+        let grey = [0.5, 0.5, 0.5];
+        assert_eq!(highlight_desaturate(grey), grey);
+
+        let dark = [0.05, 0.1, 0.3];
+        let dark_after = highlight_desaturate(dark);
+        assert_eq!(dark, dark_after);
+
+        let bright = [3.0, 0.2, 0.1];
+        let before = fdxmp_color::lab_to_lch(fdxmp_color::oklab_from_rgb(&WORKSPACE, bright))[1];
+        let after = fdxmp_color::lab_to_lch(fdxmp_color::oklab_from_rgb(
+            &WORKSPACE,
+            highlight_desaturate(bright),
+        ))[1];
+        assert!(after < before, "{before} -> {after}");
     }
 }

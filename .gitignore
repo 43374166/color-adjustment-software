@@ -40,3 +40,7 @@ platforms/android/build/
 /dt-listing.json
 /jsdelivr-listing.json
 /fetch-jsdelivr.ps1
+
+# Python caches
+__pycache__/
+*.pyc

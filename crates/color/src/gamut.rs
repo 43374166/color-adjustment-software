@@ -3,7 +3,8 @@
 //! 场景线性管线的输出可能超出显示色域；硬裁剪会把饱和高光切成死色块，
 //! 这里用单调软膝把通道压回 0..1，必要时再整体去饱和。
 
-use crate::math::luminance;
+use crate::math::{luminance, RgbSpace};
+use crate::perceptual::{lab_to_lch, lch_to_lab, oklab_from_rgb, rgb_from_oklab};
 
 /// 单调软膝：`v <= knee` 原样，超过后趋于 1（C¹ 连续）。
 #[inline]
@@ -43,6 +44,57 @@ pub fn map_to_gamut(rgb: [f32; 3], luma: [f32; 3]) -> ([f32; 3], f32) {
     let y1 = luminance(c, luma).max(1e-9);
     let out = c.map(|v| (v * y0 / y1).clamp(0.0, 1.0));
     (out, lo_k)
+}
+
+/// 感知空间色域映射：在 OkLCh 中以固定明度 / 色相降低彩度，直到进入 `space` 的 0..1。
+///
+/// 与 [`map_to_gamut`] 的区别：后者在 RGB 中朝亮度缩放，色相会因 RGB 非线性而漂移；
+/// 本函数保持 OkLCh 的 `L` 与 `h`，只压缩 `C`，因此 `饱和度 +100` 时红色不会偏橙。
+/// 返回映射后的 RGB 与彩度比例（1 表示本来就在色域内）。
+pub fn map_to_gamut_oklch(rgb: [f32; 3], space: RgbSpace) -> ([f32; 3], f32) {
+    if rgb.iter().all(|v| v.is_finite()) && rgb.iter().all(|v| (0.0..=1.0).contains(v)) {
+        return (rgb, 1.0);
+    }
+    let [l, c, h] = lab_to_lch(oklab_from_rgb(&space, rgb));
+    let l = if l.is_finite() {
+        l.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let c = if c.is_finite() { c.max(0.0) } else { 0.0 };
+    if c <= 1e-7 {
+        let grey = rgb_from_oklab(&space, lch_to_lab([l, 0.0, 0.0]));
+        return (grey.map(|v| v.clamp(0.0, 1.0)), 1.0);
+    }
+    let mut lo = 0.0f32;
+    let mut hi = c;
+    for _ in 0..12 {
+        let mid = (lo + hi) * 0.5;
+        let trial = rgb_from_oklab(&space, lch_to_lab([l, mid, h]));
+        if trial.iter().all(|v| (0.0..=1.0).contains(v)) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let out = if c <= lo * 0.85 {
+        rgb
+    } else {
+        let knee = lo * 0.85;
+        let range = (lo - knee).max(1e-7);
+        let t = ((c - knee) / range).clamp(0.0, 1.0);
+        // Smooth knee: f(0)=0, f(1)=1, and slightly below the hard boundary
+        // inside the knee; above the boundary we fall back to it.
+        let soft = t - 0.15 * t * (1.0 - t);
+        let c_out = if c > lo {
+            lo
+        } else {
+            knee + range * soft
+        };
+        let mapped = rgb_from_oklab(&space, lch_to_lab([l, c_out, h]));
+        return (mapped.map(|v| v.clamp(0.0, 1.0)), c_out / c);
+    };
+    (out.map(|v| v.clamp(0.0, 1.0)), 1.0)
 }
 
 #[cfg(test)]
@@ -89,5 +141,34 @@ mod tests {
             prev = o;
         }
         assert!(soft_clip(20.0, 0.9) > 0.999);
+    }
+
+    #[test]
+    fn oklch_map_preserves_hue_and_lightness() {
+        for v in [[2.0, 0.1, -0.2], [0.0, 3.0, 0.5], [1.5, 1.2, 0.9]] {
+            let before = lab_to_lch(oklab_from_rgb(&REC2020, v));
+            let (out, k) = map_to_gamut_oklch(v, REC2020);
+            let after = lab_to_lch(oklab_from_rgb(&REC2020, out));
+            assert!(k < 1.0, "{v:?}");
+            if before[0] <= 1.0 {
+                assert!(
+                    (before[0] - after[0]).abs() < 0.01,
+                    "{v:?}: L {} -> {}",
+                    before[0],
+                    after[0]
+                );
+            } else {
+                // 输入本身高于白点：L 被夹到 1，不再要求保持原 L。
+                assert!(after[0] <= 1.0 + 1e-4, "{v:?}: L {}", after[0]);
+            }
+            let dh = crate::perceptual::wrap_angle(after[2] - before[2]).abs();
+            // 极亮 / 极低彩度的输入夹到白点后色相没有意义，只要求结果在色域内。
+            if after[1] > 0.02 {
+                assert!(dh < 0.01, "{v:?}: hue drift {dh}");
+            }
+            assert!(out.iter().all(|c| (0.0..=1.0).contains(c)), "{out:?}");
+        }
+        let in_gamut = [0.2, 0.4, 0.1];
+        assert_eq!(map_to_gamut_oklch(in_gamut, REC2020), (in_gamut, 1.0));
     }
 }

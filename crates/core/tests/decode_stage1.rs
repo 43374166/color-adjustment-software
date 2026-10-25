@@ -273,7 +273,12 @@ fn decode_raw_rgba_from_bytes_decodes_and_scales() {
     if complete {
         let first = &preview.rgba[..4];
         assert!(
-            preview.rgba.chunks_exact(4).any(|pixel| pixel != first),
+            preview
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| pixel.as_slice() != first),
             "解码结果不应为纯色"
         );
     }

@@ -262,20 +262,33 @@ impl ColorOps {
             if dl_pos > 0.0 {
                 c *= (1.0 - 1.2 * dl_pos).max(0.0);
             }
-            l += dl * chroma_w * l.max(0.05).sqrt();
+            // 黑场 / 白场权重：纯黑、纯白不因 HSL 明亮度被抬灰或压灰。
+            let l_weight = smooth(0.0, 0.05, l);
+            l += dl * chroma_w * l_weight * l.max(0.05).sqrt();
+            // 负向明亮度不能把 L 推成负数（否则 OkLab → RGB 会出现反相 / 负通道）；
+            // 正向也不能超过白点。
+            l = l.clamp(0.0, 1.0);
+            c = c.max(0.0);
         }
         for p in &self.points {
             if !p.is_neutral() {
                 [l, c, h] = PointK::new(p).apply([l, c, h]);
+                // 点颜色的 lum_shift / variance 在极值下同样可能把 L 推出 [0,1]。
+                l = l.clamp(0.0, 1.0);
+                c = c.max(0.0);
+                h = wrap_angle(h);
             }
         }
-        c = self.vibrance_saturation(c, h);
+        c = self.vibrance_saturation(c, h).max(0.0);
         if let Some(bw) = &self.bw {
             let w = band_weights(h);
             let mix: f32 = (0..8).map(|i| w[i] * (bw[i] / 100.0) as f32).sum();
-            l = (l + mix * (c / 0.2).min(1.0) * 0.25).max(0.0);
+            l = (l + mix * (c / 0.2).min(1.0) * 0.25).clamp(0.0, 1.0);
             c = 0.0;
         }
+        l = l.clamp(0.0, 1.0);
+        c = c.max(0.0);
+        h = wrap_angle(h);
         rgb_from_oklab(&self.space, self.grade(lch_to_lab([l, c, h])))
     }
 
@@ -326,6 +339,9 @@ impl ColorOps {
             lab[2] += k.1 * wt;
             lab[0] += k.2 * wt;
         }
+        // 分级亮度在 ±100 时可能把纯黑推成负数 / 把纯白推过 1；
+        // 输出必须落在显示参考的 L 范围，否则后续 OkLab→RGB 会出现负通道。
+        lab[0] = lab[0].clamp(0.0, 1.0);
         lab
     }
 }
@@ -535,5 +551,103 @@ mod tests {
         let c0 = lab_to_lch(oklab_from_rgb(&SRGB, v))[1];
         let c1 = lab_to_lch(oklab_from_rgb(&SRGB, out))[1];
         assert!(c1 > c0, "{c0} -> {c1}");
+    }
+
+    #[test]
+    fn hsl_luminance_extremes_keep_black_and_white() {
+        // 全色带明亮度 +100 / -100 都不能把纯黑抬灰、把纯白压灰。
+        for lum in [-100.0, 100.0] {
+            let mut m = Mixer::default();
+            for band in &mut m.bands {
+                band.lum = lum;
+            }
+            let mut o = ops();
+            o.mixer = Some(m);
+            let black = o.apply([0.0, 0.0, 0.0]);
+            let white = o.apply([1.0, 1.0, 1.0]);
+            assert!(
+                black.iter().all(|v| v.abs() < 1e-4),
+                "lum {lum}: black -> {black:?}"
+            );
+            assert!(
+                white.iter().all(|v| (*v - 1.0).abs() < 2e-3),
+                "lum {lum}: white -> {white:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn point_color_extreme_lum_shift_keeps_black_black() {
+        let p = PointColor {
+            lum: 0.0,
+            chroma: 0.0,
+            hue: 0.0,
+            lum_shift: -100.0,
+            range: 100.0,
+            lum_range: 100.0,
+            ..Default::default()
+        };
+        let mut o = ops();
+        o.points.push(p);
+        let out = o.apply([0.0, 0.0, 0.0]);
+        assert!(
+            out.iter().all(|v| v.abs() < 1e-4),
+            "point lum -100 on black -> {out:?}"
+        );
+        assert!(out.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn grading_extreme_lightness_never_produces_negative_luminance() {
+        let g = Grading {
+            shadows: Wheel {
+                hue: 220.0,
+                sat: 100.0,
+                lum: 100.0,
+            },
+            midtones: Wheel {
+                hue: 120.0,
+                sat: 100.0,
+                lum: -100.0,
+            },
+            highlights: Wheel {
+                hue: 40.0,
+                sat: 100.0,
+                lum: 100.0,
+            },
+            global: Wheel {
+                hue: 300.0,
+                sat: 100.0,
+                lum: -100.0,
+            },
+            blending: 100.0,
+            balance: 100.0,
+        };
+        let mut o = ops();
+        o.grading = Some(g);
+        for rgb in [
+            [0.0, 0.0, 0.0],
+            [0.001, 0.001, 0.001],
+            [0.18, 0.18, 0.18],
+            [1.0, 1.0, 1.0],
+        ] {
+            let out = o.apply(rgb);
+            assert!(out.iter().all(|v| v.is_finite()), "{rgb:?} -> {out:?}");
+            let y: f32 = out[0] * 0.2126 + out[1] * 0.7152 + out[2] * 0.0722;
+            assert!(y >= -1e-4, "{rgb:?} -> {out:?} (Y={y})");
+        }
+    }
+
+    #[test]
+    fn saturation_extremes_never_change_neutral_grey() {
+        for sat in [-100.0, 100.0] {
+            let mut o = ops();
+            o.saturation = sat;
+            let grey = [0.18, 0.18, 0.18];
+            let out = o.apply(grey);
+            for v in out {
+                assert!((v - 0.18).abs() < 1e-4, "sat {sat}: {out:?}");
+            }
+        }
     }
 }

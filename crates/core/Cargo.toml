@@ -1,6 +1,6 @@
 [package]
 name = "fdxmp-core"
-description = "fdxmp 图像处理核心：解码、色彩管线、蒙版、预设、缓存、历史"
+description = "fdxmp image processing core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,15 +12,15 @@ workspace = true
 
 [features]
 default = []
-# wgpu 渲染上下文
+# wgpu render context
 gpu = ["dep:wgpu", "dep:tokio"]
-# LibRaw 封装（rsraw）
+# LibRaw wrapper (rsraw)
 raw = ["dep:rsraw"]
-# libheif 封装（libheif-rs）
+# libheif wrapper
 heif = ["dep:libheif-rs"]
-# 桌面 AI 蒙版（ONNX Runtime，运行时加载 onnxruntime.dll）
+# desktop AI masks (ONNX Runtime, loaded dynamically)
 ai = ["dep:ort", "dep:ureq", "ort/load-dynamic"]
-# 移动 AI 蒙版（iOS：pyke 预编译静态库 + CoreML 后端，静态链接进静态库）
+# mobile AI masks (iOS: static prebuilt library + CoreML)
 ai-static = [
     "dep:ort",
     "dep:ureq",
@@ -28,7 +28,7 @@ ai-static = [
     "ort/coreml",
     "ort/tls-rustls",
 ]
-# 全能力（四端最终形态）
+# all features
 full = ["gpu", "raw", "heif", "ai"]
 
 [dependencies]
@@ -41,6 +41,7 @@ rayon.workspace = true
 ndarray.workspace = true
 thiserror.workspace = true
 image.workspace = true
+kamadak-exif = "0.6.1"
 ab_glyph.workspace = true
 lcms2.workspace = true
 flate2.workspace = true
@@ -55,7 +56,8 @@ libheif-rs = { version = "3.0.0", optional = true }
 
 [dev-dependencies]
 criterion.workspace = true
-# 着色器语法自检（naga 与 wgpu 30 同源版本，本地跑单测即可发现 WGSL 错误）
+rsraw-sys = "0.1.1"
+# shader syntax self-check (naga shares wgpu 30)
 naga = { version = "30.0.1", features = ["wgsl-in"] }
 
 [[bench]]

@@ -19,6 +19,66 @@
 
 其余问题**不动代码**，在本文件第 3 节登记建账。
 
+## 0. 2026-10-25 极端值修复（调色优先）
+
+目标：滑块到 ±100 时不能出现反相 / 负通道 / 硬裁剪；CPU 与 GPU 的最终显示结果必须一致。
+
+算法参考：LightCraft 的显示段顺序（色调后调色、调色后色域出口）与 CPU/GPU 一致性验收；
+darktable `colorbalancergb` 的"感知空间 + 色域压缩"思路（只借鉴公开文档与参数语义，未复制 GPL 代码）。
+
+| 问题 | 修复 | 回归测试 |
+| --- | --- | --- |
+| 点颜色 `lum_shift=-100` 把近黑压成负 L，OkLab→RGB 出负通道 | `ColorOps` 在点颜色每步后夹 `L∈[0,1]`、`C≥0`、色相回绕 | `ops::point_color_extreme_lum_shift_keeps_black_black`、`color_extremes::point_color_endpoints...` |
+| 颜色分级亮度 ±100 把黑推成负 L | `grade()` 末尾夹 `lab[0]`；GPU 同步 `clamp(lab.x)` | `ops::grading_extreme_lightness...`、`color_extremes::grading_luminance...` |
+| HSL 明亮度 -100 把暗部 L 推成负数；+100 把纯黑抬灰 | 加入黑/白权重 `smooth(0,0.05,L)`，并夹 `L∈[0,1]`；GPU `smoothstep` 同步 | `ops::hsl_luminance_extremes_keep_black_and_white`、`color_extremes::hsl_luminance...` |
+| 饱和度 +100 / 极值分级产生超出色域的线性 RGB，CPU 逐通道硬裁剪、GPU 直接编码 → 色相漂移 / 死色块 | 新增 `gamut::map_to_gamut_oklch`（固定 OkLCh L/h，只压缩 C）；CPU `ColorStage::map_display_gamut` 与 GPU `gamut_map_oklch` 同算法 | `core::color_extremes::saturation_plus100...`、`display_gamut_mapping...`、`gpu_curve_only_matches_cpu_preview`、`gpu_colour_stage_extremes_match_cpu_reference` |
+| 色温 -100 + 色调 +100：3200K 的 Duv 0.032 贴近光谱边界，Bradford 蓝增益 169×，中灰 → 负 R/G + 34× B | 保留 `TINT_DUV=0.032`（不改变旧预设 tint 强度），把锥体增益夹到 `[1/4, 4]` | `white_balance::extreme_temperature_and_tint...`、`color_extremes::white_balance_endpoints...` |
+| CPU 只在“有调色”时才做色域映射，曲线单独使用时与 GPU 不一致 | `adjust_pixel` 无论调色段是否激活都做显示色域映射 | `gpu_colour_stage_matches_cpu_reference`、`gpu_monochrome_mix...` |
+
+验证（WSL Kali + Rust 1.99.1，llvmpipe Vulkan）：
+
+- `cargo test -p fdxmp-color`：42 个单元 / 文档内测试 + 3 个极端 sweep = 45 通过。
+- `cargo test -p fdxmp-core --lib -- --test-threads=1`：173 通过、1 ignored（串行；并行时 `masks::ai_masks_require_generated_raster` 为既有全局状态 flaky）。
+- `cargo test -p fdxmp-core --features gpu --test gpu_pipeline`：32 通过（含新增极端 CPU/GPU 一致性、曲线单独使用一致性）。
+- `cargo test -p fdxmp-core --test color_extremes`：12 通过（含曝光 / 效果 / 饱和度 +100 的色相漂移 <2°、明度漂移 <0.10 断言）。
+- `cargo clippy -p fdxmp-color -p fdxmp-core --all-targets -- -D warnings`：通过。
+- 真机照片 `DSC09784.jpg` 用 CPU 预览跑了 10 组极值并目检（诊断图不落盘；可用 `cargo run -p fdxmp-core --example color_sweep -- <输入> <输出目录>` 复现）。
+
+Windows 原生验证（`x86_64-pc-windows-gnu` 交叉编译，RTX 3060 Ti / Vulkan）：
+
+- Windows CPU 测试：`fdxmp-core --lib` 173、`fdxmp-color` 42 + 极端 sweep 3、`core::color_extremes` 12，全部通过。
+- Windows GPU 测试：`gpu_pipeline` 32 通过（含新增 `gpu_colour_stage_extremes_match_cpu_reference` 与曲线单独使用一致性）。
+- Windows 桌面：release `fdxmp-win-ui.exe` 启动并打开 `DSC09784.jpg`，状态栏显示首屏 314 ms、代理 2048×1365、Vulkan RTX 3060 Ti。
+- Windows UI Automation：成功把「饱和度」设为 +100、「对比度」设为 -100；画面饱和度变化、黑白不反转，历史记录正常。鼠标拖拽仍受 Windows 前台/焦点限制，未做稳定的端到端拖拽脚本。
+
+Android 模拟器验证（API 35 / x86_64 / KVM，WSL 内 headless emulator）：
+
+- 同一份 Rust 核心，`cargo test --target x86_64-linux-android` 产物 push 到模拟器运行：
+  - `fdxmp-color`：42 + 极端 sweep 3 全部通过；
+  - `fdxmp-core --lib`：173 通过、1 ignored；
+  - `color_extremes`：12 通过；
+  - `fdxmp-ffi --lib`：12 通过（JNI/C ABI 同源核心）。
+- NDK 27.2 + `x86_64-linux-android35-clang` 交叉编译；说明同一份 `crates/color` / `crates/core` 在 Android 运行时通过。复现步骤见 [`ANDROID_EMULATOR_TEST.md`](ANDROID_EMULATOR_TEST.md)。
+
+HarmonyOS：`cargo check -p fdxmp-color --target aarch64-unknown-linux-ohos` 通过（纯色彩数学层）；完整 core / bridge / 模拟器仍需 DevEco/OHOS SDK。
+
+复现命令（WSL/Linux 交叉编译到 Windows GNU）：
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
+cargo build --release -p fdxmp-win-ui --target x86_64-pc-windows-gnu
+cargo test -p fdxmp-core --features gpu --test gpu_pipeline \
+  --target x86_64-pc-windows-gnu --no-run
+```
+
+
+尚未完成（环境阻塞）：
+- HarmonyOS 模拟器：本机未装 DevEco Studio/OHOS SDK；纯色彩层已通过 OHOS target check，但没有 HAP/真机/模拟器验证。
+- Lightroom 2026 对照：已定位 `D:\install\Adobe\Adobe Lightroom Classic 2026` 与 `D:\Pictures\Lightroom\Lightroom Catalog.lrcat`，本轮未做自动化导出对照，下一步用真实 RAW/JPEG 做 ΔE 基线。
+
+
+
 ## 1. 已修复
 
 ### 1.1 对比度 -100 反相（P0）
@@ -220,11 +280,11 @@
 
 **白平衡（C3）** — 新模块 `crates/core/src/white_balance.rs`
 
-- 滑杆 ↔ 开尔文：`0 = 5500K`，1 个单位 = 55K；与 XMP 导入共用同一映射
+- 滑杆 ↔ 开尔文：`0 = 5500K`，暖端每单位 90K、冷端每单位 23K；与 XMP 导入共用同一映射
   （`kelvin_to_relative` / `relative_to_kelvin` 互逆，有往返单元测试）。
   原实现两处映射各自为政（XMP 按开尔文、渲染按固定增益），导入预设的色温必然偏。
 - 白点模型：Planckian locus（Kim et al. 2002 近似）+ 色调沿轨迹法向偏移
-  （±100 → ±0.025 Duv；正色调表示"假定照明偏绿"，校正后画面偏洋红）。
+  （±100 → ±0.02 Duv；正色调表示"假定照明偏绿"，校正后画面偏洋红）。
 - 校正模型：Bradford 色适应（假定照明白点 → 5500K 参考白点），
   CPU 侧按参数算成 3×3 矩阵，通过 uniform 88..96 传给着色器第 1 段应用。
   0/0 恒等；温度 +100 变暖（R↑ B↓）、-100 变冷；色调 +100 偏洋红。

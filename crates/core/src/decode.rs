@@ -176,6 +176,14 @@ pub struct RawMetadata {
     pub focal_length_mm: f32,
     /// 拍摄时间（RFC 3339）。
     pub captured_at: Option<String>,
+    /// 相机白平衡模式（EXIF WhiteBalance，例如 Auto / Manual）。
+    pub white_balance: Option<String>,
+    /// 色温（EXIF ColorTemperature，Kelvin）。
+    pub color_temperature_k: Option<u32>,
+    /// 光源（EXIF LightSource）。
+    pub light_source: Option<String>,
+    /// 曝光补偿（EV）。
+    pub exposure_bias_ev: Option<f32>,
 }
 
 impl RawMetadata {
@@ -194,6 +202,25 @@ impl RawMetadata {
             self.aperture,
             self.focal_length_mm
         )
+    }
+
+    /// 白平衡摘要（没有 EXIF 时返回空串）。
+    pub fn white_balance_summary(&self) -> String {
+        match (
+            &self.white_balance,
+            self.color_temperature_k,
+            &self.light_source,
+        ) {
+            (None, None, None) => String::new(),
+            (mode, kelvin, light) => format!(
+                "{} {} {}",
+                mode.as_deref().unwrap_or(""),
+                kelvin.map_or(String::new(), |k| format!("{k}K")),
+                light.as_deref().unwrap_or("")
+            )
+            .trim()
+            .to_string(),
+        }
     }
 }
 
@@ -538,7 +565,8 @@ pub fn decode_raw_bytes(
 ) -> Result<DecodedImage> {
     let mut raw = rsraw::RawImage::open(bytes)
         .map_err(|err| FdxmpError::Raw(format!("LibRaw 打开失败：{err}")))?;
-    let metadata = raw_metadata(&raw);
+    let mut metadata = raw_metadata(&raw);
+    populate_exif_metadata(bytes, &mut metadata);
 
     if options.use_embedded_preview {
         if let Some(pixels) = embedded_preview(&mut raw) {
@@ -796,6 +824,35 @@ fn probe_heif_size(_path: &Path) -> Option<(u32, u32)> {
 }
 
 #[cfg(feature = "raw")]
+fn populate_exif_metadata(bytes: &[u8], metadata: &mut RawMetadata) {
+    use std::io::Cursor;
+
+    use exif::{In, Reader, Tag};
+
+    let mut cursor = Cursor::new(bytes);
+    let Ok(exif) = Reader::new().read_from_container(&mut cursor) else {
+        return;
+    };
+    let text = |tag: Tag| {
+        exif.get_field(tag, In::PRIMARY)
+            .map(|field| {
+                field
+                    .display_value()
+                    .to_string()
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .filter(|value| !value.is_empty())
+    };
+    metadata.white_balance = text(Tag::WhiteBalance);
+    metadata.light_source = text(Tag::LightSource);
+    metadata.color_temperature_k =
+        text(Tag::Temperature).and_then(|value| value.split_whitespace().next()?.parse().ok());
+    metadata.exposure_bias_ev = text(Tag::ExposureBiasValue)
+        .and_then(|value| value.split_whitespace().next()?.parse().ok());
+}
+
+#[cfg(feature = "raw")]
 fn raw_metadata(raw: &rsraw::RawImage) -> RawMetadata {
     RawMetadata {
         make: raw.make().to_string(),
@@ -805,6 +862,7 @@ fn raw_metadata(raw: &rsraw::RawImage) -> RawMetadata {
         aperture: raw.aperture(),
         focal_length_mm: raw.focal_len(),
         captured_at: raw.datetime().map(|stamp| stamp.to_rfc3339()),
+        ..RawMetadata::default()
     }
 }
 
@@ -975,9 +1033,20 @@ mod tests {
             aperture: 4.0,
             focal_length_mm: 50.0,
             captured_at: None,
+            ..RawMetadata::default()
         };
         let summary = metadata.summary();
         assert!(summary.contains("Nikon Z 8"));
         assert!(summary.contains("ISO 400"));
+    }
+
+    #[test]
+    fn white_balance_summary_formats_optional_fields() {
+        let metadata = RawMetadata {
+            white_balance: Some("Auto".to_string()),
+            color_temperature_k: Some(5200),
+            ..RawMetadata::default()
+        };
+        assert_eq!(metadata.white_balance_summary(), "Auto 5200K");
     }
 }

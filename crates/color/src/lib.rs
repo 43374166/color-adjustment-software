@@ -24,6 +24,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bands;
+pub mod camera;
 pub mod cct;
 pub mod gamut;
 pub mod math;
@@ -33,6 +34,7 @@ pub mod spline;
 pub mod tone;
 pub mod transfer;
 
+pub use camera::CameraProfile;
 pub use cct::{
     kelvin_to_mired, mired_to_kelvin, planckian_xy, temp_tint_to_xy, wb_matrix, xy_to_temp_tint,
 };

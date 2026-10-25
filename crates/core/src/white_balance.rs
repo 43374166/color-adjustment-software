@@ -21,7 +21,17 @@ pub const KELVIN_PER_UNIT_WARM: f32 = 90.0;
 pub const KELVIN_PER_UNIT_COOL: f32 = 23.0;
 
 /// 色调滑杆 ±100 对应的 Duv 偏移（垂直黑体轨迹，正 = 洋红方向）。
+///
+/// 保留 0.032 的既有强度（不改变旧预设的 tint 观感）；极端组合
+/// （例如 3200K + 色调 +100）会让假定白点贴近光谱边界，Bradford 蓝通道
+/// 增益可达 169×，由 [`MAX_CONE_GAIN`] 兜底，避免中灰被推成负 R/G。
 const TINT_DUV: f32 = 0.032;
+
+/// Bradford 锥体响应的最大增益（防极端白点导致矩阵爆炸）。
+///
+/// 正常的色温 / 色调组合远低于此值；只有“色温 -100 + 色调 +100”这类
+/// 边界组合才会触发。限制后极端画面仍会偏色，但不会出现负通道 / 反相。
+const MAX_CONE_GAIN: f32 = 4.0;
 
 /// Lightroom 色温（开尔文）→ 相对滑杆值（5500K 为 0±100）。
 pub fn kelvin_to_relative(kelvin: f32) -> f32 {
@@ -189,7 +199,10 @@ pub fn adaptation_matrix(temperature: f32, tint: f32) -> [[f32; 3]; 3] {
     let cone_to = mat3_apply(&BRADFORD, to);
     let mut scale = [[0.0f32; 3]; 3];
     for i in 0..3 {
-        scale[i][i] = cone_to[i] / cone_from[i].max(1e-6);
+        // cone_to / cone_from 在极端白点会达到 100× 以上；夹住增益，
+        // 保证矩阵有限、中灰不出现负通道。正常范围内这个夹子不生效。
+        scale[i][i] =
+            (cone_to[i] / cone_from[i].max(1e-6)).clamp(1.0 / MAX_CONE_GAIN, MAX_CONE_GAIN);
     }
     let adapt_xyz = mat3_mul(&mat3_inverse(&BRADFORD), &mat3_mul(&scale, &BRADFORD));
     mat3_mul(&XYZ_TO_SRGB, &mat3_mul(&adapt_xyz, &SRGB_TO_XYZ))
@@ -255,6 +268,27 @@ mod tests {
                 (back - kelvin).abs() < 1.0,
                 "{kelvin}K → 滑杆 → {back}K 往返偏差过大"
             );
+        }
+    }
+
+    #[test]
+    fn extreme_temperature_and_tint_stay_finite_and_positive() {
+        for temperature in [-100.0f32, 0.0, 100.0] {
+            for tint in [-100.0f32, 0.0, 100.0] {
+                let matrix = adaptation_matrix(temperature, tint);
+                assert!(
+                    matrix.iter().flatten().all(|v| v.is_finite()),
+                    "{temperature}/{tint}: {matrix:?}"
+                );
+                // 中灰经过极值白平衡后不能变成负值 / NaN；允许偏色，但不能反相。
+                let grey = apply_matrix(&matrix, [0.18, 0.18, 0.18]);
+                assert!(
+                    grey.iter().all(|v| v.is_finite() && *v >= -1e-6),
+                    "{temperature}/{tint}: {grey:?}"
+                );
+                let y = 0.2126 * grey[0] + 0.7152 * grey[1] + 0.0722 * grey[2];
+                assert!(y > 0.0, "{temperature}/{tint}: Y={y}");
+            }
         }
     }
 }

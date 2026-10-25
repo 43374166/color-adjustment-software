@@ -963,19 +963,24 @@ fn adjust_pixel(
 
     // 调色段（自然饱和度 / 饱和度 → 8 色带混色 → 点颜色 → 黑白 → 颜色分级）：
     // 与 GPU `pipeline_colour_ops`、`fdxmp-color::ops::ColorOps` 同一份数学（OkLab / OkLCh）。
-    if !color_stage.is_identity() {
-        let linear = [
-            srgb_to_linear(rgb[0]),
-            srgb_to_linear(rgb[1]),
-            srgb_to_linear(rgb[2]),
-        ];
-        let out = color_stage.apply_color(linear);
-        rgb = [
-            linear_to_srgb_f32(out[0]).clamp(0.0, 1.0),
-            linear_to_srgb_f32(out[1]).clamp(0.0, 1.0),
-            linear_to_srgb_f32(out[2]).clamp(0.0, 1.0),
-        ];
-    }
+    // 无论调色段是否激活，都在编码前做一次与 GPU 相同的显示色域映射：
+    // 曲线也可能把高饱和色推出色域，不能只在“有调色”时才映射。
+    let linear = [
+        srgb_to_linear(rgb[0]),
+        srgb_to_linear(rgb[1]),
+        srgb_to_linear(rgb[2]),
+    ];
+    let out = if color_stage.is_identity() {
+        linear
+    } else {
+        color_stage.apply_color(linear)
+    };
+    let mapped = crate::color_engine::ColorStage::map_display_gamut(out);
+    rgb = [
+        linear_to_srgb_f32(mapped[0]).clamp(0.0, 1.0),
+        linear_to_srgb_f32(mapped[1]).clamp(0.0, 1.0),
+        linear_to_srgb_f32(mapped[2]).clamp(0.0, 1.0),
+    ];
 
     rgb
 }
@@ -1675,8 +1680,10 @@ mod tests {
             ..MaskParams::default()
         };
         mask.adjustments.light.exposure = 1.0;
-        let mut params = EditParams::default();
-        params.masks = vec![mask.clone()];
+        let params = EditParams {
+            masks: vec![mask.clone()],
+            ..Default::default()
+        };
 
         // 第一张图：主体蒙版全 1 → 整幅 +1EV。
         let mut ones = MaskRaster::zeros(4, 4);
@@ -1945,8 +1952,10 @@ mod tests {
             let value = (x * 16) as u8;
             *pixel = Rgba([value, 128, value, 255]);
         }
-        let mut lens = LensParams::default();
-        lens.chromatic_aberration = 100.0;
+        let lens = LensParams {
+            chromatic_aberration: 100.0,
+            ..Default::default()
+        };
         let out = apply_lens(&source, &lens);
         let before = source.get_pixel(3, 8).0;
         let after = out.get_pixel(3, 8).0;
