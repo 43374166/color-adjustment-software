@@ -1,5 +1,8 @@
 name: iOS 未签名 IPA
 
+permissions:
+  contents: write
+
 # 云打包：在 GitHub 的 macOS 运行器上编译 Rust 静态库 + SwiftUI App，
 # 产出 dist/ios/Fdxmp-unsigned.ipa（未签名，下载后用 Sideloadly / AltStore 签名安装）。
 on:
@@ -119,3 +122,12 @@ jobs:
           path: dist/ios/Fdxmp-unsigned.ipa
           if-no-files-found: error
           retention-days: 30
+
+      - name: 发布到 Release（免登录下载）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "ios-${GITHUB_RUN_NUMBER}" \
+            dist/ios/Fdxmp-unsigned.ipa \
+            --title "Fdxmp iOS ${GITHUB_RUN_NUMBER}" \
+            --notes "Unsigned IPA built from ${GITHUB_SHA}"
