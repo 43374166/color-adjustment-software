@@ -1,4 +1,4 @@
-# fdxmp Windows 打包：构建 win_ui → 复制 exe → 运行时 DLL → 安装包（NSIS / IExpress）→ 7z 分发包。
+﻿# fdxmp Windows 打包：构建 win_ui → 复制 exe → 运行时 DLL → 安装包（NSIS / IExpress）→ 7z 分发包。
 #
 # 用法：
 #   powershell -File packaging/windows/build.ps1
@@ -15,11 +15,12 @@ $version = "1.6.1"
 $cargoToml = Get-Content (Join-Path $root "Cargo.toml") -Raw
 if ($cargoToml -match '(?m)^version\s*=\s*"([^"]+)"') { $version = $Matches[1] }
 
-# 优先使用仓库内 .tmp 的 7-Zip（无系统安装），否则退回 PATH 上的 7za。
+# 优先使用仓库内 .tmp 的 7-Zip（无系统安装），否则退回 PATH 上的 7za / 7z。
 $sevenZip = Join-Path $root ".tmp/tools/7zip/x64/7za.exe"
 if (-not (Test-Path $sevenZip)) { $sevenZip = Join-Path $root ".tmp/tools/7zip/7za.exe" }
 if (-not (Test-Path $sevenZip)) {
     $found = Get-Command 7za -ErrorAction SilentlyContinue
+    if (-not $found) { $found = Get-Command 7z -ErrorAction SilentlyContinue }
     if ($found) { $sevenZip = $found.Source } else { $sevenZip = $null }
 }
 

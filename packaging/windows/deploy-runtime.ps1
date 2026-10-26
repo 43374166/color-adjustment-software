@@ -5,14 +5,30 @@
 #   powershell -File packaging/windows/deploy-runtime.ps1 -Exe target\release\fdxmp-win-ui.exe
 #
 # 原理：用 objdump 读取 exe 的导入表，递归收集依赖，从本地 MinGW 工具链目录
-# （%USERPROFILE%\.cache\fdxmp-tools\mingw64\bin）复制缺失的 DLL。
+# （默认 D:\dev\msys64\mingw64\bin，可用 -SourceDir 或 $env:FDXMP_TOOLS 覆盖）复制缺失的 DLL。
 
 param(
     [Parameter(Mandatory = $true)][string]$Exe,
-    [string]$SourceDir = (Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64\bin")
+    [string]$SourceDir = ""
 )
 
 $ErrorActionPreference = "Stop"
+
+if (-not $SourceDir) {
+    # 与 dev-env.ps1 保持一致的解析顺序：$env:FDXMP_TOOLS → D:\dev\msys64\mingw64 → 旧缓存目录
+    $candidates = @()
+    if ($env:FDXMP_TOOLS) { $candidates += $env:FDXMP_TOOLS }
+    $candidates += @("D:\dev\msys64\mingw64", (Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64"))
+    $mingwRoot = $candidates | Where-Object { Test-Path (Join-Path $_ "bin\objdump.exe") } | Select-Object -First 1
+    if ($mingwRoot) {
+        $SourceDir = Join-Path $mingwRoot "bin"
+    }
+    else {
+        $onPath = Get-Command objdump -ErrorAction SilentlyContinue
+        if ($onPath) { $SourceDir = Split-Path $onPath.Source -Parent }
+        else { $SourceDir = Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64\bin" }
+    }
+}
 $exePath = (Resolve-Path $Exe).Path
 $targetDir = Split-Path $exePath -Parent
 $objdump = Join-Path $SourceDir "objdump.exe"

@@ -9,12 +9,30 @@
 #   2. 使用本地缓存的 MinGW-w64 工具链提供 gcc / dlltool / as；
 #   3. 通过 RUSTUP_TOOLCHAIN 让后续裸 `cargo` 命令走该工具链。
 #
-# 首次准备（仅需一次）：
+# 首次准备（仅需一次，完整步骤见 docs/BUILD.md §0.1）：
 #   rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
-#   # MinGW-w64 工具链解压到 $env:USERPROFILE\.cache\fdxmp-tools\mingw64（见 docs/BUILD.md）
+#   MinGW-w64 用 MSYS2（本机装在 D:\dev\msys64），也可用 $env:FDXMP_TOOLS 指定其它根目录
 
 $toolchain = "stable-x86_64-pc-windows-gnu"
-$mingwBin = Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64\bin"
+
+# rustup 刚装好、当前终端 PATH 还没刷新时临时补上 cargo\bin
+if (-not (Get-Command rustup -ErrorAction SilentlyContinue)) {
+    $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
+    if (Test-Path $cargoBin) { $env:PATH = "$cargoBin;$env:PATH" }
+}
+
+# MinGW-w64 根目录（里面要有 bin\gcc.exe）。解析顺序：
+#   $env:FDXMP_TOOLS → D:\dev\msys64\mingw64（本机：MSYS2 装在 D 盘）
+#   → %USERPROFILE%\.cache\fdxmp-tools\mingw64（旧机器的缓存方案）
+$mingwRoot = $null
+$mingwCandidates = @()
+if ($env:FDXMP_TOOLS) { $mingwCandidates += $env:FDXMP_TOOLS }
+$mingwCandidates += @("D:\dev\msys64\mingw64", (Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64"))
+foreach ($candidate in $mingwCandidates) {
+    if (Test-Path (Join-Path $candidate "bin\gcc.exe")) { $mingwRoot = $candidate; break }
+}
+if (-not $mingwRoot) { $mingwRoot = $mingwCandidates[-1] }
+$mingwBin = Join-Path $mingwRoot "bin"
 
 $cargoPath = rustup which cargo --toolchain $toolchain 2>$null
 if (-not $cargoPath) {
@@ -56,23 +74,30 @@ $env:TMP = $tempDir
 # rsraw（RAW 解码）构建环境：bindgen 需要 libclang + MinGW 头文件，
 # 且必须显式给出 MinGW 目标三元组，否则 stdlib.h 解析失败。
 $libclang = Join-Path $env:USERPROFILE ".cache\fdxmp-tools\pylibs\clang\native"
-$mingwInclude = Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64\include"
-$gccInclude = Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64\lib\gcc\x86_64-w64-mingw32\16.2.0\include"
+if (-not (Test-Path (Join-Path $libclang "libclang.dll"))) {
+    $altLibclang = "D:\dev\fdxmp-tools\pylibs\clang\native"
+    if (Test-Path (Join-Path $altLibclang "libclang.dll")) { $libclang = $altLibclang }
+}
+$mingwInclude = Join-Path $mingwRoot "include"
+# gcc 内置头文件目录带版本号（如 16.2.0），取已安装的最新一个
+$gccSubdir = Get-ChildItem (Join-Path $mingwRoot "lib\gcc\x86_64-w64-mingw32") -Directory -ErrorAction SilentlyContinue |
+    Sort-Object Name -Descending | Select-Object -First 1
+$gccInclude = if ($gccSubdir) { Join-Path $gccSubdir.FullName "include" } else { $null }
 if (Test-Path (Join-Path $libclang "libclang.dll")) {
     $env:LIBCLANG_PATH = $libclang
 }
-if ((Test-Path $mingwInclude) -and (Test-Path $gccInclude)) {
+if ((Test-Path $mingwInclude) -and $gccInclude -and (Test-Path $gccInclude)) {
     $env:CPATH = "$mingwInclude;$gccInclude"
     $env:BINDGEN_EXTRA_CLANG_ARGS = "--target=x86_64-w64-windows-gnu"
 }
 
 # HEIF（libheif-rs）构建环境：pkg-config + 本地 libheif 1.23
-$pkgConfigDir = Join-Path $env:USERPROFILE ".cache\fdxmp-tools\mingw64\lib\pkgconfig"
+$pkgConfigDir = Join-Path $mingwRoot "lib\pkgconfig"
 if (Test-Path $pkgConfigDir) {
     $env:PKG_CONFIG_PATH = $pkgConfigDir
 }
 
 Write-Host "fdxmp 开发环境已就绪" -ForegroundColor Green
 Write-Host "  工具链：$toolchain（$(rustup run $toolchain rustc --version)）"
-Write-Host "  MinGW ：$mingwBin"
+Write-Host "  MinGW ：$mingwRoot"
 Write-Host "  后续可直接使用：cargo build / cargo test / cargo clippy / cargo run -p fdxmp-win-ui"

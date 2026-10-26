@@ -13,31 +13,57 @@
 ### 0.1 本机 Windows 方案（无 Visual Studio 时的替代）
 
 该机器未安装 Visual Studio / Windows SDK，因此使用 Rust 自带的 GNU 宿主工具链
-加一份本地 MinGW-w64（gcc + dlltool + as）：
+加一份 MinGW-w64（gcc + dlltool + as，来自 MSYS2）。**全部装在 D 盘**
+（C 盘只剩约 10 GB）：
 
-1. 安装 GNU 宿主工具链（自带 rust-mingw 链接器）：
+| 组件 | 位置 |
+| --- | --- |
+| rustup / cargo 数据 | `D:\dev\rust\rustup`、`D:\dev\rust\cargo`（`%USERPROFILE%\.rustup`、`.cargo` 是指向它们的目录联接，PATH 与 `rustup` 用法不变） |
+| GNU 宿主工具链 | 同上，`toolchains\stable-x86_64-pc-windows-gnu`（`rustup default` 已指向它） |
+| MinGW-w64 | `D:\dev\msys64\mingw64`（gcc 16.2 / binutils / pkgconf / libheif 1.23） |
+| libclang（rsraw bindgen 用） | `D:\dev\fdxmp-tools\pylibs\clang\native` |
+
+重装时的步骤：
+
+1. GNU 宿主工具链（国内网络需配 `RUSTUP_DIST_SERVER`，否则下载会卡住）：
 
    ```powershell
-   rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+   $env:RUSTUP_DIST_SERVER = 'https://mirrors.tuna.tsinghua.edu.cn/rustup'
+   rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal -c rustfmt -c clippy
+   rustup default stable-x86_64-pc-windows-gnu
+   rustup override set stable-x86_64-pc-windows-gnu   # 只作用于本仓库
    ```
 
-2. 准备 MinGW-w64 工具链（MSYS2 组件，解压即用，放在用户缓存目录，不进入仓库）：
+2. MSYS2（[清华镜像](https://mirrors.tuna.tsinghua.edu.cn/msys2/distrib/)的
+   `msys2-x86_64-latest.tar.xz` 解压到 `D:\dev`，得到 `D:\dev\msys64`），
+   再用 pacman 装依赖解析齐全的包：
 
-   ```text
-   %USERPROFILE%\.cache\fdxmp-tools\mingw64\bin   # gcc.exe / dlltool.exe / as.exe / ld.exe ...
-   %USERPROFILE%\.cache\fdxmp-tools\pylibs        # zstandard（解包 .tar.zst 用）
+   ```powershell
+   D:\dev\msys64\usr\bin\bash.exe -lc "pacman -Sy --noconfirm"
+   D:\dev\msys64\usr\bin\bash.exe -lc "pacman -S --noconfirm --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-pkgconf mingw-w64-x86_64-libheif"
    ```
 
-   需要的最小包：binutils、gcc、libgcc、libstdc++、gmp、mpfr、mpc、isl、
-   headers、crt、winpthreads、zstd、windows-default-manifest、libiconv、gettext、zlib。
-   下载源：`https://mirrors.tuna.tsinghua.edu.cn/msys2/mingw/mingw64/`
-   （`.pkg.tar.zst` 用 Python `zstandard` 解压为 `.tar` 后再用 `tar -xf` 展开）。
+3. libclang（只有 `raw` 特性需要）：
 
-3. 每个新终端先加载环境：
+   ```powershell
+   python -m pip install --target D:\dev\fdxmp-tools\pylibs libclang
+   ```
+
+4. crates.io 走镜像（`%USERPROFILE%\.cargo\config.toml`）：
+
+   ```toml
+   [source.crates-io]
+   replace-with = "rsproxy-sparse"
+
+   [source.rsproxy-sparse]
+   registry = "sparse+https://rsproxy.cn/index/"
+   ```
+
+5. 每个新终端先加载环境：
 
    ```powershell
    . .\packaging\windows\dev-env.ps1
-   cargo test --workspace
+   cargo build -p fdxmp-win-ui --features gpu,raw,heif
    ```
 
 ## 1. 项目初始化命令（阶段 0 实际执行）
