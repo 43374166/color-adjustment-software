@@ -225,6 +225,10 @@ fn render_cpu_command(args: &[String]) -> Result<(), String> {
         let value: f32 = args[index + 1]
             .parse()
             .map_err(|_| format!("参数 {} 需要数字，得到 {}", key, args[index + 1]))?;
+        if apply_hsl_arg(&mut params, key, value) {
+            index += 2;
+            continue;
+        }
         apply_slider(&mut params, key, value).ok_or_else(|| format!("未知参数 `--{key}`"))?;
         index += 2;
     }
@@ -306,6 +310,10 @@ fn render_command(args: &[String]) -> Result<(), String> {
         let value: f32 = args[index + 1]
             .parse()
             .map_err(|_| format!("参数 {} 需要数字，得到 {}", key, args[index + 1]))?;
+        if apply_hsl_arg(&mut params, key, value) {
+            index += 2;
+            continue;
+        }
         apply_slider(&mut params, key, value).ok_or_else(|| format!("未知参数 `--{key}`"))?;
         index += 2;
     }
@@ -355,6 +363,39 @@ fn render_command(_args: &[String]) -> Result<(), String> {
 }
 
 /// 命令行参数 → 调色参数。
+fn apply_hsl_arg(params: &mut fdxmp_core::params::EditParams, key: &str, value: f32) -> bool {
+    use fdxmp_core::params::ColorBand;
+    let Some(rest) = key.strip_prefix("hsl.") else {
+        return false;
+    };
+    let mut parts = rest.split('.');
+    let Some(band_name) = parts.next() else {
+        return false;
+    };
+    let Some(field) = parts.next() else {
+        return false;
+    };
+    let band = match band_name {
+        "red" => ColorBand::Red,
+        "orange" => ColorBand::Orange,
+        "yellow" => ColorBand::Yellow,
+        "green" => ColorBand::Green,
+        "aqua" => ColorBand::Aqua,
+        "blue" => ColorBand::Blue,
+        "purple" => ColorBand::Purple,
+        "magenta" => ColorBand::Magenta,
+        _ => return false,
+    };
+    let target = params.hsl.band_mut(band);
+    match field {
+        "hue" => target.hue = value,
+        "sat" | "saturation" => target.saturation = value,
+        "lum" | "luminance" => target.luminance = value,
+        _ => return false,
+    }
+    true
+}
+
 fn apply_slider(params: &mut fdxmp_core::params::EditParams, key: &str, value: f32) -> Option<()> {
     use fdxmp_core::params::SliderId;
     let slider = match key {

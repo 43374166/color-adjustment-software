@@ -5,9 +5,12 @@
 //! （自然饱和度的低饱和加权与肤色保护、8 色带的分割权重、点颜色的软范围、三分级的混合与平衡、
 //! 相机校准的基色矩阵构造），按 MIT 条款吸收，见 crate 根文档与 `README.md`。
 
-use crate::bands::{band_weights, oklch_hue_of_srgb_hue};
-use crate::math::{luminance, Mat3, RgbSpace};
-use crate::perceptual::{lab_to_lch, lch_to_lab, oklab_from_rgb, rgb_from_oklab, wrap_angle};
+use crate::bands::{band_weights_hue, band_weights_rgb, oklch_hue_of_srgb_hue};
+use crate::math::{luminance, Mat3, RgbSpace, SRGB};
+use crate::perceptual::{
+    hsl_to_rgb, lab_to_lch, lch_to_lab, oklab_from_rgb, rgb_from_oklab, rgb_to_hsl, wrap_angle,
+};
+use crate::transfer::{linear_to_srgb, srgb_to_linear};
 
 #[inline]
 fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
@@ -223,14 +226,55 @@ impl ColorOps {
             && self.bw.is_none()
     }
 
+    /// Lightroom 语义的 HSL 面板：先按像素的 **HSL 色相**选带，再在 HSL 中
+    /// 直接移动 H / S / L。与 OkLCh 版相比，色带边界、饱和度和明亮度的
+    /// 响应更接近 Lightroom 的 HSL 面板；OkLCh 仍用于后面的自然饱和度/分级。
+    fn apply_hsl_mixer(&self, rgb: [f32; 3]) -> [f32; 3] {
+        let Some(mixer) = &self.mixer else {
+            return rgb;
+        };
+        if mixer.is_neutral() || !rgb.iter().all(|v| v.is_finite()) {
+            return rgb;
+        }
+        let srgb_linear = if self.space == SRGB {
+            rgb
+        } else {
+            self.space.to_space(&SRGB).apply_f32(rgb)
+        };
+        let encoded = srgb_linear.map(linear_to_srgb).map(|v| v.clamp(0.0, 1.0));
+        let [h, s, l] = rgb_to_hsl(encoded);
+        if s <= 1e-4 {
+            return rgb;
+        }
+        let w = band_weights_hue(h * std::f32::consts::TAU);
+        let (mut dh, mut ds, mut dl) = (0.0f32, 0.0f32, 0.0f32);
+        for (i, weight) in w.iter().enumerate() {
+            dh += *weight * (mixer.bands[i].hue / 100.0) as f32;
+            ds += *weight * (mixer.bands[i].sat / 100.0) as f32;
+            dl += *weight * (mixer.bands[i].lum / 100.0) as f32;
+        }
+        // ±100 的行程：色相约 ±30°，饱和度 ±100%，HSL 明度约 ±0.22。
+        let hue = (h + dh * (30.0 / 360.0)).rem_euclid(1.0);
+        let sat = (s * (1.0 + ds)).clamp(0.0, 1.0);
+        let lum = (l + dl * 0.22 * (1.0 - 0.35 * l)).clamp(0.0, 1.0);
+        let out = hsl_to_rgb([hue, sat, lum]).map(srgb_to_linear);
+        if self.space == SRGB {
+            out
+        } else {
+            SRGB.to_space(&self.space).apply_f32(out)
+        }
+    }
+
     /// 逐像素应用。输入 / 输出是 `space` 的线性 RGB（可含 <0 或 >1 的高光余量）。
     #[allow(clippy::needless_range_loop)]
     pub fn apply(&self, rgb: [f32; 3]) -> [f32; 3] {
         if self.is_identity() {
             return rgb;
         }
+        let band_w = band_weights_rgb(rgb);
+        let rgb = self.apply_hsl_mixer(rgb);
         let lab = oklab_from_rgb(&self.space, rgb);
-        let needs_lch = self.mixer.is_some() || !self.points.is_empty() || self.bw.is_some();
+        let needs_lch = !self.points.is_empty() || self.bw.is_some();
         if !needs_lch {
             let mut lab = lab;
             let c0 = (lab[1] * lab[1] + lab[2] * lab[2]).sqrt();
@@ -245,31 +289,6 @@ impl ColorOps {
         }
 
         let [mut l, mut c, mut h] = lab_to_lch(lab);
-        if let Some(m) = &self.mixer {
-            let w = band_weights(h);
-            let (mut dh, mut ds, mut dl) = (0.0f32, 0.0f32, 0.0f32);
-            for i in 0..8 {
-                dh += w[i] * (m.bands[i].hue / 100.0) as f32 * 0.5;
-                ds += w[i] * (m.bands[i].sat / 100.0) as f32;
-                dl += w[i] * (m.bands[i].lum / 100.0) as f32 * 0.18;
-            }
-            let chroma_w = (c / 0.12).min(1.0);
-            h += dh * chroma_w;
-            c *= (1.0 + ds).max(0.0);
-            // 明亮度正向提升时轻微去饱和：OkLCh 保持彩度会显得更艳，
-            // Lightroom 的明亮度 + 是"柔光"方向（越亮越淡）。
-            let dl_pos = dl.max(0.0);
-            if dl_pos > 0.0 {
-                c *= (1.0 - 1.2 * dl_pos).max(0.0);
-            }
-            // 黑场 / 白场权重：纯黑、纯白不因 HSL 明亮度被抬灰或压灰。
-            let l_weight = smooth(0.0, 0.05, l);
-            l += dl * chroma_w * l_weight * l.max(0.05).sqrt();
-            // 负向明亮度不能把 L 推成负数（否则 OkLab → RGB 会出现反相 / 负通道）；
-            // 正向也不能超过白点。
-            l = l.clamp(0.0, 1.0);
-            c = c.max(0.0);
-        }
         for p in &self.points {
             if !p.is_neutral() {
                 [l, c, h] = PointK::new(p).apply([l, c, h]);
@@ -281,7 +300,7 @@ impl ColorOps {
         }
         c = self.vibrance_saturation(c, h).max(0.0);
         if let Some(bw) = &self.bw {
-            let w = band_weights(h);
+            let w = band_w;
             let mix: f32 = (0..8).map(|i| w[i] * (bw[i] / 100.0) as f32).sum();
             l = (l + mix * (c / 0.2).min(1.0) * 0.25).clamp(0.0, 1.0);
             c = 0.0;
@@ -451,15 +470,15 @@ mod tests {
 
     #[test]
     fn mixer_targets_its_band() {
-        let mut o = ops();
+        let mut o = ColorOps::new(SRGB);
         let mut mixer = Mixer::default();
         mixer.bands[5].sat = -100.0; // 蓝
         o.mixer = Some(mixer);
-        let blue = [0.02, 0.05, 0.4];
+        let blue = [0.0, 0.0, 0.4];
         let red = [0.4, 0.03, 0.02];
-        let cb = lab_to_lch(oklab_from_rgb(&REC2020, o.apply(blue)))[1];
-        let cr0 = lab_to_lch(oklab_from_rgb(&REC2020, red))[1];
-        let cr = lab_to_lch(oklab_from_rgb(&REC2020, o.apply(red)))[1];
+        let cb = lab_to_lch(oklab_from_rgb(&SRGB, o.apply(blue)))[1];
+        let cr0 = lab_to_lch(oklab_from_rgb(&SRGB, red))[1];
+        let cr = lab_to_lch(oklab_from_rgb(&SRGB, o.apply(red)))[1];
         assert!(cb < 0.02, "{cb}");
         assert!((cr - cr0).abs() < 0.01, "{cr0} {cr}");
     }
@@ -502,6 +521,78 @@ mod tests {
             let f = o.apply(far);
             for i in 0..3 {
                 assert!((f[i] - far[i]).abs() < 1e-4, "{far:?} -> {f:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn hsl_mixer_red_saturation_is_selective() {
+        let mut o = ColorOps::new(SRGB);
+        let mut mixer = Mixer::default();
+        mixer.bands[0].sat = -100.0; // 红
+        o.mixer = Some(mixer);
+        let red = [0.4, 0.02, 0.01];
+        let blue = [0.01, 0.02, 0.4];
+        let red_out = lab_to_lch(oklab_from_rgb(&SRGB, o.apply(red)))[1];
+        assert!(red_out < 0.02, "red chroma {red_out}");
+        let blue_out = o.apply(blue);
+        let blue_ref = lab_to_lch(oklab_from_rgb(&SRGB, blue))[1];
+        assert!((blue_ref - lab_to_lch(oklab_from_rgb(&SRGB, blue_out))[1]).abs() < 0.01);
+    }
+
+    #[test]
+    fn hsl_hue_shift_red_moves_toward_orange() {
+        let mut o = ColorOps::new(SRGB);
+        let mut mixer = Mixer::default();
+        mixer.bands[0].hue = 100.0;
+        o.mixer = Some(mixer);
+        let red = [0.4, 0.02, 0.01];
+        let out = o.apply(red);
+        let hue = rgb_to_hsl(out.map(linear_to_srgb))[0] * 360.0;
+        assert!((20.0..45.0).contains(&hue), "red hue -> {hue}");
+    }
+
+    #[test]
+    fn hsl_luminance_moves_monotonically_without_inversion() {
+        let mut o = ColorOps::new(SRGB);
+        let mut mixer = Mixer::default();
+        mixer.bands[0].lum = 100.0;
+        o.mixer = Some(mixer);
+        let red = [0.4, 0.02, 0.01];
+        let bright = o.apply(red);
+        let mut o2 = ColorOps::new(SRGB);
+        let mut mixer2 = Mixer::default();
+        mixer2.bands[0].lum = -100.0;
+        o2.mixer = Some(mixer2);
+        let dark = o2.apply(red);
+        let l = |rgb| lab_to_lch(oklab_from_rgb(&SRGB, rgb))[0];
+        assert!(l(bright) > l(red), "{} vs {}", l(red), l(bright));
+        assert!(l(dark) < l(red), "{} vs {}", l(red), l(dark));
+        assert!(bright
+            .iter()
+            .chain(dark.iter())
+            .all(|v| v.is_finite() && *v >= 0.0));
+    }
+
+    #[test]
+    fn hsl_mixer_keeps_neutrals() {
+        let mut o = ColorOps::new(SRGB);
+        let mut mixer = Mixer::default();
+        for band in &mut mixer.bands {
+            band.hue = 100.0;
+            band.sat = -100.0;
+            band.lum = 100.0;
+        }
+        o.mixer = Some(mixer);
+        for grey in [
+            [0.0, 0.0, 0.0],
+            [0.2, 0.2, 0.2],
+            [0.5, 0.5, 0.5],
+            [1.0, 1.0, 1.0],
+        ] {
+            let out = o.apply(grey);
+            for i in 0..3 {
+                assert!((out[i] - grey[i]).abs() < 1e-4, "{grey:?} -> {out:?}");
             }
         }
     }

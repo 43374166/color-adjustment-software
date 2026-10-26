@@ -215,8 +215,8 @@ impl ColorStage {
 pub fn pack_color_slots(data: &mut [f32], params: &EditParams) {
     use crate::gpu_pipeline::slot;
 
-    // 8 色带中心（OkLCh 色相，弧度）：GPU 侧不做 HSV→OkLCh 换算。
-    for (index, hue) in fdxmp_color::bands::band_hues().iter().enumerate() {
+    // 8 色带中心（HSL 色相，弧度）：GPU 侧按 HSL 色相选带。
+    for (index, hue) in fdxmp_color::bands::band_hues_hsl().iter().enumerate() {
         data[slot::BAND_HUES + index] = *hue;
     }
 

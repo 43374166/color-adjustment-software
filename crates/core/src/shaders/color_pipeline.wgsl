@@ -132,6 +132,35 @@ fn hsv_to_rgb(hsv: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(v, p1, q);
 }
 
+fn rgb_to_hsl(c: vec3<f32>) -> vec3<f32> {
+    let hsv = rgb_to_hsv(c);
+    let max_c = max(max(c.r, c.g), c.b);
+    let min_c = min(min(c.r, c.g), c.b);
+    let l = (max_c + min_c) * 0.5;
+    let d = max_c - min_c;
+    let s = select(0.0, d / max(1.0 - abs(2.0 * l - 1.0), 0.00001), d > 0.00001);
+    return vec3<f32>(hsv.x, clamp(s, 0.0, 1.0), clamp(l, 0.0, 1.0));
+}
+
+fn hsl_to_rgb(hsl: vec3<f32>) -> vec3<f32> {
+    let h = fract(hsl.x);
+    let s = clamp(hsl.y, 0.0, 1.0);
+    let l = clamp(hsl.z, 0.0, 1.0);
+    let c = (1.0 - abs(2.0 * l - 1.0)) * s;
+    let hp = h * 6.0;
+    let x = c * (1.0 - abs(hp % 2.0 - 1.0));
+    let m = l - c * 0.5;
+    let sector = i32(floor(hp)) % 6;
+    var rgb = vec3<f32>(0.0);
+    if (sector == 0) { rgb = vec3<f32>(c, x, 0.0); }
+    else if (sector == 1) { rgb = vec3<f32>(x, c, 0.0); }
+    else if (sector == 2) { rgb = vec3<f32>(0.0, c, x); }
+    else if (sector == 3) { rgb = vec3<f32>(0.0, x, c); }
+    else if (sector == 4) { rgb = vec3<f32>(x, 0.0, c); }
+    else { rgb = vec3<f32>(c, 0.0, x); }
+    return rgb + vec3<f32>(m);
+}
+
 // ---- OkLab / OkLCh：与 `fdxmp-color::perceptual` 同一组公开矩阵 ----
 
 fn oklab_from_linear(c: vec3<f32>) -> vec3<f32> {
@@ -186,53 +215,56 @@ fn wrap_tau(a: f32) -> f32 {
 /// 与 CPU `fdxmp-color::ops::ColorOps::apply` / `color_engine::ColorStage` 同序同公式；
 /// 色带中心与分级色轮向量在 CPU 侧换算成 OkLCh 后经 uniform 传入（108..195）。
 fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
-    let lch = oklab_to_lch(oklab_from_linear(input_color));
-    var l = lch.x;
-    var chroma = lch.y;
-    var hue = lch.z;
-
-    // 8 色带：相邻两带的升余弦分割（权重和恒为 1），同时累加黑白混色权重。
+    // HSL 面板：按像素的 HSL 色相选带，再在 HSL 中移动 H/S/L（与 CPU
+    // `ColorOps::apply_hsl_mixer` 同语义）。之后仍用 OkLCh 做点颜色/自然饱和度/分级。
+    var working = input_color;
+    let hsl_in = rgb_to_hsl(linear_to_srgb(clamp(input_color, vec3<f32>(0.0), vec3<f32>(1.0))));
+    var w = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
     var hue_shift = 0.0;
     var sat_scale = 0.0;
     var lum_shift = 0.0;
     var bw_mix = 0.0;
+    var wsum = 0.0;
+    let tau = 6.283185307179586;
     for (var i = 0u; i < 8u; i = i + 1u) {
+        let prev = (i + 7u) % 8u;
         let next = (i + 1u) % 8u;
-        let a = p(108u + i);
-        let b = p(108u + next);
-        let span = wrap_tau(b - a);
-        let d = wrap_tau(hue - a);
-        if (d <= span) {
-            let t = select(0.0, d / max(span, 1e-6), span > 1e-6);
-            let s = 0.5 - 0.5 * cos(t * 3.14159265358979);
-            let w0 = 1.0 - s;
-            let w1 = s;
-            hue_shift = hue_shift
-                + (w0 * p(32u + i * 3u) + w1 * p(32u + next * 3u)) / 100.0 * 0.5;
-            sat_scale = sat_scale
-                + (w0 * p(33u + i * 3u) + w1 * p(33u + next * 3u)) / 100.0;
-            lum_shift = lum_shift
-                + (w0 * p(34u + i * 3u) + w1 * p(34u + next * 3u)) / 100.0 * 0.18;
-            bw_mix = bw_mix + (w0 * p(117u + i) + w1 * p(117u + next)) / 100.0;
-            break;
+        let center = p(108u + i);
+        let left = wrap_tau(center - p(108u + prev));
+        let right = wrap_tau(p(108u + next) - center);
+        let half = 0.65 * max(left, right);
+        let d = abs(wrap_pi(hsl_in.x * tau - center));
+        if (d < half && half > 1e-6) {
+            let weight = 0.5 + 0.5 * cos(3.14159265358979 * d / half);
+            w[i] = weight;
+            wsum = wsum + weight;
         }
     }
-    if (abs(hue_shift) + abs(sat_scale) + abs(lum_shift) > 0.0001) {
-        let chroma_weight = min(chroma / 0.12, 1.0);
-        hue = hue + hue_shift * chroma_weight;
-        chroma = chroma * max(1.0 + sat_scale, 0.0);
-        // 明亮度正向提升时轻微去饱和（与 CPU `ColorOps` 同公式）。
-        let dl_pos = max(lum_shift, 0.0);
-        if (dl_pos > 0.0) {
-            chroma = chroma * max(1.0 - 1.2 * dl_pos, 0.0);
+    if (wsum > 1e-6) {
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            w[i] = w[i] / wsum;
+            hue_shift = hue_shift + w[i] * p(32u + i * 3u) / 100.0;
+            sat_scale = sat_scale + w[i] * p(33u + i * 3u) / 100.0;
+            lum_shift = lum_shift + w[i] * p(34u + i * 3u) / 100.0;
+            bw_mix = bw_mix + w[i] * p(117u + i) / 100.0;
         }
-        // 纯黑 / 纯白不因 HSL 明亮度被抬灰或压灰；L 必须留在 [0,1]，
-        // 否则 OkLab → RGB 会出现负通道（滑块 -100 的“反相”观感）。
-        let l_weight = smoothstep(0.0, 0.05, l);
-        l = l + lum_shift * chroma_weight * l_weight * sqrt(max(l, 0.05));
-        l = clamp(l, 0.0, 1.0);
-        chroma = max(chroma, 0.0);
     }
+    if (hsl_in.y > 1e-4 && abs(hue_shift) + abs(sat_scale) + abs(lum_shift) > 0.0001) {
+        let adjusted_h = fract(hsl_in.x + hue_shift * (30.0 / 360.0));
+        let adjusted_s = clamp(hsl_in.y * (1.0 + sat_scale), 0.0, 1.0);
+        let adjusted_l = clamp(
+            hsl_in.z + lum_shift * 0.22 * (1.0 - 0.35 * hsl_in.z),
+            0.0,
+            1.0
+        );
+        let adjusted = hsl_to_rgb(vec3<f32>(adjusted_h, adjusted_s, adjusted_l));
+        working = srgb_to_linear(clamp(adjusted, vec3<f32>(0.0), vec3<f32>(1.0)));
+    }
+
+    let lch = oklab_to_lch(oklab_from_linear(working));
+    var l = lch.x;
+    var chroma = lch.y;
+    var hue = lch.z;
 
     // 点颜色：软范围（色相 / 彩度 / 明度）内的加权调整，最多 4 个样本。
     let point_count = u32(clamp(p(136), 0.0, 4.0) + 0.5);
