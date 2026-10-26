@@ -499,6 +499,7 @@ pub fn builtin_presets() -> Vec<PresetFile> {
             saturation: 22.0,
             luminance: 4.0,
         },
+        global: GradingZone::default(),
         blending: 60.0,
         balance: 10.0,
     };

@@ -222,6 +222,10 @@ fn render_cpu_command(args: &[String]) -> Result<(), String> {
             index += 2;
             continue;
         }
+        if apply_curve_arg(&mut params, key, &args[index + 1]) {
+            index += 2;
+            continue;
+        }
         let value: f32 = args[index + 1]
             .parse()
             .map_err(|_| format!("参数 {} 需要数字，得到 {}", key, args[index + 1]))?;
@@ -307,6 +311,10 @@ fn render_command(args: &[String]) -> Result<(), String> {
     let mut index = 2;
     while index + 1 < args.len() {
         let key = args[index].trim_start_matches("--");
+        if apply_curve_arg(&mut params, key, &args[index + 1]) {
+            index += 2;
+            continue;
+        }
         let value: f32 = args[index + 1]
             .parse()
             .map_err(|_| format!("参数 {} 需要数字，得到 {}", key, args[index + 1]))?;
@@ -396,6 +404,35 @@ fn apply_hsl_arg(params: &mut fdxmp_core::params::EditParams, key: &str, value: 
     true
 }
 
+fn apply_curve_arg(params: &mut fdxmp_core::params::EditParams, key: &str, value: &str) -> bool {
+    use fdxmp_core::params::{CurvePoint, ToneCurve};
+
+    let target = match key {
+        "rgb-curve" => &mut params.curves.rgb,
+        "red-curve" => &mut params.curves.red,
+        "green-curve" => &mut params.curves.green,
+        "blue-curve" => &mut params.curves.blue,
+        _ => return false,
+    };
+    let values = value
+        .split(',')
+        .filter_map(|part| part.trim().parse::<f32>().ok())
+        .collect::<Vec<_>>();
+    if values.len() < 4 || values.len() % 2 != 0 {
+        return false;
+    }
+    *target = ToneCurve {
+        points: values
+            .chunks_exact(2)
+            .map(|pair| CurvePoint {
+                x: (pair[0] / 255.0).clamp(0.0, 1.0),
+                y: (pair[1] / 255.0).clamp(0.0, 1.0),
+            })
+            .collect(),
+    };
+    true
+}
+
 fn apply_slider(params: &mut fdxmp_core::params::EditParams, key: &str, value: f32) -> Option<()> {
     use fdxmp_core::params::SliderId;
     let slider = match key {
@@ -432,6 +469,114 @@ fn apply_slider(params: &mut fdxmp_core::params::EditParams, key: &str, value: f
         }
         "grading-balance" => {
             params.grading.balance = value;
+            return Some(());
+        }
+        "grade-shadow-hue" => {
+            params.grading.shadows.hue = value;
+            return Some(());
+        }
+        "grade-shadow-sat" => {
+            params.grading.shadows.saturation = value;
+            return Some(());
+        }
+        "grade-shadow-lum" => {
+            params.grading.shadows.luminance = value;
+            return Some(());
+        }
+        "grade-midtone-hue" => {
+            params.grading.midtones.hue = value;
+            return Some(());
+        }
+        "grade-midtone-sat" => {
+            params.grading.midtones.saturation = value;
+            return Some(());
+        }
+        "grade-midtone-lum" => {
+            params.grading.midtones.luminance = value;
+            return Some(());
+        }
+        "grade-highlight-hue" => {
+            params.grading.highlights.hue = value;
+            return Some(());
+        }
+        "grade-highlight-sat" => {
+            params.grading.highlights.saturation = value;
+            return Some(());
+        }
+        "grade-highlight-lum" => {
+            params.grading.highlights.luminance = value;
+            return Some(());
+        }
+        "grade-global-hue" => {
+            params.grading.global.hue = value;
+            return Some(());
+        }
+        "grade-global-sat" => {
+            params.grading.global.saturation = value;
+            return Some(());
+        }
+        "grade-global-lum" => {
+            params.grading.global.luminance = value;
+            return Some(());
+        }
+        "calib-red-hue" => {
+            params.calibration.red_hue = value;
+            return Some(());
+        }
+        "calib-red-sat" => {
+            params.calibration.red_sat = value;
+            return Some(());
+        }
+        "calib-green-hue" => {
+            params.calibration.green_hue = value;
+            return Some(());
+        }
+        "calib-green-sat" => {
+            params.calibration.green_sat = value;
+            return Some(());
+        }
+        "calib-blue-hue" => {
+            params.calibration.blue_hue = value;
+            return Some(());
+        }
+        "calib-blue-sat" => {
+            params.calibration.blue_sat = value;
+            return Some(());
+        }
+        "calib-shadow-tint" => {
+            params.calibration.shadows_tint = value;
+            return Some(());
+        }
+        "param-shadows" => {
+            params.curves.parametric.shadows = value;
+            return Some(());
+        }
+        "param-darks" => {
+            params.curves.parametric.darks = value;
+            return Some(());
+        }
+        "param-lights" => {
+            params.curves.parametric.lights = value;
+            return Some(());
+        }
+        "param-highlights" => {
+            params.curves.parametric.highlights = value;
+            return Some(());
+        }
+        "param-shadow-split" => {
+            params.curves.parametric.shadow_split = value;
+            return Some(());
+        }
+        "param-midtone-split" => {
+            params.curves.parametric.midtone_split = value;
+            return Some(());
+        }
+        "param-highlight-split" => {
+            params.curves.parametric.highlight_split = value;
+            return Some(());
+        }
+        "wb-reference" => {
+            params.color.wb_reference_kelvin = value.clamp(2000.0, 50000.0);
             return Some(());
         }
         _ => return None,

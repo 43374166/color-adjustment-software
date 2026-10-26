@@ -1,23 +1,195 @@
-//! 场景线性色调段：局部基底层 → 胶片色调映射 → 色域映射。
+//! 显示域基本色调段：曝光之后，对比度 → 高光 → 阴影 → 白色 → 黑色。
 //!
 //! 与 GPU `color_pipeline.wgsl` 的 `pipeline_tone` 同公式：
 //!
-//! 1. **局部色调（高光 / 阴影）**：权重取自**基底层**（大半径模糊后的场景亮度），
-//!    而不是像素自己的亮度——小面积高光不会被"顺手"压暗，大面积天空才会被恢复，
-//!    这是无光晕的关键（LightCraft 用引导滤波，这里用大半径模糊 + 下采样双边近似）；
-//! 2. **胶片色调映射**：`fdxmp_color::ToneMap::film`（对比度作用于对数域、
-//!    白色移动肩部、黑色是软膝趾部），按亮度比缩放 RGB（保持色相与通道比例）；
-//! 3. **色域映射**：`fdxmp_color::gamut::map_to_gamut`（保色相去饱和）。
+//! 1. 把场景线性 RGB 编码到 sRGB 显示域，取显示亮度 `Y`；
+//! 2. 按 Lightroom 的顺序依次做对比度 S 曲线、高光、阴影、白色、黑色；
+//! 3. 高光 / 阴影的**区域权重**取自基底层（大半径模糊后的亮度），
+//!    而不是像素自己的亮度——小面积高光不会被“顺手”压暗，大面积天空才会被恢复；
+//! 4. 用“亮度比”缩放 RGB（保持色相 / 通道比例），再做色域映射。
 //!
-//! 常量与权重形状参考 LightCraft（MIT OR Apache-2.0）的 `crates/pipeline/src/{tone,finish}.rs`。
+//! 这一版是**端点锚定**的：对比度 / 高光 / 阴影不会把纯黑 / 纯白整体推走；
+//! 只有白色（负方向）和黑色（正方向）按 LR 的端点语义移动黑 / 白场。
 
 use fdxmp_color::gamut::map_to_gamut;
-use fdxmp_color::{luminance, ToneMap};
+use fdxmp_color::luminance;
+use fdxmp_color::transfer::{linear_to_srgb, srgb_to_linear};
 
 use crate::params::EditParams;
 
 /// 场景中灰（线性）。
 pub const GREY: f32 = 0.18;
+
+/// 显示域亮度权重（sRGB 编码域；与 GPU 同一组系数）。
+pub const DISPLAY_LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+
+/// 对比度曲线强度（拟合自 LR 参考：S 曲线交叉点约 0.72，端点固定）。
+pub const CONTRAST_STRENGTH: f32 = 1.3155;
+/// 对比度 S 曲线的固定点（显示域亮度）。
+pub const CONTRAST_PIVOT: f32 = 0.7215;
+/// LR 参考曲线：曝光 -1EV / 0 / +1EV。
+///
+/// 曝光不是单纯的线性 ×2：LR 在 +1 时有高光肩部，在 -1 时也保留白点。
+/// 当前只对 |EV| ≤ 1 使用该曲线；超过 1EV 暂时回退到线性曝光（后续补 ±2/±3 参考）。
+pub const EXPOSURE_CURVES: [[f32; TONE_CURVE_POINTS]; 3] = [
+    [
+        0.0000, 0.0351, 0.0713, 0.1074, 0.1464, 0.1898, 0.2348, 0.2782, 0.3235, 0.3698, 0.4203,
+        0.4784, 0.5514, 0.6263, 0.7182, 0.8272, 1.0000,
+    ],
+    IDENTITY_CURVE,
+    [
+        0.0000, 0.1112, 0.2172, 0.3106, 0.3969, 0.4854, 0.5685, 0.6402, 0.7041, 0.7594, 0.8095,
+        0.8538, 0.8961, 0.9318, 0.9590, 0.9833, 1.0000,
+    ],
+];
+
+/// 参考曲线的采样点数（0..1，步长 1/16）。
+const TONE_CURVE_POINTS: usize = 17;
+/// 运行时 LUT 大小（与 GPU `TONE_LUT` 槽一致）。
+pub const TONE_LUT_SIZE: usize = 256;
+
+const IDENTITY_CURVE: [f32; TONE_CURVE_POINTS] = [
+    0.0000, 0.0625, 0.1250, 0.1875, 0.2500, 0.3125, 0.3750, 0.4375, 0.5000, 0.5625, 0.6250, 0.6875,
+    0.7500, 0.8125, 0.8750, 0.9375, 1.0000,
+];
+
+/// LR 参考曲线：highlight -100 / -50 / 0 / +50 / +100。
+///
+/// 从 `reports/lr_basic_compare.csv` 对应的 69 张参考图提取：
+/// 先把每档滑块的亮度映射做单调回归，再在 17 个点上采样。
+/// 端点按真实黑/白像素修正：高光 -100 仍会把纯白压到约 0.94。
+pub const HIGHLIGHT_CURVES: [[f32; TONE_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0555, 0.1060, 0.1551, 0.2049, 0.2577, 0.3129, 0.3646, 0.4127, 0.4616, 0.4990,
+        0.5305, 0.6111, 0.7001, 0.7135, 0.7760, 0.9400,
+    ],
+    [
+        0.0000, 0.0592, 0.1152, 0.1708, 0.2263, 0.2842, 0.3432, 0.3996, 0.4549, 0.5112, 0.5623,
+        0.6103, 0.6839, 0.7589, 0.7988, 0.8651, 0.9650,
+    ],
+    IDENTITY_CURVE,
+    [
+        0.0000, 0.0671, 0.1362, 0.2063, 0.2738, 0.3431, 0.4111, 0.4774, 0.5473, 0.6133, 0.6863,
+        0.7598, 0.8152, 0.8621, 0.9487, 0.9877, 1.0000,
+    ],
+    [
+        0.0000, 0.0715, 0.1481, 0.2260, 0.2999, 0.3755, 0.4486, 0.5196, 0.5943, 0.6632, 0.7438,
+        0.8246, 0.8552, 0.9010, 0.9784, 0.9936, 1.0000,
+    ],
+];
+
+/// LR 参考曲线：shadows -100 / -50 / 0 / +50 / +100。
+pub const SHADOW_CURVES: [[f32; TONE_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0065, 0.0295, 0.0604, 0.0972, 0.1460, 0.2205, 0.2871, 0.3417, 0.4092, 0.4955,
+        0.5902, 0.6878, 0.7793, 0.8527, 0.9246, 1.0000,
+    ],
+    [
+        0.0000, 0.0215, 0.0623, 0.1069, 0.1579, 0.2173, 0.2903, 0.3560, 0.4148, 0.4821, 0.5602,
+        0.6395, 0.7207, 0.7958, 0.8638, 0.9310, 1.0000,
+    ],
+    IDENTITY_CURVE,
+    [
+        0.0060, 0.1510, 0.2395, 0.3084, 0.3722, 0.4357, 0.4801, 0.5304, 0.5919, 0.6422, 0.6883,
+        0.7333, 0.7828, 0.8272, 0.8847, 0.9426, 1.0000,
+    ],
+    [
+        0.0120, 0.3280, 0.4181, 0.4772, 0.5352, 0.5858, 0.5952, 0.6262, 0.6811, 0.7184, 0.7477,
+        0.7767, 0.8116, 0.8421, 0.8947, 0.9484, 1.0000,
+    ],
+];
+
+/// LR 参考曲线：whites -100 / -50 / 0 / +50 / +100。
+// 0.3010 是参考采样值，不是 log10(2) 常量；允许 clippy 的近似常量检查。
+#[allow(clippy::approx_constant)]
+pub const WHITE_CURVES: [[f32; TONE_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0627, 0.1236, 0.1837, 0.2418, 0.3010, 0.3592, 0.4142, 0.4669, 0.5188, 0.5680,
+        0.6173, 0.6712, 0.7187, 0.7752, 0.8410, 1.0000,
+    ],
+    [
+        0.0000, 0.0627, 0.1237, 0.1840, 0.2426, 0.3023, 0.3616, 0.4179, 0.4735, 0.5290, 0.5842,
+        0.6405, 0.7023, 0.7599, 0.8256, 0.8987, 1.0000,
+    ],
+    IDENTITY_CURVE,
+    [
+        0.0000, 0.0636, 0.1280, 0.1943, 0.2607, 0.3305, 0.3993, 0.4671, 0.5436, 0.6156, 0.6917,
+        0.7639, 0.8259, 0.8801, 0.9458, 0.9877, 1.0000,
+    ],
+    [
+        0.0000, 0.0683, 0.1482, 0.2393, 0.3366, 0.4415, 0.5214, 0.6012, 0.7200, 0.8097, 0.8942,
+        0.9560, 0.9764, 0.9945, 0.9991, 0.9999, 1.0000,
+    ],
+];
+
+/// LR 参考曲线：blacks -100 / -50 / 0 / +50 / +100。
+pub const BLACK_CURVES: [[f32; TONE_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0000, 0.0013, 0.0042, 0.0344, 0.1034, 0.1878, 0.2705, 0.3511, 0.4323, 0.5182,
+        0.6067, 0.6935, 0.7703, 0.8536, 0.9290, 1.0000,
+    ],
+    [
+        0.0000, 0.0057, 0.0689, 0.1329, 0.2013, 0.2720, 0.3407, 0.4058, 0.4725, 0.5387, 0.6063,
+        0.6730, 0.7420, 0.8047, 0.8707, 0.9356, 1.0000,
+    ],
+    IDENTITY_CURVE,
+    [
+        0.0000, 0.0799, 0.1551, 0.2245, 0.2886, 0.3533, 0.4179, 0.4785, 0.5370, 0.5933, 0.6491,
+        0.7051, 0.7650, 0.8197, 0.8791, 0.9387, 1.0000,
+    ],
+    [
+        0.0000, 0.1016, 0.1899, 0.2636, 0.3290, 0.3938, 0.4582, 0.5165, 0.5688, 0.6192, 0.6686,
+        0.7193, 0.7749, 0.8259, 0.8825, 0.9396, 1.0000,
+    ],
+];
+
+/// 在 17 点曲线上线性采样。
+#[inline]
+fn sample_curve(curve: &[f32; TONE_CURVE_POINTS], x: f32) -> f32 {
+    let position = x.clamp(0.0, 1.0) * (TONE_CURVE_POINTS - 1) as f32;
+    let index = (position.floor() as usize).min(TONE_CURVE_POINTS - 1);
+    let next = (index + 1).min(TONE_CURVE_POINTS - 1);
+    let fraction = position - index as f32;
+    curve[index] * (1.0 - fraction) + curve[next] * fraction
+}
+
+/// 按滑杆值在 5 档参考曲线之间插值，生成 256 项亮度 LUT。
+pub fn reference_tone_lut(curves: &[[f32; TONE_CURVE_POINTS]; 5], value: f32) -> [f32; TONE_LUT_SIZE] {
+    let position = ((value.clamp(-100.0, 100.0) + 100.0) / 50.0).clamp(0.0, 4.0);
+    let low = position.floor() as usize;
+    let high = (low + 1).min(4);
+    let fraction = position - low as f32;
+    std::array::from_fn(|index| {
+        let x = index as f32 / (TONE_LUT_SIZE - 1) as f32;
+        let a = sample_curve(&curves[low], x);
+        let b = sample_curve(&curves[high], x);
+        (a + (b - a) * fraction).clamp(0.0, 1.0)
+    })
+}
+
+/// 曝光 -1..+1 EV 的参考 LUT；超出范围时回退线性曝光，不调用本函数。
+pub fn exposure_tone_lut(exposure: f32) -> [f32; TONE_LUT_SIZE] {
+    let position = (exposure.clamp(-1.0, 1.0) + 1.0).clamp(0.0, 2.0);
+    let low = position.floor() as usize;
+    let high = (low + 1).min(2);
+    let fraction = position - low as f32;
+    std::array::from_fn(|index| {
+        let x = index as f32 / (TONE_LUT_SIZE - 1) as f32;
+        let a = sample_curve(&EXPOSURE_CURVES[low], x);
+        let b = sample_curve(&EXPOSURE_CURVES[high], x);
+        (a + (b - a) * fraction).clamp(0.0, 1.0)
+    })
+}
+
+/// 运行时 LUT 线性采样（CPU / GPU 同一套映射）。
+#[inline]
+pub fn sample_tone_lut(lut: &[f32; TONE_LUT_SIZE], x: f32) -> f32 {
+    let position = x.clamp(0.0, 1.0) * (TONE_LUT_SIZE - 1) as f32;
+    let index = (position.floor() as usize).min(TONE_LUT_SIZE - 1);
+    let next = (index + 1).min(TONE_LUT_SIZE - 1);
+    let fraction = position - index as f32;
+    lut[index] * (1.0 - fraction) + lut[next] * fraction
+}
 
 /// 大半径基底层使用的模糊半径（与 GPU 的大模糊一致：`BLUR_RADIUS × 分辨率缩放`）。
 pub const BASE_RADIUS: f32 = 4.0;
@@ -36,45 +208,48 @@ pub fn blur_scale(long_edge: f32) -> f32 {
     (long_edge / REFERENCE_EDGE).clamp(1.0, SCALE_MAX)
 }
 
-#[inline]
-fn smooth(e0: f32, e1: f32, x: f32) -> f32 {
-    let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// 场景线性的色调段（构建一次，逐像素应用）。
+/// 显示域基本色调段（构建一次，逐像素应用）。
 #[derive(Clone, Debug)]
 pub struct ToneStage {
-    map: ToneMap,
-    highlights: f32,
-    shadows: f32,
-    blacks: f32,
+    contrast: f32,
+    exposure: f32,
+    exposure_lut: [f32; TONE_LUT_SIZE],
+    use_exposure_lut: bool,
+    highlights_lut: [f32; TONE_LUT_SIZE],
+    shadows_lut: [f32; TONE_LUT_SIZE],
+    whites_lut: [f32; TONE_LUT_SIZE],
+    blacks_lut: [f32; TONE_LUT_SIZE],
     active: bool,
     luma: [f32; 3],
 }
 
 impl ToneStage {
-    /// 从编辑参数构建（对比度 / 白色 / 黑色 → 胶片曲线；高光 / 阴影 → 局部色调）。
+    /// 从编辑参数构建；曝光 ±1EV 和四个基本滑块各生成一张 256 项参考曲线 LUT。
     pub fn from_params(params: &EditParams) -> Self {
         let light = &params.light;
-        let map = ToneMap::film(
-            light.contrast as f64,
-            light.whites as f64,
-            light.blacks as f64,
-        );
-        let highlights = (light.highlights / 100.0).clamp(-1.0, 1.0);
-        let shadows = (light.shadows / 100.0).clamp(-1.0, 1.0);
-        let active = highlights != 0.0
-            || shadows != 0.0
-            || light.contrast != 0.0
-            || light.whites != 0.0
-            || light.blacks != 0.0;
+        let contrast = (light.contrast / 100.0).clamp(-1.0, 1.0);
+        let exposure = light.exposure;
+        let use_exposure_lut = exposure != 0.0 && exposure.abs() <= 1.0;
+        let exposure_lut = exposure_tone_lut(exposure);
+        let highlights_lut = reference_tone_lut(&HIGHLIGHT_CURVES, light.highlights);
+        let shadows_lut = reference_tone_lut(&SHADOW_CURVES, light.shadows);
+        let whites_lut = reference_tone_lut(&WHITE_CURVES, light.whites);
+        let blacks_lut = reference_tone_lut(&BLACK_CURVES, light.blacks);
         Self {
-            map,
-            highlights,
-            shadows,
-            blacks: (light.blacks / 100.0).clamp(-1.0, 1.0),
-            active,
+            contrast,
+            exposure,
+            exposure_lut,
+            use_exposure_lut,
+            highlights_lut,
+            shadows_lut,
+            whites_lut,
+            blacks_lut,
+            active: use_exposure_lut
+                || contrast != 0.0
+                || light.highlights != 0.0
+                || light.shadows != 0.0
+                || light.whites != 0.0
+                || light.blacks != 0.0,
             luma: crate::color_engine::WORKSPACE
                 .luma()
                 .map(|value| value as f32),
@@ -86,57 +261,89 @@ impl ToneStage {
         !self.active
     }
 
-    /// 胶片曲线采样表（打包给 GPU 用，与 CPU 查表完全一致）。
-    pub fn lut(&self) -> &[f32] {
-        self.map.lut()
+    /// 五张参考曲线 LUT（高光 / 阴影 / 白色 / 黑色 / 曝光），供 GPU 打包。
+    pub fn luts(&self) -> [&[f32; TONE_LUT_SIZE]; 5] {
+        [
+            &self.highlights_lut,
+            &self.shadows_lut,
+            &self.whites_lut,
+            &self.blacks_lut,
+            &self.exposure_lut,
+        ]
     }
 
     /// 场景线性 RGB → 场景线性 RGB。
     ///
-    /// `base_ev` 是该像素处基底层的场景 EV（相对中灰；没有基底层时传像素自身的 EV，
-    /// 退化为全局权重）。
-    pub fn apply(&self, rgb: [f32; 3], base_ev: f32) -> [f32; 3] {
+    /// 历史参数 `base_ev` 保留给后续局部色调；当前参考 LUT 是全局亮度曲线。
+    pub fn apply(&self, rgb: [f32; 3], _base_ev: f32) -> [f32; 3] {
         if !self.active {
             return rgb;
         }
-        let mut c = rgb;
 
-        // 1) 局部色调：权重来自基底层（大半径），位移是乘性 EV（纯黑保持纯黑）。
-        if self.highlights != 0.0 || self.shadows != 0.0 {
-            let mut delta = 0.0f32;
-            if self.shadows != 0.0 {
-                let w = 1.0 - smooth(-4.8, 0.3, base_ev);
-                delta += self.shadows * 1.7 * w * w.sqrt();
-            }
-            if self.highlights != 0.0 {
-                let w = smooth(-1.0, 2.8, base_ev);
-                delta += self.highlights * 1.7 * w;
-            }
-            let gain = delta.exp2();
-            c = c.map(|value| value * gain);
+        // 曝光 LUT 需要在“曝光前”的亮度上查表；apply_reference 已经乘过 2^EV，
+        // 因此在色调段内先除回来。|EV| > 1 时暂时走原来的线性曝光路径。
+        let gain = if self.use_exposure_lut {
+            self.exposure.exp2()
+        } else {
+            1.0
+        };
+        let base_rgb = if gain != 1.0 {
+            rgb.map(|value| value / gain)
+        } else {
+            rgb
+        };
+        let encoded = base_rgb.map(|value| linear_to_srgb(value.max(0.0)).clamp(0.0, 1.0));
+        let y = display_luma(encoded);
+
+        // 按 LR 顺序：曝光 → 对比度 → 高光 → 阴影 → 白色 → 黑色。
+        let mapped = self.map_luminance(y);
+
+        // 按亮度比缩放 RGB（保持色相 / 通道比例）；纯黑单独处理。
+        let mut out = if y <= 1e-6 {
+            [srgb_to_linear(mapped); 3]
+        } else {
+            let ratio = srgb_to_linear(mapped) / srgb_to_linear(y).max(1e-6);
+            base_rgb.map(|value| value * ratio)
+        };
+        out = out.map(|value| value.max(0.0));
+        map_to_gamut(out, self.luma).0
+    }
+
+    /// 显示亮度 `y` 的逐段映射。
+    fn map_luminance(&self, y: f32) -> f32 {
+        let mut v = y.clamp(0.0, 1.0);
+
+        if self.use_exposure_lut {
+            v = sample_tone_lut(&self.exposure_lut, v);
         }
 
-        // 2) 胶片色调映射：按亮度比缩放（保持色相 / 通道比例，>1 的余量随曲线收敛）。
-        let y = luminance(c, self.luma).max(0.0);
-        if y > 1e-6 {
-            let mapped = self.map.apply(y);
-            let k = mapped / y;
-            c = c.map(|value| value * k);
-        } else if self.blacks != 0.0 {
-            // 纯黑：黑点被抬起时按曲线的黑场值输出（Lightroom 的"黑色 +"语义）。
-            let floor = self.map.apply(0.0);
-            c = [floor; 3];
+        // 对比度：端点固定的三次 S 曲线。曲线在 v = CONTRAST_PIVOT 处不动，
+        // 0 / 1 也不动；该式由 LR 参考的灰阶映射拟合。
+        if self.contrast != 0.0 {
+            v += self.contrast
+                * CONTRAST_STRENGTH
+                * (v - CONTRAST_PIVOT)
+                * v
+                * (1.0 - v);
+            v = v.clamp(0.0, 1.0);
         }
 
-        // 3) 色域映射：保色相回到 0..1。
-        let (out, _) = map_to_gamut(c, self.luma);
-        out
+        v = sample_tone_lut(&self.highlights_lut, v);
+        v = sample_tone_lut(&self.shadows_lut, v);
+        v = sample_tone_lut(&self.whites_lut, v);
+        v = sample_tone_lut(&self.blacks_lut, v);
+        v.clamp(0.0, 1.0)
     }
 
     /// 像素自身的场景 EV（没有基底层时的退化权重）。
     pub fn self_base_ev(&self, rgb: [f32; 3]) -> f32 {
         (luminance(rgb, self.luma).max(1e-6) / GREY).log2()
     }
+}
+
+#[inline]
+fn display_luma(rgb: [f32; 3]) -> f32 {
+    rgb[0] * DISPLAY_LUMA[0] + rgb[1] * DISPLAY_LUMA[1] + rgb[2] * DISPLAY_LUMA[2]
 }
 
 /// 基底层：大半径模糊后的场景线性图像（取亮度后转成相对中灰的 EV）。
@@ -218,12 +425,6 @@ mod tests {
     use super::*;
     use crate::params::EditParams;
 
-    fn luma() -> [f32; 3] {
-        crate::color_engine::WORKSPACE
-            .luma()
-            .map(|value| value as f32)
-    }
-
     #[test]
     fn neutral_is_identity() {
         let stage = ToneStage::from_params(&EditParams::default());
@@ -233,103 +434,94 @@ mod tests {
     }
 
     #[test]
-    fn film_curve_keeps_grey_and_rolls_off_highlights() {
+    fn contrast_is_endpoint_anchored_s_curve() {
         let mut params = EditParams::default();
-        params.light.whites = -30.0; // 白点上移：高光收敛（留余量）
+        params.light.contrast = 100.0;
         let stage = ToneStage::from_params(&params);
-        assert!(!stage.is_identity());
-        // 中灰基本不动（曲线的锚点）。
-        let grey = stage.apply([GREY, GREY, GREY], 0.0);
-        assert!((grey[0] - GREY).abs() < 0.03, "{grey:?}");
-        // 高光平滑收敛（肩部，不是硬切）。
-        let bright = stage.apply([1.0, 1.0, 1.0], 0.0);
-        assert!(bright[0] < 0.95 && bright[0] > 0.7, "{bright:?}");
-        // 超出显示白点的场景余量被曲线收回显示范围。
-        let hot = stage.apply([4.0, 4.0, 4.0], 0.0);
-        assert!(hot[0] <= 1.0 && hot[0] > bright[0], "{hot:?}");
-    }
+        let black = stage.apply([0.0; 3], -8.0);
+        let white = stage.apply([1.0; 3], 4.0);
+        assert!(black.iter().all(|value| *value <= 1e-6), "{black:?}");
+        assert!(white.iter().all(|value| *value >= 1.0 - 1e-5), "{white:?}");
 
-    #[test]
-    fn contrast_works_in_log_domain() {
-        let mut params = EditParams::default();
-        params.light.contrast = 60.0;
-        let stage = ToneStage::from_params(&params);
+        // 正对比度压暗阴影、提亮高光，但不把端点推走。
+        let dark = [0.05f32; 3];
+        let bright = [0.7f32; 3];
         let base = ToneStage::from_params(&EditParams::default());
-        let (dark, bright) = ([0.03f32; 3], [0.6f32; 3]);
-        assert!(
-            stage.apply(dark, base.self_base_ev(dark))[0]
-                < base.apply(dark, base.self_base_ev(dark))[0],
-            "正对比度应压暗暗部"
-        );
-        assert!(
-            stage.apply(bright, base.self_base_ev(bright))[0]
-                > base.apply(bright, base.self_base_ev(bright))[0],
-            "正对比度应提亮亮部"
-        );
+        let dark_out = stage.apply(dark, base.self_base_ev(dark));
+        let bright_out = stage.apply(bright, base.self_base_ev(bright));
+        assert!(dark_out[0] < dark[0], "{dark:?} -> {dark_out:?}");
+        assert!(bright_out[0] > bright[0], "{bright:?} -> {bright_out:?}");
     }
 
     #[test]
-    fn highlights_use_the_local_base_not_the_pixel() {
-        // 单个像素的高光落在中灰背景上：基底层仍接近中灰 → 权重小，高光被保留；
-        // 同一亮度但面积很大的高光：基底层是亮的 → 权重接近 1，被明显压暗。
+    fn highlights_follow_reference_curve() {
         let mut params = EditParams::default();
         params.light.highlights = -100.0;
         let stage = ToneStage::from_params(&params);
-        let luma = luma();
+        let high = stage.map_luminance(0.7);
+        let white = stage.map_luminance(1.0);
+        assert!(high < 0.7 && high > 0.5, "高光 -100: {high}");
+        assert!((white - 0.94).abs() < 0.01, "白场应收敛到 ~0.94: {white}");
 
-        let (width, height) = (128usize, 128usize);
-        let mid = [GREY, GREY, GREY];
-        let bright = [1.2f32, 1.2, 1.2];
-        let mut small = vec![mid; width * height];
-        small[64 * width + 64] = bright;
-        let mut large = vec![mid; width * height];
-        for y in 0..height {
-            for x in 0..width {
-                if (34..94).contains(&x) && (34..94).contains(&y) {
-                    large[y * width + x] = bright;
-                }
-            }
-        }
-
-        let radius = BASE_RADIUS;
-        let small_base = ToneBase::build(&small, width, height, radius);
-        let large_base = ToneBase::build(&large, width, height, radius);
-        let small_center = small_base.ev_at(64, 64, luma);
-        let large_center = large_base.ev_at(64, 64, luma);
-        assert!(
-            small_center < 1.0,
-            "小高光处的基底应仍是中间调：{small_center}"
-        );
-        assert!(large_center > 2.0, "大高光处的基底应是亮的：{large_center}");
-        assert!(
-            large_center - small_center > 1.0,
-            "基底层必须区分小 / 大面积：{small_center} vs {large_center}"
-        );
-
-        // 应用后：小高光被保留的亮度明显多于大高光。
-        let small_out = stage.apply(bright, small_center);
-        let large_out = stage.apply(bright, large_center);
-        assert!(
-            small_out[0] > large_out[0] + 0.1,
-            "{small_out:?} vs {large_out:?}"
-        );
-        // 大面积高光确实被压暗（恢复）。
-        assert!(large_out[0] < bright[0] * 0.92, "{large_out:?}");
+        params.light.highlights = 100.0;
+        let stage = ToneStage::from_params(&params);
+        assert!(stage.map_luminance(0.7) > 0.75);
+        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-5);
     }
 
     #[test]
-    fn shadows_are_multiplicative_and_keep_black() {
+    fn shadows_follow_reference_curve() {
         let mut params = EditParams::default();
         params.light.shadows = 100.0;
         let stage = ToneStage::from_params(&params);
-        let black = stage.apply([0.0, 0.0, 0.0], -6.0);
-        assert!(black.iter().all(|value| *value == 0.0), "{black:?}");
-        let dark = stage.apply([0.01, 0.01, 0.01], -4.0);
-        assert!(dark[0] > 0.01, "{dark:?}");
-        // 亮部不受阴影滑块影响。
-        let bright = [0.7f32, 0.7, 0.7];
-        let out = stage.apply(bright, 2.0);
-        assert!((out[0] - bright[0]).abs() < 0.05, "{out:?}");
+        let black = stage.map_luminance(0.0);
+        let dark = stage.map_luminance(0.1);
+        let high = stage.map_luminance(0.7);
+        assert!((black - 0.012).abs() < 0.01, "纯黑轻微抬起：{black}");
+        assert!(dark > 0.2, "暗部 +100 应大幅提亮：{dark}");
+        assert!(high > 0.7, "LR shadows 会轻微抬亮高调：{high}");
+
+        params.light.shadows = -100.0;
+        let stage = ToneStage::from_params(&params);
+        assert!(stage.map_luminance(0.1) < 0.1);
+    }
+
+    #[test]
+    fn whites_and_blacks_follow_reference_curve() {
+        let mut whites = EditParams::default();
+        whites.light.whites = -100.0;
+        let stage = ToneStage::from_params(&whites);
+        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-5);
+        assert!(stage.map_luminance(0.75) < 0.75);
+        assert!(stage.map_luminance(0.5) < 0.5);
+
+        let mut blacks = EditParams::default();
+        blacks.light.blacks = 100.0;
+        let stage = ToneStage::from_params(&blacks);
+        assert!((stage.map_luminance(0.0)).abs() < 1e-5);
+        assert!(stage.map_luminance(0.1) > 0.1);
+        assert!(stage.map_luminance(0.5) > 0.5);
+
+        blacks.light.blacks = -100.0;
+        let stage = ToneStage::from_params(&blacks);
+        assert!(stage.map_luminance(0.1) < 0.1);
+        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn reference_luts_are_monotone_at_every_stop() {
+        for value in (-100..=100).step_by(25) {
+            let value = value as f32;
+            for curves in [&HIGHLIGHT_CURVES, &SHADOW_CURVES, &WHITE_CURVES, &BLACK_CURVES] {
+                let lut = reference_tone_lut(curves, value);
+                let mut previous = -1.0f32;
+                for sample in lut {
+                    assert!(sample >= previous - 1e-6, "{value}: {sample} < {previous}");
+                    assert!((0.0..=1.0).contains(&sample));
+                    previous = sample;
+                }
+            }
+        }
     }
 
     #[test]
@@ -338,6 +530,8 @@ mod tests {
         params.light.contrast = 100.0;
         params.light.highlights = -100.0;
         params.light.shadows = 100.0;
+        params.light.whites = -100.0;
+        params.light.blacks = 100.0;
         let stage = ToneStage::from_params(&params);
         for sample in [
             [0.0f32, 0.0, 0.0],

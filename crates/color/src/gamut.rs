@@ -22,6 +22,15 @@ pub fn soft_clip(v: f32, knee: f32) -> f32 {
 ///
 /// 返回映射后的颜色与所用的饱和度缩放（1 表示本来就在色域内）。
 pub fn map_to_gamut(rgb: [f32; 3], luma: [f32; 3]) -> ([f32; 3], f32) {
+    // 已经落在显示色域内的像素必须原样通过。软膝只能处理 >1 的高光余量；
+    // 若先对 0..1 也做软裁剪，纯白 1.0 会被压到 0.963（255 → 251），
+    // 只要动一下阴影 / 高光就会损失白场，和 Lightroom 的端点行为相反。
+    // 容差用于吸收“按亮度比缩放”带来的 1.0000001 一类浮点溢出；没有它，
+    // 纯白附近会被软膝误判成超色域并压到 251。
+    const EPS: f32 = 1e-5;
+    if rgb.iter().all(|v| (-EPS..=1.0 + EPS).contains(v)) {
+        return (rgb.map(|v| v.clamp(0.0, 1.0)), 1.0);
+    }
     let clipped = rgb.map(|v| soft_clip(v, 0.9));
     let lo = clipped[0].min(clipped[1]).min(clipped[2]);
     let hi = clipped[0].max(clipped[1]).max(clipped[2]);
@@ -86,11 +95,7 @@ pub fn map_to_gamut_oklch(rgb: [f32; 3], space: RgbSpace) -> ([f32; 3], f32) {
         // Smooth knee: f(0)=0, f(1)=1, and slightly below the hard boundary
         // inside the knee; above the boundary we fall back to it.
         let soft = t - 0.15 * t * (1.0 - t);
-        let c_out = if c > lo {
-            lo
-        } else {
-            knee + range * soft
-        };
+        let c_out = if c > lo { lo } else { knee + range * soft };
         let mapped = rgb_from_oklab(&space, lch_to_lab([l, c_out, h]));
         return (mapped.map(|v| v.clamp(0.0, 1.0)), c_out / c);
     };
@@ -108,11 +113,17 @@ mod tests {
 
     #[test]
     fn in_gamut_colours_pass_through() {
-        let v = [0.3, 0.5, 0.2];
-        let (out, k) = map_to_gamut(v, luma());
-        assert_eq!(k, 1.0);
-        for i in 0..3 {
-            assert!((out[i] - v[i]).abs() < 1e-6, "{out:?}");
+        for v in [
+            [0.3, 0.5, 0.2],
+            [1.0, 1.0, 1.0],
+            [0.98, 1.0, 0.99],
+            [1.000_000_1, 1.000_000_1, 1.000_000_1],
+        ] {
+            let (out, k) = map_to_gamut(v, luma());
+            assert_eq!(k, 1.0);
+            for i in 0..3 {
+                assert!((out[i] - v[i]).abs() < 1e-6, "{v:?} -> {out:?}");
+            }
         }
     }
 

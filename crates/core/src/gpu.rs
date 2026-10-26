@@ -52,7 +52,9 @@ impl GpuContext {
             .map_err(|err| FdxmpError::Gpu(format!("请求 GPU 适配器失败：{err}")))?;
 
         let adapter_info = adapter.get_info();
-        let features = adapter.features();
+        // 适配器可能暴露未启用的实验特性（ray query / mesh shader 等）。
+        // 全部原样请求会让 request_device 直接失败；本管线只需要核心特性。
+        let features = adapter.features() & !wgpu::Features::all_experimental_mask();
         let limits = adapter.limits();
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {

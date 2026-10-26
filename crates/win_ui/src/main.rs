@@ -1387,6 +1387,9 @@ impl FdxmpApp {
         egui::CollapsingHeader::new("颜色分级")
             .default_open(false)
             .show(ui, |ui| self.grading_panel(ui));
+        egui::CollapsingHeader::new("校准")
+            .default_open(false)
+            .show(ui, |ui| self.calibration_panel(ui));
         egui::CollapsingHeader::new("细节（锐化 / 降噪）")
             .default_open(false)
             .show(ui, |ui| self.detail_panel(ui));
@@ -1823,7 +1826,28 @@ impl FdxmpApp {
     /// 单条调色 / 效果滑杆（基本与效果面板共用）。
     fn slider_row(&mut self, ui: &mut egui::Ui, id: SliderId) {
         let value = self.read_params().slider(id);
-        // 色温滑杆附带开尔文读数（0 = 5500K，1 单位 = 55K；蒙版显示合成后的值）
+        let reference = self.read_params().color.wb_reference_kelvin;
+        let history = id.label_zh();
+
+        // 全局色温用绝对 Kelvin 滑杆：0 = As Shot；蒙版仍编辑相对量。
+        if id == SliderId::Temperature && matches!(self.edit_target, EditTarget::Global) {
+            let current = fdxmp_core::white_balance::absolute_kelvin(value, reference);
+            let min = fdxmp_core::white_balance::absolute_kelvin(-100.0, reference);
+            let max = fdxmp_core::white_balance::absolute_kelvin(100.0, reference);
+            let label = format!("色温  {current:.0}K · As Shot {reference:.0}K");
+            self.param_slider(ui, &label, current, min..=max, history, |params, kelvin| {
+                let reference = params.color.wb_reference_kelvin;
+                params.color.temperature = if kelvin <= 0.0 {
+                    0.0
+                } else {
+                    fdxmp_core::white_balance::kelvin_to_relative(
+                        kelvin - reference + fdxmp_core::white_balance::REFERENCE_KELVIN,
+                    )
+                };
+            });
+            return;
+        }
+
         let label = if id == SliderId::Temperature {
             let effective = match self.edit_target {
                 EditTarget::Mask(_) => self.engine.params().color.temperature + value,
@@ -1837,7 +1861,6 @@ impl FdxmpApp {
         } else {
             format!("{} {}", id.label_zh(), id.label_en())
         };
-        let history = id.label_zh();
         self.param_slider(ui, &label, value, id.range(), history, move |params, v| {
             params.set_slider(id, v);
         });
@@ -3876,50 +3899,83 @@ impl FdxmpApp {
         ui.add_space(6.0);
         ui.label(egui::RichText::new("参数曲线").strong());
         let parametric = self.read_params().curves.parametric.clone();
+        // 分界存 0 表示默认值；界面显示实际生效的 0.25 / 0.50 / 0.75。
+        let [shadow_split, midtone_split, highlight_split] = parametric.effective_splits();
+        for (label, value, setter) in [
+            (
+                "  高光",
+                parametric.highlights,
+                (|params: &mut EditParams, value: f32| {
+                    params.curves.parametric.highlights = value;
+                }) as fn(&mut EditParams, f32),
+            ),
+            (
+                "  亮调",
+                parametric.lights,
+                |params: &mut EditParams, value: f32| {
+                    params.curves.parametric.lights = value;
+                },
+            ),
+            (
+                "  暗调",
+                parametric.darks,
+                |params: &mut EditParams, value: f32| {
+                    params.curves.parametric.darks = value;
+                },
+            ),
+            (
+                "  阴影",
+                parametric.shadows,
+                |params: &mut EditParams, value: f32| {
+                    params.curves.parametric.shadows = value;
+                },
+            ),
+        ] {
+            self.param_slider(ui, label, value, -100.0..=100.0, "参数曲线", setter);
+        }
         self.param_slider(
             ui,
-            "  高光",
-            parametric.highlights,
-            -100.0..=100.0,
+            "  阴影分界",
+            shadow_split,
+            0.05..=0.55,
             "参数曲线",
-            |params, value| params.curves.parametric.highlights = value,
-        );
-        self.param_slider(
-            ui,
-            "  中间调",
-            parametric.midtones,
-            -100.0..=100.0,
-            "参数曲线",
-            |params, value| params.curves.parametric.midtones = value,
-        );
-        self.param_slider(
-            ui,
-            "  阴影",
-            parametric.shadows,
-            -100.0..=100.0,
-            "参数曲线",
-            |params, value| params.curves.parametric.shadows = value,
-        );
-        self.param_slider(
-            ui,
-            "  高光分界",
-            parametric.highlights_split,
-            0.0..=1.0,
-            "参数曲线",
-            |params, value| params.curves.parametric.highlights_split = value,
+            |params, value| params.curves.parametric.shadow_split = value,
         );
         self.param_slider(
             ui,
             "  中间调分界",
-            parametric.midtones_split,
-            0.0..=1.0,
+            midtone_split,
+            0.15..=0.75,
             "参数曲线",
-            |params, value| params.curves.parametric.midtones_split = value,
+            |params, value| params.curves.parametric.midtone_split = value,
+        );
+        self.param_slider(
+            ui,
+            "  高光分界",
+            highlight_split,
+            0.35..=0.95,
+            "参数曲线",
+            |params, value| params.curves.parametric.highlight_split = value,
         );
     }
 
-    /// HSL 面板：8 个色带 × 色相 / 饱和度 / 明亮度。
+    /// HSL 面板：Lightroom 固定 8 段 / 连续色域两套方案。
     fn hsl_panel(&mut self, ui: &mut egui::Ui) {
+        use fdxmp_core::params::HslMode;
+
+        ui.horizontal(|ui| {
+            for (label, scheme) in [
+                ("Lightroom 8 段", HslMode::Lightroom),
+                ("连续色域", HslMode::ColorZones),
+            ] {
+                let selected = self.read_params().hsl.mode == scheme;
+                if ui.selectable_label(selected, label).clicked() && !selected {
+                    self.edit_params_live("HSL 方案", move |params| {
+                        params.hsl.mode = scheme;
+                    });
+                }
+            }
+        });
         ui.horizontal(|ui| {
             for (index, label) in ["色相", "饱和度", "明亮度"].iter().enumerate() {
                 if ui
@@ -3930,9 +3986,23 @@ impl FdxmpApp {
                 }
             }
         });
+
         let mode = self.hsl_mode;
-        for band in ColorBand::ALL {
-            let hsl = self.read_params().hsl.band(band);
+        let continuous = self.read_params().hsl.mode == HslMode::ColorZones;
+        ui.weak(if continuous {
+            "连续色域：8 个节点之间线性插值，类似 darktable 的 Color Zones。"
+        } else {
+            "Lightroom：8 个固定色带，带间使用重叠窗。"
+        });
+        if continuous {
+            self.hsl_zones_graph(ui, mode);
+        }
+        for (index, band) in ColorBand::ALL.into_iter().enumerate() {
+            let hsl = if continuous {
+                self.read_params().hsl.zone(index).clone()
+            } else {
+                self.read_params().hsl.band(band).clone()
+            };
             let value = match mode {
                 0 => hsl.hue,
                 1 => hsl.saturation,
@@ -3946,7 +4016,11 @@ impl FdxmpApp {
                 -100.0..=100.0,
                 "HSL",
                 move |params, v| {
-                    let hsl = params.hsl.band_mut(band);
+                    let hsl = if continuous {
+                        params.hsl.zone_mut(index)
+                    } else {
+                        params.hsl.band_mut(band)
+                    };
                     match mode {
                         0 => hsl.hue = v,
                         1 => hsl.saturation = v,
@@ -3962,32 +4036,122 @@ impl FdxmpApp {
         }
     }
 
+    /// Color Zones 的 8 节点曲线：横轴色相 0..360，纵轴当前通道 -100..100。
+    fn hsl_zones_graph(&mut self, ui: &mut egui::Ui, mode: usize) {
+        const CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 225.0, 270.0, 315.0];
+        let width = ui.available_width().clamp(220.0, 420.0);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(width, 120.0), egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(28, 30, 34));
+        for step in 0..=4 {
+            let y = rect.top() + rect.height() * step as f32 / 4.0;
+            let value = 100.0 - step as f32 * 50.0;
+            painter.line_segment(
+                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
+            );
+            painter.text(
+                egui::pos2(rect.left() + 4.0, y),
+                egui::Align2::LEFT_TOP,
+                format!("{value:+.0}"),
+                egui::FontId::monospace(9.0),
+                egui::Color32::from_gray(150),
+            );
+        }
+
+        let params = self.read_params();
+        let values: [f32; 8] = std::array::from_fn(|index| {
+            let zone = params.hsl.zone(index);
+            match mode {
+                0 => zone.hue,
+                1 => zone.saturation,
+                _ => zone.luminance,
+            }
+        });
+        let point = |index: usize, value: f32| {
+            egui::pos2(
+                rect.left() + rect.width() * CENTERS[index] / 360.0,
+                rect.center().y - value / 200.0 * rect.height(),
+            )
+        };
+        let points: Vec<egui::Pos2> = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| point(index, *value))
+            .collect();
+        painter.add(egui::Shape::line(
+            points.clone(),
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255)),
+        ));
+        for (index, position) in points.iter().enumerate() {
+            painter.circle_filled(
+                *position,
+                4.5,
+                hsv_color(CENTERS[index], 0.65, 0.95),
+            );
+            painter.circle_stroke(*position, 5.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+        }
+
+        if response.dragged() || response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let index = CENTERS
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        (pos.x - (rect.left() + rect.width() * **a / 360.0))
+                            .abs()
+                            .partial_cmp(
+                                &(pos.x - (rect.left() + rect.width() * **b / 360.0)).abs(),
+                            )
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(index, _)| index)
+                    .unwrap_or(0);
+                let value = (100.0 - (pos.y - rect.top()) / rect.height() * 200.0)
+                    .clamp(-100.0, 100.0);
+                if (value - values[index]).abs() > 0.25 {
+                    self.edit_params_live("HSL 色域曲线", move |params| {
+                        let zone = params.hsl.zone_mut(index);
+                        match mode {
+                            0 => zone.hue = value,
+                            1 => zone.saturation = value,
+                            _ => zone.luminance = value,
+                        }
+                    });
+                }
+            }
+        }
+        ui.weak("拖动节点编辑：横轴色相，纵轴当前通道值；双击滑杆可复位。");
+    }
+
     /// 颜色分级面板：阴影 / 中间调 / 高光 + 混合 / 平衡。
     fn grading_panel(&mut self, ui: &mut egui::Ui) {
-        for (label, index) in [("阴影", 0usize), ("中间调", 1), ("高光", 2)] {
+        for (label, index) in [
+            ("阴影", 0usize),
+            ("中间调", 1),
+            ("高光", 2),
+            ("全局", 3),
+        ] {
             let zone = match index {
                 0 => self.read_params().grading.shadows.clone(),
                 1 => self.read_params().grading.midtones.clone(),
-                _ => self.read_params().grading.highlights.clone(),
+                2 => self.read_params().grading.highlights.clone(),
+                _ => self.read_params().grading.global.clone(),
             };
             ui.label(egui::RichText::new(label).strong());
             let history = format!("分级{label}");
-            self.param_slider(
-                ui,
-                "  色相",
-                zone.hue,
-                0.0..=360.0,
-                &history,
-                move |params, value| grading_zone_mut(params, index).hue = value,
-            );
-            self.param_slider(
-                ui,
-                "  饱和度",
-                zone.saturation,
-                0.0..=100.0,
-                &history,
-                move |params, value| grading_zone_mut(params, index).saturation = value,
-            );
+            if let Some((hue, saturation)) = grading_wheel(ui, zone.hue, zone.saturation) {
+                self.edit_params_live(&history, move |params| {
+                    let zone = grading_zone_mut(params, index);
+                    zone.hue = hue;
+                    zone.saturation = saturation;
+                });
+            }
+            ui.weak(format!(
+                "  色相 {:.0}° · 饱和度 {:.0}%",
+                zone.hue, zone.saturation
+            ));
             self.param_slider(
                 ui,
                 "  明亮度",
@@ -4014,6 +4178,63 @@ impl FdxmpApp {
             "分级平衡",
             |params, value| params.grading.balance = value,
         );
+    }
+
+    /// 校准面板：红 / 绿 / 蓝原色色相与饱和度 + 阴影色调。
+    fn calibration_panel(&mut self, ui: &mut egui::Ui) {
+        let calibration = self.read_params().calibration.clone();
+        for (label, hue, sat, hue_set, sat_set) in [
+            (
+                "红原色",
+                calibration.red_hue,
+                calibration.red_sat,
+                (|params: &mut EditParams, value: f32| {
+                    params.calibration.red_hue = value;
+                }) as fn(&mut EditParams, f32),
+                (|params: &mut EditParams, value: f32| {
+                    params.calibration.red_sat = value;
+                }) as fn(&mut EditParams, f32),
+            ),
+            (
+                "绿原色",
+                calibration.green_hue,
+                calibration.green_sat,
+                |params: &mut EditParams, value: f32| params.calibration.green_hue = value,
+                |params: &mut EditParams, value: f32| params.calibration.green_sat = value,
+            ),
+            (
+                "蓝原色",
+                calibration.blue_hue,
+                calibration.blue_sat,
+                |params: &mut EditParams, value: f32| params.calibration.blue_hue = value,
+                |params: &mut EditParams, value: f32| params.calibration.blue_sat = value,
+            ),
+        ] {
+            ui.label(egui::RichText::new(label).strong());
+            let history = format!("校准{label}");
+            self.param_slider(ui, "  色相", hue, -100.0..=100.0, &history, hue_set);
+            self.param_slider(
+                ui,
+                "  饱和度",
+                sat,
+                -100.0..=100.0,
+                &history,
+                sat_set,
+            );
+        }
+        self.param_slider(
+            ui,
+            "阴影色调",
+            calibration.shadows_tint,
+            -100.0..=100.0,
+            "校准阴影色调",
+            |params, value| params.calibration.shadows_tint = value,
+        );
+        if ui.small_button("重置校准").clicked() {
+            self.edit_params_live("重置校准", |params| {
+                params.calibration = fdxmp_core::params::CalibrationParams::default();
+            });
+        }
     }
 
     /// 细节面板：锐化 + 降噪。
@@ -5769,6 +5990,18 @@ impl FdxmpApp {
             proxy_h
         );
         let metadata = decoded.metadata.clone();
+        // 绝对色温以照片 EXIF 的 As Shot 为参考；没有 EXIF 时回退 5500K。
+        let reference_kelvin = metadata
+            .as_ref()
+            .and_then(|meta| meta.color_temperature_k)
+            .map(|kelvin| (kelvin as f32).clamp(2000.0, 50000.0))
+            .unwrap_or(5500.0);
+        if (self.engine.params().color.wb_reference_kelvin - reference_kelvin).abs() > 0.5 {
+            let mut params = self.engine.params().clone();
+            params.color.wb_reference_kelvin = reference_kelvin;
+            self.engine.set_params_live(params);
+            self.params_dirty = true;
+        }
         // 新图片：AI 蒙版缓存失效。
         #[cfg(feature = "ai")]
         fdxmp_core::ai::clear_cache();
@@ -6335,7 +6568,8 @@ fn grading_zone_mut(params: &mut EditParams, index: usize) -> &mut fdxmp_core::p
     match index {
         0 => &mut params.grading.shadows,
         1 => &mut params.grading.midtones,
-        _ => &mut params.grading.highlights,
+        2 => &mut params.grading.highlights,
+        _ => &mut params.grading.global,
     }
 }
 
@@ -6368,6 +6602,78 @@ fn open_in_explorer(path: &std::path::Path) {
 }
 
 /// 曲线插值（与 core 的 LUT 构建一致：线性、严格过控制点）。
+/// 颜色分级色轮：色相 = 角度，饱和度 = 半径；双击回到中心。
+fn grading_wheel(ui: &mut egui::Ui, hue: f32, saturation: f32) -> Option<(f32, f32)> {
+    let size = egui::vec2(156.0, 156.0);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+    let center = rect.center();
+    let radius = rect.width() * 0.45;
+    let painter = ui.painter();
+
+    painter.circle_filled(center, radius + 2.0, egui::Color32::from_gray(24));
+    let segments = 72;
+    for index in 0..segments {
+        let a0 = index as f32 / segments as f32 * std::f32::consts::TAU;
+        let a1 = (index + 1) as f32 / segments as f32 * std::f32::consts::TAU;
+        let p0 = center + egui::vec2(a0.cos(), a0.sin()) * radius;
+        let p1 = center + egui::vec2(a1.cos(), a1.sin()) * radius;
+        let hue_deg = (index as f32 + 0.5) / segments as f32 * 360.0;
+        painter.add(egui::Shape::convex_polygon(
+            vec![center, p0, p1],
+            hsv_color(hue_deg, 1.0, 0.95),
+            egui::Stroke::NONE,
+        ));
+    }
+    painter.circle_stroke(
+        center,
+        radius,
+        egui::Stroke::new(1.0, egui::Color32::from_gray(180)),
+    );
+
+    let angle = hue.to_radians();
+    let marker = center
+        + egui::vec2(angle.cos(), angle.sin()) * (radius * (saturation / 100.0).clamp(0.0, 1.0));
+    painter.circle_filled(marker, 6.0, hsv_color(hue, saturation / 100.0, 1.0));
+    painter.circle_stroke(marker, 6.0, egui::Stroke::new(1.5, egui::Color32::WHITE));
+
+    if response.double_clicked() {
+        return Some((0.0, 0.0));
+    }
+    if response.clicked() || response.dragged() {
+        if let Some(pointer) = response.interact_pointer_pos() {
+            let delta = pointer - center;
+            let length = delta.length();
+            if length > 2.0 {
+                let hue = delta.y.atan2(delta.x).to_degrees().rem_euclid(360.0);
+                let saturation = (length / radius).clamp(0.0, 1.0) * 100.0;
+                return Some((hue, saturation));
+            }
+            return Some((hue, 0.0));
+        }
+    }
+    None
+}
+
+fn hsv_color(hue: f32, saturation: f32, value: f32) -> egui::Color32 {
+    let h = hue.rem_euclid(360.0) / 60.0;
+    let c = value * saturation;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = value - c;
+    egui::Color32::from_rgb(
+        ((r + m).clamp(0.0, 1.0) * 255.0) as u8,
+        ((g + m).clamp(0.0, 1.0) * 255.0) as u8,
+        ((b + m).clamp(0.0, 1.0) * 255.0) as u8,
+    )
+}
+
 fn value_slider(
     ui: &mut egui::Ui,
     label: &str,

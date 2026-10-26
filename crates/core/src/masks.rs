@@ -934,6 +934,8 @@ mod tests {
 
     #[test]
     fn ai_masks_require_generated_raster() {
+        // 与“已提交 raster”测试共用进程级缓存，必须串行，否则会读到别的用例留下的 raster。
+        let _guard = test_cache_lock();
         let image = gray_image(8, 8, 128);
         let err = generate_mask(&mask(MaskKind::AiSky), &image, 8, 8).unwrap_err();
         let message = err.to_string();

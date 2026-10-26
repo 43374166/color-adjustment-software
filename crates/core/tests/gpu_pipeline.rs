@@ -215,7 +215,7 @@ fn gpu_linear_upload_matches_srgb_upload() {
 }
 
 #[test]
-fn gpu_exposure_doubles_linear_light() {
+fn gpu_exposure_uses_reference_curve() {
     let Some(context) = context() else {
         return;
     };
@@ -236,10 +236,22 @@ fn gpu_exposure_doubles_linear_light() {
     let sample = (width / 2, height - 1); // 渐变中段灰阶（避免高光截断）
     let before = pixel(&source, width, sample.0, sample.1);
     let after = pixel(&output, width, sample.0, sample.1);
-    let ratio = srgb_to_linear(after[0]) / srgb_to_linear(before[0]).max(1e-4);
+    // LR 曝光 +1 带高光肩部：中灰 128 → ≈179，而不是线性 ×2 的 176/190。
     assert!(
-        (ratio - 2.0).abs() < 0.25,
-        "曝光 +1EV 的线性倍率应 ≈2，实际 {ratio:.3}"
+        after[0] > before[0] + 40,
+        "曝光 +1EV 应明显提亮：{} → {}",
+        before[0],
+        after[0]
+    );
+    assert!(
+        (before[0] as i32 - 127).abs() <= 2,
+        "测试样本应接近中灰：{}",
+        before[0]
+    );
+    assert!(
+        (after[0] as i32 - 179).abs() <= 6,
+        "曝光 +1EV 的中灰应接近 LR 参考 ~179：{}",
+        after[0]
     );
 }
 
@@ -425,10 +437,13 @@ fn gpu_base_stage_matches_cpu_reference() {
     let mut params = EditParams::default();
     params.color.temperature = 40.0;
     params.color.tint = -25.0;
+    params.color.wb_reference_kelvin = 5200.0;
     params.light.exposure = 0.4;
     params.light.contrast = 30.0;
     params.light.highlights = -40.0;
     params.light.shadows = 30.0;
+    params.light.whites = -30.0;
+    params.light.blacks = 20.0;
     pipeline.render(&context.device, &context.queue, &image, &params);
     let output = pipeline
         .readback(&context.device, &context.queue, &image)
@@ -472,7 +487,7 @@ fn gpu_base_stage_matches_cpu_reference() {
     }
 }
 
-/// 回归：对比度 -100 只压平画面（对数域斜率 < 1），不得反相。
+/// 回归：对比度 -100 只压平画面（端点固定 S 曲线），不得反相、不得移动白场。
 #[test]
 fn gpu_negative_contrast_does_not_invert() {
     let Some(context) = context() else {
@@ -516,11 +531,10 @@ fn gpu_negative_contrast_does_not_invert() {
         black <= shadow && shadow < white,
         "对比度 -100 不得反相：黑 {black} / 暗部 {shadow} / 白 {white}"
     );
-    // 曲线是乘性的：纯黑保持纯黑，暗部被提向中灰，白场被压回来。
+    // 新对比度是端点固定的显示域 S 曲线：纯黑 / 纯白不动，暗部提向中灰。
     assert_eq!(black, 0, "纯黑不应被垫灰：{black}");
     assert!(shadow > 64, "负对比度应提亮暗部：64 → {shadow}");
-    assert!(white < 255, "负对比度应压低白场：255 → {white}");
-    assert!(white > 180, "负对比度不应把白场压死：{white}");
+    assert_eq!(white, 255, "对比度不应移动白场：255 → {white}");
 }
 
 /// 回归：蒙版参数是相对全局的增量，零增量蒙版不得抹掉全局调色。
@@ -682,46 +696,17 @@ fn gpu_hsl_bands_cover_all_hues() {
         assert!(diff >= 4, "{name}色带在 90° 处应有响应（最大差 {diff}）");
     }
 
-    // 权重和恒为 1：黄 / 绿两带**在 OkLCh 空间**的正中点上，-100 与 +100 应抵消。
-    // （HSV 90° 在 OkLCh 里并非两带中点——色带判定空间从 HSV 换到 OkLCh 后，
-    //   中点要按带心表取；这里直接用线性 f32 上传，避免 8bit 量化带来的色相偏移。）
-    let hues = fdxmp_core::color_engine::band_hues();
-    let mid_hue = (hues[2] + hues[3]) * 0.5;
-    let mid_linear = fdxmp_core::color_engine::oklch_to_linear(0.7, 0.12, mid_hue);
-    let mut linear_source = vec![0.0f32; (width * height * 4) as usize];
-    for chunk in linear_source.as_chunks_mut::<4>().0 {
-        chunk[0] = mid_linear[0].clamp(0.0, 1.0);
-        chunk[1] = mid_linear[1].clamp(0.0, 1.0);
-        chunk[2] = mid_linear[2].clamp(0.0, 1.0);
-        chunk[3] = 1.0;
-    }
-    let mid_image = pipeline
-        .upload_linear_f32(
-            &context.device,
-            &context.queue,
-            &linear_source,
-            width,
-            height,
-        )
-        .unwrap();
-    pipeline.render(
-        &context.device,
-        &context.queue,
-        &mid_image,
-        &EditParams::default(),
-    );
-    let mid_identity = pipeline
-        .readback(&context.device, &context.queue, &mid_image)
-        .unwrap();
-
+    // 权重和恒为 1：HSL 90° 正好是黄（60°）与绿（120°）的中点，
+    // 黄 -100 与绿 +100 必须抵消。这里直接用同一张 90° 测试图，避免
+    // 把 OkLCh 的中点误当成 HSL 色带的中点（旧测试的假设已过时）。
     let mut params = EditParams::default();
     params.hsl.yellow.saturation = -100.0;
     params.hsl.green.saturation = 100.0;
-    pipeline.render(&context.device, &context.queue, &mid_image, &params);
+    pipeline.render(&context.device, &context.queue, &image, &params);
     let cancelled = pipeline
-        .readback(&context.device, &context.queue, &mid_image)
+        .readback(&context.device, &context.queue, &image)
         .unwrap();
-    let diff = max_channel_diff(&mid_identity, &cancelled);
+    let diff = max_channel_diff(&identity, &cancelled);
     assert!(
         diff <= 2,
         "相邻色带权重和应为 1（-100/+100 应抵消），实际最大差 {diff}"
@@ -782,37 +767,37 @@ fn gpu_tone_zones_are_separated() {
         "测试图应为黑/中灰/白三段"
     );
 
-    // 黑色 +100：抬起纯黑（乘性增益对 0 无效，旧实现纹丝不动）
+    // 黑色 +100：LR 参考曲线保持纯黑为 0，但会抬暗部 / 中间调。
     let mut params = EditParams::default();
     params.light.blacks = 100.0;
     let out = render(&mut pipeline, &context, &image, &params);
     let lifted = pixel(&out, width, black_x, 16)[0];
     assert!(
-        lifted >= black + 8,
-        "黑色 +100 应抬起纯黑：{black} → {lifted}"
+        lifted <= black + 2,
+        "黑色 +100 不应把纯黑垫灰：{black} → {lifted}"
     );
     let mid_after = pixel(&out, width, mid_x, 16)[0];
     assert!(
-        (mid_after as i32 - mid as i32).abs() <= 12,
-        "黑色滑块对中灰只应有轻微抬升：{mid} → {mid_after}"
+        mid_after >= mid + 8,
+        "黑色 +100 应抬暗部 / 中间调：{mid} → {mid_after}"
     );
 
-    // 白色 -100：压下纯白，且不碰中灰
+    // 白色 -100：LR 参考曲线保留纯白，但压缩高光中的近白，并压暗中灰。
     let mut params = EditParams::default();
     params.light.whites = -100.0;
     let out = render(&mut pipeline, &context, &image, &params);
     let pulled = pixel(&out, width, white_x, 16)[0];
     assert!(
-        pulled + 8 <= white,
-        "白色 -100 应压下纯白：{white} → {pulled}"
+        pulled as i32 + 2 >= white as i32,
+        "白色 -100 应保留纯白端点：{white} → {pulled}"
     );
     let mid_after = pixel(&out, width, mid_x, 16)[0];
     assert!(
-        (mid_after as i32 - mid as i32).abs() <= 12,
-        "白色滑块对中灰只应有轻微影响：{mid} → {mid_after}"
+        mid_after + 4 < mid,
+        "白色 -100 应压暗中灰：{mid} → {mid_after}"
     );
 
-    // 阴影 -100：对纯黑无影响（证明黑场只由"黑色"控制）
+    // 阴影 -100：纯黑保持 0。
     let mut params = EditParams::default();
     params.light.shadows = -100.0;
     let out = render(&mut pipeline, &context, &image, &params);
@@ -881,6 +866,39 @@ fn gpu_white_balance_warms_and_cools() {
 
 /// 回归：颜色分级——上色保持亮度、只作用于对应分区、明亮度滑杆是本区增益。
 #[test]
+fn gpu_shadow_tint_without_matrix_does_not_black_out() {
+    let Some(context) = context() else {
+        return;
+    };
+    let mut pipeline = ColorPipeline::new(&context.device);
+    let (width, height) = (16u32, 16u32);
+    let source = vec![128u8; (width * height * 4) as usize]
+        .chunks_mut(4)
+        .flat_map(|chunk| {
+            chunk[0] = 128;
+            chunk[1] = 128;
+            chunk[2] = 128;
+            chunk[3] = 255;
+            chunk.to_vec()
+        })
+        .collect::<Vec<_>>();
+    let image = pipeline
+        .upload(&context.device, &context.queue, &source, width, height)
+        .unwrap();
+    let mut params = EditParams::default();
+    params.calibration.shadows_tint = 50.0;
+    pipeline.render(&context.device, &context.queue, &image, &params);
+    let output = pipeline
+        .readback(&context.device, &context.queue, &image)
+        .unwrap();
+    let sample = pixel(&output, width, 8, 8);
+    assert!(
+        sample[1] > 0 && sample[0] > 0 && sample[2] > 0,
+        "只开阴影色调时不应把画面乘成黑色：{sample:?}"
+    );
+}
+
+#[test]
 fn gpu_grading_preserves_luminance_and_zones() {
     let Some(context) = context() else {
         return;
@@ -920,8 +938,13 @@ fn gpu_grading_preserves_luminance_and_zones() {
             .unwrap()
     }
 
-    fn luma(pixel: [u8; 3]) -> f32 {
-        0.2126 * pixel[0] as f32 + 0.7152 * pixel[1] as f32 + 0.0722 * pixel[2] as f32
+    fn oklab_l(pixel: [u8; 3]) -> f32 {
+        let linear = [
+            srgb_to_linear(pixel[0]),
+            srgb_to_linear(pixel[1]),
+            srgb_to_linear(pixel[2]),
+        ];
+        fdxmp_color::oklab_from_rgb(&fdxmp_core::color_engine::WORKSPACE, linear)[0]
     }
 
     let plain = render(&mut pipeline, &context, &image, &EditParams::default());
@@ -949,10 +972,10 @@ fn gpu_grading_preserves_luminance_and_zones() {
         "阴影应被染蓝：{dark:?} → {dark_after:?}"
     );
     assert!(
-        (luma(dark_after) - luma(dark)).abs() <= 8.0,
-        "上色应保持亮度：{} → {}",
-        luma(dark),
-        luma(dark_after)
+        (oklab_l(dark_after) - oklab_l(dark)).abs() <= 0.03,
+        "上色应保持 OkLab 明度：{} → {}",
+        oklab_l(dark),
+        oklab_l(dark_after)
     );
     assert!(
         max_channel_diff(&mid, &mid_after) <= 3 && max_channel_diff(&bright, &bright_after) <= 3,
@@ -1856,9 +1879,10 @@ fn gpu_colour_stage_matches_cpu_reference() {
     let mut params = EditParams::default();
     params.color.vibrance = 40.0;
     params.color.saturation = 25.0;
-    params.hsl.blue.saturation = -80.0;
-    params.hsl.orange.luminance = 35.0;
-    params.hsl.red.hue = 20.0;
+    params.hsl.mode = fdxmp_core::params::HslMode::ColorZones;
+    params.hsl.zones[5].saturation = -80.0;
+    params.hsl.zones[1].luminance = 35.0;
+    params.hsl.zones[0].hue = 20.0;
     params.grading.shadows.hue = 220.0;
     params.grading.shadows.saturation = 60.0;
     params.grading.highlights.hue = 40.0;
@@ -2076,6 +2100,11 @@ fn gpu_curve_only_matches_cpu_preview() {
         CurvePoint { x: 0.35, y: 0.55 },
         CurvePoint { x: 1.0, y: 1.0 },
     ];
+    // 参数曲线也一起测：CPU 与 GPU 现在共用同一张 256 项 LUT（GPU 存在曲线 alpha）。
+    params.curves.parametric.highlights = 40.0;
+    params.curves.parametric.lights = 20.0;
+    params.curves.parametric.darks = -25.0;
+    params.curves.parametric.shadows = 35.0;
     pipeline.render(&context.device, &context.queue, &image, &params);
     let output = pipeline
         .readback(&context.device, &context.queue, &image)

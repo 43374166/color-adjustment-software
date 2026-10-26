@@ -16,8 +16,8 @@
 //! 7. cs_overlay         蒙版叠加显示（写 8bit 暂存后拷回 display）
 //! ```
 //!
-//! 参数通过 88 floats + 256×4 曲线 LUT 的 uniform 传递，布局与
-//! `shaders/color_pipeline.wgsl` 注释一一对应。
+//! 参数通过 196 floats + 256×4 曲线 LUT + 4096 色调 LUT 的 uniform 传递，布局与
+//! `shaders/color_pipeline.wgsl` 注释一一对应；曲线 LUT 的 alpha 通道存参数曲线。
 //! 渲染目标（尺寸随裁剪变化）缓存在 [`ColorPipeline`] 内：同一张源图 + 同一
 //! 输出尺寸 + 同一几何开关时复用纹理与绑定组。
 
@@ -104,16 +104,8 @@ pub mod slot {
     pub const GRADING_BLENDING: usize = 25;
     /// 分级平衡。
     pub const GRADING_BALANCE: usize = 26;
-    /// 参数曲线高光。
-    pub const PARAM_HIGHLIGHTS: usize = 27;
-    /// 参数曲线中间调。
-    pub const PARAM_MIDTONES: usize = 28;
-    /// 参数曲线阴影。
-    pub const PARAM_SHADOWS: usize = 29;
-    /// 高光分界。
-    pub const HIGHLIGHT_SPLIT: usize = 30;
-    /// 中间调分界。
-    pub const MIDTONE_SPLIT: usize = 31;
+    /// HSL 是否使用 Color Zones 连续插值（0 = LR 8 段）。
+    pub const HSL_CONTINUOUS: usize = 27;
     /// HSL 起始下标（8 段 × 3）。
     pub const HSL_START: usize = 32;
     /// 颜色分级起始下标（3 区 × 3）。
@@ -195,6 +187,10 @@ pub mod slot {
 
     /// 色调段是否有内容（0 = 整段跳过；对比度 / 高光 / 阴影 / 白色 / 黑色全为 0 时）。
     pub const TONE_ACTIVE: usize = 193;
+    /// 参数曲线是否有内容（0 = 跳过；三个区域滑杆全为 0 时）。
+    pub const PARAM_CURVE_ACTIVE: usize = 194;
+    /// 曝光参考 LUT 是否启用（|EV| ≤ 1 时）。
+    pub const EXPOSURE_CURVE_ACTIVE: usize = 195;
 }
 
 /// 把 `EditParams` 打成 uniform 数组（[`PARAM_FLOATS`] + 1024 floats）。
@@ -213,7 +209,11 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
     data[slot::TEMPERATURE] = color.temperature;
     data[slot::TINT] = color.tint;
     // 白平衡：由色温 / 色调算 Bradford 色适应矩阵（着色器第 1 段直接应用）。
-    let white_balance = crate::white_balance::adaptation_matrix(color.temperature, color.tint);
+    let white_balance = crate::white_balance::adaptation_matrix_for(
+        color.temperature,
+        color.tint,
+        color.wb_reference_kelvin,
+    );
     for (index, value) in white_balance.iter().flatten().enumerate() {
         data[slot::WB_MATRIX + index] = *value;
     }
@@ -242,22 +242,15 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
 
     data[slot::GRADING_BLENDING] = params.grading.blending;
     data[slot::GRADING_BALANCE] = params.grading.balance;
-    data[slot::PARAM_HIGHLIGHTS] = params.curves.parametric.highlights;
-    data[slot::PARAM_MIDTONES] = params.curves.parametric.midtones;
-    data[slot::PARAM_SHADOWS] = params.curves.parametric.shadows;
-    data[slot::HIGHLIGHT_SPLIT] = if params.curves.parametric.highlights_split > 0.0 {
-        params.curves.parametric.highlights_split
-    } else {
-        0.65
-    };
-    data[slot::MIDTONE_SPLIT] = if params.curves.parametric.midtones_split > 0.0 {
-        params.curves.parametric.midtones_split
-    } else {
-        0.35
-    };
 
+    let continuous_hsl = params.hsl.mode == crate::params::HslMode::ColorZones;
+    data[slot::HSL_CONTINUOUS] = if continuous_hsl { 1.0 } else { 0.0 };
     for (band_index, band) in crate::params::ColorBand::ALL.iter().enumerate() {
-        let hsl = params.hsl.band(*band);
+        let hsl = if continuous_hsl {
+            params.hsl.zone(band_index)
+        } else {
+            params.hsl.band(*band)
+        };
         let base = slot::HSL_START + band_index * 3;
         data[base] = hsl.hue;
         data[base + 1] = hsl.saturation;
@@ -289,11 +282,14 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
     data[slot::MASK_SCALE_X] = 1.0;
     data[slot::MASK_SCALE_Y] = 1.0;
 
-    // 曲线 LUT：主曲线 → 各通道曲线，逐项合成
+    // 曲线 LUT：主曲线 → 各通道曲线，逐项合成。
+    // alpha 通道不被曲线查找使用，复用为参数曲线 LUT（x = index / (N-1)），
+    // 这样 GPU 不需要额外 uniform 区，也不会和 CPU 的参数曲线语义分叉。
     let master = build_curve_lut(&params.curves.rgb);
     let red = build_curve_lut(&params.curves.red);
     let green = build_curve_lut(&params.curves.green);
     let blue = build_curve_lut(&params.curves.blue);
+    let parametric = crate::params::parametric_curve_lut(&params.curves.parametric);
     let curve_base = PARAM_FLOATS;
     for index in 0..CURVE_ENTRIES {
         let master_value = master[index];
@@ -302,16 +298,31 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
         data[curve_base + index * 4] = red[sample_index];
         data[curve_base + index * 4 + 1] = green[sample_index];
         data[curve_base + index * 4 + 2] = blue[sample_index];
-        data[curve_base + index * 4 + 3] = 1.0;
+        data[curve_base + index * 4 + 3] = parametric[index];
     }
+    data[slot::PARAM_CURVE_ACTIVE] = if params.curves.parametric.is_identity() {
+        0.0
+    } else {
+        1.0
+    };
 
-    // 电影曲线 LUT（色调段：对比度 / 白色 / 黑色），与 CPU `ToneStage` 同一张表。
+    // 色调段：4 张 256 项参考曲线 LUT（高光 / 阴影 / 白色 / 黑色）。
+    // 复用原先电影曲线占用的 uniform 区，前 1024 项有效，其余保持 0。
     let tone_lut_base = curve_base + CURVE_ENTRIES * 4;
     let tone = crate::tone::ToneStage::from_params(params);
-    for (index, value) in tone.lut().iter().enumerate() {
-        data[tone_lut_base + index] = *value;
+    for (slot_index, lut) in tone.luts().iter().enumerate() {
+        let base = tone_lut_base + slot_index * crate::tone::TONE_LUT_SIZE;
+        for (index, value) in lut.iter().enumerate() {
+            data[base + index] = *value;
+        }
     }
     data[slot::TONE_ACTIVE] = if tone.is_identity() { 0.0 } else { 1.0 };
+    data[slot::EXPOSURE_CURVE_ACTIVE] =
+        if params.light.exposure != 0.0 && params.light.exposure.abs() <= 1.0 {
+            1.0
+        } else {
+            0.0
+        };
 
     data
 }
@@ -2610,13 +2621,11 @@ mod tests {
         assert_eq!(packed[slot::GRADING_START], 200.0);
         assert_eq!(packed[slot::WIDTH], 800.0);
         assert_eq!(packed[slot::MASK_MODE], 0.0);
-        // 色调段：LUT 尺寸必须与色彩引擎一致（4096 项 = 1024 个 vec4），
-        // 中性参数下整段关闭（0）、曲线是恒等（首尾与中段都对得上）。
-        assert_eq!(TONE_LUT_FLOATS, fdxmp_color::tone::LUT_N);
+        // 色调段：中性参数下整段关闭；4 张参考 LUT 仍是恒等曲线（0 → 0，1 → 1）。
         assert_eq!(packed[slot::TONE_ACTIVE], 0.0);
         let tone_base = PARAM_FLOATS + CURVE_ENTRIES * 4;
-        assert!(packed[tone_base] < 0.001, "{}", packed[tone_base]);
-        assert!((packed[tone_base + fdxmp_color::tone::LUT_N - 1] - 1.0).abs() < 0.02);
+        assert!(packed[tone_base] < 0.001);
+        assert!((packed[tone_base + 255] - 1.0).abs() < 0.01);
     }
 
     #[test]

@@ -102,15 +102,20 @@ impl ColorStage {
     /// 从编辑参数构建。
     pub fn from_params(params: &EditParams) -> Self {
         let monochrome = params.color.black_white;
-        let bands = ColorBand::ALL.map(|band| {
-            let hsl = params.hsl.band(band);
+        let continuous = params.hsl.mode == crate::params::HslMode::ColorZones;
+        let bands = std::array::from_fn(|index| {
+            let hsl = if continuous {
+                params.hsl.zone(index)
+            } else {
+                params.hsl.band(ColorBand::ALL[index])
+            };
             Hsl {
                 hue: hsl.hue as f64,
                 sat: hsl.saturation as f64,
                 lum: hsl.luminance as f64,
             }
         });
-        let mixer = Mixer { bands };
+        let mixer = Mixer { bands, continuous };
         let zone = |zone: &crate::params::GradingZone| Wheel {
             hue: zone.hue as f64,
             sat: zone.saturation as f64,
@@ -120,7 +125,7 @@ impl ColorStage {
             shadows: zone(&params.grading.shadows),
             midtones: zone(&params.grading.midtones),
             highlights: zone(&params.grading.highlights),
-            global: Wheel::default(),
+            global: zone(&params.grading.global),
             blending: params.grading.blending as f64,
             balance: params.grading.balance as f64,
         };
@@ -240,6 +245,13 @@ pub fn pack_color_slots(data: &mut [f32], params: &EditParams) {
                 data[slot::CALIB_MATRIX + row * 3 + col] = matrix[row][col];
             }
         }
+    } else {
+        // 只开阴影色调时矩阵未计算；必须写恒等矩阵，否则着色器会把 RGB 乘成 0。
+        for row in 0..3 {
+            for col in 0..3 {
+                data[slot::CALIB_MATRIX + row * 3 + col] = if row == col { 1.0 } else { 0.0 };
+            }
+        }
     }
     data[slot::CALIB_TINT] = tint;
 
@@ -260,9 +272,9 @@ pub fn pack_color_slots(data: &mut [f32], params: &EditParams) {
     }
 
     // 分级色轮：色相在 CPU 侧换算成 OkLCh 的 a / b 向量，着色器只做加法。
-    let wheel = |zone: &crate::params::GradingZone| {
+    let wheel = |zone: &crate::params::GradingZone, strength: f32| {
         let hue = fdxmp_color::bands::oklch_hue_of_srgb_hue(zone.hue as f64);
-        let sat = (zone.saturation as f64 / 100.0) as f32 * 0.09;
+        let sat = (zone.saturation as f64 / 100.0) as f32 * strength;
         (
             sat * hue.cos(),
             sat * hue.sin(),
@@ -270,19 +282,29 @@ pub fn pack_color_slots(data: &mut [f32], params: &EditParams) {
         )
     };
     let zones = [
-        wheel(&params.grading.shadows),
-        wheel(&params.grading.midtones),
-        wheel(&params.grading.highlights),
+        wheel(
+            &params.grading.shadows,
+            fdxmp_color::ops::GRADING_SAT_STRENGTH[0],
+        ),
+        wheel(
+            &params.grading.midtones,
+            fdxmp_color::ops::GRADING_SAT_STRENGTH[1],
+        ),
+        wheel(
+            &params.grading.highlights,
+            fdxmp_color::ops::GRADING_SAT_STRENGTH[2],
+        ),
+        wheel(
+            &params.grading.global,
+            fdxmp_color::ops::GRADING_SAT_STRENGTH[3],
+        ),
     ];
     for (index, (a, b, lum)) in zones.iter().enumerate() {
         data[slot::GRADE_VEC + index * 3] = *a;
         data[slot::GRADE_VEC + index * 3 + 1] = *b;
         data[slot::GRADE_VEC + index * 3 + 2] = *lum;
     }
-    // 全局轮（当前 UI 未开放，保留槽位给后续"全局"色轮）。
-    for index in 9..12 {
-        data[slot::GRADE_VEC + index] = 0.0;
-    }
+
     let balance = (params.grading.balance / 100.0).clamp(-1.0, 1.0);
     let blending = (params.grading.blending / 100.0).clamp(0.0, 1.0);
     data[slot::GRADE_M] = 0.5 - balance * 0.25;
@@ -340,6 +362,15 @@ mod tests {
         };
         assert!(chroma(blue) < 0.02, "{}", chroma(blue));
         assert!((chroma(red) - chroma([0.4, 0.03, 0.02])).abs() < 0.01);
+    }
+
+    #[test]
+    fn global_grading_tints_all_tones() {
+        let mut params = EditParams::default();
+        params.grading.global.hue = 240.0;
+        params.grading.global.saturation = 100.0;
+        let out = stage(&params).apply([0.2, 0.2, 0.2]);
+        assert!(out[2] > out[0], "全局分级应把中灰推向蓝：{out:?}");
     }
 
     #[test]

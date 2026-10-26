@@ -51,12 +51,15 @@ impl Grading {
             .iter()
             .all(|w| w.sat == 0.0 && w.lum == 0.0)
     }
+
 }
 
 /// 8 色带混色（顺序：红 橙 黄 绿 青 蓝 紫 洋红）。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Mixer {
     pub bands: [Hsl; 8],
+    /// true = Color Zones 连续插值；false = Lightroom 固定 8 段重叠窗。
+    pub continuous: bool,
 }
 
 impl Mixer {
@@ -108,9 +111,19 @@ pub struct Calibration {
     pub shadows_tint: f64,
 }
 
+/// 颜色分级四个色轮的 OkLab a/b 强度（阴影 / 中间调 / 高光 / 全局）。
+///
+/// 由第一轮 LR 参考的 Lab 位移反推：阴影/中间调比旧的统一 0.09 强约 3×，
+/// 高光 b 已经偏强，所以高光反而略降。
+pub const GRADING_SAT_STRENGTH: [f32; 4] = [0.30, 0.27, 0.07, 0.13];
+
 /// 校准基色在 ±100 时的色相旋转（弧度）与饱和度缩放。
 pub const CALIB_HUE: f32 = 0.5;
-pub const CALIB_SAT: f32 = 0.6;
+/// 红 / 绿 / 蓝原色的色相行程权重：LR 的蓝色原色色相明显比红绿强。
+pub const CALIB_HUE_SCALE: [f32; 3] = [1.8, 1.2, 2.8];
+pub const CALIB_SAT: f32 = 0.9;
+/// 红 / 绿 / 蓝原色的饱和度行程权重：蓝原色需要比红绿再强一些。
+pub const CALIB_SAT_SCALE: [f32; 3] = [1.0, 1.0, 1.5];
 /// 校准阴影色调在 ±100 时绿色通道的相对变化。
 pub const SHADOW_TINT: f32 = 0.3;
 
@@ -246,17 +259,26 @@ impl ColorOps {
         if s <= 1e-4 {
             return rgb;
         }
-        let w = band_weights_hue(h * std::f32::consts::TAU);
+        let w = if mixer.continuous {
+            crate::bands::band_weights_continuous(h * std::f32::consts::TAU)
+        } else {
+            band_weights_hue(h * std::f32::consts::TAU)
+        };
         let (mut dh, mut ds, mut dl) = (0.0f32, 0.0f32, 0.0f32);
         for (i, weight) in w.iter().enumerate() {
-            dh += *weight * (mixer.bands[i].hue / 100.0) as f32;
+            dh += *weight
+                * (mixer.bands[i].hue / 100.0) as f32
+                * crate::bands::HSL_HUE_SCALE[i];
             ds += *weight * (mixer.bands[i].sat / 100.0) as f32;
             dl += *weight * (mixer.bands[i].lum / 100.0) as f32;
         }
         // ±100 的行程：色相约 ±30°，饱和度 ±100%，HSL 明度约 ±0.30。
         let hue = (h + dh * (30.0 / 360.0)).rem_euclid(1.0);
-        let sat = (s * (1.0 + ds)).clamp(0.0, 1.0);
-        let lum = (l + dl * 0.30 * (1.0 - 0.35 * l)).clamp(0.0, 1.0);
+        // LR 的 HSL 饱和度 +100 约 ×1.6，而 -100 仍要能变灰；
+        // 因此正方向收 0.6，负方向保持 1.0。
+        let sat_gain = if ds >= 0.0 { ds * 0.60 } else { ds };
+        let sat = (s * (1.0 + sat_gain)).clamp(0.0, 1.0);
+        let lum = (l + dl * 0.12 * (1.0 - 0.35 * l)).clamp(0.0, 1.0);
         let out = hsl_to_rgb([hue, sat, lum]).map(srgb_to_linear);
         if self.space == SRGB {
             out
@@ -285,7 +307,8 @@ impl ColorOps {
                 lab[1] *= k;
                 lab[2] *= k;
             }
-            return rgb_from_oklab(&self.space, self.grade(lab));
+            return rgb_from_oklab(&self.space, self.grade(lab))
+                .map(|value| value.max(0.0));
         }
 
         let [mut l, mut c, mut h] = lab_to_lch(lab);
@@ -309,6 +332,7 @@ impl ColorOps {
         c = c.max(0.0);
         h = wrap_angle(h);
         rgb_from_oklab(&self.space, self.grade(lch_to_lab([l, c, h])))
+            .map(|value| value.max(0.0))
     }
 
     /// 自然饱和度 + 饱和度（自然饱和度对低饱和色加权、对肤色保护）。
@@ -337,9 +361,9 @@ impl ColorOps {
         if g.is_neutral() {
             return lab;
         }
-        let wheel = |w: &Wheel| {
+        let wheel = |w: &Wheel, strength: f32| {
             let h = oklch_hue_of_srgb_hue(w.hue);
-            let s = (w.sat / 100.0) as f32 * 0.09;
+            let s = (w.sat / 100.0) as f32 * strength;
             (s * h.cos(), s * h.sin(), (w.lum / 100.0) as f32 * 0.12)
         };
         let m = 0.5 - (g.balance / 100.0) as f32 * 0.25;
@@ -348,10 +372,10 @@ impl ColorOps {
         let wh = smooth(m - width * 0.25, m + width, lab[0]);
         let wm = (1.0 - ws - wh).max(0.0);
         let wheels = [
-            wheel(&g.shadows),
-            wheel(&g.midtones),
-            wheel(&g.highlights),
-            wheel(&g.global),
+            wheel(&g.shadows, GRADING_SAT_STRENGTH[0]),
+            wheel(&g.midtones, GRADING_SAT_STRENGTH[1]),
+            wheel(&g.highlights, GRADING_SAT_STRENGTH[2]),
+            wheel(&g.global, GRADING_SAT_STRENGTH[3]),
         ];
         for (k, wt) in wheels.iter().zip([ws, wm, wh, 1.0]) {
             lab[1] += k.0 * wt;
@@ -384,8 +408,14 @@ pub fn calibration_matrix(c: &Calibration, space: RgbSpace) -> Option<[[f32; 3];
         e[i] = 1.0;
         let lab = oklab_from_rgb(&space, e);
         let [l, ch, h] = lab_to_lch(lab);
-        let h2 = h + (hue.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_HUE;
-        let c2 = ch * (1.0 + (sat.clamp(-100.0, 100.0) / 100.0) as f32 * CALIB_SAT);
+        let h2 = h + (hue.clamp(-100.0, 100.0) / 100.0) as f32
+            * CALIB_HUE
+            * CALIB_HUE_SCALE[i];
+        let c2 = ch
+            * (1.0
+                + (sat.clamp(-100.0, 100.0) / 100.0) as f32
+                    * CALIB_SAT
+                    * CALIB_SAT_SCALE[i]);
         let q = rgb_from_oklab(&space, lch_to_lab([l, c2, h2]));
         for (r, row) in p.iter_mut().enumerate() {
             row[i] = q[r] as f64;
@@ -537,7 +567,8 @@ mod tests {
             hue_ops.mixer = Some(mixer);
             let shifted = hue_ops.apply(sample);
             let hue = rgb_to_hsl(shifted.map(linear_to_srgb))[0] * 360.0;
-            let expected = (center + 30.0).rem_euclid(360.0);
+            let expected =
+                (center + 30.0 * crate::bands::HSL_HUE_SCALE[band]).rem_euclid(360.0);
             let delta = (hue - expected + 540.0).rem_euclid(360.0) - 180.0;
             assert!(delta.abs() < 12.0, "band {band}: {center} -> {hue}, want {expected}");
 
@@ -575,7 +606,7 @@ mod tests {
         let red = [0.4, 0.02, 0.01];
         let out = o.apply(red);
         let hue = rgb_to_hsl(out.map(linear_to_srgb))[0] * 360.0;
-        assert!((20.0..45.0).contains(&hue), "red hue -> {hue}");
+        assert!((2.0..15.0).contains(&hue), "red hue -> {hue}");
     }
 
     #[test]

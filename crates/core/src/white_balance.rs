@@ -52,6 +52,25 @@ pub fn relative_to_kelvin(relative: f32) -> f32 {
     }
 }
 
+/// 允许的绝对色温范围（Kelvin）。
+pub const MIN_KELVIN: f32 = 2000.0;
+/// 允许的绝对色温上限（Kelvin）。
+pub const MAX_KELVIN: f32 = 50000.0;
+
+/// 相对滑杆 → 以 `reference_kelvin`（As Shot）为 0 的绝对色温。
+///
+/// 滑杆 0 返回 As Shot；正方向变暖、负方向变冷，仍沿用 LR 的
+/// 90K / 23K 每单位刻度。超出 2000–50000K 时夹住。
+pub fn absolute_kelvin(temperature: f32, reference_kelvin: f32) -> f32 {
+    let reference = if reference_kelvin.is_finite() && reference_kelvin > 0.0 {
+        reference_kelvin
+    } else {
+        REFERENCE_KELVIN
+    };
+    (reference + relative_to_kelvin(temperature.clamp(-100.0, 100.0)) - REFERENCE_KELVIN)
+        .clamp(MIN_KELVIN, MAX_KELVIN)
+}
+
 /// Planckian locus 近似（Kim et al. 2002）：色温 → CIE xy。
 fn kelvin_to_xy(kelvin: f32) -> [f32; 2] {
     let t = kelvin.clamp(1000.0, 40000.0);
@@ -86,8 +105,8 @@ fn uv_to_xy(uv: [f32; 2]) -> [f32; 2] {
 ///
 /// 色调滑杆与 Lightroom 一致：**+ 表示假定照明偏绿**，色适应校正后画面偏洋红
 /// （与温度同理：+ 表示假定照明偏冷，校正后画面偏暖）。
-fn white_point(temperature: f32, tint: f32) -> [f32; 2] {
-    let kelvin = relative_to_kelvin(temperature);
+fn white_point_at_kelvin(kelvin: f32, tint: f32) -> [f32; 2] {
+    let kelvin = kelvin.clamp(1000.0, 40000.0);
     let base = kelvin_to_uv(kelvin);
     if tint.abs() < 1e-4 {
         return uv_to_xy(base);
@@ -184,17 +203,36 @@ const XYZ_TO_SRGB: [[f32; 3]; 3] = [
 
 /// 由"照明白点"到"参考白点"的线性 sRGB 色适应矩阵（行主序）。
 ///
-/// `temperature` / `tint` 为滑杆值（-100..=100）：
+/// `temperature` / `tint` 为滑杆值（-100..=100），参考白点为 5500K：
 /// - 0 / 0 → 单位矩阵（不改动画面）；
 /// - 温度 > 0（假定照明更冷）→ 画面变暖（R 升、B 降），与 Lightroom 方向一致；
 /// - 色调 > 0 → 洋红方向。
 #[must_use]
 pub fn adaptation_matrix(temperature: f32, tint: f32) -> [[f32; 3]; 3] {
-    let from = xy_to_xyz(white_point(
-        temperature.clamp(-100.0, 100.0),
-        tint.clamp(-100.0, 100.0),
+    adaptation_matrix_for(temperature, tint, REFERENCE_KELVIN)
+}
+
+/// 以照片 As Shot 色温为参考白点的色适应矩阵。
+///
+/// `temperature` 仍是相对滑杆（0 = As Shot）；`reference_kelvin` 是照片的
+/// As Shot 色温。0 时 `from` 与 `to` 是同一个白点，矩阵严格为恒等。
+#[must_use]
+pub fn adaptation_matrix_for(
+    temperature: f32,
+    tint: f32,
+    reference_kelvin: f32,
+) -> [[f32; 3]; 3] {
+    let reference = if reference_kelvin.is_finite() && reference_kelvin > 0.0 {
+        reference_kelvin.clamp(MIN_KELVIN, MAX_KELVIN)
+    } else {
+        REFERENCE_KELVIN
+    };
+    let target = absolute_kelvin(temperature, reference);
+    let from = xy_to_xyz(white_point_at_kelvin(
+        target,
+        tint.clamp(-150.0, 150.0),
     ));
-    let to = xy_to_xyz(white_point(0.0, 0.0));
+    let to = xy_to_xyz(white_point_at_kelvin(reference, 0.0));
     let cone_from = mat3_apply(&BRADFORD, from);
     let cone_to = mat3_apply(&BRADFORD, to);
     let mut scale = [[0.0f32; 3]; 3];
@@ -212,6 +250,49 @@ pub fn adaptation_matrix(temperature: f32, tint: f32) -> [[f32; 3]; 3] {
 #[must_use]
 pub fn apply_matrix(matrix: &[[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
     mat3_apply(matrix, rgb)
+}
+
+/// LR 的 WB 亮度补偿：暖端 / 负 tint 会提亮画面，Bradford 矩阵本身保持 Y。
+///
+/// 由干净 5000K 基线参考拟合：
+/// - +1000K ≈ +13% 线性亮度；
+/// - Tint -50 ≈ +15%；
+/// - 冷端 / 正 tint 不加。
+#[must_use]
+pub fn adaptation_gain(temperature: f32, tint: f32) -> f32 {
+    let warm = temperature.max(0.0) * KELVIN_PER_UNIT_WARM / 1000.0;
+    let green = (-tint).max(0.0) / 50.0;
+    (1.0 + 0.13 * warm + 0.15 * green).clamp(1.0, 2.0)
+}
+
+/// LR 的白平衡色度收束系数：纯 Bradford 的色彩偏移比 LR 大。
+#[must_use]
+pub fn adaptation_chroma_scale(temperature: f32, tint: f32) -> f32 {
+    if temperature.abs() < 1e-6 && tint.abs() < 1e-6 {
+        1.0
+    } else {
+        0.80
+    }
+}
+
+/// 白平衡完整变换：色适应矩阵 → 色度收束 → 亮度补偿。
+#[must_use]
+pub fn apply_white_balance(
+    rgb: [f32; 3],
+    temperature: f32,
+    tint: f32,
+    reference_kelvin: f32,
+) -> [f32; 3] {
+    let matrix = adaptation_matrix_for(temperature, tint, reference_kelvin);
+    let mut out = mat3_apply(&matrix, rgb);
+    if temperature.abs() < 1e-6 && tint.abs() < 1e-6 {
+        return out;
+    }
+    let y = 0.2126 * out[0] + 0.7152 * out[1] + 0.0722 * out[2];
+    let scale = adaptation_chroma_scale(temperature, tint);
+    out = out.map(|value| y + (value - y) * scale);
+    let gain = adaptation_gain(temperature, tint);
+    out.map(|value| value * gain)
 }
 
 #[cfg(test)]
@@ -257,6 +338,32 @@ mod tests {
         );
         let green = apply_matrix(&adaptation_matrix(0.0, -100.0), [0.2, 0.2, 0.2]);
         assert!(green[1] > base[1], "色调 -100 应偏绿：{green:?}");
+    }
+
+    #[test]
+    fn as_shot_reference_is_identity() {
+        for reference in [3200.0f32, 5500.0, 6500.0, 9000.0] {
+            let matrix = adaptation_matrix_for(0.0, 0.0, reference);
+            for (row, expected) in matrix.iter().zip([
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+            ]) {
+                for (value, expected) in row.iter().zip(expected) {
+                    assert!((value - expected).abs() < 1e-5, "{reference}K: {matrix:?}");
+                }
+            }
+            assert!((absolute_kelvin(0.0, reference) - reference).abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn absolute_kelvin_tracks_reference_and_clamps() {
+        assert!((absolute_kelvin(0.0, 5200.0) - 5200.0).abs() < 0.01);
+        assert!(absolute_kelvin(100.0, 5200.0) > 5200.0);
+        assert!(absolute_kelvin(-100.0, 5200.0) < 5200.0);
+        assert_eq!(absolute_kelvin(-100.0, 2000.0), MIN_KELVIN);
+        assert_eq!(absolute_kelvin(100.0, 50000.0), MAX_KELVIN);
     }
 
     #[test]

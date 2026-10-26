@@ -460,9 +460,6 @@ pub fn render_preview_image_at(
     // 第 0 遍：场景线性基底（白平衡 → 相机校准 → 曝光）。基底层与色调段都基于它。
     let width = source.width() as usize;
     let height = source.height() as usize;
-    let luma = crate::color_engine::WORKSPACE
-        .luma()
-        .map(|value| value as f32);
     let mut base_linear = vec![[0.0f32; 3]; width * height];
     {
         let pixels: &[u8] = &out;
@@ -482,21 +479,9 @@ pub fn render_preview_image_at(
             });
     }
 
-    // 色调段（局部基底层 → 胶片色调映射 → 色域映射）。
-    // 基底层用与 GPU 大模糊相同的半径（大半径模糊后的场景亮度，不是像素自身亮度），
-    // 小面积高光不会被顺手压暗——这是"无光晕"的关键。
+    // 色调段：显示域参考曲线（对比度 → 高光 → 阴影 → 白色 → 黑色）。
+    // 当前参考曲线是全局亮度映射；局部基底层保留给后续局部色调阶段。
     let tone = crate::tone::ToneStage::from_params(params);
-    let tone_base = if tone.is_identity() {
-        None
-    } else {
-        let scale = crate::tone::blur_scale(width.max(height) as f32);
-        Some(crate::tone::ToneBase::build(
-            &base_linear,
-            width,
-            height,
-            crate::tone::BASE_RADIUS * scale,
-        ))
-    };
 
     // 第一遍：逐像素颜色（色调段 → 分区曲线 → 饱和度 → HSL → 分级）。
     // 像素之间相互独立，按 4 字节像素并行处理（移动端 CPU 预览约 2–4× 提速）。
@@ -506,13 +491,8 @@ pub fn render_preview_image_at(
             .par_chunks_mut(4)
             .enumerate()
             .for_each(|(index, pixel)| {
-                let (x, y) = (index % width, index / width);
                 let base = base_linear[index];
-                let base_ev = match &tone_base {
-                    Some(plane) => plane.ev_at(x, y, luma),
-                    None => 0.0,
-                };
-                let toned = tone.apply(base, base_ev);
+                let toned = tone.apply(base, 0.0);
                 let mut rgb = [
                     linear_to_srgb_f32(toned[0]),
                     linear_to_srgb_f32(toned[1]),
@@ -1355,7 +1335,7 @@ fn hash_noise(x: u32, y: u32) -> f32 {
 
 /// 预设好的曲线 LUT：参数曲线 / RGB / 单通道，恒等映射时为 None。
 struct CurveLuts {
-    parametric: Option<[f32; 257]>,
+    parametric: Option<[f32; crate::params::PARAM_CURVE_ENTRIES]>,
     rgb: Option<[f32; 257]>,
     red: Option<[f32; 257]>,
     green: Option<[f32; 257]>,
@@ -1377,7 +1357,7 @@ impl CurveLuts {
         let mut rgb = input;
         if let Some(lut) = &self.parametric {
             for channel in &mut rgb {
-                *channel = sample_lut(lut, *channel);
+                *channel = sample_curve_lut(lut, *channel);
             }
         }
         if let Some(lut) = &self.rgb {
@@ -1409,40 +1389,28 @@ fn build_curve_lut(curve: &ToneCurve) -> Option<[f32; 257]> {
     Some(lut)
 }
 
-fn build_parametric_lut(curve: &ParametricCurve) -> Option<[f32; 257]> {
-    if curve.highlights == 0.0 && curve.midtones == 0.0 && curve.shadows == 0.0 {
+fn build_parametric_lut(
+    curve: &ParametricCurve,
+) -> Option<[f32; crate::params::PARAM_CURVE_ENTRIES]> {
+    if curve.is_identity() {
         return None;
     }
-    let highlights_split = if curve.highlights_split <= 0.0 {
-        0.75
-    } else {
-        curve.highlights_split.clamp(0.5, 1.0)
-    };
-    let midtones_split = if curve.midtones_split <= 0.0 {
-        0.25
-    } else {
-        curve.midtones_split.clamp(0.0, 0.5)
-    };
-    let highlights_split = highlights_split.max(midtones_split + 0.1);
-
-    let mut lut = [0f32; 257];
-    for (index, slot) in lut.iter_mut().enumerate() {
-        let x = index as f32 / 256.0;
-        let weight_highlights = smoothstep(midtones_split, highlights_split, x);
-        let weight_shadows = 1.0 - weight_highlights;
-        let weight_midtones = (1.0 - weight_highlights - weight_shadows).max(0.0);
-        let delta = (curve.highlights / 100.0) * weight_highlights * 0.35
-            + (curve.midtones / 100.0) * weight_midtones * 0.35
-            + (curve.shadows / 100.0) * weight_shadows * 0.35;
-        *slot = (x + delta).clamp(0.0, 1.0);
-    }
-    Some(lut)
+    Some(crate::params::parametric_curve_lut(curve))
 }
 
 fn sample_lut(lut: &[f32; 257], value: f32) -> f32 {
-    let position = value.clamp(0.0, 1.0) * 256.0;
-    let index = (position.floor() as usize).min(256);
-    let next = (index + 1).min(256);
+    sample_curve_lut(lut, value)
+}
+
+/// 任意长度 LUT 的线性插值；`value` 归一到 `0..=1`，LUT 末尾对应 1.0。
+fn sample_curve_lut(lut: &[f32], value: f32) -> f32 {
+    let last = lut.len().saturating_sub(1);
+    if last == 0 {
+        return lut.first().copied().unwrap_or(value);
+    }
+    let position = value.clamp(0.0, 1.0) * last as f32;
+    let index = (position.floor() as usize).min(last);
+    let next = (index + 1).min(last);
     let fraction = position - index as f32;
     lut[index] * (1.0 - fraction) + lut[next] * fraction
 }
@@ -1475,10 +1443,11 @@ mod tests {
             render_memory_rgba(&rgba, 2, 2, r#"{"version":1,"light":{"exposure":1.0}}"#).unwrap();
         assert_eq!((out.width, out.height), (2, 2));
         assert_eq!(out.rgba.len(), 16);
-        // 64（sRGB）≈ 0.051 线性；+1EV 后约 0.103 线性 ≈ 90（sRGB）。
+        // LR 的 +1EV 带高光肩部：64（sRGB）≈ 0.051 线性，参考输出约 102（sRGB），
+        // 不是纯线性 ×2 的 90。
         assert!(
-            (85..=95).contains(&out.rgba[0]),
-            "曝光 +1EV 后应约为 90：{}",
+            (96..=108).contains(&out.rgba[0]),
+            "曝光 +1EV 后应接近 LR 参考 ~102：{}",
             out.rgba[0]
         );
     }

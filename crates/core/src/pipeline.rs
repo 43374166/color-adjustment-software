@@ -71,10 +71,13 @@ pub const STAGE_ORDER: [Stage; 15] = [
 ///
 /// 输入输出均为线性 RGB（允许 > 1.0 的高光余量）。
 pub fn apply_reference(mut rgb: [f32; 3], params: &EditParams) -> [f32; 3] {
-    // 白平衡（与 GPU 共用同一色适应矩阵实现）
-    let matrix =
-        crate::white_balance::adaptation_matrix(params.color.temperature, params.color.tint);
-    rgb = crate::white_balance::apply_matrix(&matrix, rgb);
+    // 白平衡（色适应矩阵 + LR 的亮度补偿 / 色度收束）
+    rgb = crate::white_balance::apply_white_balance(
+        rgb,
+        params.color.temperature,
+        params.color.tint,
+        params.color.wb_reference_kelvin,
+    );
 
     // 相机校准（场景线性，白平衡之后、曝光之前）：与 GPU `pipeline_base` 的 1b 段同序同公式。
     rgb = crate::color_engine::ColorStage::from_params(params).apply_calibration(rgb);

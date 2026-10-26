@@ -66,6 +66,12 @@ pub fn band_hues_hsl() -> [f32; 8] {
     MIXER_HUES_DEG.map(|deg| (deg as f32).to_radians())
 }
 
+/// HSL 色相行程的带间权重（相对 ±30° 基准）。
+///
+/// LR 的色相滑杆不是所有带同行程：红/橙很弱，蓝最强。由第一轮参考反推：
+/// 红 6°、橙 16°、黄 36°、绿 36°、青 15°、蓝 60°、紫 40°、洋红 9°。
+pub const HSL_HUE_SCALE: [f32; 8] = [0.20, 0.55, 1.20, 1.20, 0.50, 2.00, 1.35, 0.30];
+
 /// 按 HSL 色相 `h`（弧度）计算 8 个带的权重（归一化，和恒为 1）。
 ///
 /// 每个带用一个升余弦窗，半宽取左右相邻中心距离的 0.75 倍；窗口重叠后
@@ -106,6 +112,45 @@ pub fn band_weights_hue(h: f32) -> [f32; 8] {
     raw
 }
 
+/// 连续色域权重：在相邻色带中心之间线性插值，不做“带窗重叠”。
+///
+/// 与 [`band_weights_hue`] 的区别：LR 模式下每个带有一段独立的影响窗；
+/// Color Zones 模式下节点之间直接线性过渡，像 darktable 的连续色域曲线。
+#[inline]
+pub fn band_weights_continuous(h: f32) -> [f32; 8] {
+    let centers = band_hues_hsl();
+    let h = h.rem_euclid(TAU);
+    let mut nearest = 0usize;
+    let mut nearest_delta = f32::MAX;
+    for (index, center) in centers.iter().enumerate() {
+        let delta = (h - center + PI).rem_euclid(TAU) - PI;
+        if delta.abs() < nearest_delta {
+            nearest_delta = delta.abs();
+            nearest = index;
+        }
+    }
+    let delta = (h - centers[nearest] + PI).rem_euclid(TAU) - PI;
+    let neighbor = if delta >= 0.0 {
+        (nearest + 1) % 8
+    } else {
+        (nearest + 7) % 8
+    };
+    let gap = if delta >= 0.0 {
+        wrap_positive(centers[neighbor] - centers[nearest])
+    } else {
+        wrap_positive(centers[nearest] - centers[neighbor])
+    };
+    let t = if gap > 1e-6 {
+        (delta.abs() / gap).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let mut weights = [0.0f32; 8];
+    weights[nearest] = 1.0 - t;
+    weights[neighbor] += t;
+    weights
+}
+
 /// 线性 sRGB 像素的 HSL 色相（弧度）。
 pub fn hsl_hue_of_linear_srgb(rgb: [f32; 3]) -> f32 {
     let encoded = rgb.map(linear_to_srgb);
@@ -130,6 +175,21 @@ mod tests {
             let sum: f32 = w.iter().sum();
             assert!((sum - 1.0).abs() < 1e-4, "{i}: {sum}");
             assert!(w.iter().all(|v| (-1e-6..=1.0 + 1e-6).contains(v)));
+        }
+    }
+
+    #[test]
+    fn continuous_weights_partition_unity_and_hit_nodes() {
+        for i in 0..720 {
+            let h = (i as f32).to_radians() - PI;
+            let w = band_weights_continuous(h);
+            let sum: f32 = w.iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "{i}: {sum}");
+            assert!(w.iter().all(|v| (-1e-6..=1.0 + 1e-6).contains(v)));
+        }
+        for (i, hue) in band_hues_hsl().iter().enumerate() {
+            let w = band_weights_continuous(*hue);
+            assert!(w[i] > 0.999, "node {i}: {}", w[i]);
         }
     }
 

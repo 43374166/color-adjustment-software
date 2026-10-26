@@ -20,7 +20,7 @@
 //   15 锐化数量 16 锐化半径 17 锐化细节 18 锐化蒙版
 //   19 降噪亮度 20 降噪亮度细节 21 降噪亮度对比度 22 降噪颜色 23 降噪颜色细节
 //   24 降噪颜色平滑度 25 分级混合 26 分级平衡
-//   27 参数曲线高光 28 参数曲线中间调 29 参数曲线阴影 30 高光分界 31 中间调分界
+//   27..31 参数曲线旧字段（保留兼容；实际 LUT 存在 curve alpha，194 为开关）
 //   32..55 HSL 8 段 × (色相, 饱和度, 明亮度)
 //   56..64 颜色分级 阴影/中间调/高光 × (色相, 饱和度, 明亮度)
 //   65 颗粒种子 66 宽度 67 高度 68 蒙版模式（0=全局，1=局部混合）
@@ -33,6 +33,7 @@
 //   88..96 白平衡色适应矩阵（行主序；CPU 侧由色温 / 色调算好）
 //   100..101 蒙版参考图相对整图源像素的原点（分块 / 裁剪时把源坐标加回整图）
 //   104 颗粒大小 105 颗粒粗糙度 106 暗角羽化 107 暗角中点
+//   192 调色段开关 193 色调段开关 194 参数曲线开关
 
 struct Params {
     // 49 个 vec4（196 floats）：0..107 基础 / 细节 / 曲线 / HSL / 分级，
@@ -58,18 +59,11 @@ fn p(index: u32) -> f32 {
     return params.v[index / 4u][index % 4u];
 }
 
+// HSL 色相行程的带间权重（与 Rust `bands::HSL_HUE_SCALE` 一致）。
+const HSL_HUE_SCALE = array<f32, 8>(0.20, 0.55, 1.20, 1.20, 0.50, 2.00, 1.35, 0.30);
+
 fn luminance(c: vec3<f32>) -> f32 {
     return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
-}
-
-fn linear_to_gamma(c: vec3<f32>) -> vec3<f32> {
-    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
-    return pow(x, vec3<f32>(1.0 / 2.2));
-}
-
-fn gamma_to_linear(c: vec3<f32>) -> vec3<f32> {
-    let x = clamp(c, vec3<f32>(0.0), vec3<f32>(1.0));
-    return pow(x, vec3<f32>(2.2));
 }
 
 fn linear_to_srgb(c: vec3<f32>) -> vec3<f32> {
@@ -93,6 +87,15 @@ fn curve_lookup(t: f32, channel: u32) -> f32 {
     let next = min(index + 1u, 255u);
     let fraction = scaled - f32(index);
     return mix(params.curve[index][channel], params.curve[next][channel], fraction);
+}
+
+/// 参数曲线查找（CPU 侧生成，存在曲线 LUT 的 alpha 通道；x = i / 255）。
+fn param_curve_lookup(t: f32) -> f32 {
+    let scaled = clamp(t, 0.0, 1.0) * 255.0;
+    let index = u32(floor(scaled));
+    let next = min(index + 1u, 255u);
+    let fraction = scaled - f32(index);
+    return mix(params.curve[index].w, params.curve[next].w, fraction);
 }
 
 fn rgb_to_hsv(c: vec3<f32>) -> vec3<f32> {
@@ -226,24 +229,50 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
     var bw_mix = 0.0;
     var wsum = 0.0;
     let tau = 6.283185307179586;
-    for (var i = 0u; i < 8u; i = i + 1u) {
-        let prev = (i + 7u) % 8u;
-        let next = (i + 1u) % 8u;
-        let center = p(108u + i);
-        let left = wrap_tau(center - p(108u + prev));
-        let right = wrap_tau(p(108u + next) - center);
-        let half = 0.65 * max(left, right);
-        let d = abs(wrap_pi(hsl_in.x * tau - center));
-        if (d < half && half > 1e-6) {
-            let weight = 0.5 + 0.5 * cos(3.14159265358979 * d / half);
-            w[i] = weight;
-            wsum = wsum + weight;
+    if (p(27) > 0.5) {
+        // Color Zones：节点之间线性插值（与 CPU `band_weights_continuous` 同语义）。
+        let h = fract(hsl_in.x) * tau;
+        var nearest = 0u;
+        var nearest_distance = 1e9;
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            let d = abs(wrap_pi(h - p(108u + i)));
+            if (d < nearest_distance) {
+                nearest_distance = d;
+                nearest = i;
+            }
+        }
+        let center = p(108u + nearest);
+        let delta = wrap_pi(h - center);
+        var neighbor = (nearest + 1u) % 8u;
+        var gap = wrap_tau(p(108u + neighbor) - center);
+        if (delta < 0.0) {
+            neighbor = (nearest + 7u) % 8u;
+            gap = wrap_tau(center - p(108u + neighbor));
+        }
+        let t = select(0.0, clamp(nearest_distance / max(gap, 1e-6), 0.0, 1.0), gap > 1e-6);
+        w[nearest] = 1.0 - t;
+        w[neighbor] = w[neighbor] + t;
+        wsum = 1.0;
+    } else {
+        for (var i = 0u; i < 8u; i = i + 1u) {
+            let prev = (i + 7u) % 8u;
+            let next = (i + 1u) % 8u;
+            let center = p(108u + i);
+            let left = wrap_tau(center - p(108u + prev));
+            let right = wrap_tau(p(108u + next) - center);
+            let half = 0.65 * max(left, right);
+            let d = abs(wrap_pi(hsl_in.x * tau - center));
+            if (d < half && half > 1e-6) {
+                let weight = 0.5 + 0.5 * cos(3.14159265358979 * d / half);
+                w[i] = weight;
+                wsum = wsum + weight;
+            }
         }
     }
     if (wsum > 1e-6) {
         for (var i = 0u; i < 8u; i = i + 1u) {
             w[i] = w[i] / wsum;
-            hue_shift = hue_shift + w[i] * p(32u + i * 3u) / 100.0;
+            hue_shift = hue_shift + w[i] * p(32u + i * 3u) / 100.0 * HSL_HUE_SCALE[i];
             sat_scale = sat_scale + w[i] * p(33u + i * 3u) / 100.0;
             lum_shift = lum_shift + w[i] * p(34u + i * 3u) / 100.0;
             bw_mix = bw_mix + w[i] * p(117u + i) / 100.0;
@@ -251,9 +280,10 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
     }
     if (hsl_in.y > 1e-4 && abs(hue_shift) + abs(sat_scale) + abs(lum_shift) > 0.0001) {
         let adjusted_h = fract(hsl_in.x + hue_shift * (30.0 / 360.0));
-        let adjusted_s = clamp(hsl_in.y * (1.0 + sat_scale), 0.0, 1.0);
+        let sat_gain = select(sat_scale, sat_scale * 0.60, sat_scale >= 0.0);
+        let adjusted_s = clamp(hsl_in.y * (1.0 + sat_gain), 0.0, 1.0);
         let adjusted_l = clamp(
-            hsl_in.z + lum_shift * 0.30 * (1.0 - 0.35 * hsl_in.z),
+            hsl_in.z + lum_shift * 0.12 * (1.0 - 0.35 * hsl_in.z),
             0.0,
             1.0
         );
@@ -340,7 +370,7 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
     }
     // 分级亮度 ±100 不能把 L 推成负数 / 超过白点。
     lab.x = clamp(lab.x, 0.0, 1.0);
-    return linear_from_oklab(lab);
+    return max(linear_from_oklab(lab), vec3<f32>(0.0));
 }
 
 fn hash_noise(seed: vec2<f32>, salt: f32) -> f32 {
@@ -371,6 +401,15 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
         p(91) * c.r + p(92) * c.g + p(93) * c.b,
         p(94) * c.r + p(95) * c.g + p(96) * c.b
     );
+    // LR 的 WB 亮度补偿 + 色度收束（与 CPU `apply_white_balance` 同公式）。
+    // 暖端 / 负 tint 提亮；纯 Bradford 的色彩偏移比 LR 大，收束到 80%。
+    if (p(6) != 0.0 || p(7) != 0.0) {
+        let y = luminance(c);
+        c = vec3<f32>(y) + (c - vec3<f32>(y)) * 0.80;
+        let warm = max(p(6), 0.0) * 90.0 / 1000.0;
+        let green = max(-p(7), 0.0) / 50.0;
+        c = c * clamp(1.0 + 0.13 * warm + 0.15 * green, 1.0, 2.0);
+    }
 
     // 1b) 相机校准（场景线性，白平衡之后、曝光之前）：基色矩阵 + 阴影色调。
     //     与 CPU `fdxmp-color::calibrate` 同公式（矩阵在 CPU 侧算好，126..134）。
@@ -397,30 +436,7 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
     return c;
 }
 
-// ---- 色调段：局部基底层 → 电影曲线 → 色域映射（与 CPU `tone::ToneStage` 同公式）----
-
-/// 电影曲线 LUT 的定义域（相对中灰的场景 EV），与 `fdxmp_color::tone` 一致。
-const TONE_MIN_EV: f32 = -14.0;
-const TONE_MAX_EV: f32 = 10.0;
-const TONE_N: u32 = 4096u;
-
-/// 场景亮度 → 显示亮度（LUT 线性插值；低于下限时线性外推，避免黑场断层）。
-fn tone_lookup(y: f32) -> f32 {
-    if (y <= 1e-6) {
-        return 0.0;
-    }
-    let ev = log2(y / 0.18);
-    let f = clamp((ev - TONE_MIN_EV) / (TONE_MAX_EV - TONE_MIN_EV), 0.0, 1.0)
-        * f32(TONE_N - 1u);
-    let i = u32(floor(f));
-    let next = min(i + 1u, TONE_N - 1u);
-    let t = f - f32(i);
-    let v = mix(params.tone[i / 4u][i % 4u], params.tone[next / 4u][next % 4u], t);
-    if (ev < TONE_MIN_EV) {
-        return v * (y / (0.18 * exp2(TONE_MIN_EV)));
-    }
-    return v;
-}
+// ---- 色调段：显示域基本色调 + 局部基底层 → 色域映射 ----
 
 /// 色域软裁剪：`v <= knee` 原样，超过后单调趋于 1（C¹ 连续）。
 fn gamut_soft_clip(v: f32, knee: f32) -> f32 {
@@ -434,6 +450,13 @@ fn gamut_soft_clip(v: f32, knee: f32) -> f32 {
 
 /// 色域映射：软裁剪 + 按需向亮度去饱和（保持色相），与 CPU `gamut::map_to_gamut` 一致。
 fn gamut_map(rgb: vec3<f32>) -> vec3<f32> {
+    // 已在显示色域内的像素原样通过；软膝只处理 >1 的高光余量。
+    // 与 CPU `gamut::map_to_gamut` 的早退一致，避免动一下色调滑杆就把纯白压成 251。
+    // 容差吸收“按亮度比缩放”的 1.0000001 浮点溢出。
+    let gamut_eps = 1e-5;
+    if (all(rgb >= vec3<f32>(-gamut_eps)) && all(rgb <= vec3<f32>(1.0 + gamut_eps))) {
+        return clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0));
+    }
     let clipped = vec3<f32>(
         gamut_soft_clip(rgb.r, 0.9),
         gamut_soft_clip(rgb.g, 0.9),
@@ -522,40 +545,64 @@ fn highlight_desaturate(rgb: vec3<f32>) -> vec3<f32> {
     return linear_from_oklab(lch_to_oklab(vec3<f32>(lch.x, lch.y * factor, lch.z)));
 }
 
-/// 色调段：局部色调（高光 / 阴影，权重取自基底层）→ 电影曲线 → 色域映射。
-///
-/// `base_ev` 是基底层（大模糊参考）在像素处相对中灰的场景 EV——
-/// 小面积高光的基底层仍是中灰，因此不会被"顺手"压暗（无光晕）。
-fn pipeline_tone(input_color: vec3<f32>, base_ev: f32) -> vec3<f32> {
-    var c = input_color;
+fn display_luma(c: vec3<f32>) -> f32 {
+    return dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+/// 参考亮度 LUT 查询：slot 0..3 = 高光 / 阴影 / 白色 / 黑色。
+fn tone_curve_lookup(slot: u32, t: f32) -> f32 {
+    let start = slot * 256u;
+    let scaled = clamp(t, 0.0, 1.0) * 255.0;
+    let offset = u32(floor(scaled));
+    let index = start + offset;
+    let next = min(index + 1u, start + 255u);
+    let fraction = scaled - f32(offset);
+    return mix(params.tone[index / 4u][index % 4u], params.tone[next / 4u][next % 4u], fraction);
+}
+
+/// 显示域基本色调：曝光 → 对比度 → 高光 → 阴影 → 白色 → 黑色。
+fn map_basic_tone(y: f32, use_exposure: bool) -> f32 {
+    var v = clamp(y, 0.0, 1.0);
+    let contrast = clamp(p(1) / 100.0, -1.0, 1.0);
+
+    if (use_exposure) {
+        v = tone_curve_lookup(4u, v);
+    }
+    // 对比度：端点固定，曲线在 v=0.7215 处不动（拟合自 LR 灰阶映射）。
+    if (contrast != 0.0) {
+        v = v + contrast * 1.3155 * (v - 0.7215) * v * (1.0 - v);
+        v = clamp(v, 0.0, 1.0);
+    }
+    v = tone_curve_lookup(0u, v);
+    v = tone_curve_lookup(1u, v);
+    v = tone_curve_lookup(2u, v);
+    v = tone_curve_lookup(3u, v);
+    return clamp(v, 0.0, 1.0);
+}
+
+/// 色调段：显示域参考曲线 + 色域映射。
+fn pipeline_tone(input_color: vec3<f32>) -> vec3<f32> {
+    var c = max(input_color, vec3<f32>(0.0));
     if (p(193) <= 0.5) {
         return c;
     }
-    // 1) 局部色调：乘性 EV 位移（纯黑保持纯黑、通道比例不变）。
-    let h = clamp(p(2) / 100.0, -1.0, 1.0);
-    let sh = clamp(p(3) / 100.0, -1.0, 1.0);
-    if (h != 0.0 || sh != 0.0) {
-        var delta = 0.0;
-        if (sh != 0.0) {
-            let w_sh = 1.0 - smoothstep(-4.8, 0.3, base_ev);
-            delta = delta + sh * 1.7 * w_sh * sqrt(w_sh);
-        }
-        if (h != 0.0) {
-            let w_hi = smoothstep(-1.0, 2.8, base_ev);
-            delta = delta + h * 1.7 * w_hi;
-        }
-        c = c * exp2(delta);
+
+    // 曝光 LUT 在曝光前的亮度上查表；base 已经乘过 2^EV，先除回来。
+    let use_exposure = p(195) > 0.5;
+    let base = select(c, c / exp2(p(0)), use_exposure);
+    let encoded = linear_to_srgb(base);
+    let y = display_luma(encoded);
+    let mapped = map_basic_tone(y, use_exposure);
+
+    var out: vec3<f32>;
+    if (y <= 1e-6) {
+        out = vec3<f32>(srgb_to_linear(vec3<f32>(mapped)).x);
+    } else {
+        let ratio = srgb_to_linear(vec3<f32>(mapped)).x /
+            max(srgb_to_linear(vec3<f32>(y)).x, 1e-6);
+        out = base * ratio;
     }
-    // 2) 电影曲线：按亮度比缩放（保持色相与通道比例）。
-    let y = max(luminance(c), 0.0);
-    if (y > 1e-6) {
-        c = c * (tone_lookup(y) / y);
-    } else if (p(5) != 0.0) {
-        // 纯黑：黑点被抬起 / 压死时按曲线的黑场值输出（与 CPU `ToneStage` 一致）。
-        c = vec3<f32>(max(clamp(p(5), 0.0, 100.0) / 100.0 * 0.03, 0.0));
-    }
-    // 3) 色域映射。
-    return gamut_map(max(c, vec3<f32>(0.0)));
+    return gamut_map(max(out, vec3<f32>(0.0)));
 }
 
 /// 显示段（色调段之后）：参数曲线 → 曲线 LUT → 调色算子（OkLab / OkLCh）。
@@ -565,28 +612,25 @@ fn pipeline_tone(input_color: vec3<f32>, base_ev: f32) -> vec3<f32> {
 fn pipeline_display_ops(input_color: vec3<f32>) -> vec3<f32> {
     var c = input_color;
 
-    // 5) 参数曲线（分界同样是显示参考空间：默认 0.65 / 0.35 即 sRGB 亮度分界）
-    let param_lum = luminance(linear_to_srgb(c));
-    let hi_split = clamp(p(30), 0.05, 0.95);
-    let mid_split = clamp(p(31), 0.05, 0.95);
-    let param_hi_zone = smoothstep(hi_split, 1.0, param_lum);
-    let param_lo_zone = 1.0 - smoothstep(0.0, mid_split, param_lum);
-    let param_mid_zone = max(1.0 - param_hi_zone - param_lo_zone, 0.0);
-    let param_gain = 1.0
-        + p(27) / 100.0 * param_hi_zone * 0.6
-        + p(28) / 100.0 * param_mid_zone * 0.6
-        + p(29) / 100.0 * param_lo_zone * 0.6;
-    c = max(c * param_gain, vec3<f32>(0.0));
-
-    // 6) 曲线 LUT（gamma 空间；曲线定义域为 0..1，>1 的高光余量原样保留）
+    // 5) 参数曲线（sRGB 显示域查表，与 CPU `CurveLuts` 同序：参数曲线 → RGB → 单通道）。
+    //    曲线定义域为 0..1，>1 的高光余量原样保留。
     let curve_domain = min(c, vec3<f32>(1.0));
-    var gamma = linear_to_gamma(curve_domain);
-    gamma = vec3<f32>(
-        curve_lookup(gamma.r, 0u),
-        curve_lookup(gamma.g, 1u),
-        curve_lookup(gamma.b, 2u)
+    var encoded = linear_to_srgb(curve_domain);
+    if (p(194) > 0.5) {
+        encoded = vec3<f32>(
+            param_curve_lookup(encoded.r),
+            param_curve_lookup(encoded.g),
+            param_curve_lookup(encoded.b)
+        );
+    }
+
+    // 6) RGB / 单通道曲线 LUT（sRGB 编码域；CPU 预览同空间）
+    encoded = vec3<f32>(
+        curve_lookup(encoded.r, 0u),
+        curve_lookup(encoded.g, 1u),
+        curve_lookup(encoded.b, 2u)
     );
-    c = gamma_to_linear(gamma) + max(c - vec3<f32>(1.0), vec3<f32>(0.0));
+    c = srgb_to_linear(encoded) + max(c - vec3<f32>(1.0), vec3<f32>(0.0));
 
     // 7) 调色段（OkLab / OkLCh）：8 色带混色 → 点颜色 → 自然饱和度 / 饱和度
     //    → 黑白 → 颜色分级。与 CPU `fdxmp-color::ops::ColorOps` 同序同公式；
@@ -615,7 +659,11 @@ fn pipeline_detail(
     var c = input_color;
 
     // 10) 纹理（细半径微反差）/ 清晰度（大半径中间调局部对比）/ 去雾
-    let fine = select(blurred, textureLoad(aux_tex, coord, 0).rgb, p(79) > 0.5);
+    let fine = select(
+        blurred,
+        pipeline_display_ops(pipeline_tone(textureLoad(aux_tex, coord, 0).rgb)),
+        p(79) > 0.5
+    );
     let texture_weight = p(10) / 100.0;
     let clarity_weight = p(11) / 100.0;
     if (abs(texture_weight) > 0.0001) {
@@ -760,12 +808,14 @@ fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
     let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) / vec2<f32>(size);
 
     let base = textureLoad(src_tex, coord, 0).rgb;
-    let blurred = textureLoad(blur_tex, coord, 0).rgb;
+    let blurred_raw = textureLoad(blur_tex, coord, 0).rgb;
     // 色调段：局部基底层（大模糊参考的亮度）→ 局部色调 / 电影曲线 / 色域映射，
     // 然后才是显示段（曲线 + 调色算子）与细节链路。与 CPU `tone::ToneStage` /
     // `preview::render_preview_image_at` 同序同公式。
-    let toned = pipeline_tone(base, log2(max(luminance(blurred), 1e-6) / 0.18));
+    let toned = pipeline_tone(base);
     let displayed = pipeline_display_ops(toned);
+    // 细节参考必须与 `displayed` 同域：曝光 LUT / 曲线 / HSL 也要作用到模糊参考。
+    let blurred = pipeline_display_ops(pipeline_tone(blurred_raw));
     let adjusted = pipeline_detail(displayed, blurred, uv, vec2<f32>(size), gid.xy, coord);
 
     var output_linear = adjusted;

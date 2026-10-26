@@ -89,21 +89,42 @@ pub struct LightParams {
 }
 
 /// 颜色面板（色温 / 色调 / 自然饱和度 / 饱和度）。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ColorParams {
-    /// 色温，-100..=100（相对值：0 = 5500K；暖端 1 单位 = 90K、冷端 23K，
+    /// 色温，-100..=100（相对值：0 = As Shot；暖端 1 单位 = 90K、冷端 23K，
     /// 与 XMP 导入的开尔文映射共用同一换算，见 `white_balance` 模块）。
     pub temperature: f32,
+    /// 当前照片的 As Shot 参考色温（K）。0 = 5500K 兜底。
+    /// 色温 0 时白平衡矩阵恰为恒等，因此打开照片不会改变画面。
+    #[serde(default = "default_wb_reference")]
+    pub wb_reference_kelvin: f32,
     /// 黑白模式：打开后按 `bw_mix` 的 8 色带权重转单色（Lightroom 的 B&W 处理方式），
     /// 色相 / 饱和度混色与点颜色在该模式下不生效。
     pub black_white: bool,
-    /// 色调，-100..=100（正 = 洋红，负 = 绿色）。
+    /// 色调，-150..=150（正 = 洋红，负 = 绿色；与 LR 的 Tint 范围一致）。
     pub tint: f32,
     /// 自然饱和度，-100..=100。
     pub vibrance: f32,
     /// 饱和度，-100..=100。
     pub saturation: f32,
+}
+
+fn default_wb_reference() -> f32 {
+    5500.0
+}
+
+impl Default for ColorParams {
+    fn default() -> Self {
+        Self {
+            temperature: 0.0,
+            wb_reference_kelvin: default_wb_reference(),
+            black_white: false,
+            tint: 0.0,
+            vibrance: 0.0,
+            saturation: 0.0,
+        }
+    }
 }
 
 /// 效果面板（纹理 → 颗粒）。
@@ -277,20 +298,273 @@ fn compose_grading_zone(global: GradingZone, local: GradingZone) -> GradingZone 
     }
 }
 
-/// 参数曲线（高光 / 中间调 / 阴影）。
+/// 参数曲线（Lightroom 四区：高光 / 亮调 / 暗调 / 阴影）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ParametricCurve {
     /// 高光，-100..=100。
     pub highlights: f32,
-    /// 中间调，-100..=100。
-    pub midtones: f32,
+    /// 亮调，-100..=100。
+    pub lights: f32,
+    /// 暗调，-100..=100；旧预设的 `midtones` 反序列化到这里。
+    #[serde(alias = "midtones")]
+    pub darks: f32,
     /// 阴影，-100..=100。
     pub shadows: f32,
-    /// 高光 / 中间调分界，0.0..=1.0。
-    pub highlights_split: f32,
-    /// 中间调 / 阴影分界，0.0..=1.0。
-    pub midtones_split: f32,
+    /// 高光区起点，0.0..=1.0；0 表示默认 0.75。
+    #[serde(alias = "highlights_split")]
+    pub highlight_split: f32,
+    /// 亮调 / 暗调分界，0.0..=1.0；0 表示默认 0.50。
+    #[serde(alias = "midtones_split")]
+    pub midtone_split: f32,
+    /// 阴影区终点，0.0..=1.0；0 表示默认 0.25。
+    pub shadow_split: f32,
+}
+
+/// 参数曲线四个区域在 ±100 时的最大位移（显示域，1.0 = 255 级）。
+///
+/// 由 LR 参考图 `param_*` 的峰值拟合：阴影 / 高光比亮调 / 暗调弱。
+pub const PARAM_CURVE_AMOUNTS: [f32; 4] = [0.14, 0.30, 0.32, 0.16];
+
+/// 参数曲线 LUT 条目数（与 GPU `CURVE_ENTRIES` 一致，x = i / (N-1)）。
+pub const PARAM_CURVE_ENTRIES: usize = 256;
+
+const PARAM_CURVE_POINTS: usize = 17;
+const PARAM_IDENTITY_CURVE: [f32; PARAM_CURVE_POINTS] = [
+    0.0000, 0.0625, 0.1250, 0.1875, 0.2500, 0.3125, 0.3750, 0.4375, 0.5000, 0.5625, 0.6250, 0.6875,
+    0.7500, 0.8125, 0.8750, 0.9375, 1.0000,
+];
+
+/// LR 参考：参数曲线阴影 -100 / -50 / 0 / +50 / +100。
+#[allow(clippy::approx_constant)]
+pub const PARAM_SHADOWS_CURVES: [[f32; PARAM_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0002, 0.0139, 0.0654, 0.1400, 0.2336, 0.3326, 0.4201, 0.4955, 0.5609, 0.6251,
+        0.6875, 0.7505, 0.8125, 0.8746, 0.9372, 1.0000,
+    ],
+    [
+        0.0000, 0.0132, 0.0628, 0.1280, 0.2009, 0.2801, 0.3583, 0.4300, 0.4983, 0.5617, 0.6252,
+        0.6875, 0.7505, 0.8125, 0.8746, 0.9372, 1.0000,
+    ],
+    PARAM_IDENTITY_CURVE,
+    [
+        0.0000, 0.0963, 0.1720, 0.2386, 0.2933, 0.3435, 0.3927, 0.4437, 0.5022, 0.5629, 0.6254,
+        0.6874, 0.7505, 0.8125, 0.8746, 0.9371, 1.0000,
+    ],
+    [
+        0.0000, 0.1310, 0.2261, 0.3044, 0.3536, 0.3855, 0.4152, 0.4525, 0.5047, 0.5636, 0.6254,
+        0.6874, 0.7505, 0.8125, 0.8746, 0.9371, 1.0000,
+    ],
+];
+
+/// LR 参考：参数曲线暗调 -100 / -50 / 0 / +50 / +100。
+#[allow(clippy::approx_constant)]
+pub const PARAM_DARKS_CURVES: [[f32; PARAM_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0000, 0.0015, 0.0074, 0.0267, 0.0700, 0.1351, 0.2111, 0.2974, 0.3892, 0.4828,
+        0.5819, 0.6793, 0.7704, 0.8546, 0.9322, 1.0000,
+    ],
+    [
+        0.0000, 0.0062, 0.0308, 0.0757, 0.1304, 0.1960, 0.2676, 0.3390, 0.4144, 0.4898, 0.5666,
+        0.6432, 0.7203, 0.7943, 0.8659, 0.9348, 1.0000,
+    ],
+    PARAM_IDENTITY_CURVE,
+    [
+        0.0000, 0.0977, 0.1783, 0.2567, 0.3303, 0.4016, 0.4673, 0.5261, 0.5817, 0.6329, 0.6828,
+        0.7305, 0.7794, 0.8295, 0.8827, 0.9391, 1.0000,
+    ],
+    [
+        0.0000, 0.1313, 0.2311, 0.3298, 0.4234, 0.5127, 0.5889, 0.6499, 0.6978, 0.7337, 0.7636,
+        0.7904, 0.8194, 0.8526, 0.8933, 0.9421, 1.0000,
+    ],
+];
+
+/// LR 参考：参数曲线亮调 -100 / -50 / 0 / +50 / +100。
+#[allow(clippy::approx_constant)]
+pub const PARAM_LIGHTS_CURVES: [[f32; PARAM_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0612, 0.1181, 0.1680, 0.2072, 0.2395, 0.2664, 0.2917, 0.3226, 0.3597, 0.4051,
+        0.4613, 0.5333, 0.6161, 0.7159, 0.8385, 1.0000,
+    ],
+    [
+        0.0000, 0.0622, 0.1225, 0.1797, 0.2319, 0.2823, 0.3299, 0.3754, 0.4232, 0.4722, 0.5251,
+        0.5824, 0.6480, 0.7190, 0.7995, 0.8923, 1.0000,
+    ],
+    PARAM_IDENTITY_CURVE,
+    [
+        0.0000, 0.0638, 0.1289, 0.1962, 0.2667, 0.3435, 0.4244, 0.5046, 0.5888, 0.6706, 0.7504,
+        0.8227, 0.8852, 0.9347, 0.9692, 0.9908, 1.0000,
+    ],
+    [
+        0.0000, 0.0648, 0.1335, 0.2062, 0.2890, 0.3860, 0.4953, 0.6052, 0.7163, 0.8129, 0.8943,
+        0.9518, 0.9810, 0.9949, 0.9993, 0.9999, 1.0000,
+    ],
+];
+
+/// LR 参考：参数曲线高光 -100 / -50 / 0 / +50 / +100。
+#[allow(clippy::approx_constant)]
+pub const PARAM_HIGHLIGHTS_CURVES: [[f32; PARAM_CURVE_POINTS]; 5] = [
+    [
+        0.0000, 0.0630, 0.1253, 0.1880, 0.2495, 0.3127, 0.3759, 0.4371, 0.4972, 0.5449, 0.5791,
+        0.6045, 0.6319, 0.6723, 0.7407, 0.8445, 1.0000,
+    ],
+    [
+        0.0000, 0.0630, 0.1253, 0.1879, 0.2494, 0.3127, 0.3759, 0.4371, 0.4991, 0.5548, 0.6056,
+        0.6517, 0.6988, 0.7510, 0.8156, 0.8961, 1.0000,
+    ],
+    PARAM_IDENTITY_CURVE,
+    [
+        0.0000, 0.0630, 0.1253, 0.1878, 0.2491, 0.3125, 0.3759, 0.4372, 0.5018, 0.5699, 0.6460,
+        0.7254, 0.8060, 0.8794, 0.9397, 0.9823, 1.0000,
+    ],
+    [
+        0.0000, 0.0630, 0.1252, 0.1878, 0.2491, 0.3123, 0.3758, 0.4372, 0.5033, 0.5799, 0.6751,
+        0.7790, 0.8767, 0.9498, 0.9861, 0.9989, 1.0000,
+    ],
+];
+
+fn sample_param_curve(curve: &[f32; PARAM_CURVE_POINTS], x: f32) -> f32 {
+    let position = x.clamp(0.0, 1.0) * (PARAM_CURVE_POINTS - 1) as f32;
+    let index = (position.floor() as usize).min(PARAM_CURVE_POINTS - 1);
+    let next = (index + 1).min(PARAM_CURVE_POINTS - 1);
+    let fraction = position - index as f32;
+    curve[index] * (1.0 - fraction) + curve[next] * fraction
+}
+
+fn param_reference_lut(
+    curves: &[[f32; PARAM_CURVE_POINTS]; 5],
+    value: f32,
+) -> [f32; PARAM_CURVE_ENTRIES] {
+    let position = ((value.clamp(-100.0, 100.0) + 100.0) / 50.0).clamp(0.0, 4.0);
+    let low = position.floor() as usize;
+    let high = (low + 1).min(4);
+    let fraction = position - low as f32;
+    std::array::from_fn(|index| {
+        let x = index as f32 / (PARAM_CURVE_ENTRIES - 1) as f32;
+        let a = sample_param_curve(&curves[low], x);
+        let b = sample_param_curve(&curves[high], x);
+        (a + (b - a) * fraction).clamp(0.0, 1.0)
+    })
+}
+
+fn sample_param_lut(lut: &[f32; PARAM_CURVE_ENTRIES], x: f32) -> f32 {
+    let position = x.clamp(0.0, 1.0) * (PARAM_CURVE_ENTRIES - 1) as f32;
+    let index = (position.floor() as usize).min(PARAM_CURVE_ENTRIES - 1);
+    let next = (index + 1).min(PARAM_CURVE_ENTRIES - 1);
+    let fraction = position - index as f32;
+    lut[index] * (1.0 - fraction) + lut[next] * fraction
+}
+
+impl ParametricCurve {
+    /// 三个分界的实际值；0 表示默认 0.25 / 0.50 / 0.75。
+    pub fn effective_splits(&self) -> [f32; 3] {
+        let shadow = if self.shadow_split <= 0.0 {
+            0.25
+        } else {
+            self.shadow_split.clamp(0.05, 0.7)
+        };
+        let midtone = if self.midtone_split <= 0.0 {
+            0.5
+        } else {
+            self.midtone_split.clamp(shadow + 0.05, 0.85)
+        };
+        let highlight = if self.highlight_split <= 0.0 {
+            0.75
+        } else {
+            self.highlight_split.clamp(midtone + 0.05, 0.95)
+        };
+        [shadow, midtone, highlight]
+    }
+
+    /// 四个区域滑杆全为 0（分界不改变恒等曲线）。
+    pub fn is_identity(&self) -> bool {
+        self.highlights == 0.0
+            && self.lights == 0.0
+            && self.darks == 0.0
+            && self.shadows == 0.0
+    }
+
+    /// 分界是否为 LR 默认 0.25 / 0.50 / 0.75（含旧的 0 表示默认）。
+    fn uses_default_splits(&self) -> bool {
+        let near = |value: f32, default: f32| value <= 0.0 || (value - default).abs() < 1e-4;
+        near(self.shadow_split, 0.25)
+            && near(self.midtone_split, 0.5)
+            && near(self.highlight_split, 0.75)
+    }
+}
+
+/// 参数曲线 → 显示域 LUT。
+///
+/// 默认分界（0.25 / 0.50 / 0.75）下，直接使用 LR 参考的四个滑块 1D 曲线，
+/// 依次复合；这是单滑块最准确的路径。用户改分界后回退到四区单调样条，
+/// 保留“分界可调”的行为。
+pub fn parametric_curve_lut(curve: &ParametricCurve) -> [f32; PARAM_CURVE_ENTRIES] {
+    if !curve.uses_default_splits() {
+        return parametric_curve_spline_lut(curve);
+    }
+
+    let mut lut: [f32; PARAM_CURVE_ENTRIES] = std::array::from_fn(|index| {
+        index as f32 / (PARAM_CURVE_ENTRIES - 1) as f32
+    });
+    for (curves, amount) in [
+        (&PARAM_SHADOWS_CURVES, curve.shadows),
+        (&PARAM_DARKS_CURVES, curve.darks),
+        (&PARAM_LIGHTS_CURVES, curve.lights),
+        (&PARAM_HIGHLIGHTS_CURVES, curve.highlights),
+    ] {
+        let slider = param_reference_lut(curves, amount);
+        lut = std::array::from_fn(|index| sample_param_lut(&slider, lut[index]));
+    }
+    lut
+}
+
+/// 四区控制点样条（自定义分界时使用）。
+fn parametric_curve_spline_lut(curve: &ParametricCurve) -> [f32; PARAM_CURVE_ENTRIES] {
+    let [shadow_split, midtone_split, highlight_split] = curve.effective_splits();
+    let centers = [
+        shadow_split * 0.5,
+        (shadow_split + midtone_split) * 0.5,
+        (midtone_split + highlight_split) * 0.5,
+        highlight_split + (1.0 - highlight_split) * 0.5,
+    ];
+    let amounts = [curve.shadows, curve.darks, curve.lights, curve.highlights];
+    let mut values = [0.0f32; 4];
+    for index in 0..4 {
+        values[index] = (centers[index]
+            + amounts[index] / 100.0 * PARAM_CURVE_AMOUNTS[index])
+            .clamp(0.0, 1.0);
+    }
+    // 不允许控制点纵向交叉，否则样条会出现局部反相。
+    for index in 1..4 {
+        values[index] = values[index].max(values[index - 1] + 0.002);
+    }
+    for index in (0..3).rev() {
+        values[index] = values[index].min(values[index + 1] - 0.002);
+    }
+    let points = [
+        CurvePoint { x: 0.0, y: 0.0 },
+        CurvePoint {
+            x: centers[0],
+            y: values[0],
+        },
+        CurvePoint {
+            x: centers[1],
+            y: values[1],
+        },
+        CurvePoint {
+            x: centers[2],
+            y: values[2],
+        },
+        CurvePoint {
+            x: centers[3],
+            y: values[3],
+        },
+        CurvePoint { x: 1.0, y: 1.0 },
+    ];
+    std::array::from_fn(|index| {
+        let x = index as f32 / (PARAM_CURVE_ENTRIES - 1) as f32;
+        eval_curve(&points, x)
+    })
 }
 
 /// 曲线面板。
@@ -385,10 +659,25 @@ pub struct HslBand {
     pub luminance: f32,
 }
 
+/// HSL 方案。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HslMode {
+    /// Lightroom 固定 8 色带 + 重叠窗。
+    #[default]
+    Lightroom,
+    /// darktable 风格的连续色域：8 个节点之间线性插值。
+    ColorZones,
+}
+
 /// HSL 面板。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct HslParams {
+    /// 当前方案。
+    pub mode: HslMode,
+    /// 连续色域的 8 个节点（与 Lightroom 色带同序），独立于下面的固定色带。
+    pub zones: [HslBand; 8],
     /// 红。
     pub red: HslBand,
     /// 橙。
@@ -422,6 +711,16 @@ impl HslParams {
         }
     }
 
+    /// 连续色域节点（0..7，与 [`ColorBand::ALL`] 同序）。
+    pub fn zone(&self, index: usize) -> &HslBand {
+        &self.zones[index.min(7)]
+    }
+
+    /// 连续色域节点（可变）。
+    pub fn zone_mut(&mut self, index: usize) -> &mut HslBand {
+        &mut self.zones[index.min(7)]
+    }
+
     /// 按 [`ColorBand`] 写入。
     pub fn band_mut(&mut self, band: ColorBand) -> &mut HslBand {
         match band {
@@ -450,7 +749,7 @@ pub struct GradingZone {
 }
 
 /// 颜色分级面板。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ColorGradingParams {
     /// 阴影。
@@ -459,10 +758,26 @@ pub struct ColorGradingParams {
     pub midtones: GradingZone,
     /// 高光。
     pub highlights: GradingZone,
+    /// 全局。
+    pub global: GradingZone,
     /// 混合，0..=100。
     pub blending: f32,
     /// 平衡，-100..=100。
     pub balance: f32,
+}
+
+impl Default for ColorGradingParams {
+    fn default() -> Self {
+        Self {
+            shadows: GradingZone::default(),
+            midtones: GradingZone::default(),
+            highlights: GradingZone::default(),
+            global: GradingZone::default(),
+            // LR 默认 ColorGradeBlending = 50；旧实现用 0，导致中间调权重被挤成 0。
+            blending: 50.0,
+            balance: 0.0,
+        }
+    }
 }
 
 /// 相机校准（Lightroom 的 Calibration 面板）。
@@ -1154,6 +1469,7 @@ impl SliderId {
         match self {
             SliderId::Exposure => -5.0..=5.0,
             SliderId::Grain => 0.0..=100.0,
+            SliderId::Tint => -150.0..=150.0,
             _ => -100.0..=100.0,
         }
     }
@@ -1222,6 +1538,11 @@ impl EditParams {
             self.grading.highlights.saturation,
             preset.grading.highlights.saturation,
         );
+        result.grading.global.hue = lerp(self.grading.global.hue, preset.grading.global.hue);
+        result.grading.global.saturation =
+            lerp(self.grading.global.saturation, preset.grading.global.saturation);
+        result.grading.global.luminance =
+            lerp(self.grading.global.luminance, preset.grading.global.luminance);
         result.grading.blending = lerp(self.grading.blending, preset.grading.blending);
         result.grading.balance = lerp(self.grading.balance, preset.grading.balance);
 
@@ -1234,6 +1555,15 @@ impl EditParams {
                 luminance: lerp(source.luminance, target.luminance),
             };
             *result.hsl.band_mut(band) = blended;
+        }
+        for index in 0..8 {
+            let source = self.hsl.zone(index);
+            let target = preset.hsl.zone(index);
+            result.hsl.zones[index] = HslBand {
+                hue: lerp(source.hue, target.hue),
+                saturation: lerp(source.saturation, target.saturation),
+                luminance: lerp(source.luminance, target.luminance),
+            };
         }
 
         if t < 0.5 {
@@ -1289,17 +1619,23 @@ impl EditParams {
         out.curves.blue = compose_tone_curve(&self.curves.blue, &local.curves.blue);
         out.curves.parametric.highlights =
             clamp_slider(self.curves.parametric.highlights + local.curves.parametric.highlights);
-        out.curves.parametric.midtones =
-            clamp_slider(self.curves.parametric.midtones + local.curves.parametric.midtones);
+        out.curves.parametric.lights =
+            clamp_slider(self.curves.parametric.lights + local.curves.parametric.lights);
+        out.curves.parametric.darks =
+            clamp_slider(self.curves.parametric.darks + local.curves.parametric.darks);
         out.curves.parametric.shadows =
             clamp_slider(self.curves.parametric.shadows + local.curves.parametric.shadows);
-        if local.curves.parametric.highlights_split > 0.0 {
-            out.curves.parametric.highlights_split =
-                local.curves.parametric.highlights_split.clamp(0.0, 1.0);
+        if local.curves.parametric.highlight_split > 0.0 {
+            out.curves.parametric.highlight_split =
+                local.curves.parametric.highlight_split.clamp(0.0, 1.0);
         }
-        if local.curves.parametric.midtones_split > 0.0 {
-            out.curves.parametric.midtones_split =
-                local.curves.parametric.midtones_split.clamp(0.0, 1.0);
+        if local.curves.parametric.midtone_split > 0.0 {
+            out.curves.parametric.midtone_split =
+                local.curves.parametric.midtone_split.clamp(0.0, 1.0);
+        }
+        if local.curves.parametric.shadow_split > 0.0 {
+            out.curves.parametric.shadow_split =
+                local.curves.parametric.shadow_split.clamp(0.0, 1.0);
         }
 
         for band in ColorBand::ALL {
@@ -1309,6 +1645,15 @@ impl EditParams {
                 hue: clamp_slider(global_band.hue + local_band.hue),
                 saturation: clamp_slider(global_band.saturation + local_band.saturation),
                 luminance: clamp_slider(global_band.luminance + local_band.luminance),
+            };
+        }
+        for index in 0..8 {
+            let global_zone = self.hsl.zone(index).clone();
+            let local_zone = local.hsl.zone(index).clone();
+            out.hsl.zones[index] = HslBand {
+                hue: clamp_slider(global_zone.hue + local_zone.hue),
+                saturation: clamp_slider(global_zone.saturation + local_zone.saturation),
+                luminance: clamp_slider(global_zone.luminance + local_zone.luminance),
             };
         }
 
@@ -1321,6 +1666,10 @@ impl EditParams {
         out.grading.highlights = compose_grading_zone(
             self.grading.highlights.clone(),
             local.grading.highlights.clone(),
+        );
+        out.grading.global = compose_grading_zone(
+            self.grading.global.clone(),
+            local.grading.global.clone(),
         );
         out.grading.blending = (self.grading.blending + local.grading.blending).clamp(0.0, 100.0);
         out.grading.balance = clamp_slider(self.grading.balance + local.grading.balance);
@@ -1606,6 +1955,78 @@ mod tests {
                 (left - right).abs() < 0.05,
                 "控制点处一阶应连续：knot={knot} 左 {left} 右 {right}"
             );
+        }
+    }
+
+    #[test]
+    fn parametric_curve_is_identity_at_neutral() {
+        let lut = parametric_curve_lut(&ParametricCurve::default());
+        for (index, value) in lut.iter().enumerate() {
+            let x = index as f32 / (PARAM_CURVE_ENTRIES - 1) as f32;
+            assert!((value - x).abs() < 1e-5, "x={x} -> {value}");
+        }
+    }
+
+    #[test]
+    fn parametric_curve_regions_are_independent_and_endpoints_are_fixed() {
+        let neutral = parametric_curve_lut(&ParametricCurve::default());
+        for (field, index) in [
+            ("shadows", 0usize),
+            ("darks", 1),
+            ("lights", 2),
+            ("highlights", 3),
+        ] {
+            for amount in [-100.0f32, 100.0] {
+                let mut curve = ParametricCurve::default();
+                match index {
+                    0 => curve.shadows = amount,
+                    1 => curve.darks = amount,
+                    2 => curve.lights = amount,
+                    _ => curve.highlights = amount,
+                }
+                let lut = parametric_curve_lut(&curve);
+                // 端点必须不动（LR 的参数曲线端点固定）。
+                assert!((lut[0] - 0.0).abs() < 1e-5, "{field} {amount}: 黑场");
+                assert!(
+                    (lut[PARAM_CURVE_ENTRIES - 1] - 1.0).abs() < 1e-5,
+                    "{field} {amount}: 白场"
+                );
+                // 只在该区域中心产生明显位移，其他区域中心基本不动。
+                let centers = [0.125f32, 0.375, 0.625, 0.875];
+                let middle = centers[index];
+                let moved =
+                    (lut[(middle * 255.0) as usize] - neutral[(middle * 255.0) as usize]).abs();
+                assert!(moved > 0.05, "{field} {amount}: 区域中心只动了 {moved}");
+                for (other, center) in centers.iter().enumerate() {
+                    if other == index {
+                        continue;
+                    }
+                    let delta =
+                        (lut[(center * 255.0) as usize] - neutral[(center * 255.0) as usize]).abs();
+                    assert!(
+                        delta < 0.30,
+                        "{field} {amount}: 串到区域 {other}，位移 {delta}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parametric_curve_stays_monotone_with_opposing_sliders() {
+        let curve = ParametricCurve {
+            shadows: 100.0,
+            darks: -100.0,
+            lights: 100.0,
+            highlights: -100.0,
+            ..ParametricCurve::default()
+        };
+        let lut = parametric_curve_lut(&curve);
+        let mut previous = -1.0f32;
+        for value in lut {
+            assert!(value >= previous - 1e-5, "{value} < {previous}");
+            assert!((0.0..=1.0).contains(&value), "{value}");
+            previous = value;
         }
     }
 }
