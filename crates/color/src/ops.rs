@@ -526,6 +526,32 @@ mod tests {
     }
 
     #[test]
+    fn hsl_all_bands_shift_hue_and_desaturate() {
+        let centers = [0.0f32, 30.0, 60.0, 120.0, 180.0, 225.0, 270.0, 315.0];
+        for (band, center) in centers.iter().enumerate() {
+            let sample = hsl_to_rgb([center / 360.0, 0.9, 0.5]).map(srgb_to_linear);
+
+            let mut hue_ops = ColorOps::new(SRGB);
+            let mut mixer = Mixer::default();
+            mixer.bands[band].hue = 100.0;
+            hue_ops.mixer = Some(mixer);
+            let shifted = hue_ops.apply(sample);
+            let hue = rgb_to_hsl(shifted.map(linear_to_srgb))[0] * 360.0;
+            let expected = (center + 30.0).rem_euclid(360.0);
+            let delta = (hue - expected + 540.0).rem_euclid(360.0) - 180.0;
+            assert!(delta.abs() < 12.0, "band {band}: {center} -> {hue}, want {expected}");
+
+            let mut sat_ops = ColorOps::new(SRGB);
+            let mut mixer = Mixer::default();
+            mixer.bands[band].sat = -100.0;
+            sat_ops.mixer = Some(mixer);
+            let neutral = sat_ops.apply(sample);
+            let chroma = lab_to_lch(oklab_from_rgb(&SRGB, neutral))[1];
+            assert!(chroma < 0.08, "band {band}: chroma {chroma}");
+        }
+    }
+
+    #[test]
     fn hsl_mixer_red_saturation_is_selective() {
         let mut o = ColorOps::new(SRGB);
         let mut mixer = Mixer::default();
