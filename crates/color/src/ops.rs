@@ -253,10 +253,10 @@ impl ColorOps {
             ds += *weight * (mixer.bands[i].sat / 100.0) as f32;
             dl += *weight * (mixer.bands[i].lum / 100.0) as f32;
         }
-        // ±100 的行程：色相约 ±30°，饱和度 ±100%，HSL 明度约 ±0.22。
+        // ±100 的行程：色相约 ±30°，饱和度 ±100%，HSL 明度约 ±0.30。
         let hue = (h + dh * (30.0 / 360.0)).rem_euclid(1.0);
         let sat = (s * (1.0 + ds)).clamp(0.0, 1.0);
-        let lum = (l + dl * 0.22 * (1.0 - 0.35 * l)).clamp(0.0, 1.0);
+        let lum = (l + dl * 0.30 * (1.0 - 0.35 * l)).clamp(0.0, 1.0);
         let out = hsl_to_rgb([hue, sat, lum]).map(srgb_to_linear);
         if self.space == SRGB {
             out

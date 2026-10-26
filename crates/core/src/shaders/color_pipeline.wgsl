@@ -253,7 +253,7 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
         let adjusted_h = fract(hsl_in.x + hue_shift * (30.0 / 360.0));
         let adjusted_s = clamp(hsl_in.y * (1.0 + sat_scale), 0.0, 1.0);
         let adjusted_l = clamp(
-            hsl_in.z + lum_shift * 0.22 * (1.0 - 0.35 * hsl_in.z),
+            hsl_in.z + lum_shift * 0.30 * (1.0 - 0.35 * hsl_in.z),
             0.0,
             1.0
         );
