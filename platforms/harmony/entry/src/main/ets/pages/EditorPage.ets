@@ -992,7 +992,8 @@ struct EditorPage {
           vertical: this.num(I_VERTICAL),
           horizontal: this.num(I_HORIZONTAL),
           rotate: this.num(I_ROTATE),
-          scale: this.num(I_SCALE)
+          // Rust 侧 scale 是倍率（1.0 = 100%），滑杆是百分比。
+          scale: this.num(I_SCALE) / 100
         }
       },
       effects: {
@@ -1085,7 +1086,7 @@ struct EditorPage {
       profile_correction: false,
       chromatic_aberration: 0,
       vignette: 0,
-      geometry: { auto: false, distortion: 0, vertical: 0, horizontal: 0, rotate: 0, scale: 100 }
+      geometry: { auto: false, distortion: 0, vertical: 0, horizontal: 0, rotate: 0, scale: 1 }
     };
     payload.effects = {
       texture: 0, clarity: 0, dehaze: 0, vignette: 0,
@@ -3718,7 +3719,9 @@ struct EditorPage {
     next[I_VERTICAL] = payload.lens.geometry.vertical;
     next[I_HORIZONTAL] = payload.lens.geometry.horizontal;
     next[I_ROTATE] = payload.lens.geometry.rotate;
-    next[I_SCALE] = payload.lens.geometry.scale;
+    // 兼容旧存档：旧版本把百分比（100）直接写进 scale，新版本写倍率（1.0）。
+    const rawScale = payload.lens.geometry.scale;
+    next[I_SCALE] = rawScale <= 3 ? rawScale * 100 : rawScale;
     next[I_TEXTURE] = payload.effects.texture;
     next[I_CLARITY] = payload.effects.clarity;
     next[I_DEHAZE] = payload.effects.dehaze;
