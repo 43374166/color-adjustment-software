@@ -49,8 +49,7 @@ enum EditorLimits {
     static let maskThumbnailMaxEdge = 128
     /// 导出按**原图分辨率**渲染（不再限制最长边）。
     /// 导出像素预算：超过就按比例降采样。CPU 管线是 f32 多平面（约 40 字节/像素），
- MP 峰值约 
- × 40 MB，\n    /// 8MP ≈ 320MB 是 iPhone 上比较安全的上限。
+    /// N MP 的峰值约 N × 40 MB；8MP ≈ 320MB，是 iPhone 上比较安全的上限。
     static let exportPixelLimit = 8_000_000
     /// 导出格式 / 质量 / 保留元数据 / 导出后分享（与「我的」页 @AppStorage 共用）。
     static let exportFormatKey = "fdxmp_export_format"
