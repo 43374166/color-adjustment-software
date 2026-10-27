@@ -1587,9 +1587,11 @@ struct EditorTabView: View {
                 },
                 onCommit: { model.commitEdit() }
             )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .padding(.horizontal, 10)
 
             equalizerOptions
+                .frame(maxHeight: 200)
             Spacer(minLength: 0)
         }
     }

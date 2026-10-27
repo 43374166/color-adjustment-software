@@ -13,19 +13,13 @@ struct EqualizerGraph: View {
     let onCommit: () -> Void
 
     @State private var activeNode: Int?
+    @State private var dragStart: CGPoint?
+    @State private var dragMoved = false
+    @State private var lastTapNode: Int?
+    @State private var lastTapTime = Date.distantPast
 
-    /// Lightroom 8 个色带中心（度）。
-    private static let bandHues: [Double] = [0, 30, 60, 120, 180, 225, 270, 315]
-    private static let bandColors: [Color] = [
-        Color(red: 0.86, green: 0.27, blue: 0.24),
-        Color(red: 0.90, green: 0.55, blue: 0.18),
-        Color(red: 0.84, green: 0.76, blue: 0.22),
-        Color(red: 0.35, green: 0.71, blue: 0.33),
-        Color(red: 0.25, green: 0.73, blue: 0.73),
-        Color(red: 0.29, green: 0.45, blue: 0.86),
-        Color(red: 0.57, green: 0.41, blue: 0.80),
-        Color(red: 0.80, green: 0.33, blue: 0.65),
-    ]
+    /// 8 个节点等距 45°（与 Rust 的 RBF 节点一致，不是 Lightroom 的 8 个色带中心）。
+    private static let bandHues: [Double] = [0, 45, 90, 135, 180, 225, 270, 315]
 
     private var stripHeight: CGFloat { 12 }
 
@@ -48,14 +42,10 @@ struct EqualizerGraph: View {
                         handleDrag(value.location, width: size.width, graphHeight: graphHeight)
                     }
                     .onEnded { _ in
-                        if activeNode != nil {
-                            activeNode = nil
-                            onCommit()
-                        }
+                        finishDrag()
                     }
             )
         }
-        .frame(height: 220)
     }
 
     // MARK: - 曲线数据
@@ -224,7 +214,7 @@ struct EqualizerGraph: View {
                 )
             )
             context.fill(dot, with: .color(Color(white: 0.12)))
-            context.stroke(dot, with: .color(Self.bandColors[index]), lineWidth: 2.5)
+            context.stroke(dot, with: .color(nodeColor(index)), lineWidth: 2.5)
             if activeNode == index {
                 let ring = Path(
                     ellipseIn: CGRect(
@@ -261,6 +251,14 @@ struct EqualizerGraph: View {
 
     // MARK: - 交互
 
+    /// 节点圆环颜色 = 该节点当前的色相（等距 45° + 整体旋转）。
+    private func nodeColor(_ index: Int) -> Color {
+        let degrees = (Self.bandHues[index] + Double(state.hueShift))
+            .truncatingRemainder(dividingBy: 360)
+        let wrapped = degrees < 0 ? degrees + 360 : degrees
+        return Color(hue: wrapped / 360, saturation: 0.9, brightness: 0.95)
+    }
+
     private func handleDrag(_ location: CGPoint, width: CGFloat, graphHeight: CGFloat) {
         guard location.y <= graphHeight + 6 else { return }
         if activeNode == nil {
@@ -275,9 +273,19 @@ struct EqualizerGraph: View {
             }
             guard bestDistance < 30 else { return }
             activeNode = best
+            dragStart = location
+            dragMoved = false
             onBegin()
         }
-        guard let index = activeNode else { return }
+        if let start = dragStart {
+            let dx = location.x - start.x
+            let dy = location.y - start.y
+            if sqrt(dx * dx + dy * dy) > 6 {
+                dragMoved = true
+            }
+        }
+        // 点一下只选中（不跳值）；真正拖动才改值。
+        guard dragMoved, let index = activeNode else { return }
         let updated = value(atY: location.y, graphHeight: graphHeight)
         var next = state
         switch channel {
@@ -289,5 +297,42 @@ struct EqualizerGraph: View {
             next.brightness[index] = max(updated, 0)
         }
         onChange(next)
+    }
+
+    /// 松手：拖动提交一步历史；原地双击复位该节点。
+    private func finishDrag() {
+        defer {
+            activeNode = nil
+            dragStart = nil
+            dragMoved = false
+        }
+        guard let index = activeNode else { return }
+        if dragMoved {
+            onCommit()
+            return
+        }
+        let now = Date()
+        if lastTapNode == index, now.timeIntervalSince(lastTapTime) < 0.4 {
+            resetNode(index)
+            lastTapNode = nil
+        } else {
+            lastTapNode = index
+            lastTapTime = now
+        }
+    }
+
+    /// 双击复位：色相回 0°，饱和度 / 亮度回 1.0（与 Windows / Windows 端一致）。
+    private func resetNode(_ index: Int) {
+        var next = state
+        switch channel {
+        case 0:
+            next.hue[index] = 0
+        case 1:
+            next.saturation[index] = 1
+        default:
+            next.brightness[index] = 1
+        }
+        onChange(next)
+        onCommit()
     }
 }
