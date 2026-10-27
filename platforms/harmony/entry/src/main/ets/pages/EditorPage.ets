@@ -1681,7 +1681,7 @@ struct EditorPage {
       }
     }
     .width('100%')
-    .height(330)
+    .constraintSize({ maxHeight: 340 })
     .backgroundColor('#B31A1A1A')
   }
 
@@ -2157,7 +2157,7 @@ struct EditorPage {
 
       Canvas(this.curveContext)
         .width('100%')
-        .layoutWeight(1)
+        .height(200)
         .margin({ left: 10, right: 10, bottom: 8 })
         .onReady(() => {
           this.drawCurveEditor();
@@ -2172,7 +2172,6 @@ struct EditorPage {
         })
     }
     .width('100%')
-    .layoutWeight(1)
   }
 
   @Builder
@@ -2229,7 +2228,6 @@ struct EditorPage {
       }
     }
     .width('100%')
-    .layoutWeight(1)
   }
 
   @Builder
@@ -2318,6 +2316,7 @@ struct EditorPage {
     }
     .scrollBar(BarState.Off)
     .width('100%')
+    .constraintSize({ maxHeight: 260 })
     .padding({ left: 14, right: 14 })
   }
 
@@ -2398,6 +2397,7 @@ struct EditorPage {
     }
     .scrollBar(BarState.Off)
     .width('100%')
+    .constraintSize({ maxHeight: 260 })
     .padding({ left: 14, right: 14 })
   }
 
@@ -2430,6 +2430,7 @@ struct EditorPage {
     }
     .scrollBar(BarState.Off)
     .width('100%')
+    .constraintSize({ maxHeight: 260 })
     .padding({ left: 14, right: 14 })
   }
 
@@ -2461,6 +2462,7 @@ struct EditorPage {
     }
     .scrollBar(BarState.Off)
     .width('100%')
+    .constraintSize({ maxHeight: 260 })
     .padding({ left: 14, right: 14 })
   }
 
@@ -2492,7 +2494,7 @@ struct EditorPage {
 
       Canvas(this.context)
         .width('100%')
-        .layoutWeight(1)
+        .height(180)
         .margin({ left: 10, right: 10 })
         .onReady(() => {
           this.drawGraph();
@@ -2515,7 +2517,6 @@ struct EditorPage {
       }
     }
     .width('100%')
-    .layoutWeight(1)
   }
 
   // MARK: - 曲线
