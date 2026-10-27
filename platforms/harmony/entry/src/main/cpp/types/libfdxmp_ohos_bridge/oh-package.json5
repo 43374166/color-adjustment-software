@@ -1,0 +1,9 @@
+{
+  "name": "libfdxmp_ohos_bridge.so",
+  "version": "1.6.1",
+  "description": "fdxmp native bridge (Rust core over N-API)",
+  "main": "",
+  "author": "fdxmp",
+  "license": "MIT",
+  "types": "./index.d.ts"
+}

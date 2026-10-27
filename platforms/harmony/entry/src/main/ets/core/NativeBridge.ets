@@ -1,28 +1,77 @@
-// fdxmp HarmonyOS N-API 桥接封装（对应 crates/ohos_bridge，产物 libfdxmp_ohos_bridge.so）
+// fdxmp HarmonyOS 原生桥接。
 //
-// 当前 Rust 桥接尚未启用：ohos-rs 的 napi-ohos 依赖需要 GitHub 源（见 crates/ohos_bridge/README.md），
-// 先用同接口的 stub 保证 HAP 可以独立打包。桥接产物就绪后按两步切回：
-//   1) 把 libfdxmp_ohos_bridge.so 放到 entry/libs/arm64-v8a/
-//      （或运行 packaging/harmony/build.ps1 -WithRustBridge 自动交叉编译并复制）；
-//   2) 打开下面的 import，删除 stub 实现。
-// import fdxmp from 'libfdxmp_ohos_bridge.so';
+// ArkTS → `libfdxmp_ohos_bridge.so`（N-API 薄封装，见 entry/src/main/cpp/napi_init.cpp）
+//      → `libfdxmp_ffi.so`（Rust 核心，与 Windows / iOS 同一份调色管线）。
+//
+// 渲染是同步阻塞调用，必须放到 TaskPool / Worker 里执行，不要在 UI 线程直接调。
 
-export interface FdxmpNative {
-  abiVersion(): number;
+import nativeModule from 'libfdxmp_ohos_bridge.so';
+
+/** 渲染结果：行优先 RGBA8。 */
+export interface RenderResult {
+  /** 输出宽度（裁切 / 几何之后）。 */
+  width: number;
+  /** 输出高度。 */
+  height: number;
+  /** 像素数据，长度 = width × height × 4。 */
+  data: ArrayBuffer;
+}
+
+/** 原生模块的导出签名（与 entry/src/main/cpp/napi_init.cpp 一一对应）。 */
+interface FdxmpNativeApi {
   version(): string;
+  abiVersion(): number;
+  lastError(): string;
+  renderMemoryRgba(
+    rgba: ArrayBuffer,
+    width: number,
+    height: number,
+    paramsJson: string
+  ): RenderResult;
+  equalizerCurve(channel: number, paramsJson: string): ArrayBuffer;
 }
 
-/** 桥接未启用时的占位实现（ArkTS 严格模式下不能用对象字面量实现接口）。 */
-class FdxmpNativeStub implements FdxmpNative {
-  abiVersion(): number {
-    return 0;
+const native: FdxmpNativeApi = nativeModule as FdxmpNativeApi;
+
+export class NativeBridge {
+  /** 核心版本号。 */
+  static version(): string {
+    return native.version();
   }
 
-  version(): string {
-    return 'stub';
+  /** C ABI 版本号。 */
+  static abiVersion(): number {
+    return native.abiVersion();
+  }
+
+  /** 最近一次错误（没有错误时为空串）。 */
+  static lastError(): string {
+    return native.lastError();
+  }
+
+  /**
+   * 对 RGBA8 图像应用参数 JSON，返回渲染结果。
+   *
+   * 阻塞调用：放到 TaskPool 里跑。
+   */
+  static render(rgba: ArrayBuffer, width: number, height: number, paramsJson: string): RenderResult {
+    const result: RenderResult = native.renderMemoryRgba(rgba, width, height, paramsJson);
+    const out: RenderResult = {
+      width: result.width,
+      height: result.height,
+      data: result.data
+    };
+    return out;
+  }
+
+  /**
+   * 颜色均衡器曲线（512 点）。
+   *
+   * channel：0 色相（弧度）/ 1 饱和度增益 / 2 亮度增益。
+   */
+  static equalizerCurve(channel: number, paramsJson: string): Float32Array {
+    return new Float32Array(native.equalizerCurve(channel, paramsJson));
   }
 }
 
-const nativeCore: FdxmpNative = new FdxmpNativeStub();
-
-export default nativeCore;
+export default NativeBridge;

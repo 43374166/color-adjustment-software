@@ -11,3 +11,5 @@
 **/.test
 /.appanalyzer
 /entry/libs
+/entry/.cxx
+/entry/src/main/cpp/libs

@@ -3,6 +3,7 @@
 // 严格按规格实现三大 Tab：设备（默认）/ 编辑 / 我的，底部导航，无侧边栏。
 // 设备 Tab 已接入相册（权限、网格 / 列表、搜索 / 排序 / 筛选、多选、全屏预览、
 // 系统相册导入与相机入口）；编辑与我的待后续阶段。
+import { router } from '@kit.ArkUI';
 import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
 import common from '@ohos.app.ability.common';
 import dataSharePredicates from '@ohos.data.dataSharePredicates';
@@ -616,9 +617,15 @@ struct Index {
           .layoutWeight(1)
           .height(52)
           .onClick(() => {
+            const photos = this.visiblePhotos();
+            if (this.previewIndex >= 0 && this.previewIndex < photos.length) {
+              const photo = photos[this.previewIndex];
+              router.pushUrl({
+                url: 'pages/EditorPage',
+                params: { uri: photo.uri, name: photo.name }
+              });
+            }
             this.previewIndex = -1;
-            this.activeTab = 1;
-            promptAction.showToast({ message: '编辑界面阶段 6 接入' });
           })
         Text('分享')
           .fontSize(14)

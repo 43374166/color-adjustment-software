@@ -5,5 +5,7 @@
   "main": "",
   "author": "fdxmp",
   "license": "MIT",
-  "dependencies": {}
+  "dependencies": {
+    "libfdxmp_ohos_bridge.so": "file:./src/main/cpp/types/libfdxmp_ohos_bridge"
+  }
 }
