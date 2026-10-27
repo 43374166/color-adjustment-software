@@ -505,6 +505,38 @@ mod tests {
     }
 
     #[test]
+    fn mask_json_matches_ios_shape() {
+        // 鸿蒙 / iOS 面板写出的蒙版 JSON：kind 用外部标签 {"brush": {...}}，
+        // 笔画是归一化点对数组，调整参数嵌在 adjustments 里。
+        let json = r#"{
+            "masks": [{
+                "id": "mask-1",
+                "name": "蒙版 1",
+                "kind": {"type": "brush", "data": {"size": 30, "feather": 50, "flow": 100,
+                    "density": 100, "auto_mask": false,
+                    "strokes": [{"points": [[0.2, 0.3], [0.4, 0.5]], "erase": false}]}},
+                "visible": true,
+                "inverted": false,
+                "feather": 0,
+                "opacity": 100,
+                "adjustments": {"light": {"exposure": 0.6, "contrast": 0, "highlights": 0,
+                    "shadows": 0, "whites": 0, "blacks": 0}}
+            }]
+        }"#;
+        let params: EditParams = serde_json::from_str(json).expect("蒙版 JSON 应可解析");
+        assert_eq!(params.masks.len(), 1);
+        assert!(matches!(
+            params.masks[0].kind,
+            crate::params::MaskKind::Brush(_)
+        ));
+        if let crate::params::MaskKind::Brush(brush) = &params.masks[0].kind {
+            assert_eq!(brush.strokes.len(), 1);
+            assert_eq!(brush.strokes[0].points.len(), 2);
+        }
+        assert!((params.masks[0].adjustments.light.exposure - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
     fn ios_json_payload_maps_into_the_stage() {
         // iOS `EditJSON.build` 写出的键名必须能被 Rust 侧解析（跨语言契约）：
         // 每个端新增参数时，这个测试是唯一的自动检查点。

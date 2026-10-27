@@ -208,6 +208,45 @@ interface PointColorPayload {
   lum_range: number;
 }
 
+/** 画笔笔画。 */
+interface BrushStrokePayload {
+  points: number[][];
+  erase: boolean;
+}
+
+/** 画笔设置。 */
+interface BrushPayload {
+  size: number;
+  feather: number;
+  flow: number;
+  density: number;
+  auto_mask: boolean;
+  strokes: BrushStrokePayload[];
+}
+
+/** 蒙版类型（先只做画笔；Rust 侧是 `{"type": "brush", "data": {...}}`）。 */
+interface MaskKindPayload {
+  type: string;
+  data: BrushPayload;
+}
+
+/** 蒙版内的调整（先只暴露曝光）。 */
+interface MaskAdjustPayload {
+  light: LightPayload;
+}
+
+/** 一个蒙版。 */
+interface MaskPayload {
+  id: string;
+  name: string;
+  kind: MaskKindPayload;
+  visible: boolean;
+  inverted: boolean;
+  feather: number;
+  opacity: number;
+  adjustments: MaskAdjustPayload;
+}
+
 /** 整份渲染参数。 */
 interface ParamsPayload {
   light: LightPayload;
@@ -223,6 +262,7 @@ interface ParamsPayload {
   curves: CurvesPayload;
   crop: CropPayload;
   point_colors: PointColorPayload[];
+  masks: MaskPayload[];
 }
 
 /** 曲线控制点（可变）。 */
@@ -236,8 +276,7 @@ class CurvePt {
   }
 }
 
-/** 一个点颜色样本（含取色时的 sRGB，画色块用）。 */
-class PointSample {
+/** 一个点颜色样本（含取色时的 sRGB，画色块用）。 */class PointSample {
   r: number = 0;
   g: number = 0;
   b: number = 0;
@@ -368,6 +407,25 @@ const BAND_LABELS: string[] = ['红', '橙', '黄', '绿', '青', '蓝', '紫', 
 const HIST_COLUMNS: number = 96;
 const HIST_BINS: number = 48;
 
+/** 一笔画（归一化坐标点）+ 是否擦除。 */
+class StrokeItem {
+  points: number[][] = [];
+  erase: boolean = false;
+}
+
+/** 一个蒙版（先只支持画笔）。 */
+class MaskItem {
+  id: string = '';
+  name: string = '';
+  visible: boolean = true;
+  inverted: boolean = false;
+  opacity: number = 100;
+  feather: number = 0;
+  size: number = 30;
+  exposure: number = 0.6;
+  strokes: StrokeItem[] = [];
+}
+
 @Entry
 @Component
 struct EditorPage {
@@ -397,6 +455,14 @@ struct EditorPage {
   @State picking: boolean = false;
   @State areaW: number = 0;
   @State areaH: number = 0;
+
+  // 蒙版
+  @State masks: MaskItem[] = [];
+  @State selectedMask: number = 0;
+  @State maskMode: boolean = false;
+  @State brushSize: number = 30;
+  @State brushErase: boolean = false;
+  @State maskExposure: number = 0.6;
 
   // HSL（8 段）
   @State hslBand: number = 0;
@@ -431,6 +497,9 @@ struct EditorPage {
   private curveContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.curveSettings);
   private cropSettings: RenderingContextSettings = new RenderingContextSettings(true);
   private cropContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.cropSettings);
+  private maskSettings: RenderingContextSettings = new RenderingContextSettings(true);
+  private maskContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.maskSettings);
+  private paintingMask: number = -1;
 
   /** 上一帧渲染结果的尺寸（算裁剪框显示位置用）。 */
   private lastW: number = 0;
@@ -724,6 +793,7 @@ struct EditorPage {
       curves: this.curvesPayload(),
       crop: { rect: this.cropMode ? [0, 0, 1, 1] : this.cropRect },
       point_colors: this.pointColorsPayload(),
+      masks: this.masksPayload(),
       equalizer: {
         enabled: true,
         threshold: this.num(I_EQ_THRESHOLD),
@@ -1071,6 +1141,21 @@ struct EditorPage {
               this.handleCropTouch(touch.x, touch.y, event.type);
             })
         }
+        if (this.maskMode) {
+          Canvas(this.maskContext)
+            .width('100%')
+            .height('100%')
+            .onReady(() => {
+              this.drawMaskOverlay();
+            })
+            .onTouch((event: TouchEvent) => {
+              if (event.touches.length === 0) {
+                return;
+              }
+              const touch = event.touches[0];
+              this.handleMaskTouch(touch.x, touch.y, event.type);
+            })
+        }
         if (this.showPresets) {
           this.presetOverlay()
         }
@@ -1102,7 +1187,9 @@ struct EditorPage {
           this.drawHistogram();
         })
 
-      if (this.cropMode) {
+      if (this.maskMode) {
+        this.maskBar()
+      } else if (this.cropMode) {
         this.cropBar()
       } else {
         this.bottomPanel()
@@ -1129,6 +1216,21 @@ struct EditorPage {
         .textAlign(TextAlign.Center)
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text('蒙版')
+        .fontSize(13)
+        .fontColor('#4A9EFF')
+        .padding({ right: 10 })
+        .onClick(() => {
+          if (!this.maskMode) {
+            this.maskMode = true;
+            if (this.masks.length === 0) {
+              this.addMask();
+            }
+          } else {
+            this.maskMode = false;
+          }
+          this.drawMaskOverlay();
+        })
       Text('预设')
         .fontSize(13)
         .fontColor('#4A9EFF')
@@ -1199,6 +1301,125 @@ struct EditorPage {
     }
     .width('100%')
     .height(400)
+    .backgroundColor('#1A1A1A')
+  }
+
+  @Builder
+  maskBar() {
+    Column({ space: 6 }) {
+      Row() {
+        Scroll() {
+          Row() {
+            ForEach(this.masks, (mask: MaskItem, index: number) => {
+              Text(mask.name)
+                .fontSize(12)
+                .fontColor(this.selectedMask === index ? '#FFFFFF' : '#888888')
+                .backgroundColor(this.selectedMask === index ? '#3A3A3A' : '#242424')
+                .borderRadius(6)
+                .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+                .margin({ right: 6 })
+                .onClick(() => {
+                  this.selectedMask = index;
+                  this.drawMaskOverlay();
+                })
+            }, (mask: MaskItem, index: number) => mask.id + index.toString())
+          }
+        }
+        .scrollable(ScrollDirection.Horizontal)
+        .scrollBar(BarState.Off)
+        .layoutWeight(1)
+
+        Text('＋')
+          .fontSize(16)
+          .fontColor('#4A9EFF')
+          .padding({ left: 8, right: 8 })
+          .onClick(() => {
+            this.addMask();
+          })
+        Text('删除')
+          .fontSize(11)
+          .fontColor('#F06060')
+          .onClick(() => {
+            this.removeMask();
+          })
+      }
+      .width('100%')
+
+      Row({ space: 8 }) {
+        Text('笔刷大小')
+          .fontSize(11)
+          .fontColor('#AAAAAA')
+          .width(64)
+        Slider({ value: this.brushSize, min: 2, max: 100, step: 1 })
+          .layoutWeight(1)
+          .blockColor('#E8E8E8')
+          .trackColor('#3A3A3A')
+          .selectedColor('#4A9EFF')
+          .onChange((value: number) => {
+            this.brushSize = value;
+            if (this.masks.length > 0) {
+              this.masks[Math.min(this.selectedMask, this.masks.length - 1)].size = value;
+              this.drawMaskOverlay();
+            }
+          })
+        Text(this.brushSize.toFixed(0))
+          .fontSize(11)
+          .fontColor('#CCCCCC')
+          .width(36)
+      }
+      .width('100%')
+
+      Row({ space: 8 }) {
+        Text('曝光')
+          .fontSize(11)
+          .fontColor('#AAAAAA')
+          .width(64)
+        Slider({ value: this.maskExposure, min: -2, max: 2, step: 0.05 })
+          .layoutWeight(1)
+          .blockColor('#E8E8E8')
+          .trackColor('#3A3A3A')
+          .selectedColor('#4A9EFF')
+          .onChange((value: number) => {
+            this.setMaskExposure(value);
+          })
+        Text(this.maskExposure.toFixed(2))
+          .fontSize(11)
+          .fontColor('#CCCCCC')
+          .width(36)
+      }
+      .width('100%')
+
+      Row({ space: 12 }) {
+        Text(this.brushErase ? '擦除：开' : '擦除：关')
+          .fontSize(12)
+          .fontColor(this.brushErase ? '#F06060' : '#AAAAAA')
+          .onClick(() => {
+            this.brushErase = !this.brushErase;
+          })
+        Text('清除笔画')
+          .fontSize(12)
+          .fontColor('#AAAAAA')
+          .onClick(() => {
+            this.clearMaskStrokes();
+          })
+        Blank()
+        Text('完成')
+          .fontSize(13)
+          .fontColor('#4A9EFF')
+          .onClick(() => {
+            this.maskMode = false;
+            this.drawMaskOverlay();
+          })
+      }
+      .width('100%')
+
+      Text('在画面上涂抹：红色=蒙版区域，蓝色=擦除；曝光只作用在蒙版内')
+        .fontSize(10)
+        .fontColor('#777777')
+    }
+    .width('100%')
+    .height(236)
+    .padding({ left: 14, right: 14, top: 8 })
     .backgroundColor('#1A1A1A')
   }
 
@@ -2436,6 +2657,223 @@ struct EditorPage {
     this.points = next;
     this.selectedPoint = Math.max(0, Math.min(this.selectedPoint, next.length - 1));
     this.scheduleRender(false);
+  }
+
+  // MARK: - 蒙版
+
+  private masksPayload(): MaskPayload[] {
+    const result: MaskPayload[] = [];
+    for (let i = 0; i < this.masks.length; i++) {
+      const mask = this.masks[i];
+      const strokes: BrushStrokePayload[] = [];
+      for (let j = 0; j < mask.strokes.length; j++) {
+        const stroke: BrushStrokePayload = {
+          points: mask.strokes[j].points,
+          erase: mask.strokes[j].erase
+        };
+        strokes.push(stroke);
+      }
+      const light: LightPayload = {
+        exposure: mask.exposure,
+        contrast: 0,
+        highlights: 0,
+        shadows: 0,
+        whites: 0,
+        blacks: 0
+      };
+      const payload: MaskPayload = {
+        id: mask.id,
+        name: mask.name,
+        kind: {
+          type: 'brush',
+          data: {
+            size: mask.size,
+            feather: 50,
+            flow: 100,
+            density: 100,
+            auto_mask: false,
+            strokes: strokes
+          }
+        },
+        visible: mask.visible,
+        inverted: mask.inverted,
+        feather: mask.feather,
+        opacity: mask.opacity,
+        adjustments: { light: light }
+      };
+      result.push(payload);
+    }
+    return result;
+  }
+
+  private addMask(): void {
+    const mask = new MaskItem();
+    mask.id = 'mask-' + Date.now();
+    mask.name = '蒙版 ' + (this.masks.length + 1);
+    mask.size = this.brushSize;
+    mask.exposure = this.maskExposure;
+    this.masks = this.masks.concat([mask]);
+    this.selectedMask = this.masks.length - 1;
+    this.drawMaskOverlay();
+    this.scheduleRender(false);
+  }
+
+  private removeMask(): void {
+    if (this.masks.length === 0) {
+      return;
+    }
+    const index = Math.min(this.selectedMask, this.masks.length - 1);
+    const next: MaskItem[] = [];
+    for (let i = 0; i < this.masks.length; i++) {
+      if (i !== index) {
+        next.push(this.masks[i]);
+      }
+    }
+    this.masks = next;
+    this.selectedMask = Math.max(0, Math.min(index, next.length - 1));
+    this.drawMaskOverlay();
+    this.scheduleRender(false);
+  }
+
+  private clearMaskStrokes(): void {
+    if (this.masks.length === 0) {
+      return;
+    }
+    const index = Math.min(this.selectedMask, this.masks.length - 1);
+    this.masks[index].strokes = [];
+    this.drawMaskOverlay();
+    this.scheduleRender(false);
+  }
+
+  private setMaskExposure(value: number): void {
+    if (this.masks.length === 0) {
+      return;
+    }
+    this.maskExposure = value;
+    const index = Math.min(this.selectedMask, this.masks.length - 1);
+    this.masks[index].exposure = value;
+    this.scheduleRender(false);
+  }
+
+  private drawMaskOverlay(): void {
+    const ctx = this.maskContext;
+    const width = ctx.width;
+    const height = ctx.height;
+    ctx.clearRect(0, 0, width, height);
+    if (!this.maskMode || width <= 0 || height <= 0 || this.lastW <= 0 || this.lastH <= 0) {
+      return;
+    }
+    const imageAspect = this.lastW / this.lastH;
+    const areaAspect = width / height;
+    let imageW = width;
+    let imageH = height;
+    let imageX = 0;
+    let imageY = 0;
+    if (imageAspect > areaAspect) {
+      imageW = width;
+      imageH = width / imageAspect;
+      imageY = (height - imageH) / 2;
+    } else {
+      imageH = height;
+      imageW = height * imageAspect;
+      imageX = (width - imageW) / 2;
+    }
+    for (let i = 0; i < this.masks.length; i++) {
+      const mask = this.masks[i];
+      if (!mask.visible) {
+        continue;
+      }
+      const lineWidth = Math.max(2, (mask.size / 100) * Math.min(imageW, imageH));
+      for (let j = 0; j < mask.strokes.length; j++) {
+        const stroke = mask.strokes[j];
+        if (stroke.points.length === 0) {
+          continue;
+        }
+        ctx.strokeStyle = stroke.erase ? 'rgba(80,160,255,0.45)' : 'rgba(255,64,64,0.42)';
+        ctx.fillStyle = stroke.erase ? 'rgba(80,160,255,0.45)' : 'rgba(255,64,64,0.42)';
+        ctx.lineWidth = lineWidth;
+        ctx.lineCap = 'round';
+        ctx.lineJoin = 'round';
+        if (stroke.points.length === 1) {
+          const px = imageX + stroke.points[0][0] * imageW;
+          const py = imageY + stroke.points[0][1] * imageH;
+          ctx.beginPath();
+          ctx.arc(px, py, lineWidth / 2, 0, Math.PI * 2);
+          ctx.fill();
+          continue;
+        }
+        ctx.beginPath();
+        for (let k = 0; k < stroke.points.length; k++) {
+          const px = imageX + stroke.points[k][0] * imageW;
+          const py = imageY + stroke.points[k][1] * imageH;
+          if (k === 0) {
+            ctx.moveTo(px, py);
+          } else {
+            ctx.lineTo(px, py);
+          }
+        }
+        ctx.stroke();
+      }
+    }
+  }
+
+  private handleMaskTouch(x: number, y: number, phase: number): void {
+    if (!this.maskMode || this.masks.length === 0) {
+      return;
+    }
+    const ctx = this.maskContext;
+    const width = ctx.width;
+    const height = ctx.height;
+    if (width <= 0 || height <= 0 || this.lastW <= 0 || this.lastH <= 0) {
+      return;
+    }
+    const imageAspect = this.lastW / this.lastH;
+    const areaAspect = width / height;
+    let imageW = width;
+    let imageH = height;
+    let imageX = 0;
+    let imageY = 0;
+    if (imageAspect > areaAspect) {
+      imageW = width;
+      imageH = width / imageAspect;
+      imageY = (height - imageH) / 2;
+    } else {
+      imageH = height;
+      imageW = height * imageAspect;
+      imageX = (width - imageW) / 2;
+    }
+    const nx = (x - imageX) / imageW;
+    const ny = (y - imageY) / imageH;
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) {
+      return;
+    }
+    const index = Math.min(this.selectedMask, this.masks.length - 1);
+    const mask = this.masks[index];
+
+    if (phase === TouchType.Down) {
+      const stroke = new StrokeItem();
+      stroke.erase = this.brushErase;
+      stroke.points = [[nx, ny]];
+      mask.strokes = mask.strokes.concat([stroke]);
+      this.paintingMask = mask.strokes.length - 1;
+      this.drawMaskOverlay();
+      return;
+    }
+    if (phase === TouchType.Move && this.paintingMask >= 0) {
+      const stroke = mask.strokes[this.paintingMask];
+      const last = stroke.points[stroke.points.length - 1];
+      const dx = nx - last[0];
+      const dy = ny - last[1];
+      if (dx * dx + dy * dy > 0.00002) {
+        stroke.points = stroke.points.concat([[nx, ny]]);
+        this.drawMaskOverlay();
+      }
+      return;
+    }
+    if (phase === TouchType.Up || phase === TouchType.Cancel) {
+      this.paintingMask = -1;
+      this.scheduleRender(false);
+    }
   }
 
   // MARK: - 预设
