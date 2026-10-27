@@ -6,6 +6,9 @@
 import { router } from '@kit.ArkUI';
 import { image } from '@kit.ImageKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
+import { preferences } from '@kit.ArkData';
+import common from '@ohos.app.ability.common';
+import promptAction from '@ohos.promptAction';
 import NativeBridge from '../core/NativeBridge';
 
 /** 解码后的像素缓冲。 */
@@ -183,6 +186,11 @@ interface CurvesPayload {
   blue: ToneCurvePayload;
 }
 
+/** 裁剪。 */
+interface CropPayload {
+  rect: number[];
+}
+
 /** 整份渲染参数。 */
 interface ParamsPayload {
   light: LightPayload;
@@ -196,6 +204,7 @@ interface ParamsPayload {
   effects: EffectsPayload;
   detail: DetailPayload;
   curves: CurvesPayload;
+  crop: CropPayload;
 }
 
 /** 曲线控制点（可变）。 */
@@ -342,6 +351,11 @@ struct EditorPage {
   @State nums: number[] = [];
   @State lensProfile: boolean = false;
   @State curveChannel: number = 0;
+  @State showPresets: boolean = false;
+  @State presetNames: string[] = [];
+  @State cropMode: boolean = false;
+  /** 归一化裁剪矩形 [x, y, w, h]。 */
+  @State cropRect: number[] = [0, 0, 1, 1];
 
   // HSL（8 段）
   @State hslBand: number = 0;
@@ -374,6 +388,16 @@ struct EditorPage {
   private histContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.histSettings);
   private curveSettings: RenderingContextSettings = new RenderingContextSettings(true);
   private curveContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.curveSettings);
+  private cropSettings: RenderingContextSettings = new RenderingContextSettings(true);
+  private cropContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.cropSettings);
+
+  /** 上一帧渲染结果的尺寸（算裁剪框显示位置用）。 */
+  private lastW: number = 0;
+  private lastH: number = 0;
+  private cropSaved: number[] = [0, 0, 1, 1];
+  private cropHandle: number = -1;
+  private cropLastX: number = 0;
+  private cropLastY: number = 0;
 
   /** 4 条曲线：0 RGB / 1 红 / 2 绿 / 3 蓝。 */
   private curvePoints: CurvePt[][] = [];
@@ -393,6 +417,7 @@ struct EditorPage {
   private histB: number[] = [];
   private histCols: number[] = [];
   private histPeak: number = 1;
+  private presetStore: preferences.Preferences | null = null;
 
   aboutToAppear(): void {
     const params = router.getParams() as EditorParams;
@@ -411,6 +436,7 @@ struct EditorPage {
       [new CurvePt(0, 0), new CurvePt(1, 1)],
       [new CurvePt(0, 0), new CurvePt(1, 1)]
     ];
+    this.initPresets();
     this.loadPhoto();
   }
 
@@ -502,6 +528,11 @@ struct EditorPage {
       const pixelMap = await image.createPixelMap(result.data, options);
       const previous = this.preview;
       this.preview = pixelMap;
+      this.lastW = result.width;
+      this.lastH = result.height;
+      if (this.cropMode) {
+        this.drawCropOverlay();
+      }
       if (previous !== null) {
         previous.release();
       }
@@ -650,6 +681,7 @@ struct EditorPage {
         }
       },
       curves: this.curvesPayload(),
+      crop: { rect: this.cropMode ? [0, 0, 1, 1] : this.cropRect },
       equalizer: {
         enabled: true,
         threshold: this.num(I_EQ_THRESHOLD),
@@ -982,7 +1014,30 @@ struct EditorPage {
             .width('100%')
             .height('100%')
         }
+        if (this.cropMode) {
+          Canvas(this.cropContext)
+            .width('100%')
+            .height('100%')
+            .onReady(() => {
+              this.drawCropOverlay();
+            })
+            .onTouch((event: TouchEvent) => {
+              if (event.touches.length === 0) {
+                return;
+              }
+              const touch = event.touches[0];
+              this.handleCropTouch(touch.x, touch.y, event.type);
+            })
+        }
+        if (this.showPresets) {
+          this.presetOverlay()
+        }
       }
+      .onAreaChange((oldArea: Area, newArea: Area) => {
+        if (this.cropMode) {
+          this.drawCropOverlay();
+        }
+      })
       .width('100%')
       .layoutWeight(1)
       .backgroundColor('#000000')
@@ -998,7 +1053,11 @@ struct EditorPage {
           this.drawHistogram();
         })
 
-      this.bottomPanel()
+      if (this.cropMode) {
+        this.cropBar()
+      } else {
+        this.bottomPanel()
+      }
     }
     .width('100%')
     .height('100%')
@@ -1021,6 +1080,29 @@ struct EditorPage {
         .textAlign(TextAlign.Center)
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
+      Text('预设')
+        .fontSize(13)
+        .fontColor('#4A9EFF')
+        .padding({ right: 10 })
+        .onClick(() => {
+          this.showPresets = true;
+        })
+      Text('裁剪')
+        .fontSize(13)
+        .fontColor('#4A9EFF')
+        .padding({ right: 10 })
+        .onClick(() => {
+          if (!this.cropMode) {
+            this.enterCrop();
+          }
+        })
+      Text('导出')
+        .fontSize(13)
+        .fontColor('#4A9EFF')
+        .padding({ right: 10 })
+        .onClick(() => {
+          this.exportPhoto();
+        })
       Text(this.statusText)
         .fontSize(11)
         .fontColor('#888888')
@@ -1069,6 +1151,127 @@ struct EditorPage {
     .width('100%')
     .height(400)
     .backgroundColor('#1A1A1A')
+  }
+
+  @Builder
+  cropBar() {
+    Column() {
+      Row() {
+        ForEach(['自由', '1:1', '4:3', '16:9', '3:2'], (label: string, index: number) => {
+          Text(label)
+            .fontSize(12)
+            .fontColor('#DDDDDD')
+            .backgroundColor('#2A2A2A')
+            .borderRadius(6)
+            .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+            .margin({ right: 6 })
+            .onClick(() => {
+              const ratios: number[] = [0, 1, 4 / 3, 16 / 9, 3 / 2];
+              this.setAspect(ratios[index]);
+            })
+        })
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 10, bottom: 8 })
+
+      Row() {
+        Text('取消')
+          .fontSize(14)
+          .fontColor('#CCCCCC')
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .height(44)
+          .onClick(() => {
+            this.cancelCrop();
+          })
+        Text('应用')
+          .fontSize(14)
+          .fontColor('#4A9EFF')
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .height(44)
+          .onClick(() => {
+            this.applyCrop();
+          })
+      }
+      .width('100%')
+
+      Text('拖动四角改裁剪范围，拖框内移动')
+        .fontSize(11)
+        .fontColor('#777777')
+        .margin({ top: 6 })
+    }
+    .width('100%')
+    .height(160)
+    .backgroundColor('#1A1A1A')
+  }
+
+  @Builder
+  presetOverlay() {
+    Column() {
+      Row() {
+        Text('预设')
+          .fontSize(14)
+          .fontColor('#FFFFFF')
+          .layoutWeight(1)
+        Text('保存当前')
+          .fontSize(12)
+          .fontColor('#4A9EFF')
+          .padding({ right: 14 })
+          .onClick(() => {
+            this.savePreset();
+          })
+        Text('关闭')
+          .fontSize(12)
+          .fontColor('#888888')
+          .onClick(() => {
+            this.showPresets = false;
+          })
+      }
+      .width('100%')
+      .height(42)
+      .padding({ left: 14, right: 14 })
+
+      if (this.presetNames.length === 0) {
+        Text('还没有预设：调好参数后点「保存当前」')
+          .fontSize(11)
+          .fontColor('#888888')
+          .margin({ top: 24 })
+      } else {
+        Scroll() {
+          Column() {
+            ForEach(this.presetNames, (name: string) => {
+              Row() {
+                Text(name)
+                  .fontSize(13)
+                  .fontColor('#DDDDDD')
+                  .layoutWeight(1)
+                Text('删除')
+                  .fontSize(11)
+                  .fontColor('#F06060')
+                  .padding({ left: 12 })
+                  .onClick(() => {
+                    this.deletePreset(name);
+                  })
+              }
+              .width('100%')
+              .height(44)
+              .padding({ left: 14, right: 14 })
+              .onClick(() => {
+                this.applyPreset(name);
+              })
+            }, (name: string) => name)
+          }
+        }
+        .layoutWeight(1)
+        .scrollBar(BarState.Off)
+      }
+    }
+    .width('72%')
+    .height('58%')
+    .backgroundColor('#E61E1E1E')
+    .borderRadius(10)
+    .clip(true)
   }
 
   @Builder
@@ -1688,6 +1891,406 @@ struct EditorPage {
     this.curvePoints[this.curveChannel] = [new CurvePt(0, 0), new CurvePt(1, 1)];
     this.drawCurveEditor();
     this.scheduleRender(false);
+  }
+
+  // MARK: - 裁剪
+
+  private enterCrop(): void {
+    this.cropSaved = this.cropRect.slice();
+    this.cropMode = true;
+    this.scheduleRender(false);
+  }
+
+  private applyCrop(): void {
+    this.cropMode = false;
+    this.scheduleRender(false);
+  }
+
+  private cancelCrop(): void {
+    this.cropRect = this.cropSaved;
+    this.cropMode = false;
+    this.scheduleRender(false);
+  }
+
+  private setAspect(ratio: number): void {
+    if (ratio <= 0 || this.lastW <= 0 || this.lastH <= 0) {
+      return;
+    }
+    const imageAspect = this.lastW / this.lastH;
+    let width = 1;
+    let height = 1;
+    if (ratio > imageAspect) {
+      width = 1;
+      height = imageAspect / ratio;
+    } else {
+      height = 1;
+      width = ratio / imageAspect;
+    }
+    const centerX = this.cropRect[0] + this.cropRect[2] / 2;
+    const centerY = this.cropRect[1] + this.cropRect[3] / 2;
+    let x = centerX - width / 2;
+    let y = centerY - height / 2;
+    x = Math.min(Math.max(x, 0), 1 - width);
+    y = Math.min(Math.max(y, 0), 1 - height);
+    this.cropRect = [x, y, width, height];
+    this.drawCropOverlay();
+  }
+
+  private drawCropOverlay(): void {
+    const ctx = this.cropContext;
+    const width = ctx.width;
+    const height = ctx.height;
+    ctx.clearRect(0, 0, width, height);
+    if (width <= 0 || height <= 0 || this.lastW <= 0 || this.lastH <= 0) {
+      return;
+    }
+    const imageAspect = this.lastW / this.lastH;
+    const areaAspect = width / height;
+    let imageW = width;
+    let imageH = height;
+    let imageX = 0;
+    let imageY = 0;
+    if (imageAspect > areaAspect) {
+      imageW = width;
+      imageH = width / imageAspect;
+      imageY = (height - imageH) / 2;
+    } else {
+      imageH = height;
+      imageW = height * imageAspect;
+      imageX = (width - imageW) / 2;
+    }
+    const rx = imageX + this.cropRect[0] * imageW;
+    const ry = imageY + this.cropRect[1] * imageH;
+    const rw = this.cropRect[2] * imageW;
+    const rh = this.cropRect[3] * imageH;
+
+    // 裁掉的部分压暗
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+    ctx.fillRect(0, 0, width, ry);
+    ctx.fillRect(0, ry + rh, width, height - ry - rh);
+    ctx.fillRect(0, ry, rx, rh);
+    ctx.fillRect(rx + rw, ry, width - rx - rw, rh);
+
+    // 边框 + 三分线
+    ctx.strokeStyle = '#FFFFFF';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(rx, ry, rw, rh);
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 3; i++) {
+      ctx.beginPath();
+      ctx.moveTo(rx + (rw * i) / 3, ry);
+      ctx.lineTo(rx + (rw * i) / 3, ry + rh);
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.moveTo(rx, ry + (rh * i) / 3);
+      ctx.lineTo(rx + rw, ry + (rh * i) / 3);
+      ctx.stroke();
+    }
+
+    // 四角把手
+    const corners: number[][] = [
+      [rx, ry], [rx + rw, ry], [rx, ry + rh], [rx + rw, ry + rh]
+    ];
+    ctx.fillStyle = '#FFFFFF';
+    for (let i = 0; i < corners.length; i++) {
+      ctx.fillRect(corners[i][0] - 6, corners[i][1] - 6, 12, 12);
+    }
+  }
+
+  private handleCropTouch(x: number, y: number, phase: number): void {
+    const ctx = this.cropContext;
+    const width = ctx.width;
+    const height = ctx.height;
+    if (width <= 0 || height <= 0 || this.lastW <= 0 || this.lastH <= 0) {
+      return;
+    }
+    const imageAspect = this.lastW / this.lastH;
+    const areaAspect = width / height;
+    let imageW = width;
+    let imageH = height;
+    let imageX = 0;
+    let imageY = 0;
+    if (imageAspect > areaAspect) {
+      imageW = width;
+      imageH = width / imageAspect;
+      imageY = (height - imageH) / 2;
+    } else {
+      imageH = height;
+      imageW = height * imageAspect;
+      imageX = (width - imageW) / 2;
+    }
+    const nx = Math.min(Math.max((x - imageX) / imageW, 0), 1);
+    const ny = Math.min(Math.max((y - imageY) / imageH, 0), 1);
+    const rx = imageX + this.cropRect[0] * imageW;
+    const ry = imageY + this.cropRect[1] * imageH;
+    const rw = this.cropRect[2] * imageW;
+    const rh = this.cropRect[3] * imageH;
+
+    if (phase === TouchType.Down) {
+      const corners: number[][] = [
+        [rx, ry], [rx + rw, ry], [rx, ry + rh], [rx + rw, ry + rh]
+      ];
+      this.cropHandle = -1;
+      for (let i = 0; i < corners.length; i++) {
+        const dx = x - corners[i][0];
+        const dy = y - corners[i][1];
+        if (Math.sqrt(dx * dx + dy * dy) <= 30) {
+          this.cropHandle = i;
+          break;
+        }
+      }
+      if (this.cropHandle < 0 && x >= rx && x <= rx + rw && y >= ry && y <= ry + rh) {
+        this.cropHandle = 4;
+      }
+      this.cropLastX = nx;
+      this.cropLastY = ny;
+      return;
+    }
+
+    if (phase === TouchType.Move && this.cropHandle >= 0) {
+      const rect = this.cropRect.slice();
+      const dx = nx - this.cropLastX;
+      const dy = ny - this.cropLastY;
+      const minimum = 0.06;
+      if (this.cropHandle === 4) {
+        rect[0] = Math.min(Math.max(rect[0] + dx, 0), 1 - rect[2]);
+        rect[1] = Math.min(Math.max(rect[1] + dy, 0), 1 - rect[3]);
+      } else {
+        let left = rect[0];
+        let top = rect[1];
+        let right = rect[0] + rect[2];
+        let bottom = rect[1] + rect[3];
+        if (this.cropHandle === 0) {
+          left = Math.min(Math.max(left + dx, 0), right - minimum);
+          top = Math.min(Math.max(top + dy, 0), bottom - minimum);
+        } else if (this.cropHandle === 1) {
+          right = Math.max(Math.min(right + dx, 1), left + minimum);
+          top = Math.min(Math.max(top + dy, 0), bottom - minimum);
+        } else if (this.cropHandle === 2) {
+          left = Math.min(Math.max(left + dx, 0), right - minimum);
+          bottom = Math.max(Math.min(bottom + dy, 1), top + minimum);
+        } else {
+          right = Math.max(Math.min(right + dx, 1), left + minimum);
+          bottom = Math.max(Math.min(bottom + dy, 1), top + minimum);
+        }
+        rect[0] = left;
+        rect[1] = top;
+        rect[2] = right - left;
+        rect[3] = bottom - top;
+      }
+      this.cropRect = rect;
+      this.cropLastX = nx;
+      this.cropLastY = ny;
+      this.drawCropOverlay();
+      return;
+    }
+
+    if (phase === TouchType.Up || phase === TouchType.Cancel) {
+      this.cropHandle = -1;
+      this.scheduleRender(false);
+    }
+  }
+
+  // MARK: - 导出
+
+  /** 导出当前参数下的照片（先落应用缓存目录，相册写入用安全控件，下一阶段接）。 */
+  private async exportPhoto(): Promise<void> {
+    this.statusText = '导出中…';
+    try {
+      const buffer = await this.decode(this.photoUri, 4096);
+      if (buffer === null) {
+        this.statusText = '解码失败';
+        return;
+      }
+      const result = NativeBridge.render(buffer.data, buffer.width, buffer.height, this.paramsJson());
+      const options: image.InitializationOptions = {
+        size: { width: result.width, height: result.height },
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
+        pixelFormat: image.PixelMapFormat.RGBA_8888,
+        editable: false
+      };
+      const pixelMap = await image.createPixelMap(result.data, options);
+      const packer = image.createImagePacker();
+      const packed = await packer.packing(pixelMap, { format: 'image/jpeg', quality: 95 });
+      pixelMap.release();
+      packer.release();
+
+      const context = getContext(this) as common.UIAbilityContext;
+      const path = context.cacheDir + '/fdxmp_export_' + Date.now() + '.jpg';
+      const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+      fs.writeSync(file.fd, packed);
+      fs.closeSync(file);
+
+      this.statusText = '已导出 ' + result.width + '×' + result.height;
+      promptAction.showToast({ message: '已导出到缓存：' + path });
+    } catch (error) {
+      this.statusText = '导出失败';
+      promptAction.showToast({ message: '导出失败：' + NativeBridge.lastError() });
+    }
+  }
+
+  // MARK: - 预设
+
+  private async initPresets(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      this.presetStore = await preferences.getPreferences(context, 'fdxmp_presets');
+      const raw = await this.presetStore.get('names', '[]') as string;
+      this.presetNames = JSON.parse(raw) as string[];
+    } catch (error) {
+      this.presetNames = [];
+    }
+  }
+
+  private async savePreset(): Promise<void> {
+    const store = this.presetStore;
+    if (store === null) {
+      return;
+    }
+    const name = '预设 ' + (this.presetNames.length + 1);
+    try {
+      await store.put('preset_' + name, this.paramsJson());
+      const names = this.presetNames.concat([name]);
+      await store.put('names', JSON.stringify(names));
+      await store.flush();
+      this.presetNames = names;
+      promptAction.showToast({ message: '已保存 ' + name });
+    } catch (error) {
+      promptAction.showToast({ message: '保存失败' });
+    }
+  }
+
+  private async applyPreset(name: string): Promise<void> {
+    const store = this.presetStore;
+    if (store === null) {
+      return;
+    }
+    try {
+      const raw = await store.get('preset_' + name, '') as string;
+      if (raw.length === 0) {
+        return;
+      }
+      const payload = JSON.parse(raw) as ParamsPayload;
+      this.applyPayload(payload);
+      this.showPresets = false;
+      this.drawGraph();
+      this.drawCurveEditor();
+      this.scheduleRender(false);
+      promptAction.showToast({ message: '已应用 ' + name });
+    } catch (error) {
+      promptAction.showToast({ message: '应用失败' });
+    }
+  }
+
+  private async deletePreset(name: string): Promise<void> {
+    const store = this.presetStore;
+    if (store === null) {
+      return;
+    }
+    try {
+      await store.delete('preset_' + name);
+      const names: string[] = [];
+      for (let i = 0; i < this.presetNames.length; i++) {
+        if (this.presetNames[i] !== name) {
+          names.push(this.presetNames[i]);
+        }
+      }
+      await store.put('names', JSON.stringify(names));
+      await store.flush();
+      this.presetNames = names;
+    } catch (error) {
+      promptAction.showToast({ message: '删除失败' });
+    }
+  }
+
+  /** 把一份参数 JSON 灌回全部 UI 状态。 */
+  private applyPayload(payload: ParamsPayload): void {
+    const next = this.nums.slice();
+    next[I_TEMPERATURE] = payload.color.temperature;
+    next[I_TINT] = payload.color.tint;
+    next[I_VIBRANCE] = payload.color.vibrance;
+    next[I_SATURATION] = payload.color.saturation;
+    next[I_EQ_THRESHOLD] = payload.equalizer.threshold;
+    next[I_EQ_SMOOTHING] = payload.equalizer.smoothing_hue;
+    next[I_EQ_CONTRAST] = payload.equalizer.contrast;
+    next[I_CAL_RED_HUE] = payload.calibration.red_hue;
+    next[I_CAL_RED_SAT] = payload.calibration.red_sat;
+    next[I_CAL_GREEN_HUE] = payload.calibration.green_hue;
+    next[I_CAL_GREEN_SAT] = payload.calibration.green_sat;
+    next[I_CAL_BLUE_HUE] = payload.calibration.blue_hue;
+    next[I_CAL_BLUE_SAT] = payload.calibration.blue_sat;
+    next[I_CAL_SHADOW_TINT] = payload.calibration.shadows_tint;
+    next[I_CA] = payload.lens.chromatic_aberration;
+    next[I_LENS_VIGNETTE] = payload.lens.vignette;
+    next[I_DISTORTION] = payload.lens.geometry.distortion;
+    next[I_VERTICAL] = payload.lens.geometry.vertical;
+    next[I_HORIZONTAL] = payload.lens.geometry.horizontal;
+    next[I_ROTATE] = payload.lens.geometry.rotate;
+    next[I_SCALE] = payload.lens.geometry.scale;
+    next[I_TEXTURE] = payload.effects.texture;
+    next[I_CLARITY] = payload.effects.clarity;
+    next[I_DEHAZE] = payload.effects.dehaze;
+    next[I_VIGNETTE] = payload.effects.vignette;
+    next[I_VIGNETTE_MID] = payload.effects.vignette_midpoint;
+    next[I_VIGNETTE_FEATHER] = payload.effects.vignette_feather;
+    next[I_GRAIN] = payload.effects.grain;
+    next[I_GRAIN_SIZE] = payload.effects.grain_size;
+    next[I_GRAIN_ROUGH] = payload.effects.grain_roughness;
+    next[I_SHARPEN_AMOUNT] = payload.detail.sharpen.amount;
+    next[I_SHARPEN_RADIUS] = payload.detail.sharpen.radius;
+    next[I_SHARPEN_DETAIL] = payload.detail.sharpen.detail;
+    next[I_SHARPEN_MASK] = payload.detail.sharpen.masking;
+    next[I_NOISE_LUM] = payload.detail.noise.luminance;
+    next[I_NOISE_LUM_DETAIL] = payload.detail.noise.luminance_detail;
+    next[I_NOISE_LUM_CONTRAST] = payload.detail.noise.luminance_contrast;
+    next[I_NOISE_COLOR] = payload.detail.noise.color;
+    next[I_NOISE_COLOR_DETAIL] = payload.detail.noise.color_detail;
+    next[I_NOISE_COLOR_SMOOTH] = payload.detail.noise.color_smoothness;
+    this.nums = next;
+    this.blackWhite = payload.color.black_white;
+    this.lensProfile = payload.lens.profile_correction;
+    this.hslHue = [payload.hsl.red.hue, payload.hsl.orange.hue, payload.hsl.yellow.hue,
+      payload.hsl.green.hue, payload.hsl.aqua.hue, payload.hsl.blue.hue,
+      payload.hsl.purple.hue, payload.hsl.magenta.hue];
+    this.hslSat = [payload.hsl.red.saturation, payload.hsl.orange.saturation,
+      payload.hsl.yellow.saturation, payload.hsl.green.saturation, payload.hsl.aqua.saturation,
+      payload.hsl.blue.saturation, payload.hsl.purple.saturation, payload.hsl.magenta.saturation];
+    this.hslLum = [payload.hsl.red.luminance, payload.hsl.orange.luminance,
+      payload.hsl.yellow.luminance, payload.hsl.green.luminance, payload.hsl.aqua.luminance,
+      payload.hsl.blue.luminance, payload.hsl.purple.luminance, payload.hsl.magenta.luminance];
+    this.gradingHue = [payload.grading.shadows.hue, payload.grading.midtones.hue,
+      payload.grading.highlights.hue, payload.grading.global.hue];
+    this.gradingSat = [payload.grading.shadows.saturation, payload.grading.midtones.saturation,
+      payload.grading.highlights.saturation, payload.grading.global.saturation];
+    this.gradingLum = [payload.grading.shadows.luminance, payload.grading.midtones.luminance,
+      payload.grading.highlights.luminance, payload.grading.global.luminance];
+    this.gradingBlending = payload.grading.blending;
+    this.gradingBalance = payload.grading.balance;
+    this.bwMix = [payload.bw_mix.red, payload.bw_mix.orange, payload.bw_mix.yellow,
+      payload.bw_mix.green, payload.bw_mix.aqua, payload.bw_mix.blue, payload.bw_mix.purple,
+      payload.bw_mix.magenta];
+    this.eqHue = payload.equalizer.hue;
+    this.eqSat = payload.equalizer.saturation;
+    this.eqBri = payload.equalizer.brightness;
+    this.curvePoints = [
+      this.pointsFrom(payload.curves.rgb),
+      this.pointsFrom(payload.curves.red),
+      this.pointsFrom(payload.curves.green),
+      this.pointsFrom(payload.curves.blue)
+    ];
+  }
+
+  private pointsFrom(curve: ToneCurvePayload): CurvePt[] {
+    const points: CurvePt[] = [];
+    for (let i = 0; i < curve.points.length; i++) {
+      points.push(new CurvePt(curve.points[i].x, curve.points[i].y));
+    }
+    if (points.length < 2) {
+      points.push(new CurvePt(0, 0));
+      points.push(new CurvePt(1, 1));
+    }
+    return points;
   }
 
   // MARK: - 滑块
