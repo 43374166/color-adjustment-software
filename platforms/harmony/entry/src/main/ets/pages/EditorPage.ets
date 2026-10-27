@@ -298,6 +298,13 @@ interface EditorParams {
   name: string;
 }
 
+/** 最近编辑记录（与 Index 的编辑 Tab 共用 preferences 结构）。 */
+interface RecentEntry {
+  uri: string;
+  name: string;
+  time: number;
+}
+
 /** 一个标量滑块的规格（下标就是 nums 里的位置）。 */
 class SliderSpec {
   label: string;
@@ -460,6 +467,8 @@ struct EditorPage {
   @State showPresets: boolean = false;
   @State presetNames: string[] = [];
   @State cropMode: boolean = false;
+  /** 90° 旋转步数（0..3，解码时应用）。 */
+  @State rotationStep: number = 0;
   /** 归一化裁剪矩形 [x, y, w, h]。 */
   @State cropRect: number[] = [0, 0, 1, 1];
 
@@ -562,7 +571,7 @@ struct EditorPage {
       [new CurvePt(0, 0), new CurvePt(1, 1)]
     ];
     this.initPresets();
-    this.loadPhoto();
+    this.startup();
   }
 
   aboutToDisappear(): void {
@@ -570,6 +579,61 @@ struct EditorPage {
       clearTimeout(this.renderTimer);
       this.renderTimer = -1;
     }
+    this.saveCurrentEdit();
+  }
+
+  // MARK: - 每张照片的编辑记录
+
+  /** 用 uri 的短哈希做键，避免把整个 uri 塞进 preferences 的键名。 */
+  private photoKey(): string {
+    const text = this.photoUri;
+    let hash = 0;
+    for (let i = 0; i < text.length; i++) {
+      hash = (hash * 31 + text.charCodeAt(i)) | 0;
+    }
+    return (hash >>> 0).toString(36);
+  }
+
+  private async startup(): Promise<void> {
+    await this.loadSavedEdit();
+    await this.loadPhoto();
+  }
+
+  private async loadSavedEdit(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const store = await preferences.getPreferences(context, 'fdxmp_edits');
+      const key = this.photoKey();
+      const raw = await store.get('params_' + key, '') as string;
+      const rotation = await store.get('rotation_' + key, '0') as string;
+      this.rotationStep = Number(rotation) % 4;
+      if (raw.length > 0) {
+        const payload = JSON.parse(raw) as ParamsPayload;
+        this.applyPayload(payload, true);
+        this.drawGraph();
+        this.drawCurveEditor();
+      }
+    } catch (error) {
+    }
+  }
+
+  /** 保存当前照片的编辑参数 + 旋转步数。 */
+  private async saveCurrentEdit(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const store = await preferences.getPreferences(context, 'fdxmp_edits');
+      const key = this.photoKey();
+      await store.put('params_' + key, this.paramsJson());
+      await store.put('rotation_' + key, this.rotationStep.toString());
+      await store.flush();
+    } catch (error) {
+    }
+  }
+
+  /** 返回前保存一次。 */
+  private async leave(): Promise<void> {
+    await this.saveCurrentEdit();
+    router.back();
   }
 
   private zeros(count: number): number[] {
@@ -597,6 +661,41 @@ struct EditorPage {
 
   // MARK: - 解码 / 渲染
 
+  /** 按 rotationStep 把像素缓冲顺时针旋转 90°×n（宽高互换）。 */
+  private rotateBuffer(source: PixelBuffer): PixelBuffer {
+    const steps = ((this.rotationStep % 4) + 4) % 4;
+    if (steps === 0) {
+      return source;
+    }
+    let width = source.width;
+    let height = source.height;
+    let current = new Uint8Array(source.data);
+    for (let step = 0; step < steps; step++) {
+      const nextWidth = height;
+      const nextHeight = width;
+      const next = new Uint8Array(nextWidth * nextHeight * 4);
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const from = (y * width + x) * 4;
+          const to = (x * nextWidth + (height - 1 - y)) * 4;
+          next[to] = current[from];
+          next[to + 1] = current[from + 1];
+          next[to + 2] = current[from + 2];
+          next[to + 3] = current[from + 3];
+        }
+      }
+      current = next;
+      width = nextWidth;
+      height = nextHeight;
+    }
+    const rotated: PixelBuffer = {
+      width: width,
+      height: height,
+      data: current.buffer as ArrayBuffer
+    };
+    return rotated;
+  }
+
   private async decode(uri: string, maxEdge: number): Promise<PixelBuffer | null> {
     try {
       const file = fs.openSync(uri, fs.OpenMode.READ_ONLY);
@@ -620,7 +719,7 @@ struct EditorPage {
       source.release();
       fs.closeSync(file);
       const result: PixelBuffer = { width: width, height: height, data: buffer };
-      return result;
+      return this.rotateBuffer(result);
     } catch (error) {
       return null;
     }
@@ -1055,6 +1154,38 @@ struct EditorPage {
     return (deg / 360) * width;
   }
 
+  /** HSL → `rgb()` 字符串（ArkUI Canvas 不支持 CSS 的 hsl()）。 */
+  private hslColor(hue: number, saturation: number, lightness: number): string {
+    const h = (((hue % 360) + 360) % 360) / 360;
+    const s = Math.min(Math.max(saturation / 100, 0), 1);
+    const l = Math.min(Math.max(lightness / 100, 0), 1);
+    if (s === 0) {
+      const grey = Math.round(l * 255);
+      return 'rgb(' + grey + ',' + grey + ',' + grey + ')';
+    }
+    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
+    const p = 2 * l - q;
+    const channel = (t0: number): number => {
+      let t = t0;
+      if (t < 0) {
+        t += 1;
+      }
+      if (t > 1) {
+        t -= 1;
+      }
+      let value = p;
+      if (t < 1 / 6) {
+        value = p + (q - p) * 6 * t;
+      } else if (t < 0.5) {
+        value = q;
+      } else if (t < 2 / 3) {
+        value = p + (q - p) * (2 / 3 - t) * 6;
+      }
+      return Math.round(value * 255);
+    };
+    return 'rgb(' + channel(h + 1 / 3) + ',' + channel(h) + ',' + channel(h - 1 / 3) + ')';
+  }
+
   private drawGraph(): void {
     const ctx = this.context;
     const width = ctx.width;
@@ -1065,7 +1196,7 @@ struct EditorPage {
     const strips = 36;
     for (let i = 0; i < strips; i++) {
       const hue = Math.round((i * 360) / strips);
-      ctx.fillStyle = 'hsl(' + hue + ', 62%, 52%)';
+      ctx.fillStyle = this.hslColor(hue, 62, 52);
       ctx.fillRect((width * i) / strips, 0, width / strips + 1, height);
     }
     ctx.fillStyle = 'rgba(0, 0, 0, 0.18)';
@@ -1124,7 +1255,7 @@ struct EditorPage {
       ctx.fillStyle = '#1c1c1c';
       ctx.fill();
       ctx.lineWidth = 2.5;
-      ctx.strokeStyle = 'hsl(' + deg + ', 85%, 62%)';
+      ctx.strokeStyle = this.hslColor(deg, 85, 62);
       ctx.stroke();
       if (index === this.activeNode) {
         ctx.beginPath();
@@ -1140,7 +1271,7 @@ struct EditorPage {
         ctx.fillStyle = '#1c1c1c';
         ctx.fill();
         ctx.lineWidth = 2.5;
-        ctx.strokeStyle = 'hsl(' + deg + ', 85%, 62%)';
+        ctx.strokeStyle = this.hslColor(deg, 85, 62);
         ctx.stroke();
       }
     }
@@ -1285,62 +1416,80 @@ struct EditorPage {
 
   @Builder
   topBar() {
-    Row() {
-      Text('‹ 返回')
-        .fontSize(15)
-        .fontColor('#E8E8E8')
-        .onClick(() => {
-          router.back();
-        })
-      Text(this.photoName)
-        .fontSize(13)
-        .fontColor('#BBBBBB')
-        .layoutWeight(1)
-        .textAlign(TextAlign.Center)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-      Text('蒙版')
-        .fontSize(13)
-        .fontColor('#4A9EFF')
-        .padding({ right: 10 })
-        .onClick(() => {
-          if (!this.maskMode) {
-            this.enterMaskMode();
-          } else {
-            this.exitMaskMode();
-          }
-        })
-      Text('预设')
-        .fontSize(13)
-        .fontColor('#4A9EFF')
-        .padding({ right: 10 })
-        .onClick(() => {
-          this.showPresets = true;
-        })
-      Text('裁剪')
-        .fontSize(13)
-        .fontColor('#4A9EFF')
-        .padding({ right: 10 })
-        .onClick(() => {
-          if (!this.cropMode) {
-            this.enterCrop();
-          }
-        })
-      Text('导出')
-        .fontSize(13)
-        .fontColor('#4A9EFF')
-        .padding({ right: 10 })
-        .onClick(() => {
-          this.exportPhoto();
-        })
-      Text(this.statusText)
-        .fontSize(11)
-        .fontColor('#888888')
+    Column() {
+      Row() {
+        Text('‹ 返回')
+          .fontSize(15)
+          .fontColor('#E8E8E8')
+          .onClick(() => {
+            this.leave();
+          })
+        Text(this.shortName())
+          .fontSize(13)
+          .fontColor('#BBBBBB')
+          .layoutWeight(1)
+          .textAlign(TextAlign.Center)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .padding({ left: 8, right: 8 })
+        Text(this.statusText)
+          .fontSize(10)
+          .fontColor('#888888')
+      }
+      .width('100%')
+      .height(40)
+      .padding({ left: 14, right: 14 })
+
+      Row() {
+        ForEach(['蒙版', '预设', '裁剪', '旋转', '导出'], (label: string, index: number) => {
+          Text(label)
+            .fontSize(12)
+            .fontColor(index === 0 && this.maskMode ? '#FFFFFF' : '#4A9EFF')
+            .backgroundColor(index === 0 && this.maskMode ? '#2A2A2A' : Color.Transparent)
+            .borderRadius(6)
+            .layoutWeight(1)
+            .textAlign(TextAlign.Center)
+            .height(30)
+            .onClick(() => {
+              this.topAction(index);
+            })
+        }, (label: string, index: number) => label + index.toString())
+      }
+      .width('100%')
+      .height(34)
+      .padding({ left: 8, right: 8 })
     }
     .width('100%')
-    .height(48)
-    .padding({ left: 14, right: 14 })
     .backgroundColor('#1A1A1A')
+  }
+
+  private shortName(): string {
+    const name = this.photoName;
+    if (name.length <= 16) {
+      return name;
+    }
+    return name.substring(0, 14) + '…';
+  }
+
+  private topAction(index: number): void {
+    if (index === 0) {
+      if (!this.maskMode) {
+        this.enterMaskMode();
+      } else {
+        this.exitMaskMode();
+      }
+    } else if (index === 1) {
+      this.showPresets = true;
+    } else if (index === 2) {
+      if (!this.cropMode) {
+        this.enterCrop();
+      }
+    } else if (index === 3) {
+      this.rotationStep = (this.rotationStep + 1) % 4;
+      this.loadPhoto();
+    } else {
+      this.exportPhoto();
+    }
   }
 
   @Builder
@@ -2595,11 +2744,24 @@ struct EditorPage {
       };
       const pixelMap = await image.createPixelMap(result.data, options);
       const packer = image.createImagePacker();
-      const packed = await packer.packing(pixelMap, { format: 'image/jpeg', quality: 95 });
+      const context = getContext(this) as common.UIAbilityContext;
+
+      // 导出格式 / 质量来自「我的 → 导出」设置。
+      let format = 'jpeg';
+      let quality = 95;
+      try {
+        const settings = await preferences.getPreferences(context, 'fdxmp_export');
+        format = await settings.get('format', 'jpeg') as string;
+        quality = Number(await settings.get('quality', '95'));
+      } catch (error) {
+      }
+      const packOptions: image.PackingOption = {
+        format: format === 'png' ? 'image/png' : 'image/jpeg',
+        quality: quality
+      };
+      const packed = await packer.packing(pixelMap, packOptions);
       pixelMap.release();
       packer.release();
-
-      const context = getContext(this) as common.UIAbilityContext;
 
       // 优先写系统相册（需要 WRITE_IMAGEVIDEO 授权），失败则落到应用缓存目录。
       let savedToGallery = false;
@@ -2629,6 +2791,8 @@ struct EditorPage {
         this.statusText = '已导出 ' + result.width + '×' + result.height;
         promptAction.showToast({ message: '已导出到缓存：' + path });
       }
+      this.recordRecent();
+      this.saveCurrentEdit();
     } catch (error) {
       this.statusText = '导出失败';
       promptAction.showToast({ message: '导出失败：' + NativeBridge.lastError() });
@@ -3104,6 +3268,26 @@ struct EditorPage {
     }
   }
 
+  /** 记一条「最近编辑」（编辑 Tab 用）。 */
+  private async recordRecent(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const store = await preferences.getPreferences(context, 'fdxmp_recent');
+      const raw = await store.get('items', '[]') as string;
+      const items = JSON.parse(raw) as RecentEntry[];
+      const entry: RecentEntry = { uri: this.photoUri, name: this.photoName, time: Date.now() };
+      const next: RecentEntry[] = [entry];
+      for (let i = 0; i < items.length && next.length < 20; i++) {
+        if (items[i].uri !== this.photoUri) {
+          next.push(items[i]);
+        }
+      }
+      await store.put('items', JSON.stringify(next));
+      await store.flush();
+    } catch (error) {
+    }
+  }
+
   // MARK: - 预设
 
   private async initPresets(): Promise<void> {
@@ -3179,7 +3363,7 @@ struct EditorPage {
   }
 
   /** 把一份参数 JSON 灌回全部 UI 状态。 */
-  private applyPayload(payload: ParamsPayload): void {
+  private applyPayload(payload: ParamsPayload, restoreMasks: boolean = false): void {
     const next = this.nums.slice();
     next[I_TEMPERATURE] = payload.color.temperature;
     next[I_TINT] = payload.color.tint;
@@ -3253,6 +3437,73 @@ struct EditorPage {
       this.pointsFrom(payload.curves.green),
       this.pointsFrom(payload.curves.blue)
     ];
+    if (restoreMasks) {
+      this.cropRect = payload.crop.rect;
+      this.masks = this.masksFrom(payload.masks);
+      this.selectedMask = 0;
+      const restoredPoints: PointSample[] = [];
+      for (let i = 0; i < payload.point_colors.length; i++) {
+        const source = payload.point_colors[i];
+        const sample = new PointSample();
+        sample.lum = source.lum;
+        sample.chroma = source.chroma;
+        sample.hue = source.hue;
+        sample.hueShift = source.hue_shift;
+        sample.satShift = source.sat_shift;
+        sample.lumShift = source.lum_shift;
+        sample.hueRange = source.hue_range;
+        sample.satRange = source.sat_range;
+        sample.lumRange = source.lum_range;
+        restoredPoints.push(sample);
+      }
+      this.points = restoredPoints;
+      this.selectedPoint = 0;
+    }
+  }
+
+  /** 从参数 JSON 还原蒙版列表。 */
+  private masksFrom(source: MaskPayload[]): MaskItem[] {
+    const masks: MaskItem[] = [];
+    for (let i = 0; i < source.length; i++) {
+      const incoming = source[i];
+      const mask = new MaskItem();
+      mask.id = incoming.id;
+      mask.name = incoming.name;
+      mask.visible = incoming.visible;
+      mask.inverted = incoming.inverted;
+      mask.opacity = incoming.opacity;
+      mask.feather = incoming.feather;
+      const data = incoming.kind.data;
+      if (incoming.kind.type === 'linear_gradient' && data.start !== undefined && data.end !== undefined) {
+        mask.type = 1;
+        mask.startX = data.start[0];
+        mask.startY = data.start[1];
+        mask.endX = data.end[0];
+        mask.endY = data.end[1];
+      } else if (incoming.kind.type === 'radial_gradient' && data.center !== undefined &&
+        data.radii !== undefined) {
+        mask.type = 2;
+        mask.centerX = data.center[0];
+        mask.centerY = data.center[1];
+        mask.radiusX = data.radii[0];
+        mask.radiusY = data.radii[1];
+      } else {
+        mask.type = 0;
+        mask.size = data.size !== undefined ? data.size : 30;
+        const strokes = data.strokes;
+        if (strokes !== undefined) {
+          for (let j = 0; j < strokes.length; j++) {
+            const stroke = new StrokeItem();
+            stroke.erase = strokes[j].erase;
+            stroke.points = strokes[j].points;
+            mask.strokes = mask.strokes.concat([stroke]);
+          }
+        }
+      }
+      mask.adjustJson = JSON.stringify(incoming.adjustments);
+      masks.push(mask);
+    }
+    return masks;
   }
 
   private pointsFrom(curve: ToneCurvePayload): CurvePt[] {

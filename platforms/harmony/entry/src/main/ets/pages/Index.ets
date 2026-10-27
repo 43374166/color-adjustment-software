@@ -4,6 +4,8 @@
 // 设备 Tab 已接入相册（权限、网格 / 列表、搜索 / 排序 / 筛选、多选、全屏预览、
 // 系统相册导入与相机入口）；编辑与我的待后续阶段。
 import { router } from '@kit.ArkUI';
+import { fileIo as fs } from '@kit.CoreFileKit';
+import { preferences } from '@kit.ArkData';
 import abilityAccessCtrl, { Permissions } from '@ohos.abilityAccessCtrl';
 import common from '@ohos.app.ability.common';
 import dataSharePredicates from '@ohos.data.dataSharePredicates';
@@ -15,11 +17,22 @@ import cameraPicker from '@ohos.multimedia.cameraPicker';
 import { PhotoItem } from '../model/PhotoItem';
 import nativeCore from '../core/NativeBridge';
 
+/** 最近编辑记录（编辑 Tab 用）。 */
+interface RecentEntry {
+  uri: string;
+  name: string;
+  time: number;
+}
+
 @Entry
 @Component
 struct Index {
   @State activeTab: number = 0;
   @State coreVersion: string = '未加载';
+  @State recent: RecentEntry[] = [];
+  @State cacheBytes: number = 0;
+  @State exportFormat: string = 'jpeg';
+  @State exportQuality: number = 95;
   // 0 = 还没请求过，1 = 已授权，2 = 被拒绝
   @State permissionState: number = 0;
   @State loading: boolean = false;
@@ -45,6 +58,101 @@ struct Index {
   aboutToAppear(): void {
     this.coreVersion = nativeCore.version();
     this.requestPermission();
+    this.loadRecent();
+    this.refreshCacheSize();
+    this.loadExportSettings();
+  }
+
+  private async loadExportSettings(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const store = await preferences.getPreferences(context, 'fdxmp_export');
+      this.exportFormat = await store.get('format', 'jpeg') as string;
+      this.exportQuality = Number(await store.get('quality', '95'));
+    } catch (error) {
+    }
+  }
+
+  private async saveExportSettings(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const store = await preferences.getPreferences(context, 'fdxmp_export');
+      await store.put('format', this.exportFormat);
+      await store.put('quality', this.exportQuality.toString());
+      await store.flush();
+    } catch (error) {
+    }
+  }
+
+  /* ------------------------------------------------------------ 编辑记录 / 缓存 */
+
+  private async loadRecent(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const store = await preferences.getPreferences(context, 'fdxmp_recent');
+      const raw = await store.get('items', '[]') as string;
+      this.recent = JSON.parse(raw) as RecentEntry[];
+    } catch (error) {
+      this.recent = [];
+    }
+  }
+
+  private async refreshCacheSize(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const files = fs.listFileSync(context.cacheDir);
+      let total = 0;
+      for (let i = 0; i < files.length; i++) {
+        try {
+          const stat = fs.statSync(context.cacheDir + '/' + files[i]);
+          total += stat.size;
+        } catch (error) {
+        }
+      }
+      this.cacheBytes = total;
+    } catch (error) {
+      this.cacheBytes = 0;
+    }
+  }
+
+  private async clearCache(): Promise<void> {
+    try {
+      const context = getContext(this) as common.UIAbilityContext;
+      const files = fs.listFileSync(context.cacheDir);
+      for (let i = 0; i < files.length; i++) {
+        try {
+          fs.unlinkSync(context.cacheDir + '/' + files[i]);
+        } catch (error) {
+        }
+      }
+      promptAction.showToast({ message: '缓存已清理' });
+      this.refreshCacheSize();
+    } catch (error) {
+      promptAction.showToast({ message: '清理失败' });
+    }
+  }
+
+  private openEditor(uri: string, name: string): void {
+    router.pushUrl({ url: 'pages/EditorPage', params: { uri: uri, name: name } });
+  }
+
+  private formatTime(ms: number): string {
+    const date = new Date(ms);
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+    const day = date.getDate().toString().padStart(2, '0');
+    const hour = date.getHours().toString().padStart(2, '0');
+    const minute = date.getMinutes().toString().padStart(2, '0');
+    return month + '-' + day + ' ' + hour + ':' + minute;
+  }
+
+  private formatBytes(bytes: number): string {
+    if (bytes >= 1024 * 1024) {
+      return (bytes / 1024 / 1024).toFixed(1) + ' MB';
+    }
+    if (bytes >= 1024) {
+      return (bytes / 1024).toFixed(0) + ' KB';
+    }
+    return bytes.toString() + ' B';
   }
 
   /* ------------------------------------------------------------ 数据 */
@@ -274,6 +382,11 @@ struct Index {
         .justifyContent(FlexAlign.Center)
         .onClick(() => {
           this.activeTab = index;
+          if (index === 1) {
+            this.loadRecent();
+          } else if (index === 2) {
+            this.refreshCacheSize();
+          }
         })
       }, (label: string) => label)
     }
@@ -648,38 +761,229 @@ struct Index {
 
   @Builder
   editTab() {
-    Column({ space: 8 }) {
-      Text('编辑')
-        .fontSize(18)
-        .fontColor('#E8E8E8')
-      Text('已编辑记录 + 缩略图 + 预设名')
-        .fontSize(14)
-        .fontColor('#CCCCCC')
-      Text('空状态时引导去设备 Tab 选图；编辑界面阶段 6 接入')
-        .fontSize(12)
-        .fontColor('#888888')
+    Scroll() {
+      Column({ space: 12 }) {
+        Row() {
+          Text('最近编辑')
+            .fontSize(14)
+            .fontColor('#E8E8E8')
+            .layoutWeight(1)
+          Text('刷新')
+            .fontSize(12)
+            .fontColor('#4A9EFF')
+            .onClick(() => {
+              this.loadRecent();
+            })
+        }
+        .width('100%')
+
+        if (this.recent.length === 0) {
+          Column({ space: 8 }) {
+            Text('还没有编辑记录')
+              .fontSize(13)
+              .fontColor('#888888')
+            Text('去「设备」选一张照片开始编辑')
+              .fontSize(11)
+              .fontColor('#666666')
+            Button('去设备选照片')
+              .fontSize(12)
+              .backgroundColor('#1F3B5A')
+              .fontColor('#9FD0FF')
+              .onClick(() => {
+                this.activeTab = 0;
+              })
+          }
+          .width('100%')
+          .padding(20)
+          .backgroundColor('#151515')
+          .borderRadius(10)
+        } else {
+          ForEach(this.recent, (item: RecentEntry) => {
+            Row({ space: 10 }) {
+              Image(item.uri)
+                .width(56)
+                .height(56)
+                .objectFit(ImageFit.Cover)
+                .borderRadius(6)
+              Column({ space: 4 }) {
+                Text(item.name)
+                  .fontSize(13)
+                  .fontColor('#DDDDDD')
+                  .maxLines(1)
+                  .textOverflow({ overflow: TextOverflow.Ellipsis })
+                Text(this.formatTime(item.time))
+                  .fontSize(10)
+                  .fontColor('#777777')
+              }
+              .alignItems(HorizontalAlign.Start)
+              .layoutWeight(1)
+
+              Text('继续编辑')
+                .fontSize(12)
+                .fontColor('#4A9EFF')
+            }
+            .width('100%')
+            .padding(10)
+            .backgroundColor('#151515')
+            .borderRadius(10)
+            .onClick(() => {
+              this.openEditor(item.uri, item.name);
+            })
+          }, (item: RecentEntry) => item.uri + item.time.toString())
+        }
+      }
+      .padding(16)
     }
     .width('100%')
     .layoutWeight(1)
-    .justifyContent(FlexAlign.Center)
+    .align(Alignment.Top)
   }
 
   @Builder
   meTab() {
-    Column({ space: 8 }) {
-      Text('我的')
-        .fontSize(18)
-        .fontColor('#E8E8E8')
-      Text('账号 / 缓存管理 / 预设管理 / 主题 / 关于')
-        .fontSize(14)
-        .fontColor('#CCCCCC')
-      Text('清除缓存为核心功能（对应 Rust 侧 CacheManager）')
-        .fontSize(12)
-        .fontColor('#888888')
+    Scroll() {
+      Column({ space: 12 }) {
+        Column({ space: 8 }) {
+          Text('关于')
+            .fontSize(12)
+            .fontColor('#888888')
+            .width('100%')
+          Row() {
+            Text('核心版本')
+              .fontSize(12)
+              .fontColor('#AAAAAA')
+              .layoutWeight(1)
+            Text(this.coreVersion)
+              .fontSize(12)
+              .fontColor('#DDDDDD')
+          }
+          .width('100%')
+          Row() {
+            Text('C ABI')
+              .fontSize(12)
+              .fontColor('#AAAAAA')
+              .layoutWeight(1)
+            Text(nativeCore.abiVersion().toString())
+              .fontSize(12)
+              .fontColor('#DDDDDD')
+          }
+          .width('100%')
+          Text('调色核心与 Windows / iOS 同源 · 许可证 MIT')
+            .fontSize(10)
+            .fontColor('#666666')
+            .width('100%')
+        }
+        .width('100%')
+        .padding(14)
+        .backgroundColor('#151515')
+        .borderRadius(10)
+
+        Column({ space: 10 }) {
+          Text('导出')
+            .fontSize(12)
+            .fontColor('#888888')
+            .width('100%')
+          Row() {
+            Text('格式')
+              .fontSize(12)
+              .fontColor('#AAAAAA')
+              .layoutWeight(1)
+            Row({ space: 6 }) {
+              Text('JPEG')
+                .fontSize(12)
+                .fontColor(this.exportFormat === 'jpeg' ? '#FFFFFF' : '#888888')
+                .backgroundColor(this.exportFormat === 'jpeg' ? '#3A3A3A' : '#242424')
+                .borderRadius(6)
+                .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+                .onClick(() => {
+                  this.exportFormat = 'jpeg';
+                  this.saveExportSettings();
+                })
+              Text('PNG')
+                .fontSize(12)
+                .fontColor(this.exportFormat === 'png' ? '#FFFFFF' : '#888888')
+                .backgroundColor(this.exportFormat === 'png' ? '#3A3A3A' : '#242424')
+                .borderRadius(6)
+                .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+                .onClick(() => {
+                  this.exportFormat = 'png';
+                  this.saveExportSettings();
+                })
+            }
+          }
+          .width('100%')
+
+          if (this.exportFormat === 'jpeg') {
+            Row({ space: 8 }) {
+              Text('质量')
+                .fontSize(12)
+                .fontColor('#AAAAAA')
+                .width(52)
+              Slider({ value: this.exportQuality, min: 50, max: 100, step: 1 })
+                .layoutWeight(1)
+                .blockColor('#E8E8E8')
+                .trackColor('#3A3A3A')
+                .selectedColor('#4A9EFF')
+                .onChange((value: number) => {
+                  this.exportQuality = value;
+                  this.saveExportSettings();
+                })
+              Text(this.exportQuality.toFixed(0))
+                .fontSize(12)
+                .fontColor('#DDDDDD')
+                .width(30)
+            }
+            .width('100%')
+          }
+        }
+        .width('100%')
+        .padding(14)
+        .backgroundColor('#151515')
+        .borderRadius(10)
+
+        Column({ space: 10 }) {
+          Text('缓存')
+            .fontSize(12)
+            .fontColor('#888888')
+            .width('100%')
+          Row() {
+            Text('占用')
+              .fontSize(12)
+              .fontColor('#AAAAAA')
+              .layoutWeight(1)
+            Text(this.formatBytes(this.cacheBytes))
+              .fontSize(12)
+              .fontColor('#DDDDDD')
+          }
+          .width('100%')
+          Row({ space: 10 }) {
+            Button('刷新')
+              .fontSize(12)
+              .backgroundColor('#242424')
+              .fontColor('#CCCCCC')
+              .onClick(() => {
+                this.refreshCacheSize();
+              })
+            Button('清除缓存')
+              .fontSize(12)
+              .backgroundColor('#3A2020')
+              .fontColor('#FF9A9A')
+              .onClick(() => {
+                this.clearCache();
+              })
+          }
+          .width('100%')
+        }
+        .width('100%')
+        .padding(14)
+        .backgroundColor('#151515')
+        .borderRadius(10)
+      }
+      .padding(16)
     }
     .width('100%')
     .layoutWeight(1)
-    .justifyContent(FlexAlign.Center)
+    .align(Alignment.Top)
   }
 
   build() {
