@@ -29,6 +29,7 @@ interface FdxmpNativeApi {
     paramsJson: string
   ): RenderResult;
   equalizerCurve(channel: number, paramsJson: string): ArrayBuffer;
+  oklch(r: number, g: number, b: number): ArrayBuffer;
 }
 
 const native: FdxmpNativeApi = nativeModule as FdxmpNativeApi;
@@ -71,6 +72,11 @@ export class NativeBridge {
    */
   static equalizerCurve(channel: number, paramsJson: string): Float32Array {
     return new Float32Array(native.equalizerCurve(channel, paramsJson));
+  }
+
+  /** 8bit sRGB → OkLCh（L / C / 色相弧度）。 */
+  static oklch(r: number, g: number, b: number): Float32Array {
+    return new Float32Array(native.oklch(r, g, b));
   }
 }
 

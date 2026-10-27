@@ -24,6 +24,9 @@ uint8_t *fdxmp_render_memory_rgba(const uint8_t *rgba, uint32_t width, uint32_t 
                                   const char *params_json, uint32_t *out_width,
                                   uint32_t *out_height, size_t *out_len);
 
+// 8bit sRGB → OkLCh（3 个 f32：L / C / 色相弧度）。
+int32_t fdxmp_color_oklch_from_srgb8(uint8_t r, uint8_t g, uint8_t b, float *out);
+
 // 512 点曲线；channel：0 色相 / 1 饱和度 / 2 亮度。
 int32_t fdxmp_equalizer_curve(uint32_t channel, const char *params_json, float *out);
 }
@@ -174,6 +177,35 @@ napi_value EqualizerCurve(napi_env env, napi_callback_info info) {
     return buffer;
 }
 
+// oklch(r, g, b) -> ArrayBuffer（3 个 f32：L / C / 色相弧度）
+napi_value Oklch(napi_env env, napi_callback_info info) {
+    size_t argc = 3;
+    napi_value argv[3] = {nullptr, nullptr, nullptr};
+    if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 3) {
+        return Throw(env, "oklch 需要 3 个参数");
+    }
+    uint32_t r = 0;
+    uint32_t g = 0;
+    uint32_t b = 0;
+    if (napi_get_value_uint32(env, argv[0], &r) != napi_ok ||
+        napi_get_value_uint32(env, argv[1], &g) != napi_ok ||
+        napi_get_value_uint32(env, argv[2], &b) != napi_ok) {
+        return Throw(env, "rgb 必须是整数");
+    }
+    float lch[3] = {0.0f, 0.0f, 0.0f};
+    if (fdxmp_color_oklch_from_srgb8(static_cast<uint8_t>(r & 0xFF), static_cast<uint8_t>(g & 0xFF),
+                                     static_cast<uint8_t>(b & 0xFF), lch) != 0) {
+        return Throw(env, LastError());
+    }
+    napi_value buffer = nullptr;
+    void *buffer_data = nullptr;
+    if (napi_create_arraybuffer(env, sizeof(lch), &buffer_data, &buffer) != napi_ok) {
+        return Throw(env, "分配缓冲区失败");
+    }
+    std::memcpy(buffer_data, lch, sizeof(lch));
+    return buffer;
+}
+
 napi_value Init(napi_env env, napi_value exports) {
     napi_property_descriptor desc[] = {
         {"version", nullptr, Version, nullptr, nullptr, nullptr, napi_default, nullptr},
@@ -183,6 +215,7 @@ napi_value Init(napi_env env, napi_value exports) {
          nullptr},
         {"equalizerCurve", nullptr, EqualizerCurve, nullptr, nullptr, nullptr, napi_default,
          nullptr},
+        {"oklch", nullptr, Oklch, nullptr, nullptr, nullptr, napi_default, nullptr},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;

@@ -41,3 +41,6 @@ export const renderMemoryRgba: (
  * paramsJson 传整份渲染参数（只读其中的 `equalizer`）。
  */
 export const equalizerCurve: (channel: number, paramsJson: string) => ArrayBuffer;
+
+/** 8bit sRGB → OkLCh（3 个 float32：L / C / 色相弧度）。 */
+export const oklch: (r: number, g: number, b: number) => ArrayBuffer;

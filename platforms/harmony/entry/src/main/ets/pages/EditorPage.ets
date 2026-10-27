@@ -9,6 +9,8 @@ import { fileIo as fs } from '@kit.CoreFileKit';
 import { preferences } from '@kit.ArkData';
 import common from '@ohos.app.ability.common';
 import promptAction from '@ohos.promptAction';
+import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
+import photoAccessHelper from '@ohos.file.photoAccessHelper';
 import NativeBridge from '../core/NativeBridge';
 
 /** 解码后的像素缓冲。 */
@@ -191,6 +193,21 @@ interface CropPayload {
   rect: number[];
 }
 
+/** 点颜色样本。 */
+interface PointColorPayload {
+  lum: number;
+  chroma: number;
+  hue: number;
+  hue_shift: number;
+  sat_shift: number;
+  lum_shift: number;
+  variance: number;
+  range: number;
+  hue_range: number;
+  sat_range: number;
+  lum_range: number;
+}
+
 /** 整份渲染参数。 */
 interface ParamsPayload {
   light: LightPayload;
@@ -205,6 +222,7 @@ interface ParamsPayload {
   detail: DetailPayload;
   curves: CurvesPayload;
   crop: CropPayload;
+  point_colors: PointColorPayload[];
 }
 
 /** 曲线控制点（可变）。 */
@@ -216,6 +234,22 @@ class CurvePt {
     this.x = x;
     this.y = y;
   }
+}
+
+/** 一个点颜色样本（含取色时的 sRGB，画色块用）。 */
+class PointSample {
+  r: number = 0;
+  g: number = 0;
+  b: number = 0;
+  lum: number = 0;
+  chroma: number = 0;
+  hue: number = 0;
+  hueShift: number = 0;
+  satShift: number = 0;
+  lumShift: number = 0;
+  hueRange: number = 50;
+  satRange: number = 50;
+  lumRange: number = 50;
 }
 
 /** 路由参数。 */
@@ -356,6 +390,13 @@ struct EditorPage {
   @State cropMode: boolean = false;
   /** 归一化裁剪矩形 [x, y, w, h]。 */
   @State cropRect: number[] = [0, 0, 1, 1];
+
+  // 点颜色
+  @State points: PointSample[] = [];
+  @State selectedPoint: number = 0;
+  @State picking: boolean = false;
+  @State areaW: number = 0;
+  @State areaH: number = 0;
 
   // HSL（8 段）
   @State hslBand: number = 0;
@@ -682,6 +723,7 @@ struct EditorPage {
       },
       curves: this.curvesPayload(),
       crop: { rect: this.cropMode ? [0, 0, 1, 1] : this.cropRect },
+      point_colors: this.pointColorsPayload(),
       equalizer: {
         enabled: true,
         threshold: this.num(I_EQ_THRESHOLD),
@@ -1034,8 +1076,15 @@ struct EditorPage {
         }
       }
       .onAreaChange((oldArea: Area, newArea: Area) => {
+        this.areaW = Number(newArea.width);
+        this.areaH = Number(newArea.height);
         if (this.cropMode) {
           this.drawCropOverlay();
+        }
+      })
+      .onClick((event: ClickEvent) => {
+        if (this.picking) {
+          this.sampleAt(event.x, event.y);
         }
       })
       .width('100%')
@@ -1204,6 +1253,137 @@ struct EditorPage {
     .width('100%')
     .height(160)
     .backgroundColor('#1A1A1A')
+  }
+
+  private pointValue(kind: number): number {
+    if (this.points.length === 0) {
+      return 0;
+    }
+    const index = Math.min(this.selectedPoint, this.points.length - 1);
+    const point = this.points[index];
+    if (kind === 200) {
+      return point.hueShift;
+    }
+    if (kind === 201) {
+      return point.satShift;
+    }
+    if (kind === 202) {
+      return point.lumShift;
+    }
+    if (kind === 203) {
+      return point.hueRange;
+    }
+    if (kind === 204) {
+      return point.satRange;
+    }
+    return point.lumRange;
+  }
+
+  @Builder
+  pointColorPanel() {
+    Column({ space: 4 }) {
+      Row() {
+        Text(this.picking ? '点击预览取色…' : '＋ 点预览取色')
+          .fontSize(12)
+          .fontColor('#4A9EFF')
+          .onClick(() => {
+            this.picking = !this.picking;
+          })
+        Text('最多 4 个')
+          .fontSize(10)
+          .fontColor('#777777')
+          .padding({ left: 8 })
+      }
+      .width('100%')
+
+      if (this.points.length === 0) {
+        Text('取色后可以用色相 / 饱和度 / 明亮度 + 范围做局部调整')
+          .fontSize(11)
+          .fontColor('#777777')
+          .margin({ top: 6 })
+      } else {
+        Row({ space: 8 }) {
+          ForEach(this.points, (point: PointSample, index: number) => {
+            Stack() {
+              Circle({ width: 30, height: 30 })
+                .fill('rgb(' + point.r + ',' + point.g + ',' + point.b + ')')
+              if (this.selectedPoint === index) {
+                Circle({ width: 38, height: 38 })
+                  .fill(Color.Transparent)
+                  .stroke('#4A9EFF')
+                  .strokeWidth(2)
+              }
+            }
+            .width(44)
+            .height(44)
+            .onClick(() => {
+              this.selectedPoint = index;
+            })
+          }, (point: PointSample, index: number) => index.toString())
+
+          Text('删除')
+            .fontSize(11)
+            .fontColor('#F06060')
+            .padding({ left: 6 })
+            .onClick(() => {
+              this.removePoint(Math.min(this.selectedPoint, this.points.length - 1));
+            })
+        }
+        .width('100%')
+
+        this.pointSliderRow('色相', 200, -100, 100)
+        this.pointSliderRow('饱和度', 201, -100, 100)
+        this.pointSliderRow('明亮度', 202, -100, 100)
+        this.pointSliderRow('范围·色相', 203, 0, 100)
+        this.pointSliderRow('范围·饱和度', 204, 0, 100)
+        this.pointSliderRow('范围·明亮度', 205, 0, 100)
+      }
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 4 })
+  }
+
+  @Builder
+  pointSliderRow(label: string, kind: number, min: number, max: number) {
+    Row({ space: 8 }) {
+      Text(label)
+        .fontSize(11)
+        .fontColor('#AAAAAA')
+        .width(78)
+      Slider({ value: this.pointValue(kind), min: min, max: max, step: 1 })
+        .layoutWeight(1)
+        .blockColor('#E8E8E8')
+        .trackColor('#3A3A3A')
+        .selectedColor('#4A9EFF')
+        .onChange((changed: number) => {
+          this.applyPoint(kind, changed);
+        })
+      Text(this.formatValue(this.pointValue(kind), 1))
+        .fontSize(11)
+        .fontColor('#CCCCCC')
+        .width(38)
+        .textAlign(TextAlign.End)
+    }
+    .width('100%')
+  }
+
+  private applyPoint(kind: number, value: number): void {
+    const index = Math.min(this.selectedPoint, this.points.length - 1);
+    this.updatePoint(index, (point: PointSample) => {
+      if (kind === 200) {
+        point.hueShift = value;
+      } else if (kind === 201) {
+        point.satShift = value;
+      } else if (kind === 202) {
+        point.lumShift = value;
+      } else if (kind === 203) {
+        point.hueRange = value;
+      } else if (kind === 204) {
+        point.satRange = value;
+      } else {
+        point.lumRange = value;
+      }
+    });
   }
 
   @Builder
@@ -1449,20 +1629,6 @@ struct EditorPage {
     }
     .width('100%')
     .padding({ left: 14, right: 14 })
-  }
-
-  @Builder
-  pointColorPanel() {
-    Column({ space: 6 }) {
-      Text('点颜色：取色后按软范围调整（下一阶段接入取色器）')
-        .fontSize(11)
-        .fontColor('#888888')
-      Text('当前版本请先用 HSL / 均衡器做局部颜色调整。')
-        .fontSize(11)
-        .fontColor('#666666')
-    }
-    .width('100%')
-    .padding({ left: 14, right: 14, top: 10 })
   }
 
   @Builder
@@ -2117,17 +2283,155 @@ struct EditorPage {
       packer.release();
 
       const context = getContext(this) as common.UIAbilityContext;
-      const path = context.cacheDir + '/fdxmp_export_' + Date.now() + '.jpg';
-      const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
-      fs.writeSync(file.fd, packed);
-      fs.closeSync(file);
 
-      this.statusText = '已导出 ' + result.width + '×' + result.height;
-      promptAction.showToast({ message: '已导出到缓存：' + path });
+      // 优先写系统相册（需要 WRITE_IMAGEVIDEO 授权），失败则落到应用缓存目录。
+      let savedToGallery = false;
+      try {
+        const manager = abilityAccessCtrl.createAtManager();
+        const result = await manager.requestPermissionsFromUser(context, ['ohos.permission.WRITE_IMAGEVIDEO']);
+        if (result.authResults.length > 0 && result.authResults[0] === 0) {
+          const helper = photoAccessHelper.getPhotoAccessHelper(context);
+          const uri = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, 'jpg');
+          const file = fs.openSync(uri, fs.OpenMode.READ_WRITE);
+          fs.writeSync(file.fd, packed);
+          fs.closeSync(file);
+          savedToGallery = true;
+        }
+      } catch (error) {
+        savedToGallery = false;
+      }
+
+      if (savedToGallery) {
+        this.statusText = '已保存到相册 ' + result.width + '×' + result.height;
+        promptAction.showToast({ message: '已保存到相册' });
+      } else {
+        const path = context.cacheDir + '/fdxmp_export_' + Date.now() + '.jpg';
+        const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
+        fs.writeSync(file.fd, packed);
+        fs.closeSync(file);
+        this.statusText = '已导出 ' + result.width + '×' + result.height;
+        promptAction.showToast({ message: '已导出到缓存：' + path });
+      }
     } catch (error) {
       this.statusText = '导出失败';
       promptAction.showToast({ message: '导出失败：' + NativeBridge.lastError() });
     }
+  }
+
+  private pointColorsPayload(): PointColorPayload[] {
+    const result: PointColorPayload[] = [];
+    const count = Math.min(this.points.length, 4);
+    for (let i = 0; i < count; i++) {
+      const point = this.points[i];
+      const payload: PointColorPayload = {
+        lum: point.lum,
+        chroma: point.chroma,
+        hue: point.hue,
+        hue_shift: point.hueShift,
+        sat_shift: point.satShift,
+        lum_shift: point.lumShift,
+        variance: 0,
+        range: 50,
+        hue_range: point.hueRange,
+        sat_range: point.satRange,
+        lum_range: point.lumRange
+      };
+      result.push(payload);
+    }
+    return result;
+  }
+
+  // MARK: - 点颜色取色
+
+  /** 预览上点击取色：把屏幕坐标换算到图像坐标，取 480px 缓冲里的原图颜色。 */
+  private sampleAt(x: number, y: number): void {
+    const buffer = this.fast;
+    if (buffer === null || this.areaW <= 0 || this.areaH <= 0 || this.lastW <= 0 || this.lastH <= 0) {
+      return;
+    }
+    const imageAspect = this.lastW / this.lastH;
+    const areaAspect = this.areaW / this.areaH;
+    let imageW = this.areaW;
+    let imageH = this.areaH;
+    let imageX = 0;
+    let imageY = 0;
+    if (imageAspect > areaAspect) {
+      imageW = this.areaW;
+      imageH = this.areaW / imageAspect;
+      imageY = (this.areaH - imageH) / 2;
+    } else {
+      imageH = this.areaH;
+      imageW = this.areaH * imageAspect;
+      imageX = (this.areaW - imageW) / 2;
+    }
+    const nx = (x - imageX) / imageW;
+    const ny = (y - imageY) / imageH;
+    if (nx < 0 || nx > 1 || ny < 0 || ny > 1) {
+      return;
+    }
+    const px = Math.min(buffer.width - 1, Math.max(0, Math.round(nx * buffer.width)));
+    const py = Math.min(buffer.height - 1, Math.max(0, Math.round(ny * buffer.height)));
+    const pixels = new Uint8Array(buffer.data);
+    const offset = (py * buffer.width + px) * 4;
+    const r = pixels[offset];
+    const g = pixels[offset + 1];
+    const b = pixels[offset + 2];
+    const lch = NativeBridge.oklch(r, g, b);
+    if (lch.length < 3) {
+      return;
+    }
+    const sample = new PointSample();
+    sample.r = r;
+    sample.g = g;
+    sample.b = b;
+    sample.lum = lch[0];
+    sample.chroma = lch[1];
+    sample.hue = (lch[2] * 180) / Math.PI;
+    this.points = this.points.concat([sample]);
+    this.selectedPoint = this.points.length - 1;
+    this.picking = false;
+    this.scheduleRender(false);
+    promptAction.showToast({ message: '已取色（' + r + ', ' + g + ', ' + b + '）' });
+  }
+
+  private updatePoint(index: number, mutate: (point: PointSample) => void): void {
+    if (index < 0 || index >= this.points.length) {
+      return;
+    }
+    const next = this.points.slice();
+    const copy = new PointSample();
+    const source = next[index];
+    copy.r = source.r;
+    copy.g = source.g;
+    copy.b = source.b;
+    copy.lum = source.lum;
+    copy.chroma = source.chroma;
+    copy.hue = source.hue;
+    copy.hueShift = source.hueShift;
+    copy.satShift = source.satShift;
+    copy.lumShift = source.lumShift;
+    copy.hueRange = source.hueRange;
+    copy.satRange = source.satRange;
+    copy.lumRange = source.lumRange;
+    mutate(copy);
+    next[index] = copy;
+    this.points = next;
+    this.scheduleRender(true);
+  }
+
+  private removePoint(index: number): void {
+    if (index < 0 || index >= this.points.length) {
+      return;
+    }
+    const next: PointSample[] = [];
+    for (let i = 0; i < this.points.length; i++) {
+      if (i !== index) {
+        next.push(this.points[i]);
+      }
+    }
+    this.points = next;
+    this.selectedPoint = Math.max(0, Math.min(this.selectedPoint, next.length - 1));
+    this.scheduleRender(false);
   }
 
   // MARK: - 预设
