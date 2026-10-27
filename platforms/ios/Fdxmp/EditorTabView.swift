@@ -1149,6 +1149,11 @@ struct EditorTabView: View {
                 // 光学只有两个开关：面板压矮，少挡画面。
                 return 224
             }
+            if model.category == .color, model.colorTab == .equalizer {
+                // 颜色均衡器：曲线图占的空间越大，8 个节点越好点。
+                // 想再高/再矮改这个数（也可以写成 UIScreen.main.bounds.height * 0.44）。
+                return 380
+            }
             return 288
         case .crop: return 210
         // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
