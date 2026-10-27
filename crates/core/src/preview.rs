@@ -74,6 +74,15 @@ pub fn render_memory_rgba(
             "RGBA 图像宽高必须大于 0".to_string(),
         ));
     }
+    // 内存边界：CPU 管线是 f32 多平面（约 40 字节/像素），超大图在手机上会被系统直接杀掉。
+    // 这里显式拒绝而不是让分配器崩，调用方应自行降采样后重试。
+    const MAX_PIXELS: u64 = 64_000_000;
+    if u64::from(width) * u64::from(height) > MAX_PIXELS {
+        return Err(FdxmpError::InvalidArgument(format!(
+            "图像过大：{width}×{height} 超过 {} 像素上限，请先降采样",
+            MAX_PIXELS
+        )));
+    }
     let expected = width as usize * height as usize * 4;
     if rgba.len() < expected {
         return Err(FdxmpError::InvalidArgument(format!(

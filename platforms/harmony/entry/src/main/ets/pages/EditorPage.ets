@@ -482,6 +482,9 @@ struct EditorPage {
   /** 当前工具：-1 无 / 0 预设 / 1 裁切 / 2 编辑 / 3 蒙版。 */
   @State activeTool: number = -1;
   /** 浸没模式：点照片隐藏全部 UI。 */
+  /** 导出的进度浮层状态。 */
+  @State exporting: boolean = false;
+  @State exportProgress: number = 0;
   @State chromeVisible: boolean = true;
   /** 正在拖动的滑块 id（非空时进入「专注调色」：只留该滑块，面板背景透明）。 */
   @State focusRow: string = '';
@@ -1642,6 +1645,33 @@ struct EditorPage {
       .width('100%')
       .height('100%')
       .hitTestBehavior(HitTestMode.Transparent)
+
+      if (this.exporting) {
+        Column() {
+          Column({ space: 12 }) {
+            Text('正在导出…')
+              .fontSize(14)
+              .fontColor('#E8E8E8')
+            Progress({ value: Math.round(this.exportProgress * 100), total: 100,
+              type: ProgressType.Linear })
+              .width(200)
+              .color('#4A9EFF')
+              .backgroundColor('#3A3A3A')
+            Text(Math.round(this.exportProgress * 100).toString() + '%')
+              .fontSize(12)
+              .fontColor('#AAAAAA')
+          }
+          .padding(24)
+          .backgroundColor('#E61A1A1A')
+          .borderRadius(12)
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#66000000')
+        .justifyContent(FlexAlign.Center)
+        .onClick(() => {
+        })
+      }
 
       if (this.showPresets) {
         this.presetOverlay()
@@ -3219,15 +3249,38 @@ struct EditorPage {
   // MARK: - 导出
 
   /** 导出当前参数下的照片（先落应用缓存目录，相册写入用安全控件，下一阶段接）。 */
+  /** 导出：进度浮层 + 失败提示（超边/失败都不再让进程崩掉）。 */
+  /** 按像素预算解码（导出用）：先探 512 拿比例，再按预算算最长边。 */
+  private async decodeWithBudget(pixelBudget: number): Promise<PixelBuffer | null> {
+    const probe = await this.decode(this.photoUri, 512);
+    if (probe === null || probe.width <= 0 || probe.height <= 0) {
+      return null;
+    }
+    const ratio = probe.width / probe.height;
+    const edge = Math.max(256, Math.floor(Math.sqrt(pixelBudget * ratio)));
+    return await this.decode(this.photoUri, edge);
+  }
+
   private async exportPhoto(): Promise<void> {
+    if (this.exporting) {
+      return;
+    }
+    this.exporting = true;
+    this.exportProgress = 0.05;
     this.statusText = '导出中…';
     try {
-      const buffer = await this.decode(this.photoUri, 4096);
+      // 内存边界：手机端按像素预算解码（约 6MP），避免核心的 f32 管线把内存打爆。
+      const buffer = await this.decodeWithBudget(6_000_000);
       if (buffer === null) {
-        this.statusText = '解码失败';
-        return;
+        throw new Error('无法解码原图');
       }
-      const result = NativeBridge.render(buffer.data, buffer.width, buffer.height, this.paramsJson());
+      this.exportProgress = 0.3;
+      const result = NativeBridge.render(buffer.data, buffer.width, buffer.height,
+        this.paramsJson());
+      if (result.width <= 0 || result.height <= 0 || result.data.byteLength <= 0) {
+        throw new Error('渲染失败：' + NativeBridge.lastError());
+      }
+      this.exportProgress = 0.6;
       const options: image.InitializationOptions = {
         size: { width: result.width, height: result.height },
         srcPixelFormat: image.PixelMapFormat.RGBA_8888,
@@ -3238,7 +3291,6 @@ struct EditorPage {
       const packer = image.createImagePacker();
       const context = getContext(this) as common.UIAbilityContext;
 
-      // 导出格式 / 质量来自「我的 → 导出」设置。
       let format = 'jpeg';
       let quality = 95;
       try {
@@ -3254,13 +3306,14 @@ struct EditorPage {
       const packed = await packer.packing(pixelMap, packOptions);
       pixelMap.release();
       packer.release();
+      this.exportProgress = 0.85;
 
-      // 优先写系统相册（需要 WRITE_IMAGEVIDEO 授权），失败则落到应用缓存目录。
       let savedToGallery = false;
       try {
         const manager = abilityAccessCtrl.createAtManager();
-        const result = await manager.requestPermissionsFromUser(context, ['ohos.permission.WRITE_IMAGEVIDEO']);
-        if (result.authResults.length > 0 && result.authResults[0] === 0) {
+        const permission = await manager.requestPermissionsFromUser(context,
+          ['ohos.permission.WRITE_IMAGEVIDEO']);
+        if (permission.authResults.length > 0 && permission.authResults[0] === 0) {
           const helper = photoAccessHelper.getPhotoAccessHelper(context);
           const uri = await helper.createAsset(photoAccessHelper.PhotoType.IMAGE, 'jpg');
           const file = fs.openSync(uri, fs.OpenMode.READ_WRITE);
@@ -3283,11 +3336,16 @@ struct EditorPage {
         this.statusText = '已导出 ' + result.width + '×' + result.height;
         promptAction.showToast({ message: '已导出到缓存：' + path });
       }
+      this.exportProgress = 1;
       this.recordRecent();
       this.saveCurrentEdit();
     } catch (error) {
+      const reason = error instanceof Error ? error.message : JSON.stringify(error);
       this.statusText = '导出失败';
-      promptAction.showToast({ message: '导出失败：' + NativeBridge.lastError() });
+      promptAction.showToast({ message: '导出失败：' + reason, duration: 4000 });
+    } finally {
+      this.exporting = false;
+      this.exportProgress = 0;
     }
   }
 
