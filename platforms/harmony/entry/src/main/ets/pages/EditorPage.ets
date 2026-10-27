@@ -69,12 +69,55 @@ interface EqualizerPayload {
   brightness: number[];
 }
 
+/** 颜色分级的一个区域。 */
+interface GradingZonePayload {
+  hue: number;
+  saturation: number;
+  luminance: number;
+}
+
+/** 颜色分级。 */
+interface GradingPayload {
+  shadows: GradingZonePayload;
+  midtones: GradingZonePayload;
+  highlights: GradingZonePayload;
+  global: GradingZonePayload;
+  blending: number;
+  balance: number;
+}
+
+/** 相机校准。 */
+interface CalibrationPayload {
+  red_hue: number;
+  red_sat: number;
+  green_hue: number;
+  green_sat: number;
+  blue_hue: number;
+  blue_sat: number;
+  shadows_tint: number;
+}
+
+/** 黑白混色（8 色带）。 */
+interface BwMixPayload {
+  red: number;
+  orange: number;
+  yellow: number;
+  green: number;
+  aqua: number;
+  blue: number;
+  purple: number;
+  magenta: number;
+}
+
 /** 整份渲染参数（Rust 侧 `#[serde(default)]`，缺字段按默认值）。 */
 interface ParamsPayload {
   light: LightPayload;
   color: ColorPayload;
   hsl: HslPayload;
   equalizer: EqualizerPayload;
+  grading: GradingPayload;
+  calibration: CalibrationPayload;
+  bw_mix: BwMixPayload;
 }
 
 /** 路由参数。 */
@@ -83,7 +126,7 @@ interface EditorParams {
   name: string;
 }
 
-const COLOR_TABS: string[] = ['颜色', 'HSL', '均衡器', '分级'];
+const COLOR_TABS: string[] = ['颜色', 'HSL', '均衡器', '分级', '点颜色', '校准', '黑白'];
 const EQ_CHANNELS: string[] = ['色相', '饱和度', '亮度'];
 const BAND_DEGREES: number[] = [0, 45, 90, 135, 180, 225, 270, 315];
 const BAND_LABELS: string[] = ['红', '橙', '黄', '绿', '青', '蓝', '紫', '品红'];
@@ -115,6 +158,27 @@ struct EditorPage {
   @State hslHue: number[] = [0, 0, 0, 0, 0, 0, 0, 0];
   @State hslSat: number[] = [0, 0, 0, 0, 0, 0, 0, 0];
   @State hslLum: number[] = [0, 0, 0, 0, 0, 0, 0, 0];
+
+  // 分级（阴影 / 中间调 / 高光 / 全局）
+  @State gradingZone: number = 0;
+  @State gradingHue: number[] = [0, 0, 0, 0];
+  @State gradingSat: number[] = [0, 0, 0, 0];
+  @State gradingLum: number[] = [0, 0, 0, 0];
+  @State gradingBlending: number = 50;
+  @State gradingBalance: number = 0;
+
+  // 校准
+  @State calRedHue: number = 0;
+  @State calRedSat: number = 0;
+  @State calGreenHue: number = 0;
+  @State calGreenSat: number = 0;
+  @State calBlueHue: number = 0;
+  @State calBlueSat: number = 0;
+  @State calShadowsTint: number = 0;
+
+  // 黑白
+  @State blackWhite: boolean = false;
+  @State bwMix: number[] = [0, 0, 0, 0, 0, 0, 0, 0];
 
   // 均衡器
   @State eqHue: number[] = [0, 0, 0, 0, 0, 0, 0, 0];
@@ -258,6 +322,15 @@ struct EditorPage {
     return band;
   }
 
+  private gradingZonePayload(index: number): GradingZonePayload {
+    const zone: GradingZonePayload = {
+      hue: this.gradingHue[index],
+      saturation: this.gradingSat[index],
+      luminance: this.gradingLum[index]
+    };
+    return zone;
+  }
+
   private paramsJson(): string {
     const payload: ParamsPayload = {
       light: { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0 },
@@ -266,7 +339,7 @@ struct EditorPage {
         tint: this.tint,
         vibrance: this.vibrance,
         saturation: this.saturation,
-        black_white: false
+        black_white: this.blackWhite
       },
       hsl: {
         red: this.hslBandPayload(0),
@@ -277,6 +350,33 @@ struct EditorPage {
         blue: this.hslBandPayload(5),
         purple: this.hslBandPayload(6),
         magenta: this.hslBandPayload(7)
+      },
+      grading: {
+        shadows: this.gradingZonePayload(0),
+        midtones: this.gradingZonePayload(1),
+        highlights: this.gradingZonePayload(2),
+        global: this.gradingZonePayload(3),
+        blending: this.gradingBlending,
+        balance: this.gradingBalance
+      },
+      calibration: {
+        red_hue: this.calRedHue,
+        red_sat: this.calRedSat,
+        green_hue: this.calGreenHue,
+        green_sat: this.calGreenSat,
+        blue_hue: this.calBlueHue,
+        blue_sat: this.calBlueSat,
+        shadows_tint: this.calShadowsTint
+      },
+      bw_mix: {
+        red: this.bwMix[0],
+        orange: this.bwMix[1],
+        yellow: this.bwMix[2],
+        green: this.bwMix[3],
+        aqua: this.bwMix[4],
+        blue: this.bwMix[5],
+        purple: this.bwMix[6],
+        magenta: this.bwMix[7]
       },
       equalizer: {
         enabled: true,
@@ -698,22 +798,27 @@ struct EditorPage {
   @Builder
   colorPanel() {
     Column() {
-      Row() {
-        ForEach(COLOR_TABS, (label: string, index: number) => {
-          Text(label)
-            .fontSize(12)
-            .fontColor(this.colorTab === index ? '#FFFFFF' : '#888888')
-            .backgroundColor(this.colorTab === index ? '#3A3A3A' : '#242424')
-            .borderRadius(6)
-            .padding({ left: 12, right: 12, top: 5, bottom: 5 })
-            .margin({ right: 6 })
-            .onClick(() => {
-              this.colorTab = index;
-            })
-        })
+      Scroll() {
+        Row() {
+          ForEach(COLOR_TABS, (label: string, index: number) => {
+            Text(label)
+              .fontSize(12)
+              .fontColor(this.colorTab === index ? '#FFFFFF' : '#888888')
+              .backgroundColor(this.colorTab === index ? '#3A3A3A' : '#242424')
+              .borderRadius(6)
+              .padding({ left: 12, right: 12, top: 5, bottom: 5 })
+              .margin({ right: 6 })
+              .onClick(() => {
+                this.colorTab = index;
+              })
+          })
+        }
+        .padding({ left: 12, right: 12 })
       }
+      .scrollable(ScrollDirection.Horizontal)
+      .scrollBar(BarState.Off)
       .width('100%')
-      .padding({ left: 12, right: 12, top: 8, bottom: 6 })
+      .height(34)
 
       if (this.colorTab === 0) {
         this.basicColorPanel()
@@ -721,11 +826,14 @@ struct EditorPage {
         this.hslPanel()
       } else if (this.colorTab === 2) {
         this.equalizerPanel()
+      } else if (this.colorTab === 3) {
+        this.gradingPanel()
+      } else if (this.colorTab === 4) {
+        this.pointColorPanel()
+      } else if (this.colorTab === 5) {
+        this.calibrationPanel()
       } else {
-        Text('该子页下一阶段接入')
-          .fontSize(12)
-          .fontColor('#777777')
-          .margin({ top: 30 })
+        this.bwPanel()
       }
     }
     .width('100%')
@@ -826,6 +934,109 @@ struct EditorPage {
     .layoutWeight(1)
   }
 
+  @Builder
+  gradingPanel() {
+    Column({ space: 2 }) {
+      Row() {
+        ForEach(['阴影', '中间调', '高光', '全局'], (label: string, index: number) => {
+          Text(label)
+            .fontSize(11)
+            .fontColor(this.gradingZone === index ? '#FFFFFF' : '#888888')
+            .backgroundColor(this.gradingZone === index ? '#3A3A3A' : '#242424')
+            .borderRadius(5)
+            .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+            .margin({ right: 5 })
+            .onClick(() => {
+              this.gradingZone = index;
+            })
+        })
+      }
+      .width('100%')
+      .padding({ bottom: 4 })
+
+      this.sliderRow('色相', this.gradingHue[this.gradingZone], 0, 360, 1, 10)
+      this.sliderRow('饱和度', this.gradingSat[this.gradingZone], 0, 100, 1, 11)
+      this.sliderRow('明亮度', this.gradingLum[this.gradingZone], -100, 100, 1, 12)
+      this.sliderRow('混合', this.gradingBlending, 0, 100, 1, 13)
+      this.sliderRow('平衡', this.gradingBalance, -100, 100, 1, 14)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14 })
+  }
+
+  @Builder
+  pointColorPanel() {
+    Column({ space: 6 }) {
+      Text('点颜色：取色后按软范围调整（下一阶段接入取色器）')
+        .fontSize(11)
+        .fontColor('#888888')
+      Text('当前版本请先用 HSL / 均衡器做局部颜色调整。')
+        .fontSize(11)
+        .fontColor('#666666')
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 10 })
+  }
+
+  @Builder
+  calibrationPanel() {
+    Scroll() {
+      Column({ space: 2 }) {
+        this.sliderRow('红原色色相', this.calRedHue, -100, 100, 1, 15)
+        this.sliderRow('红原色饱和', this.calRedSat, -100, 100, 1, 16)
+        this.sliderRow('绿原色色相', this.calGreenHue, -100, 100, 1, 17)
+        this.sliderRow('绿原色饱和', this.calGreenSat, -100, 100, 1, 18)
+        this.sliderRow('蓝原色色相', this.calBlueHue, -100, 100, 1, 19)
+        this.sliderRow('蓝原色饱和', this.calBlueSat, -100, 100, 1, 20)
+        this.sliderRow('阴影色调', this.calShadowsTint, -100, 100, 1, 21)
+      }
+      .width('100%')
+    }
+    .scrollBar(BarState.Off)
+    .width('100%')
+    .padding({ left: 14, right: 14 })
+  }
+
+  @Builder
+  bwPanel() {
+    Column({ space: 2 }) {
+      Row() {
+        Text('黑白模式')
+          .fontSize(12)
+          .fontColor('#CCCCCC')
+          .layoutWeight(1)
+        Toggle({ type: ToggleType.Switch, isOn: this.blackWhite })
+          .onChange((isOn: boolean) => {
+            this.blackWhite = isOn;
+            this.scheduleRender(false);
+          })
+      }
+      .width('100%')
+      .padding({ bottom: 4 })
+
+      Scroll() {
+        Column({ space: 2 }) {
+          this.sliderRow('红', this.bwMix[0], -100, 100, 1, 22)
+          this.sliderRow('橙', this.bwMix[1], -100, 100, 1, 23)
+          this.sliderRow('黄', this.bwMix[2], -100, 100, 1, 24)
+          this.sliderRow('绿', this.bwMix[3], -100, 100, 1, 25)
+          this.sliderRow('青', this.bwMix[4], -100, 100, 1, 26)
+          this.sliderRow('蓝', this.bwMix[5], -100, 100, 1, 27)
+          this.sliderRow('紫', this.bwMix[6], -100, 100, 1, 28)
+          this.sliderRow('品红', this.bwMix[7], -100, 100, 1, 29)
+        }
+        .width('100%')
+      }
+      .scrollBar(BarState.Off)
+      .width('100%')
+      .layoutWeight(1)
+      .opacity(this.blackWhite ? 1 : 0.4)
+    }
+    .width('100%')
+    .layoutWeight(1)
+    .padding({ left: 14, right: 14 })
+  }
+
   /** 滑块改动统一入口（@Builder 不能带函数参数，用 kind 分发）。 */
   private applySlider(kind: number, value: number): void {
     if (kind === 0) {
@@ -854,9 +1065,46 @@ struct EditorPage {
     } else if (kind === 8) {
       this.smoothing = value;
       this.drawGraph();
-    } else {
+    } else if (kind === 9) {
       this.eqContrast = value;
       this.drawGraph();
+    } else if (kind === 10 || kind === 11 || kind === 12) {
+      const index = this.gradingZone;
+      if (kind === 10) {
+        const next = this.gradingHue.slice();
+        next[index] = value;
+        this.gradingHue = next;
+      } else if (kind === 11) {
+        const next = this.gradingSat.slice();
+        next[index] = value;
+        this.gradingSat = next;
+      } else {
+        const next = this.gradingLum.slice();
+        next[index] = value;
+        this.gradingLum = next;
+      }
+    } else if (kind === 13) {
+      this.gradingBlending = value;
+    } else if (kind === 14) {
+      this.gradingBalance = value;
+    } else if (kind === 15) {
+      this.calRedHue = value;
+    } else if (kind === 16) {
+      this.calRedSat = value;
+    } else if (kind === 17) {
+      this.calGreenHue = value;
+    } else if (kind === 18) {
+      this.calGreenSat = value;
+    } else if (kind === 19) {
+      this.calBlueHue = value;
+    } else if (kind === 20) {
+      this.calBlueSat = value;
+    } else if (kind === 21) {
+      this.calShadowsTint = value;
+    } else if (kind >= 22) {
+      const next = this.bwMix.slice();
+      next[kind - 22] = value;
+      this.bwMix = next;
     }
     this.scheduleRender(true);
   }
