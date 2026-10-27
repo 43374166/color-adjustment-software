@@ -485,7 +485,12 @@ struct EditorPage {
   @State chromeVisible: boolean = true;
   /** 照片缩放（双指 / 双击），1 = 原始大小。 */
   @State photoZoom: number = 1;
+  /** 放大后单指拖动的位移（屏幕像素）。 */
+  @State panX: number = 0;
+  @State panY: number = 0;
   private pinchBase: number = 1;
+  private panBaseX: number = 0;
+  private panBaseY: number = 0;
   @State cropMode: boolean = false;
   /** 90° 旋转步数（0..3，解码时应用）。 */
   @State rotationStep: number = 0;
@@ -1525,7 +1530,24 @@ struct EditorPage {
             this.photoZoom = Math.min(Math.max(this.pinchBase * event.scale, 1), 8);
           })
           .onActionEnd(() => {
+            if (this.photoZoom <= 1.01) {
+              this.photoZoom = 1;
+              this.panX = 0;
+              this.panY = 0;
+            }
             this.pinchBase = this.photoZoom;
+          }))
+        .parallelGesture(PanGesture({ fingers: 1, distance: 8 })
+          .onActionStart(() => {
+            this.panBaseX = this.panX;
+            this.panBaseY = this.panY;
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            if (this.photoZoom <= 1.01) {
+              return;
+            }
+            this.panX = this.clampPan(this.panBaseX + event.offsetX, this.areaW, this.photoZoom);
+            this.panY = this.clampPan(this.panBaseY + event.offsetY, this.areaH, this.photoZoom);
           }))
       }
 
@@ -1602,7 +1624,24 @@ struct EditorPage {
 
   /** 双击照片：1× ↔ 2.5×。 */
   private togglePhotoZoom(): void {
-    this.photoZoom = this.photoZoom > 1.5 ? 1 : 2.5;
+    const next = this.photoZoom > 1.5 ? 1 : 2.5;
+    this.photoZoom = next;
+    if (next <= 1.01) {
+      this.panX = 0;
+      this.panY = 0;
+    }
+  }
+
+  /** 放大后拖动时限制边界，避免把照片拖出画面。 */
+  private clampPan(value: number, extent: number, zoom: number): number {
+    const limit = Math.max((extent * (zoom - 1)) / 2, 0);
+    return Math.min(Math.max(value, -limit), limit);
+  }
+
+  private resetZoomPan(): void {
+    this.photoZoom = 1;
+    this.panX = 0;
+    this.panY = 0;
   }
 
   /** 点照片：取色模式下取色，否则切换沉浸模式。 */
@@ -2114,7 +2153,7 @@ struct EditorPage {
           .onClick(() => {
             this.picking = !this.picking;
             if (this.picking) {
-              this.photoZoom = 1;
+              this.resetZoomPan();
             }
           })
         Text('最多 4 个')
@@ -2919,7 +2958,7 @@ struct EditorPage {
   }
 
   private enterCrop(): void {
-    this.photoZoom = 1;
+    this.resetZoomPan();
     this.cropSaved = this.cropRect.slice();
     this.cropMode = true;
     this.scheduleRender(false);
@@ -3436,7 +3475,7 @@ struct EditorPage {
 
   /** 进入蒙版模式：先记下全局参数，再载入选中蒙版。 */
   private enterMaskMode(): void {
-    this.photoZoom = 1;
+    this.resetZoomPan();
     this.globalJson = JSON.stringify(this.buildPayload());
     if (this.masks.length === 0) {
       this.addMask(0);
