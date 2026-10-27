@@ -1594,16 +1594,22 @@ struct EditorPage {
       Column() {
         Blank()
         if (this.chromeVisible) {
-          if (this.activeTool === 0) {
-            this.presetPanel()
-          } else if (this.activeTool === 1) {
-            this.cropBar()
-          } else if (this.activeTool === 2) {
-            this.bottomPanel()
-          } else if (this.activeTool === 3) {
-            this.maskBar()
+          // 面板区自己吃掉点击，避免点在面板空白处穿透到照片的单击/双击手势。
+          Column() {
+            if (this.activeTool === 0) {
+              this.presetPanel()
+            } else if (this.activeTool === 1) {
+              this.cropBar()
+            } else if (this.activeTool === 2) {
+              this.bottomPanel()
+            } else if (this.activeTool === 3) {
+              this.maskBar()
+            }
+            this.editorToolBar()
           }
-          this.editorToolBar()
+          .width('100%')
+          .onClick(() => {
+          })
         }
       }
       .width('100%')
@@ -1832,6 +1838,8 @@ struct EditorPage {
     .height(44 + this.safeTop)
     .padding({ left: 14, right: 14, top: this.safeTop })
     .backgroundColor('#B31A1A1A')
+    .onClick(() => {
+    })
   }
 
   private shortName(): string {
