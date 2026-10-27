@@ -86,6 +86,29 @@ struct EditorTabView: View {
             }
         }
         .background(Color(white: 0.08))
+        // 导出进度弹框：半透明遮罩 + 进度条 + 百分比。
+        .overlay {
+            if model.isExporting {
+                ZStack {
+                    Color.black.opacity(0.45).ignoresSafeArea()
+                    VStack(spacing: 12) {
+                        Text("正在导出…")
+                            .font(.subheadline)
+                            .foregroundStyle(.white)
+                        ProgressView(value: model.exportProgress ?? 0, total: 1)
+                            .progressViewStyle(.linear)
+                            .tint(Color.accentColor)
+                            .frame(width: 200)
+                        Text("\(Int(((model.exportProgress ?? 0) * 100).rounded()))%")
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    .padding(24)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                }
+                .transition(.opacity)
+            }
+        }
         .onPreferenceChange(SliderDragPreferenceKey.self) { info in
             model.setDraggingSlider(info)
         }

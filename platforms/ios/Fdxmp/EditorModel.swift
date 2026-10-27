@@ -468,6 +468,10 @@ final class EditorModel: ObservableObject {
     }
 
     /// MetalPreviewView 报告预览图层（pointer = 新图层，nil = 该实例销毁）。
+    ///
+    /// 注意：`nil` 分支来自 SwiftUI 的 `dismantleUIView`，此时正处于属性图失效阶段，
+    /// 直接改 `@Published` 会触发 Swift 独占访问检查（`swift_beginAccess`）崩溃。
+    /// 所以这里只改非 Published 的簿记字段，Published 的部分挪到下一个 runloop。
     func attachPreviewLayer(_ pointer: UnsafeMutableRawPointer?, token: UUID) {
         if let pointer {
             previewLayerToken = token
@@ -477,7 +481,12 @@ final class EditorModel: ObservableObject {
             guard previewLayerToken == token else { return }
             previewLayerToken = nil
             previewLayerPointer = nil
-            zeroCopyActive = false
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.previewLayerPointer == nil else { return }
+                if self.zeroCopyActive {
+                    self.zeroCopyActive = false
+                }
+            }
         }
     }
 
