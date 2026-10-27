@@ -2369,8 +2369,12 @@ struct EditorPage {
     if (nx < 0 || nx > 1 || ny < 0 || ny > 1) {
       return;
     }
-    const px = Math.min(buffer.width - 1, Math.max(0, Math.round(nx * buffer.width)));
-    const py = Math.min(buffer.height - 1, Math.max(0, Math.round(ny * buffer.height)));
+    // 预览可能已按 crop 裁过：把显示坐标映射回原图坐标再取样。
+    const crop = this.cropMode ? [0, 0, 1, 1] : this.cropRect;
+    const originX = crop[0] + nx * crop[2];
+    const originY = crop[1] + ny * crop[3];
+    const px = Math.min(buffer.width - 1, Math.max(0, Math.round(originX * buffer.width)));
+    const py = Math.min(buffer.height - 1, Math.max(0, Math.round(originY * buffer.height)));
     const pixels = new Uint8Array(buffer.data);
     const offset = (py * buffer.width + px) * 4;
     const r = pixels[offset];
