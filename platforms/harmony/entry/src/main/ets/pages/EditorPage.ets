@@ -364,6 +364,12 @@ const I_NOISE_LUM_CONTRAST: number = 36;
 const I_NOISE_COLOR: number = 37;
 const I_NOISE_COLOR_DETAIL: number = 38;
 const I_NOISE_COLOR_SMOOTH: number = 39;
+const I_EXPOSURE: number = 40;
+const I_LIGHT_CONTRAST: number = 41;
+const I_HIGHLIGHTS: number = 42;
+const I_SHADOWS: number = 43;
+const I_WHITES: number = 44;
+const I_BLACKS: number = 45;
 
 const SLIDERS: SliderSpec[] = [
   new SliderSpec('色温', -100, 100, 1, 0),
@@ -406,10 +412,16 @@ const SLIDERS: SliderSpec[] = [
   new SliderSpec('颜色降噪', 0, 100, 1, 25),
   new SliderSpec('颜色细节', 0, 100, 1, 50),
   new SliderSpec('颜色平滑度', 0, 100, 1, 50),
+  new SliderSpec('曝光度', -5, 5, 0.05, 0),
+  new SliderSpec('对比度', -100, 100, 1, 0),
+  new SliderSpec('高光', -100, 100, 1, 0),
+  new SliderSpec('阴影', -100, 100, 1, 0),
+  new SliderSpec('白色', -100, 100, 1, 0),
+  new SliderSpec('黑色', -100, 100, 1, 0),
 ];
 
 const COLOR_TABS: string[] = ['颜色', 'HSL', '均衡器', '分级', '点颜色', '校准', '黑白'];
-const CATEGORIES: string[] = ['颜色', '曲线', '光学', '细节', '效果', '几何'];
+const CATEGORIES: string[] = ['亮度', '颜色', '曲线', '光学', '细节', '效果', '几何'];
 const EQ_CHANNELS: string[] = ['色相', '饱和度', '亮度'];
 const BAND_DEGREES: number[] = [0, 45, 90, 135, 180, 225, 270, 315];
 const BAND_LABELS: string[] = ['红', '橙', '黄', '绿', '青', '蓝', '紫', '品红'];
@@ -826,7 +838,14 @@ struct EditorPage {
 
   private buildPayload(): ParamsPayload {
     const payload: ParamsPayload = {
-      light: { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0 },
+      light: {
+        exposure: this.num(I_EXPOSURE),
+        contrast: this.num(I_LIGHT_CONTRAST),
+        highlights: this.num(I_HIGHLIGHTS),
+        shadows: this.num(I_SHADOWS),
+        whites: this.num(I_WHITES),
+        blacks: this.num(I_BLACKS)
+      },
       color: {
         temperature: this.num(I_TEMPERATURE),
         tint: this.num(I_TINT),
@@ -1336,115 +1355,127 @@ struct EditorPage {
   // MARK: - UI
 
   build() {
-    Stack({ alignContent: Alignment.TopEnd }) {
-      Column() {
-      if (this.chromeVisible) {
+    Stack({ alignContent: Alignment.TopStart }) {
+      // 照片铺满整屏（面板浮在上面，不再挤压照片）。
+      if (this.preview !== null) {
+        Image(this.preview)
+          .objectFit(ImageFit.Contain)
+          .width('100%')
+          .height('100%')
+          .onClick((event: ClickEvent) => {
+            this.handlePreviewTap(event.x, event.y);
+          })
+      } else {
+        Image(this.photoUri)
+          .objectFit(ImageFit.Contain)
+          .width('100%')
+          .height('100%')
+      }
+
+      if (this.cropMode) {
+        Canvas(this.cropContext)
+          .width('100%')
+          .height('100%')
+          .onReady(() => {
+            this.drawCropOverlay();
+          })
+          .onTouch((event: TouchEvent) => {
+            if (event.touches.length === 0) {
+              return;
+            }
+            const touch = event.touches[0];
+            this.handleCropTouch(touch.x, touch.y, event.type);
+          })
+      }
+      if (this.maskMode) {
+        Canvas(this.maskContext)
+          .width('100%')
+          .height('100%')
+          .onReady(() => {
+            this.drawMaskOverlay();
+          })
+          .onTouch((event: TouchEvent) => {
+            if (event.touches.length === 0) {
+              return;
+            }
+            const touch = event.touches[0];
+            this.handleMaskTouch(touch.x, touch.y, event.type);
+          })
+      }
+      if (this.showPresets) {
+        this.presetOverlay()
+      }
+
+      // 顶部：返回栏（调色时隐藏，只留正在调的 UI）。
+      if (this.chromeVisible && this.activeTool < 0) {
         this.topBar()
       }
-      Stack() {
-        if (this.preview !== null) {
-          Image(this.preview)
-            .objectFit(ImageFit.Contain)
-            .width('100%')
-            .height('100%')
-        } else {
-          Image(this.photoUri)
-            .objectFit(ImageFit.Contain)
-            .width('100%')
-            .height('100%')
-        }
-        if (this.cropMode) {
-          Canvas(this.cropContext)
-            .width('100%')
-            .height('100%')
+
+      // 直方图：图片右上角浮卡（无面板时显示）。
+      if (this.chromeVisible && this.activeTool < 0) {
+        Row() {
+          Blank()
+          Canvas(this.histContext)
+            .width(190)
+            .height(100)
+            .borderRadius(8)
+            .clip(true)
             .onReady(() => {
-              this.drawCropOverlay();
+              this.drawHistogram();
             })
-            .onTouch((event: TouchEvent) => {
-              if (event.touches.length === 0) {
-                return;
-              }
-              const touch = event.touches[0];
-              this.handleCropTouch(touch.x, touch.y, event.type);
+            .onClick(() => {
+              this.histogramWaveform = !this.histogramWaveform;
+              this.drawHistogram();
             })
         }
-        if (this.maskMode) {
-          Canvas(this.maskContext)
-            .width('100%')
-            .height('100%')
-            .onReady(() => {
-              this.drawMaskOverlay();
-            })
-            .onTouch((event: TouchEvent) => {
-              if (event.touches.length === 0) {
-                return;
-              }
-              const touch = event.touches[0];
-              this.handleMaskTouch(touch.x, touch.y, event.type);
-            })
-        }
-        if (this.showPresets) {
-          this.presetOverlay()
+        .width('100%')
+        .height(100)
+        .margin({ top: 52 })
+        .padding({ right: 12 })
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      // 底部：面板（半透明浮层） + 工具条。
+      Column() {
+        Blank()
+        if (this.chromeVisible) {
+          if (this.activeTool === 0) {
+            this.presetPanel()
+          } else if (this.activeTool === 1) {
+            this.cropBar()
+          } else if (this.activeTool === 2) {
+            this.bottomPanel()
+          } else if (this.activeTool === 3) {
+            this.maskBar()
+          }
+          this.editorToolBar()
         }
       }
-      .onAreaChange((oldArea: Area, newArea: Area) => {
-        this.areaW = Number(newArea.width);
-        this.areaH = Number(newArea.height);
-        if (this.cropMode) {
-          this.drawCropOverlay();
-        }
-      })
-      .onClick((event: ClickEvent) => {
-        if (this.picking) {
-          this.sampleAt(event.x, event.y);
-          return;
-        }
-        // 裁切 / 蒙版进行中时，点击交给叠加层，不触发沉浸模式。
-        if (!this.cropMode && !this.maskMode) {
-          this.chromeVisible = !this.chromeVisible;
-        }
-      })
       .width('100%')
-      .layoutWeight(1)
-      .backgroundColor('#000000')
-
-      if (this.chromeVisible) {
-        if (this.activeTool === 0) {
-          this.presetPanel()
-        } else if (this.activeTool === 1) {
-          this.cropBar()
-        } else if (this.activeTool === 2) {
-          this.bottomPanel()
-        } else if (this.activeTool === 3) {
-          this.maskBar()
-        }
-
-        this.editorToolBar()
-      }
+      .height('100%')
+      .hitTestBehavior(HitTestMode.Transparent)
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#111111')
-
-      // 直方图浮在图片右上角（半透明卡片，点一下切换填充 / 波形）。
-      if (this.chromeVisible) {
-        Canvas(this.histContext)
-          .width(190)
-          .height(100)
-          .margin({ top: 56, right: 12 })
-          .borderRadius(8)
-          .clip(true)
-          .onReady(() => {
-            this.drawHistogram();
-          })
-          .onClick(() => {
-            this.histogramWaveform = !this.histogramWaveform;
-            this.drawHistogram();
-          })
+    .backgroundColor('#000000')
+    .onAreaChange((oldArea: Area, newArea: Area) => {
+      this.areaW = Number(newArea.width);
+      this.areaH = Number(newArea.height);
+      if (this.cropMode) {
+        this.drawCropOverlay();
       }
+    })
+  }
+
+  /** 点照片：取色模式下取色，否则切换沉浸模式。 */
+  private handlePreviewTap(x: number, y: number): void {
+    if (this.picking) {
+      this.sampleAt(x, y);
+      return;
     }
-    .width('100%')
-    .height('100%')
+    if (!this.cropMode && !this.maskMode) {
+      this.chromeVisible = !this.chromeVisible;
+    }
   }
 
   /** 底部工具条：预设 / 裁切 / 编辑 / 蒙版。 */
@@ -1558,7 +1589,7 @@ struct EditorPage {
     .width('100%')
     .height(210)
     .padding({ left: 14, right: 14, top: 10 })
-    .backgroundColor('#1A1A1A')
+    .backgroundColor('#B31A1A1A')
   }
 
   @Builder
@@ -1589,7 +1620,7 @@ struct EditorPage {
     .width('100%')
     .height(44)
     .padding({ left: 14, right: 14 })
-    .backgroundColor('#1A1A1A')
+    .backgroundColor('#B31A1A1A')
   }
 
   private shortName(): string {
@@ -1643,22 +1674,24 @@ struct EditorPage {
       .height(34)
 
       if (this.categoryIndex === 0) {
-        this.colorPanel()
+        this.lightPanel()
       } else if (this.categoryIndex === 1) {
-        this.curvePanel()
+        this.colorPanel()
       } else if (this.categoryIndex === 2) {
-        this.opticsPanel()
+        this.curvePanel()
       } else if (this.categoryIndex === 3) {
-        this.detailPanel()
+        this.opticsPanel()
       } else if (this.categoryIndex === 4) {
+        this.detailPanel()
+      } else if (this.categoryIndex === 5) {
         this.effectsPanel()
       } else {
         this.geometryPanel()
       }
     }
     .width('100%')
-    .height(400)
-    .backgroundColor('#1A1A1A')
+    .height(330)
+    .backgroundColor('#B31A1A1A')
   }
 
   @Builder
@@ -1794,7 +1827,7 @@ struct EditorPage {
     .width('100%')
     .height(210)
     .padding({ left: 14, right: 14, top: 8 })
-    .backgroundColor('#1A1A1A')
+    .backgroundColor('#B31A1A1A')
   }
 
   @Builder
@@ -1885,7 +1918,7 @@ struct EditorPage {
     }
     .width('100%')
     .height(210)
-    .backgroundColor('#1A1A1A')
+    .backgroundColor('#B31A1A1A')
   }
 
   private pointValue(kind: number): number {
@@ -2085,6 +2118,20 @@ struct EditorPage {
     .backgroundColor('#E61E1E1E')
     .borderRadius(10)
     .clip(true)
+  }
+
+  @Builder
+  lightPanel() {
+    Column({ space: 2 }) {
+      this.sliderRow(I_EXPOSURE)
+      this.sliderRow(I_LIGHT_CONTRAST)
+      this.sliderRow(I_HIGHLIGHTS)
+      this.sliderRow(I_SHADOWS)
+      this.sliderRow(I_WHITES)
+      this.sliderRow(I_BLACKS)
+    }
+    .width('100%')
+    .padding({ left: 14, right: 14, top: 4 })
   }
 
   @Builder
