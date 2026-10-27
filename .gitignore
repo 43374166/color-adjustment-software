@@ -44,3 +44,7 @@ platforms/android/build/
 # Python caches
 __pycache__/
 *.pyc
+
+# 临时构建日志
+build-out.log
+build-err.log
