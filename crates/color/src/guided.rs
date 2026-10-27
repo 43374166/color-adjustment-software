@@ -11,6 +11,10 @@
 
 /// 引导滤波降采样倍率上限。
 const MAX_SCALING: usize = 4;
+/// 导向滤波的降采样像素预算（约 4MP）：2 通道 f32 约 32MB/份，峰值 5 份 ≈ 160MB。
+const FILTER_PIXEL_BUDGET: usize = 4_000_000;
+/// 内存预算触发的最大降采样倍数（再大就影响修正场的平滑度了）。
+const MAX_MEMORY_SCALING: usize = 8;
 
 /// 少于这么多元素就不值得开线程。
 const PARALLEL_THRESHOLD: usize = 32 * 1024;
@@ -304,6 +308,11 @@ pub(crate) fn guided_filter_2ch(
     }
 
     let mut scaling = get_scaling(sigma).min(MAX_SCALING);
+    // 大图按内存预算强制降采样：全分辨率下 2 通道 f32 平面是 8 字节/像素，
+    // 导向滤波同时要保留 3–5 份，24MP 导出会直接吃掉 1GB 以上（iOS 上被系统杀掉）。
+    // 修正场本身是低频的，降采样后再上采样几乎不损失观感。
+    let memory_scale = ((pixels as f32) / FILTER_PIXEL_BUDGET as f32).sqrt().ceil() as usize;
+    scaling = scaling.max(memory_scale.min(MAX_MEMORY_SCALING));
     // 太小的图不降采样，否则窗口没有意义。
     while scaling > 1 && (width / scaling < 2 || height / scaling < 2) {
         scaling -= 1;

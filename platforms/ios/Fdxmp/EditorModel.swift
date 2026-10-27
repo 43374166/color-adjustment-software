@@ -48,6 +48,8 @@ enum EditorLimits {
     /// 蒙版列表缩略图最长边。
     static let maskThumbnailMaxEdge = 128
     /// 导出按**原图分辨率**渲染（不再限制最长边）。
+    /// 导出像素预算：超过就按比例降采样（48MP RAW 全分辨率导出在 iPhone 上会被系统杀掉）。
+    static let exportPixelLimit = 18_000_000
     /// 导出格式 / 质量 / 保留元数据 / 导出后分享（与「我的」页 @AppStorage 共用）。
     static let exportFormatKey = "fdxmp_export_format"
     static let exportQualityKey = "fdxmp_export_quality"
@@ -3182,8 +3184,13 @@ final class EditorModel: ObservableObject {
         let format = EditorLimits.exportFormat
         let quality = EditorLimits.exportQuality
         let keepMetadata = EditorLimits.exportKeepMetadata
-        // 原图分辨率（不再限制最长边）。
-        let targetEdge = max(asset.pixelWidth, asset.pixelHeight)
+        // 原图分辨率（受像素预算约束：超限按比例降采样，避免导出时被系统 OOM 杀掉）。
+        var targetEdge = max(asset.pixelWidth, asset.pixelHeight)
+        let sourcePixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
+        if sourcePixels > Double(EditorLimits.exportPixelLimit) {
+            let scale = (Double(EditorLimits.exportPixelLimit) / sourcePixels).squareRoot()
+            targetEdge = max(1024, Int((Double(targetEdge) * scale).rounded()))
+        }
         let crop = state.crop
         let identityGeometry = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
             && crop.rotation == 0
