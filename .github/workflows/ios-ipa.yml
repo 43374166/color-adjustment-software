@@ -47,8 +47,6 @@ jobs:
             "$base/BritishWerewolf/U-2-Netp/resolve/main/onnx/model.onnx"
           curl -L --fail --retry 3 -o dist/ios/models/face_landmarks_mediapipe_v2_fp32.onnx \
             "$base/fernandotonon/QtMeshEditor-facemesh-onnx/resolve/main/face_landmarks.onnx"
-          # 人脸解析：自转 BiSeNet-19（MIT 权重，见 packaging/models/）——随仓库携带，保证哈希一致。
-          cp models/face_parsing_bisenet19_fp32.onnx dist/ios/models/
           # 超分：自转 Real-ESRGAN 紧凑版（BSD-3，动态尺寸，权重内嵌；随仓库携带）。
           cp models/superres_realesrgan_x4v3_fp32.onnx dist/ios/models/
           cd dist/ios/models
@@ -56,7 +54,6 @@ jobs:
           3f1ac54e769cb5fd76eda11ac3c088eed78d1f51a935a839d04d49b0e770219e  face_detector_scrfd2p5g_bnkps_fp32.onnx
           309c8469258dda742793dce0ebea8e6dd393174f89934733ecc8b14c76f4ddd8  u2netp.onnx
           d16e5a55e6a480284d468ee32469692464049518c311662ab3956681de31e3e9  face_landmarks_mediapipe_v2_fp32.onnx
-          2453dcc1592590d1f9f7b064b3031c20f35bca74375445d23ab7f5ad3c38ea2f  face_parsing_bisenet19_fp32.onnx
           572e44f2040bcbca2cbdc661ccf8e720199d338088fe114d7eacdf8867e737d9  superres_realesrgan_x4v3_fp32.onnx
           EOF
           ls -lh

@@ -109,6 +109,8 @@ final class EditorModel: ObservableObject {
     /// 放大查看时的高分辨率帧（仅缩放 > 1 时显示）。
     @Published private(set) var detailImage: UIImage?
     @Published private(set) var isLoading = false
+    /// 首帧加载期间是否在恢复历史调色（决定加载弹框的文案）。
+    @Published private(set) var isRestoringEdits = false
     @Published private(set) var isRendering = false
     @Published private(set) var isExporting = false
     /// 导出进度（0..1；nil = 未在导出）。
@@ -297,10 +299,12 @@ final class EditorModel: ObservableObject {
             state = EditJSON.parse(json)
             presetName = "自定义"
             presetRef = nil
+            isRestoringEdits = true
         } else {
             state = EditState()
             presetName = "原片"
             presetRef = EditorSpec.presets.first?.ref
+            isRestoringEdits = false
         }
         selectedMaskId = state.masks.first?.id
         isLoading = true
@@ -314,6 +318,7 @@ final class EditorModel: ObservableObject {
             guard let image else { return }
             self.previewImage = image
             self.isLoading = false
+            self.isRestoringEdits = false
         }
 
         // 2) 正式图：RAW（ProRAW / DNG）走 LibRaw 解调，其余交给系统解码后转像素缓冲。
@@ -372,6 +377,7 @@ final class EditorModel: ObservableObject {
             }
             guard let image else {
                 self.isLoading = false
+                self.isRestoringEdits = false
                 self.message = "无法读取这张照片"
                 return
             }

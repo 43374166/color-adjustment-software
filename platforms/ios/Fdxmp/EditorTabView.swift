@@ -787,26 +787,24 @@ struct EditorTabView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            // 切图 / 首帧加载：只在顶部显示小胶囊，不遮挡画面（原图不再被压暗发糊）。
+            // 切图 / 首帧加载：居中弹框（半透明遮罩 + 圆角卡片），加载期间拦截所有点击，
+            // 加载完自动消失，避免先看到原图再跳成调色结果。
             if model.isLoading {
-                VStack {
-                    HStack(spacing: 8) {
+                ZStack {
+                    Color.black.opacity(0.35).ignoresSafeArea()
+                    VStack(spacing: 12) {
                         ProgressView()
-                            .controlSize(.mini)
                             .tint(.white)
-                        Text("正在加载照片…")
-                            .font(.caption2)
-                            .foregroundStyle(.white.opacity(0.85))
+                        Text(model.isRestoringEdits ? "正在应用上次的调色…" : "正在加载照片…")
+                            .font(.footnote)
+                            .foregroundStyle(.white.opacity(0.9))
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Capsule().fill(Color.black.opacity(0.55)))
-                    .padding(.top, 10)
-                    Spacer()
+                    .padding(.horizontal, 28)
+                    .padding(.vertical, 22)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 }
-                .allowsHitTesting(false)
                 .transition(.opacity)
-                .zIndex(20)
+                .zIndex(30)
             }
             // 放大后的 1:1 区域帧（核心按帧外坐标渲染），按归一化矩形对齐贴上。
             if model.tool != .mask,
