@@ -60,8 +60,6 @@ struct EditorTabView: View {
     @AppStorage("fdxmp_hsl_style") private var hslStyle = "dots"
     /// 颜色均衡器当前页签：0 色相 / 1 饱和度 / 2 亮度。
     @State private var eqChannel = 0
-    /// 颜色均衡器的 8 个色带名（与 Rust 的节点顺序一致）。
-    private let eqBandNames = ["红", "橙", "黄", "绿", "青", "蓝", "紫", "品红"]
     /// 预览区尺寸（用于按视口取放大细节帧分辨率）。
     @State private var previewAreaSize: CGSize = .zero
     /// 相册式左右滑动：内容偏移（手指跟随 / 回弹）。
@@ -462,9 +460,10 @@ struct EditorTabView: View {
         previewArea
     }
 
-    /// HSL 专注模式：进 HSL 后隐藏所有导航（含底部 tab），只留「完成」退出。
+    /// HSL / 颜色均衡器专注模式：进子页后隐藏所有导航（含底部 tab），只留「完成」退出。
     private var hslFocused: Bool {
-        model.tool == .edit && model.category == .color && model.colorTab == .hsl
+        model.tool == .edit && model.category == .color
+            && (model.colorTab == .hsl || model.colorTab == .equalizer)
     }
 
     /// 曲线 / 蒙版 / HSL 下隐藏顶部栏与底部工具条，把空间让给编辑区。
@@ -1567,21 +1566,6 @@ struct EditorTabView: View {
 
     private var equalizerPanel: some View {
         VStack(spacing: 0) {
-            Toggle(isOn: Binding(
-                get: { model.state.equalizer.enabled },
-                set: { value in
-                    var updated = model.state.equalizer
-                    updated.enabled = value
-                    model.updateEqualizer(updated, commit: true)
-                    Haptics.light()
-                }
-            )) {
-                Text("启用颜色均衡器")
-                    .font(.caption)
-            }
-            .padding(.horizontal, 18)
-            .padding(.vertical, 8)
-
             Picker("", selection: $eqChannel) {
                 Text("色相").tag(0)
                 Text("饱和度").tag(1)
@@ -1589,25 +1573,36 @@ struct EditorTabView: View {
             }
             .pickerStyle(.segmented)
             .padding(.horizontal, 14)
-            .padding(.bottom, 6)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
             .opacity(model.draggingSlider == nil ? 1 : 0)
             .allowsHitTesting(model.draggingSlider == nil)
 
-            equalizerSliders
+            EqualizerGraph(
+                channel: eqChannel,
+                state: model.state.equalizer,
+                onBegin: { model.beginEdit() },
+                onChange: { updated in
+                    model.updateEqualizer(updated, commit: false)
+                },
+                onCommit: { model.commitEdit() }
+            )
+            .padding(.horizontal, 10)
+
+            equalizerOptions
             Spacer(minLength: 0)
         }
     }
 
-    private var equalizerSliders: some View {
+    private var equalizerOptions: some View {
         let eq = model.state.equalizer
         return ScrollView {
             VStack(spacing: 0) {
-                ForEach(0..<8, id: \.self) { index in
-                    equalizerRow(index)
-                }
-                Divider()
-                    .padding(.horizontal, 18)
-                    .padding(.vertical, 6)
+                Text("拖动节点改当前通道；节点整体旋转在下面。")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 6)
+                    .padding(.bottom, 2)
                 ValueSliderRow(
                     label: "阈值",
                     value: eq.threshold,
@@ -1724,60 +1719,7 @@ struct EditorTabView: View {
         .scrollDisabled(model.draggingSlider != nil)
     }
 
-    @ViewBuilder
-    private func equalizerRow(_ index: Int) -> some View {
-        let eq = model.state.equalizer
-        let label = eqBandNames[index]
-        switch eqChannel {
-        case 0:
-            ValueSliderRow(
-                label: label,
-                value: eq.hue[index],
-                range: -180...180,
-                onBegin: { model.beginEdit() },
-                onChange: { value in
-                    var updated = model.state.equalizer
-                    updated.hue[index] = value
-                    model.updateEqualizer(updated, commit: false)
-                },
-                onCommit: { model.commitEdit() }
-            )
-            .opacity(model.sliderVisible(label) ? 1 : 0)
-            .allowsHitTesting(model.sliderVisible(label))
-        case 1:
-            ValueSliderRow(
-                label: label,
-                value: (eq.saturation[index] - 1) * 100,
-                range: -100...100,
-                onBegin: { model.beginEdit() },
-                onChange: { value in
-                    var updated = model.state.equalizer
-                    updated.saturation[index] = max(1 + value / 100, 0)
-                    model.updateEqualizer(updated, commit: false)
-                },
-                onCommit: { model.commitEdit() }
-            )
-            .opacity(model.sliderVisible(label) ? 1 : 0)
-            .allowsHitTesting(model.sliderVisible(label))
-        default:
-            ValueSliderRow(
-                label: label,
-                value: (eq.brightness[index] - 1) * 100,
-                range: -100...100,
-                onBegin: { model.beginEdit() },
-                onChange: { value in
-                    var updated = model.state.equalizer
-                    updated.brightness[index] = max(1 + value / 100, 0)
-                    model.updateEqualizer(updated, commit: false)
-                },
-                onCommit: { model.commitEdit() }
-            )
-            .opacity(model.sliderVisible(label) ? 1 : 0)
-            .allowsHitTesting(model.sliderVisible(label))
-        }
-    }
-
-    private var hslPanel: some View {
+        private var hslPanel: some View {
         VStack(spacing: 0) {
             // 色带选择：默认 Lightroom 那种 8 个色圆点（可横滑），
             // 也可切回"彩虹色带"老式样式（选择记忆在本地）。

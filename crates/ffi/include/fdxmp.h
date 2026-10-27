@@ -42,6 +42,16 @@ void fdxmp_bytes_free(uint8_t *ptr, size_t len);
  */
 int32_t fdxmp_color_oklch_from_srgb8(uint8_t r, uint8_t g, uint8_t b, float *out);
 
+/*
+ * 颜色均衡器曲线（给 UI 画图用，与渲染同一份算法）。
+ *
+ * `channel`：0 = 色相（弧度）/ 1 = 饱和度增益 / 2 = 亮度增益。
+ * `params_json`：整份渲染参数 JSON（只读其中的 `equalizer` 字段，缺失按默认值）。
+ * `out`：至少 512 个 float，写入 512 点 LUT（定义域 [-π, π)）。
+ * 返回 FDXMP_OK / FDXMP_ERR。
+ */
+int32_t fdxmp_equalizer_curve(uint32_t channel, const char *params_json, float *out);
+
 /* ---- 引擎 ---- */
 
 void *fdxmp_engine_new(void);

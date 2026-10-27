@@ -132,6 +132,55 @@ pub unsafe extern "C" fn fdxmp_color_oklch_from_srgb8(r: u8, g: u8, b: u8, out: 
     FDXMP_OK
 }
 
+/// 颜色均衡器曲线：把 8 个节点 + 选项算成 512 点 LUT（与渲染同一份算法）。
+///
+/// `channel`：0 色相（弧度）/ 1 饱和度增益 / 2 亮度增益。`params_json` 是整份
+/// 渲染参数，只读其中的 `equalizer` 字段（缺失按默认值）。
+///
+/// # Safety
+///
+/// `params_json` 必须是有效的 UTF-8 C 字符串，`out` 必须指向可写、长度 ≥ 512 的
+/// `float` 数组；任一为 NULL 时返回错误。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_equalizer_curve(
+    channel: u32,
+    params_json: *const c_char,
+    out: *mut f32,
+) -> i32 {
+    if out.is_null() || params_json.is_null() {
+        set_last_error("参数为空指针");
+        return FDXMP_ERR;
+    }
+    // SAFETY: 调用方保证是有效 C 字符串（见函数文档）。
+    let json = match CStr::from_ptr(params_json).to_str() {
+        Ok(text) => text,
+        Err(_) => {
+            set_last_error("参数 JSON 不是有效的 UTF-8");
+            return FDXMP_ERR;
+        }
+    };
+    let root: serde_json::Value = match serde_json::from_str(json) {
+        Ok(value) => value,
+        Err(error) => {
+            set_last_error(format!("参数 JSON 解析失败：{error}"));
+            return FDXMP_ERR;
+        }
+    };
+    let params: fdxmp_core::params::EqualizerParams = root
+        .get("equalizer")
+        .and_then(|value| serde_json::from_value(value.clone()).ok())
+        .unwrap_or_default();
+    let channel = match channel {
+        0 => fdxmp_core::Channel::Hue,
+        1 => fdxmp_core::Channel::Saturation,
+        _ => fdxmp_core::Channel::Brightness,
+    };
+    let lut = fdxmp_core::equalizer_curve(&params, channel);
+    // SAFETY: 调用方保证 out 指向 ≥512 个 float 的可写数组（见函数文档）。
+    std::ptr::copy_nonoverlapping(lut.as_ptr(), out, lut.len());
+    FDXMP_OK
+}
+
 /// 返回最近一次错误的 UTF-8 消息（调用方用 `fdxmp_string_free` 释放）；无错误返回 NULL。
 #[no_mangle]
 pub extern "C" fn fdxmp_last_error_message() -> *mut c_char {

@@ -50,6 +50,20 @@ use params::EditParams;
 /// 核心语义版本号（与 crate 版本一致）。
 pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// 颜色均衡器的三个通道（UI 画曲线用）。
+pub use fdxmp_color::equalizer::Channel;
+
+/// 颜色均衡器单通道曲线（512 点，定义域 `[-π, π)`）。
+///
+/// 与渲染走同一份 8 节点周期 RBF 烘焙，UI 画出来的曲线就是实际生效的曲线；
+/// 只算曲线、不建色域边界表，可每帧调用。
+pub fn equalizer_curve(
+    params: &params::EqualizerParams,
+    channel: Channel,
+) -> [f32; fdxmp_color::ucs::LUT_ELEM] {
+    fdxmp_color::equalizer::curve(&params.to_engine(), channel)
+}
+
 /// C ABI 版本号：任何破坏性 ABI 变更都必须递增。
 pub const ABI_VERSION: u32 = 1;
 

@@ -50,11 +50,23 @@ final class NativeCore {
         return (out[0], out[1], out[2])
     }
 
+    /// 颜色均衡器曲线（512 点）：`channel` 0 色相 / 1 饱和度 / 2 亮度。
+    ///
+    /// 与渲染走同一份 Rust 算法，UI 画出来的曲线就是实际生效的曲线。
+    func equalizerCurve(channel: Int, paramsJson: String) -> [Float] {
+        var out = [Float](repeating: 0, count: 512)
+        let code = paramsJson.withCString { json in
+            out.withUnsafeMutableBufferPointer { buffer -> Int32 in
+                fdxmp_equalizer_curve(UInt32(channel), json, buffer.baseAddress)
+            }
+        }
+        return code == 0 ? out : []
+    }
+
     /// 对内存 RGBA8 图像应用 `EditParams` JSON，返回渲染后的像素。
     ///
     /// 阻塞调用，必须在工作线程执行；失败返回 nil（原因见 `lastError()`）。
-    func render(buffer: RgbaBuffer, paramsJson: String) -> RenderResult? {
-        var outWidth: UInt32 = 0
+    func render(buffer: RgbaBuffer, paramsJson: String) -> RenderResult? {        var outWidth: UInt32 = 0
         var outHeight: UInt32 = 0
         var outLen = 0
         let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in

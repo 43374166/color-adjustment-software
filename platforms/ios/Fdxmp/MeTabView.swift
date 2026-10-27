@@ -7,6 +7,8 @@ struct MeTabView: View {
     @AppStorage(EditorLimits.exportQualityKey) private var exportQuality = 0.92
     @AppStorage(EditorLimits.exportKeepMetadataKey) private var exportKeepMetadata = true
     @AppStorage(EditorLimits.exportShareKey) private var exportShare = false
+    /// 颜色均衡器总开关（全局，默认开启）。
+    @AppStorage("fdxmp_eq_enabled") private var equalizerEnabled = true
 
     @State private var editCount = 0
     @State private var lastEdited: Date?
@@ -26,6 +28,7 @@ struct MeTabView: View {
             VStack(spacing: 14) {
                 headerCard
                 editsCard
+                editingCard
                 presetsCard
                 exportCard
                 aboutCard
@@ -152,6 +155,19 @@ struct MeTabView: View {
     }
 
     // MARK: - 导出设置
+
+    /// 编辑总开关：颜色均衡器默认开启，开关放在「我的」里。
+    private var editingCard: some View {
+        card("编辑") {
+            Toggle(isOn: $equalizerEnabled) {
+                Text("颜色均衡器")
+                    .font(.footnote)
+            }
+            Text("默认开启（与 Windows 端一致）；关闭后所有照片都不跑均衡器。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
 
     private var exportCard: some View {
         card("导出") {

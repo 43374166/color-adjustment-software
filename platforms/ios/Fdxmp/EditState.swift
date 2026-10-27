@@ -164,7 +164,6 @@ struct HslState: Equatable {
 /// 8 个色相节点 × 三通道（色相偏移 / 饱和度增益 / 亮度增益）+ 一组选项，
 /// 与 Rust `crates/core/src/params.rs::EqualizerParams` 一一对应。
 struct EqualizerState: Equatable {
-    var enabled = false
     /// 低饱和抑制拐点，0..0.3。
     var threshold: Float = 0.1
     /// 色相曲线过渡宽度，0.05..2。
@@ -1170,9 +1169,9 @@ enum EditJSON {
         return result
     }
 
-    private static func equalizerJson(_ equalizer: EqualizerState) -> [String: Any] {
-        [
-            "enabled": equalizer.enabled,
+    static func equalizerJson(_ equalizer: EqualizerState) -> [String: Any] {        [
+            // 总开关在「我的」里（全局），新装默认开启。
+            "enabled": UserDefaults.standard.object(forKey: "fdxmp_eq_enabled") as? Bool ?? true,
             "threshold": Double(equalizer.threshold),
             "smoothing_hue": Double(equalizer.smoothingHue),
             "contrast": Double(equalizer.contrast),
@@ -1293,6 +1292,39 @@ enum EditJSON {
 
     // MARK: 解析
 
+    /// 解析颜色均衡器（与 `equalizerJson` 对称；缺字段按默认值）。
+    static func parseEqualizer(_ node: Any?) -> EqualizerState {
+        var state = EqualizerState()
+        guard let object = node as? [String: Any] else { return state }
+        func number(_ key: String, _ fallback: Float) -> Float {
+            (object[key] as? NSNumber)?.floatValue ?? fallback
+        }
+        state.threshold = number("threshold", state.threshold)
+        state.smoothingHue = number("smoothing_hue", state.smoothingHue)
+        state.contrast = number("contrast", state.contrast)
+        state.whiteLevel = number("white_level", state.whiteLevel)
+        state.chromaSize = number("chroma_size", state.chromaSize)
+        state.paramSize = number("param_size", state.paramSize)
+        state.useFilter = (object["use_filter"] as? Bool) ?? state.useFilter
+        state.hueShift = number("hue_shift", state.hueShift)
+        if let array = object["saturation"] as? [NSNumber] {
+            for (index, value) in array.prefix(8).enumerated() {
+                state.saturation[index] = value.floatValue
+            }
+        }
+        if let array = object["hue"] as? [NSNumber] {
+            for (index, value) in array.prefix(8).enumerated() {
+                state.hue[index] = value.floatValue
+            }
+        }
+        if let array = object["brightness"] as? [NSNumber] {
+            for (index, value) in array.prefix(8).enumerated() {
+                state.brightness[index] = value.floatValue
+            }
+        }
+        return state
+    }
+
     static func parse(_ json: String) -> EditState {
         var state = EditState()
         guard let root = jsonObject(json) else { return state }
@@ -1307,6 +1339,7 @@ enum EditJSON {
         }
         state.curves = parseCurves(root["curves"])
         state.hsl = parseHsl(root["hsl"])
+        state.equalizer = parseEqualizer(root["equalizer"])
         state.grading = parseGrading(root["grading"])
         state.blackWhite = (root["color"] as? [String: Any])?["black_white"] as? Bool ?? false
         state.calibration = parseCalibration(root["calibration"])
