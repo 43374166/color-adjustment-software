@@ -63,6 +63,31 @@ final class NativeCore {
         return code == 0 ? out : []
     }
 
+    /// 分块渲染整帧（导出用，原图分辨率）：内部按条带切分，几何为裁切/翻转时也能保持内存受控。
+    ///
+    /// 阻塞调用，必须在工作线程执行；失败返回 nil（原因见 `lastError()`）。
+    func renderTiled(buffer: RgbaBuffer, paramsJson: String, stripPixels: Int = 2_000_000)
+        -> RenderResult? {
+        var outWidth: UInt32 = 0
+        var outHeight: UInt32 = 0
+        var outLen = 0
+        let pointer = buffer.pixels.withUnsafeBufferPointer { pixels in
+            paramsJson.withCString { params in
+                fdxmp_render_memory_tiled_rgba(
+                    pixels.baseAddress,
+                    UInt32(buffer.width),
+                    UInt32(buffer.height),
+                    params,
+                    UInt32(max(stripPixels, 1)),
+                    &outWidth,
+                    &outHeight,
+                    &outLen
+                )
+            }
+        }
+        return decodePayload(pointer: pointer, outLen: outLen)
+    }
+
     /// 对内存 RGBA8 图像应用 `EditParams` JSON，返回渲染后的像素。
     ///
     /// 阻塞调用，必须在工作线程执行；失败返回 nil（原因见 `lastError()`）。

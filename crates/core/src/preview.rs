@@ -98,7 +98,10 @@ pub fn render_memory_rgba(
 /// 分块渲染整帧：把大图切成长条逐块走区域管线，再把可见行拼回整帧。
 ///
 /// 手机上整帧 f32 管线动辄几百 MB，这条路径把单次峰值压到「一条 + 余量」，
-/// 同时保留原图分辨率（导出用）。几何非单位变换时自动回退整帧渲染。
+/// 同时保留**原图分辨率**（导出用）。
+///
+/// 支持的几何：裁切矩形 + 水平/垂直翻转（在拷贝条带时处理）。
+/// 旋转 / 镜头校正 / 几何变换仍然回退整帧渲染（这些需要重采样，不能按条带切）。
 pub fn render_memory_tiled_rgba(
     rgba: &[u8],
     width: u32,
@@ -106,10 +109,7 @@ pub fn render_memory_tiled_rgba(
     params_json: &str,
     strip_pixels: u32,
 ) -> Result<PreviewRgba> {
-    let params: EditParams = serde_json::from_str(params_json)?;
-    if !geometry_is_identity(&params) {
-        return render_memory_rgba(rgba, width, height, params_json);
-    }
+    let mut params: EditParams = serde_json::from_str(params_json)?;
     if width == 0 || height == 0 {
         return Err(FdxmpError::InvalidArgument(
             "RGBA 图像宽高必须大于 0".to_string(),
@@ -122,43 +122,97 @@ pub fn render_memory_tiled_rgba(
             rgba.len()
         )));
     }
+    let needs_resample = params.crop.rotation_deg.abs() > 1e-3
+        || params.lens.geometry.distortion.abs() > 1e-4
+        || params.lens.geometry.vertical.abs() > 1e-4
+        || params.lens.geometry.horizontal.abs() > 1e-4
+        || params.lens.geometry.rotate.abs() > 1e-3
+        || (params.lens.geometry.scale > 0.0
+            && (params.lens.geometry.scale - 1.0).abs() > 1e-4)
+        || params.lens.profile_correction;
+    if needs_resample {
+        return render_memory_rgba(rgba, width, height, params_json);
+    }
+
+    // 裁切矩形（归一化 → 像素，夹到图像内，至少 1px）。
+    let rect = params.crop.rect;
+    let left = (rect[0].clamp(0.0, 1.0) * width as f32).round() as u32;
+    let top = (rect[1].clamp(0.0, 1.0) * height as f32).round() as u32;
+    let right = ((rect[0] + rect[2]).clamp(0.0, 1.0) * width as f32).round() as u32;
+    let bottom = ((rect[1] + rect[3]).clamp(0.0, 1.0) * height as f32).round() as u32;
+    let out_width = right.saturating_sub(left).max(1).min(width.saturating_sub(left));
+    let out_height = bottom.saturating_sub(top).max(1).min(height.saturating_sub(top));
+    let flip_h = params.crop.flip_horizontal;
+    let flip_v = params.crop.flip_vertical;
+
+    // 条带管线里裁切/翻转已经由拷贝负责，参数里要置回单位，否则区域管线会再裁一次。
+    params.crop.rect = [0.0, 0.0, 1.0, 1.0];
+    params.crop.flip_horizontal = false;
+    params.crop.flip_vertical = false;
+    let identity_json = serde_json::to_string(&params)?;
+
+    let source_stride = width as usize * 4;
+    let out_stride = out_width as usize * 4;
+    let mut out = vec![0u8; out_stride * out_height as usize];
+
     // 每块约 strip_pixels 像素（至少 1 行），再各加 16 行余量给细节模糊。
-    let strip_height = ((strip_pixels as usize) / (width as usize))
+    let strip_height = ((strip_pixels as usize) / (out_width as usize))
         .max(1)
-        .min(height as usize);
+        .min(out_height as usize);
     const MARGIN: u32 = 16;
-    let mut out = vec![0u8; expected];
     let mut y = 0u32;
-    while (y as usize) < height as usize {
-        let rows = strip_height.min((height - y) as usize);
+    while (y as usize) < out_height as usize {
+        let rows = strip_height.min((out_height - y) as usize);
         let region_y = y.saturating_sub(MARGIN);
-        let region_bottom = (y + rows as u32 + MARGIN).min(height);
+        let region_bottom = (y + rows as u32 + MARGIN).min(out_height);
         let region_height = region_bottom - region_y;
-        let row_bytes = width as usize * 4;
-        let start = region_y as usize * row_bytes;
-        let end = start + region_height as usize * row_bytes;
+
+        // 把源图对应的一段拷成「裁切后」的区域缓冲（必要时翻转）。
+        let mut region = vec![0u8; region_height as usize * out_stride];
+        for row in 0..region_height {
+            let out_y = region_y + row; // 裁切后坐标
+            let src_y = top
+                + if flip_v {
+                    out_height - 1 - out_y
+                } else {
+                    out_y
+                };
+            let src_row = src_y as usize * source_stride + left as usize * 4;
+            let dst_row = row as usize * out_stride;
+            let source = &rgba[src_row..src_row + out_stride];
+            let target = &mut region[dst_row..dst_row + out_stride];
+            if flip_h {
+                for x in 0..out_width as usize {
+                    let from = (out_width as usize - 1 - x) * 4;
+                    target[x * 4..x * 4 + 4].copy_from_slice(&source[from..from + 4]);
+                }
+            } else {
+                target.copy_from_slice(source);
+            }
+        }
+
         let strip = render_memory_rgba_region(
-            &rgba[start..end],
-            width,
+            &region,
+            out_width,
             region_height,
-            params_json,
+            &identity_json,
             0,
             region_y,
             0,
             y,
-            width,
+            out_width,
             rows as u32,
-            width,
-            height,
+            out_width,
+            out_height,
         )?;
-        let dst = y as usize * row_bytes;
-        let len = strip.rgba.len().min(row_bytes * rows);
+        let dst = y as usize * out_stride;
+        let len = strip.rgba.len().min(out_stride * rows);
         out[dst..dst + len].copy_from_slice(&strip.rgba[..len]);
         y += rows as u32;
     }
     Ok(PreviewRgba {
-        width,
-        height,
+        width: out_width,
+        height: out_height,
         rgba: out,
     })
 }

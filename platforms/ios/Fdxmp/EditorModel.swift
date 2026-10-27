@@ -66,7 +66,7 @@ enum EditorLimits {
     /// JPEG 质量（0.5..1，其它格式忽略）。
     static var exportQuality: Double {
         let stored = UserDefaults.standard.double(forKey: exportQualityKey)
-        return stored > 0 ? stored : 0.92
+        return stored > 0 ? stored : 1.0
     }
 
     /// 是否保留原图 EXIF / GPS 等拍摄信息。
@@ -3185,13 +3185,8 @@ final class EditorModel: ObservableObject {
         let format = EditorLimits.exportFormat
         let quality = EditorLimits.exportQuality
         let keepMetadata = EditorLimits.exportKeepMetadata
-        // 原图分辨率（受像素预算约束：超限按比例降采样，避免导出时被系统 OOM 杀掉）。
-        var targetEdge = max(asset.pixelWidth, asset.pixelHeight)
-        let sourcePixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
-        if sourcePixels > Double(EditorLimits.exportPixelLimit) {
-            let scale = (Double(EditorLimits.exportPixelLimit) / sourcePixels).squareRoot()
-            targetEdge = max(1024, Int((Double(targetEdge) * scale).rounded()))
-        }
+        // 原图分辨率导出（内存由分块渲染控制，不再按像素上限降采样）。
+        let targetEdge = max(asset.pixelWidth, asset.pixelHeight)
         let crop = state.crop
         let identityGeometry = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
             && crop.rotation == 0
@@ -3390,12 +3385,13 @@ final class EditorModel: ObservableObject {
         }
         // 大图优先按横向条带分块渲染（每块只跑区域管线，内存峰值明显低于整帧）。
         let renderedBuffer: RgbaBuffer?
-        if let buffer, let tiled = renderTiledExport(
-            buffer: buffer,
-            paramsJson: json,
-            identityGeometry: identityGeometry
-        ) {
-            renderedBuffer = tiled
+        if let buffer,
+           let result = NativeCore.shared.renderTiled(buffer: buffer, paramsJson: json) {
+            renderedBuffer = RgbaBuffer(
+                pixels: result.pixels,
+                width: result.width,
+                height: result.height
+            )
         } else if let buffer,
                   let result = NativeCore.shared.render(buffer: buffer, paramsJson: json) {
             renderedBuffer = RgbaBuffer(

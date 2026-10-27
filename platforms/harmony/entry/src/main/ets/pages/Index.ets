@@ -35,7 +35,7 @@ struct Index {
   @State recent: RecentEntry[] = [];
   @State cacheBytes: number = 0;
   @State exportFormat: string = 'jpeg';
-  @State exportQuality: number = 95;
+  @State exportQuality: number = 100;
   // 0 = 还没请求过，1 = 已授权，2 = 被拒绝
   @State permissionState: number = 0;
   @State loading: boolean = false;
@@ -72,7 +72,7 @@ struct Index {
       const context = getContext(this) as common.UIAbilityContext;
       const store = await preferences.getPreferences(context, 'fdxmp_export');
       this.exportFormat = await store.get('format', 'jpeg') as string;
-      this.exportQuality = Number(await store.get('quality', '95'));
+      this.exportQuality = Number(await store.get('quality', '100'));
     } catch (error) {
     }
   }

@@ -3309,7 +3309,7 @@ struct EditorPage {
     this.statusText = '导出中…';
     try {
       // 内存边界：按 16MP 预算解码（多数手机原图 ≤12MP，超出则等比降采样）。
-      const buffer = await this.decodeWithBudget(16_000_000);
+      const buffer = await this.decode(this.photoUri, 100000);
       if (buffer === null) {
         throw new Error('无法解码原图');
       }
@@ -3332,11 +3332,11 @@ struct EditorPage {
       const context = getContext(this) as common.UIAbilityContext;
 
       let format = 'jpeg';
-      let quality = 95;
+      let quality = 100;
       try {
         const settings = await preferences.getPreferences(context, 'fdxmp_export');
         format = await settings.get('format', 'jpeg') as string;
-        quality = Number(await settings.get('quality', '95'));
+        quality = Number(await settings.get('quality', '100'));
       } catch (error) {
       }
       const packOptions: image.PackingOption = {
