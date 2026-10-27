@@ -1448,69 +1448,71 @@ struct EditorPage {
   // MARK: - UI
 
   build() {
-    Column() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      // 1) 照片铺满整屏（Contain：保持原始比例、完整显示）。
+      if (this.preview !== null) {
+        Image(this.preview)
+          .objectFit(ImageFit.Contain)
+          .width('100%')
+          .height('100%')
+      } else {
+        Image(this.photoUri)
+          .objectFit(ImageFit.Contain)
+          .width('100%')
+          .height('100%')
+      }
+
+      // 2) 裁切 / 蒙版叠加层；否则铺一层透明点击层（点照片切换沉浸 / 取色）。
+      if (this.cropMode) {
+        Canvas(this.cropContext)
+          .width('100%')
+          .height('100%')
+          .onReady(() => {
+            this.drawCropOverlay();
+          })
+          .onTouch((event: TouchEvent) => {
+            if (event.touches.length === 0) {
+              return;
+            }
+            const touch = event.touches[0];
+            this.handleCropTouch(touch.x, touch.y, event.type);
+          })
+      } else if (this.maskMode) {
+        Canvas(this.maskContext)
+          .width('100%')
+          .height('100%')
+          .onReady(() => {
+            this.drawMaskOverlay();
+          })
+          .onTouch((event: TouchEvent) => {
+            if (event.touches.length === 0) {
+              return;
+            }
+            const touch = event.touches[0];
+            this.handleMaskTouch(touch.x, touch.y, event.type);
+          })
+      } else {
+        Stack() {
+        }
+        .width('100%')
+        .height('100%')
+        .onClick((event: ClickEvent) => {
+          this.handlePreviewTap(event.x, event.y);
+        })
+      }
+
+      // 3) 顶部栏（半透明）
       if (this.chromeVisible) {
         this.topBar()
       }
 
-      // 照片区：按 Contain 保持原始比例，完整显示（不放大、不裁切）；
-      // 直方图浮在右上角，面板在照片下方，不遮盖照片。
-      Stack({ alignContent: Alignment.TopEnd }) {
-        if (this.preview !== null) {
-          Image(this.preview)
-            .objectFit(ImageFit.Contain)
-            .width('100%')
-            .height('100%')
-            .onClick((event: ClickEvent) => {
-              this.handlePreviewTap(event.x, event.y);
-            })
-        } else {
-          Image(this.photoUri)
-            .objectFit(ImageFit.Contain)
-            .width('100%')
-            .height('100%')
-        }
-
-        if (this.cropMode) {
-          Canvas(this.cropContext)
-            .width('100%')
-            .height('100%')
-            .onReady(() => {
-              this.drawCropOverlay();
-            })
-            .onTouch((event: TouchEvent) => {
-              if (event.touches.length === 0) {
-                return;
-              }
-              const touch = event.touches[0];
-              this.handleCropTouch(touch.x, touch.y, event.type);
-            })
-        }
-        if (this.maskMode) {
-          Canvas(this.maskContext)
-            .width('100%')
-            .height('100%')
-            .onReady(() => {
-              this.drawMaskOverlay();
-            })
-            .onTouch((event: TouchEvent) => {
-              if (event.touches.length === 0) {
-                return;
-              }
-              const touch = event.touches[0];
-              this.handleMaskTouch(touch.x, touch.y, event.type);
-            })
-        }
-        if (this.showPresets) {
-          this.presetOverlay()
-        }
-
-        // 直方图：图片右上角浮卡，调色时也保留。
-        if (this.chromeVisible) {
+      // 4) 直方图：照片右上角浮卡
+      if (this.chromeVisible) {
+        Row() {
+          Blank()
           Canvas(this.histContext)
             .width(190)
             .height(100)
-            .margin({ top: 8, right: 8 })
             .borderRadius(8)
             .clip(true)
             .onReady(() => {
@@ -1521,34 +1523,47 @@ struct EditorPage {
               this.drawHistogram();
             })
         }
+        .width('100%')
+        .height(100)
+        .margin({ top: 52 })
+        .padding({ right: 8 })
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
+      // 5) 底部：半透明面板 + 工具条（浮在照片上，不改变照片尺寸）
+      Column() {
+        Blank()
+        if (this.chromeVisible) {
+          if (this.activeTool === 0) {
+            this.presetPanel()
+          } else if (this.activeTool === 1) {
+            this.cropBar()
+          } else if (this.activeTool === 2) {
+            this.bottomPanel()
+          } else if (this.activeTool === 3) {
+            this.maskBar()
+          }
+          this.editorToolBar()
+        }
       }
       .width('100%')
-      .layoutWeight(1)
-      .backgroundColor('#000000')
-      .onAreaChange((oldArea: Area, newArea: Area) => {
-        this.areaW = Number(newArea.width);
-        this.areaH = Number(newArea.height);
-        if (this.cropMode) {
-          this.drawCropOverlay();
-        }
-      })
+      .height('100%')
+      .hitTestBehavior(HitTestMode.Transparent)
 
-      if (this.chromeVisible) {
-        if (this.activeTool === 0) {
-          this.presetPanel()
-        } else if (this.activeTool === 1) {
-          this.cropBar()
-        } else if (this.activeTool === 2) {
-          this.bottomPanel()
-        } else if (this.activeTool === 3) {
-          this.maskBar()
-        }
-        this.editorToolBar()
+      if (this.showPresets) {
+        this.presetOverlay()
       }
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#111111')
+    .backgroundColor('#000000')
+    .onAreaChange((oldArea: Area, newArea: Area) => {
+      this.areaW = Number(newArea.width);
+      this.areaH = Number(newArea.height);
+      if (this.cropMode) {
+        this.drawCropOverlay();
+      }
+    })
   }
 
   /** 点照片：取色模式下取色，否则切换沉浸模式。 */
@@ -1584,7 +1599,7 @@ struct EditorPage {
       }, (label: string) => label)
     }
     .width('100%')
-    .backgroundColor('#141414')
+    .backgroundColor('#CC141414')
     .borderWidth({ top: 1 })
     .borderColor('#22000000')
   }
