@@ -485,6 +485,9 @@ struct EditorPage {
   @State chromeVisible: boolean = true;
   /** 正在拖动的滑块 id（非空时进入「专注调色」：只留该滑块，面板背景透明）。 */
   @State focusRow: string = '';
+  /** 全屏布局下的安全区（由 EntryAbility 写入 AppStorage）。 */
+  @StorageProp('safeTop') safeTop: number = 0;
+  @StorageProp('safeBottom') safeBottom: number = 0;
   /** 照片缩放（双指 / 双击），1 = 原始大小。 */
   @State photoZoom: number = 1;
   /** 放大后单指拖动的位移（屏幕像素）。 */
@@ -1411,6 +1414,11 @@ struct EditorPage {
 
   private handleGraphTouch(x: number, y: number, height: number, phase: number): void {
     if (phase === TouchType.Down) {
+      this.focusRow = 'eq';
+    } else if (phase === TouchType.Up || phase === TouchType.Cancel) {
+      this.focusRow = '';
+    }
+    if (phase === TouchType.Down) {
       let best = -1;
       let bestDistance = 999;
       const width = this.context.width;
@@ -1577,7 +1585,7 @@ struct EditorPage {
         }
         .width('100%')
         .height(100)
-        .margin({ top: 52 })
+        .margin({ top: 52 + this.safeTop })
         .padding({ right: 8 })
         .hitTestBehavior(HitTestMode.Transparent)
       }
@@ -1681,7 +1689,7 @@ struct EditorPage {
     }
     .width('100%')
     .backgroundColor('#CC141414')
-    .padding({ bottom: 16 })
+    .padding({ bottom: 16 + this.safeBottom })
     .opacity(this.focusRow === '' ? 1 : 0)
     .borderWidth({ top: 1 })
     .borderColor('#22000000')
@@ -1821,8 +1829,8 @@ struct EditorPage {
         })
     }
     .width('100%')
-    .height(44)
-    .padding({ left: 14, right: 14 })
+    .height(44 + this.safeTop)
+    .padding({ left: 14, right: 14, top: this.safeTop })
     .backgroundColor('#B31A1A1A')
   }
 
@@ -2369,6 +2377,7 @@ struct EditorPage {
           })
       }
       .width('100%')
+      .opacity(this.focusRow === '' || this.focusRow === 'curve' ? 1 : 0)
       .padding({ left: 12, right: 12, top: 2, bottom: 6 })
 
       Canvas(this.curveContext)
@@ -2708,6 +2717,7 @@ struct EditorPage {
       }
       .width('100%')
       .height(32)
+      .opacity(this.focusRow === '' || this.focusRow === 'eq' ? 1 : 0)
 
       Canvas(this.context)
         .width('100%')
@@ -2865,6 +2875,11 @@ struct EditorPage {
   private handleCurveTouch(x: number, y: number, width: number, height: number, phase: number): void {
     if (width <= 0 || height <= 0) {
       return;
+    }
+    if (phase === TouchType.Down) {
+      this.focusRow = 'curve';
+    } else if (phase === TouchType.Up || phase === TouchType.Cancel) {
+      this.focusRow = '';
     }
     const px = Math.min(Math.max(x / width, 0), 1);
     const py = Math.min(Math.max(1 - y / height, 0), 1);

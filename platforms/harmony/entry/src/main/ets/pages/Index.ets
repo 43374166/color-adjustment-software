@@ -30,6 +30,8 @@ interface RecentEntry {
 struct Index {
   @State activeTab: number = 0;
   @State coreVersion: string = '未加载';
+  @StorageProp('safeTop') safeTop: number = 0;
+  @StorageProp('safeBottom') safeBottom: number = 0;
   @State recent: RecentEntry[] = [];
   @State cacheBytes: number = 0;
   @State exportFormat: string = 'jpeg';
@@ -396,7 +398,7 @@ struct Index {
         .fontColor('#888888')
     }
     .width('100%')
-    .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+    .padding({ left: 16, right: 16, top: 12 + this.safeTop, bottom: 12 })
     .backgroundColor('#141414')
   }
 
@@ -427,7 +429,7 @@ struct Index {
     }
     .width('100%')
     .backgroundColor('#141414')
-    .padding({ bottom: 16 })
+    .padding({ bottom: 16 + this.safeBottom })
     .borderWidth({ top: 1 })
     .borderColor('#22000000')
   }
