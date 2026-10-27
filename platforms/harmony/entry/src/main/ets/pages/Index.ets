@@ -427,6 +427,7 @@ struct Index {
     }
     .width('100%')
     .backgroundColor('#141414')
+    .padding({ bottom: 16 })
     .borderWidth({ top: 1 })
     .borderColor('#22000000')
   }
@@ -1074,5 +1075,6 @@ struct Index {
     }
     .width('100%')
     .height('100%')
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
   }
 }

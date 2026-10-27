@@ -1607,6 +1607,7 @@ struct EditorPage {
     .width('100%')
     .height('100%')
     .backgroundColor('#000000')
+    .expandSafeArea([SafeAreaType.SYSTEM], [SafeAreaEdge.BOTTOM])
     .onAreaChange((oldArea: Area, newArea: Area) => {
       this.areaW = Number(newArea.width);
       this.areaH = Number(newArea.height);
@@ -1678,6 +1679,7 @@ struct EditorPage {
     }
     .width('100%')
     .backgroundColor('#CC141414')
+    .padding({ bottom: 16 })
     .borderWidth({ top: 1 })
     .borderColor('#22000000')
   }

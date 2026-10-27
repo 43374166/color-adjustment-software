@@ -13,6 +13,13 @@ export default class EntryAbility extends UIAbility {
         hilog.error(0x0000, 'fdxmp', 'loadContent failed: %{public}s', JSON.stringify(err));
       }
     });
+    // 底部安全区（手势条）用工具条同色填充，避免出现一条黑边。
+    try {
+      const mainWindow = windowStage.getMainWindowSync();
+      mainWindow.setWindowBackgroundColor('#141414');
+    } catch (error) {
+      hilog.warn(0x0000, 'fdxmp', 'setWindowBackgroundColor failed');
+    }
   }
 
   onDestroy(): void {
