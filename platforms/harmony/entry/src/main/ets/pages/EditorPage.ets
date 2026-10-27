@@ -543,6 +543,11 @@ struct EditorPage {
   private paintingMask: number = -1;
   /** 进入蒙版模式前保存的全局参数（蒙版外的编辑）。 */
   private globalJson: string = '';
+  /** 撤销 / 重做：保存历史参数 JSON（最多 50 步）。 */
+  private history: string[] = [];
+  private redoStack: string[] = [];
+  private lastCommitted: string = '';
+  private snapshotTimer: number = -1;
 
   /** 上一帧渲染结果的尺寸（算裁剪框显示位置用）。 */
   private lastW: number = 0;
@@ -598,6 +603,10 @@ struct EditorPage {
       clearTimeout(this.renderTimer);
       this.renderTimer = -1;
     }
+    if (this.snapshotTimer >= 0) {
+      clearTimeout(this.snapshotTimer);
+      this.snapshotTimer = -1;
+    }
     this.saveCurrentEdit();
   }
 
@@ -616,6 +625,7 @@ struct EditorPage {
   private async startup(): Promise<void> {
     await this.loadSavedEdit();
     await this.loadPhoto();
+    this.lastCommitted = this.paramsJson();
   }
 
   private async loadSavedEdit(): Promise<void> {
@@ -794,6 +804,88 @@ struct EditorPage {
       this.renderTimer = -1;
       this.renderNow(useFast);
     }, useFast ? 70 : 180);
+    this.scheduleSnapshot();
+  }
+
+  // MARK: - 撤销 / 重做 / 重置
+
+  /** 停止操作 600ms 后记一步历史（一次拖动 = 一步）。 */
+  private scheduleSnapshot(): void {
+    if (this.snapshotTimer >= 0) {
+      clearTimeout(this.snapshotTimer);
+    }
+    this.snapshotTimer = setTimeout(() => {
+      this.snapshotTimer = -1;
+      this.commitSnapshot();
+    }, 600);
+  }
+
+  private commitSnapshot(): void {
+    const current = this.paramsJson();
+    if (current === this.lastCommitted) {
+      return;
+    }
+    if (this.lastCommitted.length > 0) {
+      this.history.push(this.lastCommitted);
+      if (this.history.length > 50) {
+        this.history.shift();
+      }
+    }
+    this.redoStack = [];
+    this.lastCommitted = current;
+  }
+
+  private undo(): void {
+    if (this.history.length === 0) {
+      return;
+    }
+    this.commitSnapshot();
+    const previous = this.history[this.history.length - 1];
+    this.history.pop();
+    this.redoStack.push(this.lastCommitted);
+    this.restore(previous);
+  }
+
+  private redo(): void {
+    if (this.redoStack.length === 0) {
+      return;
+    }
+    const next = this.redoStack[this.redoStack.length - 1];
+    this.redoStack.pop();
+    this.history.push(this.lastCommitted);
+    this.restore(next);
+  }
+
+  /** 载入一份参数快照并重绘 / 重渲。 */
+  private restore(json: string): void {
+    this.maskMode = false;
+    this.activeTool = -1;
+    this.cropMode = false;
+    this.applyPayload(JSON.parse(json) as ParamsPayload, true);
+    this.lastCommitted = this.paramsJson();
+    this.drawGraph();
+    this.drawCurveEditor();
+    this.drawMaskOverlay();
+    this.scheduleRender(false);
+  }
+
+  /** 重置：清空所有调整（含裁剪、蒙版、点颜色）。 */
+  private resetAll(): void {
+    this.commitSnapshot();
+    const identity = this.identityPayloadJson();
+    this.maskMode = false;
+    this.cropMode = false;
+    this.flipH = false;
+    this.cropRect = [0, 0, 1, 1];
+    this.masks = [];
+    this.points = [];
+    this.applyPayload(JSON.parse(identity) as ParamsPayload, true);
+    this.lastCommitted = this.paramsJson();
+    this.drawGraph();
+    this.drawCurveEditor();
+    this.drawMaskOverlay();
+    this.scheduleRender(false);
+    promptAction.showToast({ message: '已重置所有调整' });
   }
 
   // MARK: - 参数 JSON
@@ -1599,7 +1691,28 @@ struct EditorPage {
         .textAlign(TextAlign.Center)
         .maxLines(1)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .padding({ left: 8, right: 8 })
+        .padding({ left: 6, right: 6 })
+      Text('↶')
+        .fontSize(17)
+        .fontColor('#E8E8E8')
+        .padding({ left: 6, right: 6 })
+        .onClick(() => {
+          this.undo();
+        })
+      Text('↷')
+        .fontSize(17)
+        .fontColor('#E8E8E8')
+        .padding({ right: 8 })
+        .onClick(() => {
+          this.redo();
+        })
+      Text('重置')
+        .fontSize(12)
+        .fontColor('#AAAAAA')
+        .padding({ right: 10 })
+        .onClick(() => {
+          this.resetAll();
+        })
       Text('导出')
         .fontSize(13)
         .fontColor('#4A9EFF')
