@@ -496,6 +496,7 @@ struct EditorPage {
   private pinchBase: number = 1;
   /** 上一次多指/拖动交互的结束时间戳，用于抑制随后的误点击。 */
   private suppressTapUntil: number = 0;
+  private focusTimer: number = -1;
   private panBaseX: number = 0;
   private panBaseY: number = 0;
   @State cropMode: boolean = false;
@@ -1416,11 +1417,7 @@ struct EditorPage {
 
   private handleGraphTouch(x: number, y: number, height: number, phase: number): void {
     this.suppressTapUntil = Date.now() + 500;
-    if (phase === TouchType.Down) {
-      this.focusRow = 'eq';
-    } else if (phase === TouchType.Up || phase === TouchType.Cancel) {
-      this.focusRow = '';
-    }
+    this.keepFocus('eq', phase);
     if (phase === TouchType.Down) {
       let best = -1;
       let bestDistance = 999;
@@ -1470,55 +1467,14 @@ struct EditorPage {
 
   build() {
     Stack({ alignContent: Alignment.TopStart }) {
-      // 1) 照片铺满整屏（Contain：保持原始比例、完整显示）。
-      if (this.preview !== null) {
-        Image(this.preview)
-          .objectFit(ImageFit.Contain)
-          .width('100%')
-          .height('100%')
-          .scale({ x: this.photoZoom, y: this.photoZoom })
-      } else {
-        Image(this.photoUri)
-          .objectFit(ImageFit.Contain)
-          .width('100%')
-          .height('100%')
-          .scale({ x: this.photoZoom, y: this.photoZoom })
-      }
-
-      // 2) 裁切 / 蒙版叠加层；否则铺一层透明点击层（点照片切换沉浸 / 取色）。
-      if (this.cropMode) {
-        Canvas(this.cropContext)
-          .width('100%')
-          .height('100%')
-          .onReady(() => {
-            this.drawCropOverlay();
-          })
-          .onTouch((event: TouchEvent) => {
-            if (event.touches.length === 0) {
-              return;
-            }
-            const touch = event.touches[0];
-            this.handleCropTouch(touch.x, touch.y, event.type);
-          })
-      } else if (this.maskMode) {
-        Canvas(this.maskContext)
-          .width('100%')
-          .height('100%')
-          .onReady(() => {
-            this.drawMaskOverlay();
-          })
-          .onTouch((event: TouchEvent) => {
-            if (event.touches.length === 0) {
-              return;
-            }
-            const touch = event.touches[0];
-            this.handleMaskTouch(touch.x, touch.y, event.type);
-          })
-      } else {
-        Stack() {
-        }
+      // 1) 照片铺满整屏（Contain）；所有预览手势直接挂在图片上，
+      //    面板 / 顶栏在图片上层，点它们不会误触发沉浸或缩放。
+      Image(this.preview !== null ? this.preview : this.photoUri)
+        .objectFit(ImageFit.Contain)
         .width('100%')
         .height('100%')
+        .scale({ x: this.photoZoom, y: this.photoZoom })
+        .translate({ x: this.panX, y: this.panY })
         .gesture(GestureGroup(GestureMode.Exclusive,
           TapGesture({ count: 2 })
             .onAction(() => {
@@ -1573,6 +1529,36 @@ struct EditorPage {
             this.panX = this.clampPan(this.panBaseX + event.offsetX, this.areaW, this.photoZoom);
             this.panY = this.clampPan(this.panBaseY + event.offsetY, this.areaH, this.photoZoom);
           }))
+
+      // 2) 裁切 / 蒙版叠加层（在图片上层，自己接管触摸）。
+      if (this.cropMode) {
+        Canvas(this.cropContext)
+          .width('100%')
+          .height('100%')
+          .onReady(() => {
+            this.drawCropOverlay();
+          })
+          .onTouch((event: TouchEvent) => {
+            if (event.touches.length === 0) {
+              return;
+            }
+            const touch = event.touches[0];
+            this.handleCropTouch(touch.x, touch.y, event.type);
+          })
+      } else if (this.maskMode) {
+        Canvas(this.maskContext)
+          .width('100%')
+          .height('100%')
+          .onReady(() => {
+            this.drawMaskOverlay();
+          })
+          .onTouch((event: TouchEvent) => {
+            if (event.touches.length === 0) {
+              return;
+            }
+            const touch = event.touches[0];
+            this.handleMaskTouch(touch.x, touch.y, event.type);
+          })
       }
 
       // 3) 顶部栏（半透明；专注调色时隐藏）
@@ -2899,11 +2885,7 @@ struct EditorPage {
       return;
     }
     this.suppressTapUntil = Date.now() + 500;
-    if (phase === TouchType.Down) {
-      this.focusRow = 'curve';
-    } else if (phase === TouchType.Up || phase === TouchType.Cancel) {
-      this.focusRow = '';
-    }
+    this.keepFocus('curve', phase);
     const px = Math.min(Math.max(x / width, 0), 1);
     const py = Math.min(Math.max(1 - y / height, 0), 1);
     const points = this.curvePoints[this.curveChannel];
@@ -4036,6 +4018,23 @@ struct EditorPage {
   }
 
   /** 拖动开始/结束：进入或退出「专注调色」。 */
+  /** 曲线 / 均衡器：进入专注，并保证 1.2s 内必定恢复（防 Up 丢失）。 */
+  private keepFocus(id: string, phase: number): void {
+    if (this.focusTimer >= 0) {
+      clearTimeout(this.focusTimer);
+      this.focusTimer = -1;
+    }
+    if (phase === TouchType.Up || phase === TouchType.Cancel) {
+      this.focusRow = '';
+      return;
+    }
+    this.focusRow = id;
+    this.focusTimer = setTimeout(() => {
+      this.focusTimer = -1;
+      this.focusRow = '';
+    }, 1200);
+  }
+
   private touchAdjust(id: string, mode: SliderChangeMode): void {
     this.suppressTapUntil = Date.now() + 400;
     if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
