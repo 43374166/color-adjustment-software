@@ -323,7 +323,7 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
     }
     data[slot::TONE_ACTIVE] = if tone.is_identity() { 0.0 } else { 1.0 };
     data[slot::EXPOSURE_CURVE_ACTIVE] =
-        if params.light.exposure != 0.0 && params.light.exposure.abs() <= 1.0 {
+        if params.light.exposure != 0.0 {
             1.0
         } else {
             0.0

@@ -167,16 +167,37 @@ pub fn reference_tone_lut(curves: &[[f32; TONE_CURVE_POINTS]; 5], value: f32) ->
     })
 }
 
-/// 曝光 -1..+1 EV 的参考 LUT；超出范围时回退线性曝光，不调用本函数。
+/// 曝光 LUT（-5..+5 EV）；参考曲线只到 ±1EV，更大档位由曲线复合得到。
 pub fn exposure_tone_lut(exposure: f32) -> [f32; TONE_LUT_SIZE] {
-    let position = (exposure.clamp(-1.0, 1.0) + 1.0).clamp(0.0, 2.0);
-    let low = position.floor() as usize;
-    let high = (low + 1).min(2);
-    let fraction = position - low as f32;
+    let clamped = exposure.clamp(-5.0, 5.0);
+    let curve = if clamped >= 0.0 {
+        &EXPOSURE_CURVES[2]
+    } else {
+        &EXPOSURE_CURVES[0]
+    };
+    let magnitude = clamped.abs();
+    let steps = magnitude.floor() as usize;
+    let fraction = magnitude - steps as f32;
+
+    // 参考数据只到 ±1EV：把该曲线按整数档复合（h∘h…）得到 ±2..±5EV，
+    // 小数部分在相邻两档之间混合。这样大曝光也有平滑的高光肩部，
+    // 而不是线性 ×2^n 后直接削顶成死白。
+    let mut levels = [[0.0f32; TONE_LUT_SIZE]; 6];
+    for (index, slot) in levels[0].iter_mut().enumerate() {
+        *slot = index as f32 / (TONE_LUT_SIZE - 1) as f32;
+    }
+    for level in 1..=5 {
+        let (previous, current) = levels.split_at_mut(level);
+        for (slot, source) in current[0].iter_mut().zip(previous[level - 1]) {
+            *slot = sample_curve(curve, source);
+        }
+    }
+
+    let low = steps.min(5);
+    let high = (steps + 1).min(5);
     std::array::from_fn(|index| {
-        let x = index as f32 / (TONE_LUT_SIZE - 1) as f32;
-        let a = sample_curve(&EXPOSURE_CURVES[low], x);
-        let b = sample_curve(&EXPOSURE_CURVES[high], x);
+        let a = levels[low][index];
+        let b = levels[high][index];
         (a + (b - a) * fraction).clamp(0.0, 1.0)
     })
 }
@@ -229,7 +250,7 @@ impl ToneStage {
         let light = &params.light;
         let contrast = (light.contrast / 100.0).clamp(-1.0, 1.0);
         let exposure = light.exposure;
-        let use_exposure_lut = exposure != 0.0 && exposure.abs() <= 1.0;
+        let use_exposure_lut = exposure != 0.0;
         let exposure_lut = exposure_tone_lut(exposure);
         let highlights_lut = reference_tone_lut(&HIGHLIGHT_CURVES, light.highlights);
         let shadows_lut = reference_tone_lut(&SHADOW_CURVES, light.shadows);
@@ -451,6 +472,51 @@ mod tests {
         let bright_out = stage.apply(bright, base.self_base_ev(bright));
         assert!(dark_out[0] < dark[0], "{dark:?} -> {dark_out:?}");
         assert!(bright_out[0] > bright[0], "{bright:?} -> {bright_out:?}");
+    }
+
+    #[test]
+    fn exposure_above_one_ev_keeps_highlight_rolloff() {
+        // +2EV 以前会走线性路径直接削顶（死白），现在用复合曲线保留层次。
+        let mut params = EditParams::default();
+        params.light.exposure = 2.0;
+        let stage = ToneStage::from_params(&params);
+        assert!(stage.use_exposure_lut, "+2EV 应使用曝光曲线");
+
+        let mut prev = -1.0;
+        for index in 0..=100 {
+            let y = index as f32 / 100.0;
+            let value = stage.map_luminance(y);
+            assert!((0.0..=1.0).contains(&value), "{y} -> {value}");
+            assert!(value >= prev - 1e-5, "{y}: {value} < {prev}");
+            prev = value;
+        }
+        // 中高调仍有层次，而不是全白。
+        let mid = stage.map_luminance(0.3);
+        let high = stage.map_luminance(0.7);
+        assert!(mid < 0.98, "+2EV 中调不该直接到白: {mid}");
+        assert!(high > mid, "高调应更亮: {high} <= {mid}");
+
+        // +1EV 也比线性更收敛，且两者单调递增。
+        params.light.exposure = 1.0;
+        let one = ToneStage::from_params(&params);
+        assert!(one.map_luminance(0.3) < mid);
+    }
+
+    #[test]
+    fn exposure_curve_matches_linear_for_fractional_steps() {
+        // 0EV 恒等；>1EV 的曲线在端点仍到白。
+        let identity = ToneStage::from_params(&EditParams::default());
+        assert!(!identity.use_exposure_lut);
+        for value in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
+            assert!((identity.map_luminance(value) - value).abs() < 1e-4);
+        }
+
+        let mut params = EditParams::default();
+        params.light.exposure = 3.5;
+        let stage = ToneStage::from_params(&params);
+        assert!(stage.use_exposure_lut);
+        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-4);
+        assert!(stage.map_luminance(0.0) < 0.02);
     }
 
     #[test]

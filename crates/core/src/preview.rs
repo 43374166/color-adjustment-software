@@ -1858,7 +1858,7 @@ mod tests {
         let out = render_preview_image(&source, &params);
         let pixel = out.get_pixel(0, 0).0;
         assert!(pixel[0] > 200, "明亮度 +100 应提亮：{pixel:?}");
-        assert!(pixel[0] <= 255, "明亮度 +100 不应顶到白场：{pixel:?}");
+        assert!(pixel[0] < 255, "明亮度 +100 不应顶到白场：{pixel:?}");
         let spread_before = 200i32 - 60;
         let spread_after = pixel[0] as i32 - pixel[2] as i32;
         // 新算法在 dt UCS 里做亮度增益（B×gain），不像旧的 HSL 明度那样自动伴随去饱和；

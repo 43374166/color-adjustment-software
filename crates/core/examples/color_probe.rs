@@ -48,10 +48,7 @@ fn params_to_ops(params: &EditParams) -> ColorOps {
                 lum: b.luminance as f64,
             }
         });
-        ops.mixer = Some(fdxmp_color::Mixer {
-            bands,
-            continuous: false,
-        });
+        ops.mixer = Some(fdxmp_color::Mixer { bands });
     }
     ops
 }
