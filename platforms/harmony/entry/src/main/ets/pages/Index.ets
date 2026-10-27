@@ -445,8 +445,11 @@ struct Index {
           this.selectionBar()
         }
         if (this.loading) {
-          Column() {
+          Column({ space: 12 }) {
             LoadingProgress().width(48).height(48).color('#4A9EFF')
+            Text('正在加载图库资源…')
+              .fontSize(13)
+              .fontColor('#AAAAAA')
           }
           .width('100%')
           .layoutWeight(1)

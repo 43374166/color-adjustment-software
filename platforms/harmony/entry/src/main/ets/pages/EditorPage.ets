@@ -488,6 +488,10 @@ struct EditorPage {
   @State exporting: boolean = false;
   @State exportProgress: number = 0;
 
+  /** 首次进入 / 载入上次调色期间的加载提示。 */
+  @State photoLoading: boolean = true;
+  @State loadingHint: string = '正在加载照片…';
+
   /** 放大查看时的 1:1 细节图（2560 渲染，退出放大后丢弃）。 */
   @State detailPreview: image.PixelMap | null = null;
   private detailLoading: boolean = false;
@@ -649,12 +653,19 @@ struct EditorPage {
   }
 
   private async startup(): Promise<void> {
-    await this.loadSavedEdit();
+    this.photoLoading = true;
+    this.loadingHint = '正在加载照片…';
+    const restored = await this.loadSavedEdit();
+    if (restored) {
+      this.loadingHint = '正在应用上次的调色…';
+    }
     await this.loadPhoto();
     this.lastCommitted = this.paramsJson();
+    this.photoLoading = false;
   }
 
-  private async loadSavedEdit(): Promise<void> {
+  private async loadSavedEdit(): Promise<boolean> {
+    let restored = false;
     try {
       const context = getContext(this) as common.UIAbilityContext;
       const store = await preferences.getPreferences(context, 'fdxmp_edits');
@@ -667,9 +678,11 @@ struct EditorPage {
         this.applyPayload(payload, true);
         this.drawGraph();
         this.drawCurveEditor();
+        restored = true;
       }
     } catch (error) {
     }
+    return restored;
   }
 
   /** 保存当前照片的编辑参数 + 旋转步数。 */
@@ -1653,6 +1666,29 @@ struct EditorPage {
       .width('100%')
       .height('100%')
       .hitTestBehavior(HitTestMode.Transparent)
+
+      if (this.photoLoading) {
+        Column() {
+          Column({ space: 12 }) {
+            LoadingProgress()
+              .width(44)
+              .height(44)
+              .color('#4A9EFF')
+            Text(this.loadingHint)
+              .fontSize(13)
+              .fontColor('#CCCCCC')
+          }
+          .padding(24)
+          .backgroundColor('#E61A1A1A')
+          .borderRadius(14)
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#000000')
+        .justifyContent(FlexAlign.Center)
+        .onClick(() => {
+        })
+      }
 
       if (this.exporting) {
         Column() {
