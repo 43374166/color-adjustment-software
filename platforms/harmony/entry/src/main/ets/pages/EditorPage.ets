@@ -191,6 +191,7 @@ interface CurvesPayload {
 /** 裁剪。 */
 interface CropPayload {
   rect: number[];
+  flip_horizontal?: boolean;
 }
 
 /** 点颜色样本。 */
@@ -466,9 +467,15 @@ struct EditorPage {
   @State curveChannel: number = 0;
   @State showPresets: boolean = false;
   @State presetNames: string[] = [];
+  /** 当前工具：-1 无 / 0 预设 / 1 裁切 / 2 编辑 / 3 蒙版。 */
+  @State activeTool: number = -1;
+  /** 沉浸模式：点照片隐藏全部 UI。 */
+  @State chromeVisible: boolean = true;
   @State cropMode: boolean = false;
   /** 90° 旋转步数（0..3，解码时应用）。 */
   @State rotationStep: number = 0;
+  /** 水平翻转（写进 crop.flip_horizontal）。 */
+  @State flipH: boolean = false;
   /** 归一化裁剪矩形 [x, y, w, h]。 */
   @State cropRect: number[] = [0, 0, 1, 1];
 
@@ -905,7 +912,10 @@ struct EditorPage {
         }
       },
       curves: this.curvesPayload(),
-      crop: { rect: this.cropMode ? [0, 0, 1, 1] : this.cropRect },
+      crop: {
+        rect: this.cropMode ? [0, 0, 1, 1] : this.cropRect,
+        flip_horizontal: this.flipH
+      },
       point_colors: this.pointColorsPayload(),
       masks: [],
       equalizer: {
@@ -1327,7 +1337,9 @@ struct EditorPage {
 
   build() {
     Column() {
-      this.topBar()
+      if (this.chromeVisible) {
+        this.topBar()
+      }
       Stack() {
         if (this.preview !== null) {
           Image(this.preview)
@@ -1384,29 +1396,40 @@ struct EditorPage {
       .onClick((event: ClickEvent) => {
         if (this.picking) {
           this.sampleAt(event.x, event.y);
+          return;
+        }
+        // 裁切 / 蒙版进行中时，点击交给叠加层，不触发沉浸模式。
+        if (!this.cropMode && !this.maskMode) {
+          this.chromeVisible = !this.chromeVisible;
         }
       })
       .width('100%')
       .layoutWeight(1)
       .backgroundColor('#000000')
 
-      Canvas(this.histContext)
-        .width('100%')
-        .height(84)
-        .onReady(() => {
-          this.drawHistogram();
-        })
-        .onClick(() => {
-          this.histogramWaveform = !this.histogramWaveform;
-          this.drawHistogram();
-        })
+      if (this.chromeVisible) {
+        Canvas(this.histContext)
+          .width('100%')
+          .height(84)
+          .onReady(() => {
+            this.drawHistogram();
+          })
+          .onClick(() => {
+            this.histogramWaveform = !this.histogramWaveform;
+            this.drawHistogram();
+          })
 
-      if (this.maskMode) {
-        this.maskBar()
-      } else if (this.cropMode) {
-        this.cropBar()
-      } else {
-        this.bottomPanel()
+        if (this.activeTool === 0) {
+          this.presetPanel()
+        } else if (this.activeTool === 1) {
+          this.cropBar()
+        } else if (this.activeTool === 2) {
+          this.bottomPanel()
+        } else if (this.activeTool === 3) {
+          this.maskBar()
+        }
+
+        this.editorToolBar()
       }
     }
     .width('100%')
@@ -1414,52 +1437,148 @@ struct EditorPage {
     .backgroundColor('#111111')
   }
 
+  /** 底部工具条：预设 / 裁切 / 编辑 / 蒙版。 */
   @Builder
-  topBar() {
-    Column() {
-      Row() {
-        Text('‹ 返回')
-          .fontSize(15)
-          .fontColor('#E8E8E8')
-          .onClick(() => {
-            this.leave();
-          })
-        Text(this.shortName())
-          .fontSize(13)
-          .fontColor('#BBBBBB')
-          .layoutWeight(1)
-          .textAlign(TextAlign.Center)
-          .maxLines(1)
-          .textOverflow({ overflow: TextOverflow.Ellipsis })
-          .padding({ left: 8, right: 8 })
-        Text(this.statusText)
-          .fontSize(10)
-          .fontColor('#888888')
-      }
-      .width('100%')
-      .height(40)
-      .padding({ left: 14, right: 14 })
-
-      Row() {
-        ForEach(['蒙版', '预设', '裁剪', '旋转', '导出'], (label: string, index: number) => {
+  editorToolBar() {
+    Row() {
+      ForEach(['预设', '裁切', '编辑', '蒙版'], (label: string, index: number) => {
+        Column({ space: 2 }) {
+          Text(['✦', '⌗', '☰', '◐'][index])
+            .fontSize(16)
+            .fontColor(this.activeTool === index ? '#4A9EFF' : '#777777')
           Text(label)
-            .fontSize(12)
-            .fontColor(index === 0 && this.maskMode ? '#FFFFFF' : '#4A9EFF')
-            .backgroundColor(index === 0 && this.maskMode ? '#2A2A2A' : Color.Transparent)
-            .borderRadius(6)
-            .layoutWeight(1)
-            .textAlign(TextAlign.Center)
-            .height(30)
-            .onClick(() => {
-              this.topAction(index);
-            })
-        }, (label: string, index: number) => label + index.toString())
-      }
-      .width('100%')
-      .height(34)
-      .padding({ left: 8, right: 8 })
+            .fontSize(11)
+            .fontColor(this.activeTool === index ? '#4A9EFF' : '#777777')
+        }
+        .layoutWeight(1)
+        .height(56)
+        .justifyContent(FlexAlign.Center)
+        .onClick(() => {
+          this.selectTool(index);
+        })
+      }, (label: string) => label)
     }
     .width('100%')
+    .backgroundColor('#141414')
+    .borderWidth({ top: 1 })
+    .borderColor('#22000000')
+  }
+
+  /** 切换工具：再点一次收起。裁切 / 蒙版需要进出对应模式。 */
+  private selectTool(index: number): void {
+    if (this.activeTool === index) {
+      this.closeTool();
+      return;
+    }
+    // 先从上一个工具退出
+    if (this.activeTool === 1 && this.cropMode) {
+      this.cancelCrop();
+    }
+    if (this.activeTool === 3 && this.maskMode) {
+      this.exitMaskMode();
+    }
+    this.activeTool = index;
+    if (index === 1) {
+      this.enterCrop();
+    } else if (index === 3) {
+      this.enterMaskMode();
+    }
+  }
+
+  private closeTool(): void {
+    if (this.activeTool === 1 && this.cropMode) {
+      this.cancelCrop();
+    }
+    if (this.activeTool === 3 && this.maskMode) {
+      this.exitMaskMode();
+    }
+    this.activeTool = -1;
+  }
+
+  @Builder
+  presetPanel() {
+    Column({ space: 6 }) {
+      Row() {
+        Text('预设')
+          .fontSize(13)
+          .fontColor('#CCCCCC')
+          .layoutWeight(1)
+        Text('保存当前')
+          .fontSize(12)
+          .fontColor('#4A9EFF')
+          .onClick(() => {
+            this.savePreset();
+          })
+      }
+      .width('100%')
+
+      if (this.presetNames.length === 0) {
+        Text('还没有预设：调好参数后点「保存当前」')
+          .fontSize(11)
+          .fontColor('#777777')
+          .margin({ top: 12, bottom: 12 })
+      } else {
+        Scroll() {
+          Column() {
+            ForEach(this.presetNames, (name: string) => {
+              Row() {
+                Text(name)
+                  .fontSize(13)
+                  .fontColor('#DDDDDD')
+                  .layoutWeight(1)
+                Text('删除')
+                  .fontSize(11)
+                  .fontColor('#F06060')
+                  .onClick(() => {
+                    this.deletePreset(name);
+                  })
+              }
+              .width('100%')
+              .height(40)
+              .onClick(() => {
+                this.applyPreset(name);
+              })
+            }, (name: string) => name)
+          }
+        }
+        .height(150)
+        .scrollBar(BarState.Off)
+      }
+    }
+    .width('100%')
+    .height(210)
+    .padding({ left: 14, right: 14, top: 10 })
+    .backgroundColor('#1A1A1A')
+  }
+
+  @Builder
+  topBar() {
+    Row() {
+      Text('‹ 返回')
+        .fontSize(15)
+        .fontColor('#E8E8E8')
+        .onClick(() => {
+          this.leave();
+        })
+      Text(this.shortName())
+        .fontSize(13)
+        .fontColor('#BBBBBB')
+        .layoutWeight(1)
+        .textAlign(TextAlign.Center)
+        .maxLines(1)
+        .textOverflow({ overflow: TextOverflow.Ellipsis })
+        .padding({ left: 8, right: 8 })
+      Text('导出')
+        .fontSize(13)
+        .fontColor('#4A9EFF')
+        .padding({ right: 4 })
+        .onClick(() => {
+          this.exportPhoto();
+        })
+    }
+    .width('100%')
+    .height(44)
+    .padding({ left: 14, right: 14 })
     .backgroundColor('#1A1A1A')
   }
 
@@ -1653,7 +1772,7 @@ struct EditorPage {
           .fontSize(13)
           .fontColor('#4A9EFF')
           .onClick(() => {
-            this.exitMaskMode();
+            this.closeTool();
           })
       }
       .width('100%')
@@ -1689,6 +1808,42 @@ struct EditorPage {
       .width('100%')
       .padding({ left: 12, right: 12, top: 10, bottom: 8 })
 
+      Row({ space: 10 }) {
+        Text('⟲ 90°')
+          .fontSize(12)
+          .fontColor('#DDDDDD')
+          .backgroundColor('#2A2A2A')
+          .borderRadius(6)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .onClick(() => {
+            this.rotate90(3);
+          })
+        Text('⟳ 90°')
+          .fontSize(12)
+          .fontColor('#DDDDDD')
+          .backgroundColor('#2A2A2A')
+          .borderRadius(6)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .onClick(() => {
+            this.rotate90(1);
+          })
+        Text('旋转 ' + (this.rotationStep * 90).toString() + '°')
+          .fontSize(11)
+          .fontColor('#888888')
+        Blank()
+        Text('翻转')
+          .fontSize(12)
+          .fontColor('#DDDDDD')
+          .backgroundColor('#2A2A2A')
+          .borderRadius(6)
+          .padding({ left: 10, right: 10, top: 5, bottom: 5 })
+          .onClick(() => {
+            this.flipHorizontal();
+          })
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, bottom: 8 })
+
       Row() {
         Text('取消')
           .fontSize(14)
@@ -1698,6 +1853,7 @@ struct EditorPage {
           .height(44)
           .onClick(() => {
             this.cancelCrop();
+            this.activeTool = -1;
           })
         Text('应用')
           .fontSize(14)
@@ -1707,17 +1863,18 @@ struct EditorPage {
           .height(44)
           .onClick(() => {
             this.applyCrop();
+            this.activeTool = -1;
           })
       }
       .width('100%')
 
-      Text('拖动四角改裁剪范围，拖框内移动')
+      Text('拖动四角改裁剪范围，拖框内移动；旋转 90° 在裁切里')
         .fontSize(11)
         .fontColor('#777777')
         .margin({ top: 6 })
     }
     .width('100%')
-    .height(160)
+    .height(210)
     .backgroundColor('#1A1A1A')
   }
 
@@ -2526,6 +2683,20 @@ struct EditorPage {
   }
 
   // MARK: - 裁剪
+
+  /** 90° 旋转（在裁切面板里）：重新解码 + 重渲。 */
+  private rotate90(delta: number): void {
+    this.rotationStep = ((this.rotationStep + delta) % 4 + 4) % 4;
+    this.loadPhoto();
+  }
+
+  /** 水平翻转（写入 crop.flip，Rust 侧处理）。 */
+  private flipHorizontal(): void {
+    this.flipH = !this.flipH;
+    this.scheduleRender(false);
+    this.drawCropOverlay();
+    promptAction.showToast({ message: this.flipH ? '水平翻转：开' : '水平翻转：关' });
+  }
 
   private enterCrop(): void {
     this.cropSaved = this.cropRect.slice();

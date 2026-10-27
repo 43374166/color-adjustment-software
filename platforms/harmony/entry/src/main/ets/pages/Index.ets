@@ -14,6 +14,7 @@ import picker from '@ohos.file.picker';
 import promptAction from '@ohos.promptAction';
 import camera from '@ohos.multimedia.camera';
 import cameraPicker from '@ohos.multimedia.cameraPicker';
+import { systemShare } from '@kit.ShareKit';
 import { PhotoItem } from '../model/PhotoItem';
 import nativeCore from '../core/NativeBridge';
 
@@ -46,6 +47,7 @@ struct Index {
   @State previewIndex: number = -1;
 
   private tabs: string[] = ['设备', '编辑', '我的'];
+  private tabIcons: string[] = ['▦', '✎', '☰'];
   private filters: string[] = ['全部', 'RAW', '常见格式'];
   private permissions: Permissions[] = ['ohos.permission.READ_IMAGEVIDEO'];
   private sortOptions: SelectOption[] = [
@@ -344,9 +346,38 @@ struct Index {
       promptAction.showToast({ message: '长按照片进入多选后再分享' });
       return;
     }
-    promptAction.showToast({
-      message: '已选 ' + count.toString() + ' 张，系统分享阶段 6 接入',
-    });
+    this.shareUris(this.selectedUris);
+  }
+
+  /** 调系统分享面板（多张照片一起分享）。 */
+  private async shareUris(uris: string[]): Promise<void> {
+    if (uris.length === 0) {
+      return;
+    }
+    try {
+      const records: systemShare.SharedRecord[] = [];
+      for (let i = 0; i < uris.length && i < 9; i++) {
+        const record: systemShare.SharedRecord = {
+          utd: 'general.image',
+          uri: uris[i]
+        };
+        records.push(record);
+      }
+      if (records.length === 0) {
+        return;
+      }
+      const data = new systemShare.SharedData(records[0]);
+      for (let i = 1; i < records.length; i++) {
+        data.addRecord(records[i]);
+      }
+      const controller = new systemShare.ShareController(data);
+      await controller.show(getContext(this) as common.UIAbilityContext, {
+        previewMode: systemShare.SharePreviewMode.DETAIL,
+        selectionMode: systemShare.SelectionMode.SINGLE
+      });
+    } catch (error) {
+      promptAction.showToast({ message: '分享失败' });
+    }
   }
 
   /* -------------------------------------------------------------- UI */
@@ -372,13 +403,16 @@ struct Index {
   tabBar() {
     Row() {
       ForEach(this.tabs, (label: string, index: number) => {
-        Column() {
+        Column({ space: 2 }) {
+          Text(this.tabIcons[index])
+            .fontSize(16)
+            .fontColor(this.activeTab === index ? '#4A9EFF' : '#777777')
           Text(label)
-            .fontSize(14)
+            .fontSize(11)
             .fontColor(this.activeTab === index ? '#4A9EFF' : '#777777')
         }
         .layoutWeight(1)
-        .height(48)
+        .height(52)
         .justifyContent(FlexAlign.Center)
         .onClick(() => {
           this.activeTab = index;
@@ -645,35 +679,52 @@ struct Index {
   @Builder
   bottomActions() {
     Row() {
-      Text('导入')
-        .fontSize(13)
-        .fontColor('#E8E8E8')
-        .textAlign(TextAlign.Center)
-        .layoutWeight(1)
-        .height(52)
-        .onClick(() => {
-          this.importPhotos();
-        })
-      Text('相机')
-        .fontSize(13)
-        .fontColor('#E8E8E8')
-        .textAlign(TextAlign.Center)
-        .layoutWeight(1)
-        .height(52)
-        .onClick(() => {
-          this.takePhoto();
-        })
-      Text(this.selectedUris.length > 0
-        ? '分享(' + this.selectedUris.length.toString() + ')'
-        : '分享')
-        .fontSize(13)
-        .fontColor(this.selectedUris.length > 0 ? '#E8E8E8' : '#666666')
-        .textAlign(TextAlign.Center)
-        .layoutWeight(1)
-        .height(52)
-        .onClick(() => {
-          this.shareSelected();
-        })
+      Column({ space: 2 }) {
+        Text('⬇')
+          .fontSize(18)
+          .fontColor('#E8E8E8')
+        Text('导入')
+          .fontSize(11)
+          .fontColor('#E8E8E8')
+      }
+      .layoutWeight(1)
+      .height(56)
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => {
+        this.importPhotos();
+      })
+
+      Column({ space: 2 }) {
+        Text('◉')
+          .fontSize(18)
+          .fontColor('#E8E8E8')
+        Text('相机')
+          .fontSize(11)
+          .fontColor('#E8E8E8')
+      }
+      .layoutWeight(1)
+      .height(56)
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => {
+        this.takePhoto();
+      })
+
+      Column({ space: 2 }) {
+        Text('↗')
+          .fontSize(18)
+          .fontColor(this.selectedUris.length > 0 ? '#E8E8E8' : '#666666')
+        Text(this.selectedUris.length > 0
+          ? '分享(' + this.selectedUris.length.toString() + ')'
+          : '分享')
+          .fontSize(11)
+          .fontColor(this.selectedUris.length > 0 ? '#E8E8E8' : '#666666')
+      }
+      .layoutWeight(1)
+      .height(56)
+      .justifyContent(FlexAlign.Center)
+      .onClick(() => {
+        this.shareSelected();
+      })
     }
     .width('100%')
     .backgroundColor('#141414')
@@ -723,32 +774,46 @@ struct Index {
       })
 
       Row() {
-        Text('编辑')
-          .fontSize(14)
-          .fontColor('#E8E8E8')
-          .textAlign(TextAlign.Center)
-          .layoutWeight(1)
-          .height(52)
-          .onClick(() => {
-            const photos = this.visiblePhotos();
-            if (this.previewIndex >= 0 && this.previewIndex < photos.length) {
-              const photo = photos[this.previewIndex];
-              router.pushUrl({
-                url: 'pages/EditorPage',
-                params: { uri: photo.uri, name: photo.name }
-              });
-            }
-            this.previewIndex = -1;
-          })
-        Text('分享')
-          .fontSize(14)
-          .fontColor('#E8E8E8')
-          .textAlign(TextAlign.Center)
-          .layoutWeight(1)
-          .height(52)
-          .onClick(() => {
-            promptAction.showToast({ message: '系统分享阶段 6 接入' });
-          })
+        Column({ space: 2 }) {
+          Text('✎')
+            .fontSize(16)
+            .fontColor('#E8E8E8')
+          Text('编辑')
+            .fontSize(12)
+            .fontColor('#E8E8E8')
+        }
+        .layoutWeight(1)
+        .height(56)
+        .justifyContent(FlexAlign.Center)
+        .onClick(() => {
+          const photos = this.visiblePhotos();
+          if (this.previewIndex >= 0 && this.previewIndex < photos.length) {
+            const photo = photos[this.previewIndex];
+            router.pushUrl({
+              url: 'pages/EditorPage',
+              params: { uri: photo.uri, name: photo.name }
+            });
+          }
+          this.previewIndex = -1;
+        })
+
+        Column({ space: 2 }) {
+          Text('↗')
+            .fontSize(16)
+            .fontColor('#E8E8E8')
+          Text('分享')
+            .fontSize(12)
+            .fontColor('#E8E8E8')
+        }
+        .layoutWeight(1)
+        .height(56)
+        .justifyContent(FlexAlign.Center)
+        .onClick(() => {
+          const photos = this.visiblePhotos();
+          if (this.previewIndex >= 0 && this.previewIndex < photos.length) {
+            this.shareUris([photos[this.previewIndex].uri]);
+          }
+        })
       }
       .width('100%')
       .backgroundColor('#99000000')
