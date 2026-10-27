@@ -1566,6 +1566,18 @@ struct EditorPage {
         this.topBar()
       }
 
+      // 3.5) 专注调色的大号读数
+      if (this.chromeVisible && this.focusRow.length > 1 && this.focusRow.substring(0, 1) === 's') {
+        Row() {
+          this.focusReadout()
+        }
+        .width('100%')
+        .height(80)
+        .justifyContent(FlexAlign.Center)
+        .margin({ top: 96 })
+        .hitTestBehavior(HitTestMode.Transparent)
+      }
+
       // 4) 直方图：照片右上角浮卡
       if (this.chromeVisible) {
         Row() {
@@ -3986,7 +3998,7 @@ struct EditorPage {
   sliderRow(index: number) {
     Row({ space: 8 }) {
       Text(SLIDERS[index].label)
-        .fontSize(this.focusRow === 's' + index ? 13 : 11)
+        .fontSize(11)
         .fontColor(this.focusRow === 's' + index ? '#FFFFFF' : '#AAAAAA')
         .width(72)
       Slider({
@@ -4004,9 +4016,9 @@ struct EditorPage {
           this.applyScalar(index, changed);
         })
       Text(this.formatValue(this.num(index), SLIDERS[index].step))
-        .fontSize(this.focusRow === 's' + index ? 18 : 11)
+        .fontSize(12)
         .fontColor(this.focusRow === 's' + index ? '#FFFFFF' : '#CCCCCC')
-        .width(this.focusRow === 's' + index ? 64 : 42)
+        .width(46)
         .textAlign(TextAlign.End)
     }
     .width('100%')
@@ -4033,6 +4045,24 @@ struct EditorPage {
       this.focusTimer = -1;
       this.focusRow = '';
     }, 1200);
+  }
+
+  /** 专注调色时的大号读数（单独浮层，不改变滑轨布局）。 */
+  @Builder
+  focusReadout() {
+    if (this.focusRow.length > 1 && this.focusRow.substring(0, 1) === 's') {
+      Column({ space: 2 }) {
+        Text(SLIDERS[Number(this.focusRow.substring(1))].label)
+          .fontSize(12)
+          .fontColor('#CCCCCC')
+        Text(this.formatValue(this.num(Number(this.focusRow.substring(1))),
+          SLIDERS[Number(this.focusRow.substring(1))].step))
+          .fontSize(30)
+          .fontColor('#FFFFFF')
+      }
+      .width('100%')
+      .alignItems(HorizontalAlign.Center)
+    }
   }
 
   private touchAdjust(id: string, mode: SliderChangeMode): void {
@@ -4064,9 +4094,9 @@ struct EditorPage {
           this.applyBand(kind, changed);
         })
       Text(this.formatValue(value, this.focusRow === 'b' + kind ? 18 : 11))
-        .fontSize(this.focusRow === 'b' + kind ? 18 : 11)
+        .fontSize(12)
         .fontColor(this.focusRow === 'b' + kind ? '#FFFFFF' : '#CCCCCC')
-        .width(this.focusRow === 'b' + kind ? 64 : 42)
+        .width(46)
         .textAlign(TextAlign.End)
     }
     .width('100%')
@@ -4119,9 +4149,9 @@ struct EditorPage {
           this.scheduleRender(true);
         })
       Text(this.formatValue(value, 1))
-        .fontSize(this.focusRow === 'w' + index ? 18 : 11)
+        .fontSize(12)
         .fontColor(this.focusRow === 'w' + index ? '#FFFFFF' : '#CCCCCC')
-        .width(this.focusRow === 'w' + index ? 64 : 42)
+        .width(46)
         .textAlign(TextAlign.End)
     }
     .width('100%')
