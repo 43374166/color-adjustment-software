@@ -60,6 +60,8 @@ struct EditorTabView: View {
     @AppStorage("fdxmp_hsl_style") private var hslStyle = "dots"
     /// 颜色均衡器当前页签：0 色相 / 1 饱和度 / 2 亮度。
     @State private var eqChannel = 0
+    /// 是否展开均衡器选项（阈值 / 曲线宽度 / 半径 / 旋转）。
+    @State private var eqShowOptions = false
     /// 预览区尺寸（用于按视口取放大细节帧分辨率）。
     @State private var previewAreaSize: CGSize = .zero
     /// 相册式左右滑动：内容偏移（手指跟随 / 回弹）。
@@ -1566,15 +1568,30 @@ struct EditorTabView: View {
 
     private var equalizerPanel: some View {
         VStack(spacing: 0) {
-            Picker("", selection: $eqChannel) {
-                Text("色相").tag(0)
-                Text("饱和度").tag(1)
-                Text("亮度").tag(2)
+            HStack(spacing: 10) {
+                Picker("", selection: $eqChannel) {
+                    Text("色相").tag(0)
+                    Text("饱和度").tag(1)
+                    Text("亮度").tag(2)
+                }
+                .pickerStyle(.segmented)
+                // 选项按钮：平时只留曲线，点了才展开下面的选项滑块。
+                Button {
+                    eqShowOptions.toggle()
+                    Haptics.tick()
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.system(size: 14, weight: .semibold))
+                        .foregroundStyle(eqShowOptions ? Color.accentColor : Color.secondary)
+                        .frame(width: 34, height: 30)
+                        .background(Color.white.opacity(eqShowOptions ? 0.18 : 0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 7))
+                }
+                .buttonStyle(.plain)
             }
-            .pickerStyle(.segmented)
             .padding(.horizontal, 14)
             .padding(.top, 8)
-            .padding(.bottom, 4)
+            .padding(.bottom, 6)
             .opacity(model.draggingSlider == nil ? 1 : 0)
             .allowsHitTesting(model.draggingSlider == nil)
 
@@ -1588,11 +1605,14 @@ struct EditorTabView: View {
                 onCommit: { model.commitEdit() }
             )
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .layoutPriority(1)
             .padding(.horizontal, 10)
+            .padding(.bottom, 8)
 
-            equalizerOptions
-                .frame(maxHeight: 200)
-            Spacer(minLength: 0)
+            if eqShowOptions {
+                equalizerOptions
+                    .frame(maxHeight: 210)
+            }
         }
     }
 

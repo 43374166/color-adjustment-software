@@ -195,37 +195,60 @@ struct EqualizerGraph: View {
 
     private func drawNodes(_ context: inout GraphicsContext, size: CGSize, graphHeight: CGFloat) {
         for index in 0..<8 {
-            let position = CGPoint(
-                x: nodeX(index, width: size.width),
-                y: yPosition(value(index), graphHeight: graphHeight)
-            )
-            if activeNode == index {
-                var pillar = Path()
-                pillar.move(to: CGPoint(x: position.x, y: graphHeight / 2))
-                pillar.addLine(to: position)
-                context.stroke(pillar, with: .color(.white.opacity(0.35)), lineWidth: 4)
+            let x = nodeX(index, width: size.width)
+            let y = yPosition(value(index), graphHeight: graphHeight)
+            drawNode(&context, at: CGPoint(x: x, y: y), index: index, graphHeight: graphHeight)
+            // 周期闭合：贴着左/右边缘的节点在对侧再画一次（红点在两端各一半）。
+            if x < 10 {
+                drawNode(
+                    &context,
+                    at: CGPoint(x: x + size.width, y: y),
+                    index: index,
+                    graphHeight: graphHeight
+                )
+            } else if x > size.width - 10 {
+                drawNode(
+                    &context,
+                    at: CGPoint(x: x - size.width, y: y),
+                    index: index,
+                    graphHeight: graphHeight
+                )
             }
-            let dot = Path(
+        }
+    }
+
+    private func drawNode(
+        _ context: inout GraphicsContext,
+        at position: CGPoint,
+        index: Int,
+        graphHeight: CGFloat
+    ) {
+        if activeNode == index {
+            var pillar = Path()
+            pillar.move(to: CGPoint(x: position.x, y: graphHeight / 2))
+            pillar.addLine(to: position)
+            context.stroke(pillar, with: .color(.white.opacity(0.35)), lineWidth: 4)
+        }
+        let dot = Path(
+            ellipseIn: CGRect(
+                x: position.x - 6,
+                y: position.y - 6,
+                width: 12,
+                height: 12
+            )
+        )
+        context.fill(dot, with: .color(Color(white: 0.12)))
+        context.stroke(dot, with: .color(nodeColor(index)), lineWidth: 2.5)
+        if activeNode == index {
+            let ring = Path(
                 ellipseIn: CGRect(
-                    x: position.x - 6,
-                    y: position.y - 6,
-                    width: 12,
-                    height: 12
+                    x: position.x - 9,
+                    y: position.y - 9,
+                    width: 18,
+                    height: 18
                 )
             )
-            context.fill(dot, with: .color(Color(white: 0.12)))
-            context.stroke(dot, with: .color(nodeColor(index)), lineWidth: 2.5)
-            if activeNode == index {
-                let ring = Path(
-                    ellipseIn: CGRect(
-                        x: position.x - 9,
-                        y: position.y - 9,
-                        width: 18,
-                        height: 18
-                    )
-                )
-                context.stroke(ring, with: .color(.white.opacity(0.85)), lineWidth: 1.2)
-            }
+            context.stroke(ring, with: .color(.white.opacity(0.85)), lineWidth: 1.2)
         }
     }
 
