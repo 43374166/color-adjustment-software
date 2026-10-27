@@ -483,6 +483,8 @@ struct EditorPage {
   @State activeTool: number = -1;
   /** 浸没模式：点照片隐藏全部 UI。 */
   @State chromeVisible: boolean = true;
+  /** 正在拖动的滑块 id（非空时进入「专注调色」：只留该滑块，面板背景透明）。 */
+  @State focusRow: string = '';
   /** 照片缩放（双指 / 双击），1 = 原始大小。 */
   @State photoZoom: number = 1;
   /** 放大后单指拖动的位移（屏幕像素）。 */
@@ -1551,8 +1553,8 @@ struct EditorPage {
           }))
       }
 
-      // 3) 顶部栏（半透明）
-      if (this.chromeVisible) {
+      // 3) 顶部栏（半透明；专注调色时隐藏）
+      if (this.chromeVisible && this.focusRow === '') {
         this.topBar()
       }
 
@@ -1680,6 +1682,7 @@ struct EditorPage {
     .width('100%')
     .backgroundColor('#CC141414')
     .padding({ bottom: 16 })
+    .opacity(this.focusRow === '' ? 1 : 0)
     .borderWidth({ top: 1 })
     .borderColor('#22000000')
   }
@@ -1872,6 +1875,7 @@ struct EditorPage {
       .scrollBar(BarState.Off)
       .width('100%')
       .height(34)
+      .opacity(this.focusRow === '' ? 1 : 0)
 
       if (this.categoryIndex === 0) {
         this.lightPanel()
@@ -1891,7 +1895,7 @@ struct EditorPage {
     }
     .width('100%')
     .constraintSize({ maxHeight: 340 })
-    .backgroundColor('#B31A1A1A')
+    .backgroundColor(this.focusRow === '' ? '#B31A1A1A' : Color.Transparent)
   }
 
   @Builder
@@ -2422,6 +2426,7 @@ struct EditorPage {
       .scrollBar(BarState.Off)
       .width('100%')
       .height(34)
+      .opacity(this.focusRow === '' ? 1 : 0)
 
       if (this.colorTab === 0) {
         this.basicColorPanel()
@@ -3961,8 +3966,8 @@ struct EditorPage {
   sliderRow(index: number) {
     Row({ space: 8 }) {
       Text(SLIDERS[index].label)
-        .fontSize(11)
-        .fontColor('#AAAAAA')
+        .fontSize(this.focusRow === 's' + index ? 13 : 11)
+        .fontColor(this.focusRow === 's' + index ? '#FFFFFF' : '#AAAAAA')
         .width(72)
       Slider({
         value: this.num(index),
@@ -3974,20 +3979,33 @@ struct EditorPage {
         .blockColor('#E8E8E8')
         .trackColor('#3A3A3A')
         .selectedColor('#4A9EFF')
-        .onChange((changed: number) => {
+        .onChange((changed: number, mode: SliderChangeMode) => {
+          this.touchAdjust('s' + index, mode);
           this.applyScalar(index, changed);
         })
       Text(this.formatValue(this.num(index), SLIDERS[index].step))
-        .fontSize(11)
-        .fontColor('#CCCCCC')
-        .width(42)
+        .fontSize(this.focusRow === 's' + index ? 18 : 11)
+        .fontColor(this.focusRow === 's' + index ? '#FFFFFF' : '#CCCCCC')
+        .width(this.focusRow === 's' + index ? 64 : 42)
         .textAlign(TextAlign.End)
     }
     .width('100%')
+    .opacity(this.focusRow === '' || this.focusRow === 's' + index ? 1 : 0)
     .parallelGesture(TapGesture({ count: 2 })
       .onAction(() => {
         this.resetSlider(index);
       }))
+  }
+
+  /** 拖动开始/结束：进入或退出「专注调色」。 */
+  private touchAdjust(id: string, mode: SliderChangeMode): void {
+    if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
+      if (this.focusRow !== id) {
+        this.focusRow = id;
+      }
+    } else if (mode === SliderChangeMode.End) {
+      this.focusRow = '';
+    }
   }
 
   /** 色带滑块（HSL / 分级）。 */
@@ -4003,16 +4021,18 @@ struct EditorPage {
         .blockColor('#E8E8E8')
         .trackColor('#3A3A3A')
         .selectedColor('#4A9EFF')
-        .onChange((changed: number) => {
+        .onChange((changed: number, mode: SliderChangeMode) => {
+          this.touchAdjust('b' + kind, mode);
           this.applyBand(kind, changed);
         })
-      Text(this.formatValue(value, 1))
-        .fontSize(11)
-        .fontColor('#CCCCCC')
-        .width(42)
+      Text(this.formatValue(value, this.focusRow === 'b' + kind ? 18 : 11))
+        .fontSize(this.focusRow === 'b' + kind ? 18 : 11)
+        .fontColor(this.focusRow === 'b' + kind ? '#FFFFFF' : '#CCCCCC')
+        .width(this.focusRow === 'b' + kind ? 64 : 42)
         .textAlign(TextAlign.End)
     }
     .width('100%')
+    .opacity(this.focusRow === '' || this.focusRow === 'b' + kind ? 1 : 0)
   }
 
   @Builder
@@ -4028,7 +4048,8 @@ struct EditorPage {
         .blockColor('#E8E8E8')
         .trackColor('#3A3A3A')
         .selectedColor('#4A9EFF')
-        .onChange((changed: number) => {
+        .onChange((changed: number, mode: SliderChangeMode) => {
+          this.touchAdjust('p' + kind, mode);
           this.applyBand(kind, changed);
         })
       Text(this.formatValue(value, step))
@@ -4052,19 +4073,21 @@ struct EditorPage {
         .blockColor('#E8E8E8')
         .trackColor('#3A3A3A')
         .selectedColor('#4A9EFF')
-        .onChange((changed: number) => {
+        .onChange((changed: number, mode: SliderChangeMode) => {
+          this.touchAdjust('w' + index, mode);
           const next = this.bwMix.slice();
           next[index] = changed;
           this.bwMix = next;
           this.scheduleRender(true);
         })
       Text(this.formatValue(value, 1))
-        .fontSize(11)
-        .fontColor('#CCCCCC')
-        .width(42)
+        .fontSize(this.focusRow === 'w' + index ? 18 : 11)
+        .fontColor(this.focusRow === 'w' + index ? '#FFFFFF' : '#CCCCCC')
+        .width(this.focusRow === 'w' + index ? 64 : 42)
         .textAlign(TextAlign.End)
     }
     .width('100%')
+    .opacity(this.focusRow === '' || this.focusRow === 'w' + index ? 1 : 0)
   }
 
   private formatValue(value: number, step: number): string {
