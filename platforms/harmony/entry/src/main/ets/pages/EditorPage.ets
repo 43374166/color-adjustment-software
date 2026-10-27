@@ -1684,7 +1684,7 @@ struct EditorPage {
         }
         .width('100%')
         .height('100%')
-        .backgroundColor('#000000')
+        .backgroundColor('#66000000')
         .justifyContent(FlexAlign.Center)
         .onClick(() => {
         })

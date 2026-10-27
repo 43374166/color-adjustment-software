@@ -149,6 +149,9 @@ pub fn render_memory_tiled_rgba(
     params.crop.rect = [0.0, 0.0, 1.0, 1.0];
     params.crop.flip_horizontal = false;
     params.crop.flip_vertical = false;
+    // 条带各自独立：均衡器的空间导向滤波在条带间会产生接缝，而且每块都要重跑一遍，
+    // 导出耗时会成倍增加（手机上表现为「卡住」）。导出时关掉滤波，色调映射本身不变。
+    params.equalizer.use_filter = false;
     let identity_json = serde_json::to_string(&params)?;
 
     let source_stride = width as usize * 4;
