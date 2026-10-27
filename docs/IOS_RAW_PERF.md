@@ -98,3 +98,22 @@
 - iCloud「优化存储」下首次仍要下载原始文件，可以给 `PHAssetResourceRequestOptions.progressHandler`
   接一个「正在从 iCloud 下载 RAW…」的进度提示。
 - 两个缓存的 `totalCostLimit` 是按常见机型估的，可按真机 `Instruments → Allocations` 实测再调。
+
+## 附：编辑页首帧加载框
+
+**现象**：点进一张调过色的照片，先看到没调色的原图，过一会才跳成调色结果。
+
+**原因**：原图一就位就收加载框了。`finishLoading` 里先 `previewImage = original`，
+调色首帧是之后 `scheduleRender` 才渲染出来的，中间那几百毫秒就是"没调色的图"。
+
+**改法**（`EditorModel.swift` + `EditorTabView.swift`）
+
+- `isLoading` 的含义改为「首帧加载框」：从 `load` 亮起，到**带当前调色**的首帧真正上屏
+  才收起（`finishLoadingOverlay`，由 `startRender` 的完成回调触发）。
+- 只有存在已保存调色 / 自动基础调色的照片才等这一帧（`awaitingEditedFrame`）：
+  纯原图解码完就收，避免相册式左右滑动时每张都多等一次渲染。
+- 加载框最短显示 0.3s（缓存命中时首帧很快，避免闪一下）；30s 看门狗兜底
+  （坏文件 / 渲染异常时强制收起，不会永远盖住画面）。
+- 渲染带 `loadToken` 代际：换图后在途的旧帧不再覆盖新图，也不再被算成新图的首帧。
+- `retouchStage`（AI 修图识别）在加载框期间不叠第二层全屏 loading，文案直接显示在卡片里。
+- 卡片带 0.22s 淡入淡出，加载期间遮罩拦截点击。

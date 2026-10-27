@@ -112,6 +112,24 @@ final class EditorModel: ObservableObject {
     /// 首帧加载期间是否在恢复历史调色（决定加载弹框的文案）。
     @Published private(set) var isRestoringEdits = false
     @Published private(set) var isRendering = false
+    /// 加载框：从 `load` 开始显示，直到**第一帧带当前调色**的画面真正上屏才收起。
+    ///
+    /// 之前原图一就位就把加载框关了，而调色首帧要等渲染完才出来，
+    /// 于是"点进去先看到没调色的图，过一会才跳成调色结果"。
+    private var awaitingFirstFrame = false
+    /// 这张图有没有"已保存的调色 / 自动基础调色"要等。
+    ///
+    /// 没有调色的图原图就是最终效果，解码完就能收加载框（不然每张图都要多等一次渲染，
+    /// 相册式左右滑动会变慢）；有调色才必须等带调色的首帧。
+    private var awaitingEditedFrame = false
+    /// 加载框出现时刻（首帧太快时补足最短显示时间，避免闪一下）。
+    private var loadingStartedAt: CFAbsoluteTime = 0
+    /// 首帧看门狗（坏文件 / 渲染异常时不能让加载框永远盖住画面）。
+    private var firstFrameWatchdog: DispatchWorkItem?
+    /// 加载框最短显示时间（秒）。
+    private static let loadingMinDuration: CFAbsoluteTime = 0.3
+    /// 首帧看门狗超时（秒）。
+    private static let loadingTimeout: TimeInterval = 30
     @Published private(set) var isExporting = false
     /// 导出进度（0..1；nil = 未在导出）。
     @Published private(set) var exportProgress: Double?
@@ -310,8 +328,11 @@ final class EditorModel: ObservableObject {
         }
         selectedMaskId = state.masks.first?.id
         isLoading = true
+        // 有已保存的调色才需要等"带调色的首帧"（自动基础调色会在 finishLoading 里补上）。
+        awaitingEditedFrame = isRestoringEdits
         loadToken &+= 1
         let token = loadToken
+        beginAwaitingFirstFrame(token: token)
         let maxEdge = EditorLimits.previewMaxEdge
         let isRaw = PhotoRaw.isRawAsset(asset)
         rawCacheKey = isRaw
@@ -339,13 +360,12 @@ final class EditorModel: ObservableObject {
             return
         }
 
-        // 1) 快速首图：RAW / 大图先出一张低质量图，避免几秒空屏。
+        // 1) 快速首图：RAW / 大图先出一张低质量图垫在加载框后面。
+        //    注意：这里不能关加载框——调色首帧还没出来，关了就会先看到没调色的图。
         requestImage(asset: asset, maxEdge: maxEdge, mode: .fastFormat) { [weak self] image, _ in
             guard let self, self.loadToken == token, self.baseBuffer == nil else { return }
             guard let image else { return }
             self.previewImage = image
-            self.isLoading = false
-            self.isRestoringEdits = false
         }
 
         // 2) 正式图：RAW（ProRAW / DNG）走 LibRaw 解调，其余交给系统解码后转像素缓冲。
@@ -410,9 +430,8 @@ final class EditorModel: ObservableObject {
                 return
             }
             guard let image else {
-                self.isLoading = false
-                self.isRestoringEdits = false
                 self.message = "无法读取这张照片"
+                self.finishFirstFrameFailed()
                 return
             }
             // 像素转换（方向校正 + 缩放 + 色彩空间）放到渲染线程，避免卡主线程。
@@ -428,11 +447,15 @@ final class EditorModel: ObservableObject {
     }
 
     /// 载入完成（系统解码与 LibRaw 共用）：缓冲 / 原图 / 首帧渲染 / GPU 会话。
+    ///
+    /// 这里**不直接关加载框**：`previewImage` 先垫一版原图；
+    /// 有调色时等 `scheduleRender` 把带调色的首帧渲染出来（`finishLoadingOverlay`）再收起，
+    /// 避免先看到没调色的图。
     private func finishLoading(buffer: RgbaBuffer?, original: UIImage?, token: Int) {
         guard loadToken == token else { return }
-        isLoading = false
         guard let buffer else {
             message = "无法读取这张照片的像素数据"
+            finishFirstFrameFailed()
             return
         }
         baseBuffer = buffer
@@ -450,10 +473,64 @@ final class EditorModel: ObservableObject {
         if let source = renderSource {
             createGpuSession(for: source)
         }
+        // 没有调色要等（纯原图）：解码完成就收加载框，不再多等一次渲染。
+        if !awaitingEditedFrame {
+            finishLoadingOverlay()
+        }
         // 有保存过修图参数的照片：后台重算修图缓冲。
         prepareRetouchAfterLoad()
         // Vision 人像蒙版（MODNet 不随包）：后台算好提交给核心（身体塑形 / 人像路径用）。
         prepareVisionPersonMask()
+    }
+
+    // MARK: - 首帧加载框
+
+    /// 开始等首帧：加载框亮起，直到**第一帧带当前调色**的画面真正上屏。
+    private func beginAwaitingFirstFrame(token: Int) {
+        awaitingFirstFrame = true
+        loadingStartedAt = CFAbsoluteTimeGetCurrent()
+        firstFrameWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.loadToken == token, self.awaitingFirstFrame else { return }
+            // 弱网 / 坏文件 / 渲染异常：到点强制收起，不能让加载框永远盖住画面。
+            self.awaitingFirstFrame = false
+            self.clearLoadingIfNeeded()
+        }
+        firstFrameWatchdog = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.loadingTimeout, execute: item)
+    }
+
+    /// 收起加载框：带调色的首帧上屏时调用；首帧太快时补足最短显示时间，避免闪一下。
+    private func finishLoadingOverlay() {
+        guard awaitingFirstFrame else { return }
+        awaitingFirstFrame = false
+        firstFrameWatchdog?.cancel()
+        firstFrameWatchdog = nil
+        let token = loadToken
+        let remaining = Self.loadingMinDuration - (CFAbsoluteTimeGetCurrent() - loadingStartedAt)
+        guard remaining > 0.02 else {
+            clearLoadingIfNeeded()
+            return
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+            // 延迟期间又换了照片：让新的加载流程自己收尾。
+            guard let self, self.loadToken == token, !self.awaitingFirstFrame else { return }
+            self.clearLoadingIfNeeded()
+        }
+    }
+
+    /// 首帧失败（取不到图 / 渲染失败）：收起加载框，露出原图，错误提示保留在 `message`。
+    private func finishFirstFrameFailed() {
+        awaitingFirstFrame = false
+        firstFrameWatchdog?.cancel()
+        firstFrameWatchdog = nil
+        clearLoadingIfNeeded()
+    }
+
+    private func clearLoadingIfNeeded() {
+        guard isLoading else { return }
+        isLoading = false
+        isRestoringEdits = false
     }
 
     /// RAW：后台解一版更精细的缓冲（≤2560）供放大 1:1 / 区域细节复用。
@@ -2494,6 +2571,8 @@ final class EditorModel: ObservableObject {
         state.values = values
         presetName = "基础调色"
         presetRef = nil
+        // 自动基础调色也会改变画面：加载框要等这一版渲染出来再收。
+        awaitingEditedFrame = true
         scheduleRender(immediate: true)
     }
 
@@ -3115,7 +3194,11 @@ final class EditorModel: ObservableObject {
     }
 
     private func scheduleRender(immediate: Bool = false) {
-        guard renderSource != nil else { return }
+        guard renderSource != nil else {
+            // 没有可渲染的源（载入失败）：别让加载框一直挂着。
+            if awaitingFirstFrame { finishFirstFrameFailed() }
+            return
+        }
         // 空闲时立即渲染；正在渲染则记下待渲染，当前帧结束后自动接着渲染。
         // （此前的 140ms 防抖在持续拖动时会一直被重置，导致松手才出图。）
         if renderBusy {
@@ -3133,6 +3216,8 @@ final class EditorModel: ObservableObject {
         }
         renderBusy = true
         isRendering = true
+        // 这一帧属于哪次载入：换图后在途的旧帧不能覆盖新图，也不能算作新图的"首帧"。
+        let generation = loadToken
         let json = currentJson()
         // 蒙版拖动 / 涂抹、以及沉浸拖动滑块时用低分辨率缓冲：
         // CPU 渲染量降约 4 倍，手感更跟手；松手提交后自动回到全分辨率预览。
@@ -3151,6 +3236,14 @@ final class EditorModel: ObservableObject {
                     guard let self else { return }
                     self.renderBusy = false
                     self.isRendering = false
+                    guard generation == self.loadToken else {
+                        // 换图前就在跑的那一帧：别拿旧图覆盖新图，直接放行新任务。
+                        if self.renderPending {
+                            self.renderPending = false
+                            self.startRender()
+                        }
+                        return
+                    }
                     self.previewOutputSize = CGSize(width: size.width, height: size.height)
                     if let histogram {
                         self.histogram = histogram
@@ -3159,6 +3252,7 @@ final class EditorModel: ObservableObject {
                     self.message = nil
                     // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
                     self.scheduleMaskAssetsRefresh()
+                    self.finishLoadingOverlay()
                     if self.renderPending {
                         self.renderPending = false
                         self.startRender()
@@ -3189,20 +3283,25 @@ final class EditorModel: ObservableObject {
                 guard let self else { return }
                 self.renderBusy = false
                 self.isRendering = false
-                if let image, let histogram {
-                    self.previewImage = image
-                    self.previewPixels = pixels
-                    self.histogram = histogram
-                    self.previewOutputSize = outputSize
-                    self.renderMillis = millis
-                    self.message = nil
-                    // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
-                    self.scheduleMaskAssetsRefresh()
-                } else if !fallback, self.fastBuffer != nil {
-                    // 全分辨率渲染失败：降一档用快速缓冲重试一次，不再直接报错。
-                    self.startRender(fallback: true)
-                } else {
-                    self.message = failure ?? "渲染失败"
+                if generation == self.loadToken {
+                    if let image, let histogram {
+                        self.previewImage = image
+                        self.previewPixels = pixels
+                        self.histogram = histogram
+                        self.previewOutputSize = outputSize
+                        self.renderMillis = millis
+                        self.message = nil
+                        // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
+                        self.scheduleMaskAssetsRefresh()
+                        // 带当前调色的首帧已经上屏：这时才收起加载框。
+                        self.finishLoadingOverlay()
+                    } else if !fallback, self.fastBuffer != nil {
+                        // 全分辨率渲染失败：降一档用快速缓冲重试一次，不再直接报错。
+                        self.startRender(fallback: true)
+                    } else {
+                        self.message = failure ?? "渲染失败"
+                        self.finishFirstFrameFailed()
+                    }
                 }
                 if self.renderPending {
                     self.renderPending = false

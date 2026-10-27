@@ -461,6 +461,11 @@ struct EditorTabView: View {
 
     /// 全屏加载文案：修图阶段 / 工作台切换 / 调色下的 AI 识别（智能蒙版）。
     private var activeOverlayStage: String? {
+        // 首帧加载框（图片区居中卡片）已经在显示"正在…"了：
+        // 这里先让位，避免两个 loading 叠在一起。
+        if model.isLoading {
+            return nil
+        }
         if let stage = model.retouchStage {
             return stage
         }
@@ -783,21 +788,31 @@ struct EditorTabView: View {
                 // 避免同时出现「居中转圈」和「弹框」两套加载 UI。
                 Color.clear
             }
-            // 切图 / 首帧加载：居中弹框（半透明遮罩 + 圆角卡片），加载期间拦截所有点击，
-            // 加载完自动消失，避免先看到原图再跳成调色结果。
+            // 切图 / 首帧加载：居中弹框（半透明遮罩 + 圆角卡片）。
+            //
+            // 关键：它一直留到**带当前调色的首帧**真正上屏（EditorModel.finishLoadingOverlay）
+            // 才收起，否则就会"先看到没调色的原图，过一会才跳成调色结果"。
+            // 加载期间遮罩拦截所有点击。
             if model.isLoading {
                 ZStack {
-                    Color.black.opacity(0.35).ignoresSafeArea()
-                    VStack(spacing: 12) {
+                    Color.black.opacity(0.45).ignoresSafeArea()
+                    VStack(spacing: 14) {
                         ProgressView()
+                            .controlSize(.large)
                             .tint(.white)
-                        Text(model.isRestoringEdits ? "正在应用上次的调色…" : "正在加载照片…")
+                        Text(loadingText)
                             .font(.footnote)
                             .foregroundStyle(.white.opacity(0.9))
+                            .multilineTextAlignment(.center)
                     }
-                    .padding(.horizontal, 28)
-                    .padding(.vertical, 22)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+                    .padding(.horizontal, 30)
+                    .padding(.vertical, 24)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 18)
+                            .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                    }
+                    .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
                 }
                 .transition(.opacity)
                 .zIndex(30)
@@ -891,6 +906,16 @@ struct EditorTabView: View {
                 .padding(10)
             }
         }
+        // 加载框淡入淡出（首帧太快时由模型补足最短显示时间，不会闪一下）。
+        .animation(.easeOut(duration: 0.22), value: model.isLoading)
+    }
+
+    /// 加载框文案：修图阶段 > 恢复上次调色 > 普通加载。
+    private var loadingText: String {
+        if let stage = model.retouchStage {
+            return stage
+        }
+        return model.isRestoringEdits ? "正在应用上次的调色…" : "正在加载照片…"
     }
 
     /// 蒙版触摸事件 → 蒙版控件 / 画布操作。
