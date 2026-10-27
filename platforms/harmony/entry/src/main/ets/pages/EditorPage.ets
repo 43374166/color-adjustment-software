@@ -497,6 +497,7 @@ struct EditorPage {
   /** 上一次多指/拖动交互的结束时间戳，用于抑制随后的误点击。 */
   private suppressTapUntil: number = 0;
   private focusTimer: number = -1;
+  private panelTop: number = 99999;
   private panBaseX: number = 0;
   private panBaseY: number = 0;
   @State cropMode: boolean = false;
@@ -1415,6 +1416,17 @@ struct EditorPage {
     }
   }
 
+  /** 触摸事件里 Up / Cancel 的 touches 常为空，用 changedTouches 兜底。 */
+  private firstTouch(event: TouchEvent): TouchObject | null {
+    if (event.touches.length > 0) {
+      return event.touches[0];
+    }
+    if (event.changedTouches.length > 0) {
+      return event.changedTouches[0];
+    }
+    return null;
+  }
+
   private handleGraphTouch(x: number, y: number, height: number, phase: number): void {
     this.suppressTapUntil = Date.now() + 500;
     this.keepFocus('eq', phase);
@@ -1539,10 +1551,10 @@ struct EditorPage {
             this.drawCropOverlay();
           })
           .onTouch((event: TouchEvent) => {
-            if (event.touches.length === 0) {
+            const touch = this.firstTouch(event);
+            if (touch === null) {
               return;
             }
-            const touch = event.touches[0];
             this.handleCropTouch(touch.x, touch.y, event.type);
           })
       } else if (this.maskMode) {
@@ -1553,10 +1565,10 @@ struct EditorPage {
             this.drawMaskOverlay();
           })
           .onTouch((event: TouchEvent) => {
-            if (event.touches.length === 0) {
+            const touch = this.firstTouch(event);
+            if (touch === null) {
               return;
             }
-            const touch = event.touches[0];
             this.handleMaskTouch(touch.x, touch.y, event.type);
           })
       }
@@ -1622,6 +1634,9 @@ struct EditorPage {
           .width('100%')
           .onClick(() => {
           })
+          .onAreaChange((oldArea: Area, newArea: Area) => {
+            this.panelTop = Number(newArea.globalPosition.y);
+          })
         }
       }
       .width('100%')
@@ -1677,6 +1692,13 @@ struct EditorPage {
   private handlePreviewTap(x: number, y: number): void {
     if (this.picking) {
       this.sampleAt(x, y);
+      return;
+    }
+    // 面板展开时，点在面板区域的触摸不应触发沉浸（双保险）。
+    if (this.activeTool >= 0 && y > this.panelTop - 8) {
+      return;
+    }
+    if (this.focusRow !== '') {
       return;
     }
     if (!this.cropMode && !this.maskMode) {
@@ -2408,10 +2430,10 @@ struct EditorPage {
           this.drawCurveEditor();
         })
         .onTouch((event: TouchEvent) => {
-          if (event.touches.length === 0) {
+          const touch = this.firstTouch(event);
+          if (touch === null) {
             return;
           }
-          const touch = event.touches[0];
           this.handleCurveTouch(touch.x, touch.y, this.curveContext.width,
             this.curveContext.height, event.type);
         })
@@ -2747,10 +2769,10 @@ struct EditorPage {
           this.drawGraph();
         })
         .onTouch((event: TouchEvent) => {
-          if (event.touches.length === 0) {
+          const touch = this.firstTouch(event);
+          if (touch === null) {
             return;
           }
-          const touch = event.touches[0];
           this.handleGraphTouch(touch.x, touch.y, this.context.height, event.type);
         })
 
