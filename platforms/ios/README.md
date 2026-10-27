@@ -44,6 +44,8 @@ platforms/ios/
     ├── FdxmpApp.swift       # App 入口
     ├── ContentView.swift    # 三大 Tab
     ├── DeviceTabView.swift  # 设备 Tab（相册）
+    ├── PhotoIndex.swift     # 文件名 / RAW 索引 + 磁盘缓存 + 缩略图缓存
+    ├── RawFrameCache.swift  # 已解码 RAW 帧缓存（退出编辑页再进不再重解）
     ├── EditorTabView.swift  # 编辑 Tab（调色界面）
     ├── EditorModel.swift    # 渲染状态机（防抖 / 历史 / 导出 / 工具切换）
     ├── EditParams.swift     # 滑块规格表 / 预设 / 存储

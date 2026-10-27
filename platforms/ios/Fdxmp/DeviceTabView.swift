@@ -28,17 +28,33 @@ enum DeviceFilter: String, CaseIterable, Identifiable {
 
 // MARK: - 相册数据源
 
+/// 相册数据源。
+///
+/// 性能约束（改动前 iOS 上切「RAW」筛选会卡死十几秒，Xcode 报 9999+ms）：
+/// `PHAssetResource.assetResources(for:)` 是跨进程查询，每张约 0.3–3ms、iCloud 库更慢；
+/// 旧代码在 `body` 里对整库逐张调用（`PHAsset.isRaw` 查一次、`displayName` 又查一次），
+/// 5000 张照片 = 上万次 XPC 全压在主线程上。现在文件名 / 是否 RAW 先读磁盘索引，
+/// 后台只补新增照片，主线程只查字典。
 final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     @Published var authorization: PHAuthorizationStatus =
         PHPhotoLibrary.authorizationStatus(for: .readWrite)
-    @Published var assets: [PHAsset] = []
+    @Published private(set) var assets: [PHAsset] = []
+    /// 元信息索引（localIdentifier → 文件名 / 是否 RAW）。
+    @Published private(set) var index: [String: PhotoIndexEntry] = PhotoIndexStore.load()
+    /// 后台补索引进度（0..1；1 = 完成）。
+    @Published private(set) var indexProgress: Double = 1
 
     let imageManager = PHCachingImageManager()
 
-    /// 文件名缓存（`PHAssetResource` 查询较慢，网格/搜索会频繁用到）。
-    private var nameCache: [String: String] = [:]
-    /// RAW 判定缓存（同上，避免每次渲染都查资源）。
-    private var rawCache: [String: Bool] = [:]
+    private let indexQueue = DispatchQueue(
+        label: "fdxmp.ios.photo-index-build",
+        qos: .userInitiated
+    )
+    /// 索引代际（换库 / 重新加载后旧的构建结果作废）。
+    private var indexToken = 0
+    /// 已预取的缩略图批次（避免同一屏反复 startCaching）。
+    private var cachedIds: [String] = []
+    private var cachedSize = CGSize.zero
 
     override init() {
         super.init()
@@ -48,6 +64,9 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
     deinit {
         PHPhotoLibrary.shared().unregisterChangeObserver(self)
     }
+
+    /// 索引是否已建完（RAW 筛选 / 搜索可以直接用）。
+    var indexComplete: Bool { indexProgress >= 1 }
 
     func requestAuthorizationAndLoad() {
         let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
@@ -74,33 +93,133 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let result = PHAsset.fetchAssets(with: .image, options: options)
         var list: [PHAsset] = []
+        list.reserveCapacity(result.count)
         result.enumerateObjects { asset, _, _ in
             list.append(asset)
         }
-        nameCache.removeAll()
-        rawCache.removeAll()
         assets = list
+        rebuildIndex(for: list)
     }
 
-    /// 原始文件名（带缓存）。
+    /// 后台补索引：只查缓存里没有的照片（新增 / 刚导入），不重跑整库。
+    private func rebuildIndex(for list: [PHAsset]) {
+        indexToken &+= 1
+        let token = indexToken
+        let known = index
+        // 删掉已经不在相册里的条目，避免缓存无限增长。
+        let aliveIds = Set(list.map { $0.localIdentifier })
+        let base = known.filter { aliveIds.contains($0.key) }
+
+        var missing: [PHAsset] = []
+        for asset in list where known[asset.localIdentifier] == nil {
+            missing.append(asset)
+        }
+        guard !missing.isEmpty else {
+            indexProgress = 1
+            if base.count != known.count {
+                index = base
+                PhotoIndexStore.save(base)
+            }
+            return
+        }
+
+        indexProgress = 0
+        indexQueue.async { [weak self] in
+            var built: [String: PhotoIndexEntry] = [:]
+            built.reserveCapacity(missing.count)
+            var done = 0
+            var published = 0
+            for asset in missing {
+                built[asset.localIdentifier] = PhotoLibraryModel.makeEntry(for: asset)
+                done += 1
+                // 每 96 张回报一次进度：足够平滑，又不会把主线程刷爆。
+                if done - published >= 96 {
+                    published = done
+                    let progress = Double(done) / Double(missing.count)
+                    DispatchQueue.main.async {
+                        guard let self, self.indexToken == token else { return }
+                        self.indexProgress = progress
+                    }
+                }
+            }
+            DispatchQueue.main.async {
+                guard let self, self.indexToken == token else { return }
+                var merged = base
+                merged.merge(built) { _, new in new }
+                self.index = merged
+                self.indexProgress = 1
+                PhotoIndexStore.save(merged)
+            }
+        }
+    }
+
+    /// 一次 `PHAssetResource` 查询同时拿到文件名与 RAW 判定。
+    private static func makeEntry(for asset: PHAsset) -> PhotoIndexEntry {
+        let resources = PHAssetResource.assetResources(for: asset)
+        let name = resources.first?.originalFilename ?? "未命名照片"
+        PhotoNames.remember(name, for: asset)
+        let isRaw = resources.contains { PhotoRaw.isRawResource($0) }
+        return PhotoIndexEntry(name: name, isRaw: isRaw)
+    }
+
+    /// 原始文件名（索引查询，主线程安全）。
     func fileName(for asset: PHAsset) -> String {
-        if let cached = nameCache[asset.localIdentifier] {
-            return cached
-        }
-        let name = PHAssetResource.assetResources(for: asset).first?.originalFilename
-            ?? "未命名照片"
-        nameCache[asset.localIdentifier] = name
-        return name
+        index[asset.localIdentifier]?.name ?? ""
     }
 
-    /// 是否 RAW（带缓存）。
+    /// 是否 RAW（索引查询，主线程安全）。
     func isRaw(_ asset: PHAsset) -> Bool {
-        if let cached = rawCache[asset.localIdentifier] {
-            return cached
+        index[asset.localIdentifier]?.isRaw ?? false
+    }
+
+    /// 索引里是否已经有这张照片（还没轮到时不参与 RAW / 常见格式筛选）。
+    func isIndexed(_ asset: PHAsset) -> Bool {
+        index[asset.localIdentifier] != nil
+    }
+
+    // MARK: 缩略图
+
+    /// 缩略图请求参数（与 `warmThumbnails` 的预取参数必须一致）。
+    ///
+    /// 沿用 1.1.0 实机对比后定下的 `.opportunistic` + `.exact`（先快图再清晰图），
+    /// 不靠降清晰度换速度；提速靠三件事：内存缓存、预取、以及不再在主线程逐张查资源。
+    static let thumbnailOptions: PHImageRequestOptions = {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .exact
+        options.isNetworkAccessAllowed = true
+        options.version = .current
+        return options
+    }()
+
+    func thumbnailKey(for asset: PHAsset, size: CGSize) -> String {
+        "\(asset.localIdentifier)|\(Int(size.width))x\(Int(size.height))"
+    }
+
+    func cachedThumbnail(for asset: PHAsset, size: CGSize) -> UIImage? {
+        ThumbnailCache.shared.image(for: thumbnailKey(for: asset, size: size))
+    }
+
+    func storeThumbnail(_ image: UIImage, for asset: PHAsset, size: CGSize) {
+        ThumbnailCache.shared.store(image, for: thumbnailKey(for: asset, size: size))
+    }
+
+    /// 预取一屏缩略图（筛完 / 排序后可见的前几十张），滚动到时直接命中。
+    func warmThumbnails(_ list: [PHAsset], size: CGSize) {
+        let ids = list.map { $0.localIdentifier }
+        if ids == cachedIds, size == cachedSize { return }
+        if !cachedIds.isEmpty {
+            imageManager.stopCachingImagesForAllAssets()
         }
-        let value = asset.isRaw
-        rawCache[asset.localIdentifier] = value
-        return value
+        cachedIds = ids
+        cachedSize = size
+        guard !list.isEmpty else { return }
+        imageManager.startCachingImages(
+            for: list,
+            targetSize: size,
+            contentMode: .aspectFill,
+            options: Self.thumbnailOptions
+        )
     }
 
     func photoLibraryDidChange(_ changeInstance: PHChange) {
@@ -111,23 +230,9 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
 }
 
 extension PHAsset {
+    /// 原始文件名（进程内缓存，界面反复读也不会重复查 PhotoKit）。
     var displayName: String {
-        PHAssetResource.assetResources(for: self).first?.originalFilename
-            ?? "未命名照片"
-    }
-
-    var isRaw: Bool {
-        let name = displayName.lowercased()
-        let rawExtensions = [
-            ".dng", ".cr2", ".cr3", ".nef", ".nrw", ".arw", ".raf", ".rw2",
-            ".orf", ".pef", ".srw", ".raw", ".rwl", ".x3f", ".3fr",
-        ]
-        if rawExtensions.contains(where: { name.hasSuffix($0) }) {
-            return true
-        }
-        return PHAssetResource.assetResources(for: self).contains {
-            $0.uniformTypeIdentifier.lowercased().contains("raw")
-        }
+        PhotoNames.name(for: self)
     }
 
     var pixelDescription: String {
@@ -170,21 +275,27 @@ struct AssetThumbnail: View {
     }
 
     private func load() {
-        let options = PHImageRequestOptions()
-        // 先给一版快图保证不空屏，再补一版高质量图（opportunistic 会回调两次，
-        // 后到的清晰版直接覆盖，缩略图不再糊）。
-        options.deliveryMode = .opportunistic
-        options.resizeMode = .exact
-        options.isNetworkAccessAllowed = true
-        requestId = model.imageManager.requestImage(
+        // 拿到强引用再进异步回调：视图结构体销毁后 environment 已经不可靠。
+        let library = model
+        // 命中缓存直接出图：退出编辑页 / 关掉预览再回来不再重新排队渲染。
+        if let cached = library.cachedThumbnail(for: asset, size: targetSize) {
+            image = cached
+            return
+        }
+        // opportunistic 会回调两次：先一版快图保证不空屏，后到的清晰版覆盖并进缓存。
+        requestId = library.imageManager.requestImage(
             for: asset,
             targetSize: targetSize,
             contentMode: .aspectFill,
-            options: options
-        ) { result, _ in
+            options: PhotoLibraryModel.thumbnailOptions
+        ) { result, info in
             guard let result else { return }
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             DispatchQueue.main.async {
                 image = result
+                if !degraded {
+                    library.storeThumbnail(result, for: asset, size: targetSize)
+                }
             }
         }
     }
@@ -436,36 +547,40 @@ struct DeviceTabView: View {
     @State private var showCamera = false
     @State private var message: String?
 
+    /// 当前可见照片。
+    ///
+    /// 只做内存字典查询 + 过滤：切「RAW」时不再逐张跨进程查 PhotoKit
+    /// （那是之前卡死十几秒的原因），1 万张的过滤 / 排序都在毫秒级。
     private var visibleAssets: [PHAsset] {
         let tokens = searchTokens
-        var list = model.assets.filter { asset in
-            let matchesQuery = tokens.isEmpty
-                || tokens.contains { token in
-                    model.fileName(for: asset).localizedCaseInsensitiveContains(token)
-                }
-            let matchesFilter: Bool
+        let list = model.assets.filter { asset in
+            if !tokens.isEmpty {
+                let name = model.fileName(for: asset)
+                let hit = tokens.contains { name.localizedCaseInsensitiveContains($0) }
+                guard hit else { return false }
+            }
             switch filter {
             case .all:
-                matchesFilter = true
+                return true
             case .raw:
-                matchesFilter = model.isRaw(asset)
+                return model.isRaw(asset)
             case .standard:
-                matchesFilter = !model.isRaw(asset)
+                // 还没进索引的照片先不参与「常见格式」，避免一闪而过。
+                return model.isIndexed(asset) && !model.isRaw(asset)
             }
-            return matchesQuery && matchesFilter
         }
+        // 相册本身按创建时间倒序取回：最新优先不用再排，最早优先直接反转。
         switch sort {
         case .newest:
-            list.sort { ($0.creationDate ?? .distantPast) > ($1.creationDate ?? .distantPast) }
+            return list
         case .oldest:
-            list.sort { ($0.creationDate ?? .distantPast) < ($1.creationDate ?? .distantPast) }
+            return Array(list.reversed())
         case .name:
-            list.sort {
+            return list.sorted {
                 model.fileName(for: $0).localizedStandardCompare(model.fileName(for: $1))
                     == .orderedAscending
             }
         }
-        return list
     }
 
     /// 搜索词：支持逗号（中英文）分隔多个文件名，任意一个命中即显示。
@@ -474,6 +589,17 @@ struct DeviceTabView: View {
             .split(whereSeparator: { $0 == "," || $0 == "，" })
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
+    }
+
+    /// 缩略图预取的触发键：筛选 / 排序 / 搜索 / 索引完成状态变化时重新预取一屏。
+    private var warmKey: String {
+        [
+            filter.rawValue,
+            sort.rawValue,
+            searchText,
+            "\(model.assets.count)",
+            "\(model.indexComplete)",
+        ].joined(separator: "|")
     }
 
     var body: some View {
@@ -518,6 +644,8 @@ struct DeviceTabView: View {
             toolbar
             if model.assets.isEmpty {
                 emptyState
+            } else if visibleAssets.isEmpty {
+                noMatchState
             } else if gridMode {
                 grid
             } else {
@@ -595,6 +723,18 @@ struct DeviceTabView: View {
                 }
                 .buttonStyle(.bordered)
             }
+
+            // 首次安装 / 大量新照片：后台补索引时给一条进度，点「RAW」不会再卡住。
+            if !model.indexComplete {
+                HStack(spacing: 8) {
+                    ProgressView(value: model.indexProgress)
+                        .tint(Color.accentColor)
+                    Text("正在识别照片格式…")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize()
+                }
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
@@ -671,6 +811,15 @@ struct DeviceTabView: View {
             .padding(2)
         }
         .background(Color(white: 0.06))
+        // 预取首屏缩略图：滚到 / 切回来时直接命中缓存，不再一格一格排队渲染。
+        // 只预取约一屏半（30 张）：再多会和屏幕上的请求抢 PhotoKit 的渲染队列，
+        // RAW 反而更慢。
+        .task(id: warmKey) {
+            model.warmThumbnails(
+                Array(visibleAssets.prefix(30)),
+                size: CGSize(width: 480, height: 480)
+            )
+        }
     }
 
     private var list: some View {
@@ -711,6 +860,19 @@ struct DeviceTabView: View {
             Text("相册里还没有照片")
                 .font(.headline)
             Text("可以用下方相机拍一张，或把照片同步到设备相册")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// 有照片、但当前筛选 / 搜索没有命中（例如索引还没建完就看到 RAW 页）。
+    private var noMatchState: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "line.3.horizontal.decrease.circle")
+                .font(.system(size: 36))
+                .foregroundStyle(.secondary)
+            Text(model.indexComplete ? "没有符合当前筛选的照片" : "正在识别照片格式…")
                 .font(.footnote)
                 .foregroundStyle(.secondary)
         }

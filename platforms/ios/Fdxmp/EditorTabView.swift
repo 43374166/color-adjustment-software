@@ -779,13 +779,9 @@ struct EditorTabView: View {
                 // 手指跟随时整块内容平移（相册式滑动）。
                 .offset(x: pan.width + (zoom <= 1.01 ? swipeOffset : 0), y: pan.height)
             } else if model.isLoading {
-                VStack(spacing: 10) {
-                    ProgressView()
-                        .tint(.white)
-                    Text("正在加载照片")
-                        .font(.footnote)
-                        .foregroundStyle(.secondary)
-                }
+                // 首帧还没出来：占位保持布局，真正的加载提示由下面的居中弹框负责，
+                // 避免同时出现「居中转圈」和「弹框」两套加载 UI。
+                Color.clear
             }
             // 切图 / 首帧加载：居中弹框（半透明遮罩 + 圆角卡片），加载期间拦截所有点击，
             // 加载完自动消失，避免先看到原图再跳成调色结果。

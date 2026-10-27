@@ -182,6 +182,8 @@ final class EditorModel: ObservableObject {
     private var baseBuffer: RgbaBuffer?
     /// 当前 RAW 照片的原始文件字节（LibRaw 解码源；细节帧 / 导出复用）。
     private(set) var rawData: Data?
+    /// 当前 RAW 帧的缓存键（nil = 非 RAW / 无缓存）。
+    private var rawCacheKey: String?
     /// RAW 细节缓冲（LibRaw 解一版 ≤2560，供放大 1:1 / 区域细节复用；nil = 未就绪）。
     private var rawDetailBuffer: RgbaBuffer?
     private var rawDetailInFlight = false
@@ -311,6 +313,31 @@ final class EditorModel: ObservableObject {
         loadToken &+= 1
         let token = loadToken
         let maxEdge = EditorLimits.previewMaxEdge
+        let isRaw = PhotoRaw.isRawAsset(asset)
+        rawCacheKey = isRaw
+            ? RawFrameCache.key(
+                assetId: asset.localIdentifier,
+                maxEdge: maxEdge,
+                version: asset.modificationDate?.timeIntervalSince1970
+            )
+            : nil
+
+        // 0) 命中上次解好的 RAW 帧：退出编辑页再进来不再重新下载 / 解调
+        //    （原来这条链路要十几秒，命中后只剩一次首帧渲染）。
+        if let key = rawCacheKey, let cached = RawFrameCache.shared.entry(for: key) {
+            rawData = cached.data
+            baseBuffer = cached.base
+            rawDetailBuffer = cached.detail
+            let buffer = cached.base
+            renderQueue.async { [weak self] in
+                let original = ImageUtil.image(from: buffer)
+                Task { @MainActor in
+                    guard let self, self.loadToken == token else { return }
+                    self.finishLoading(buffer: buffer, original: original, token: token)
+                }
+            }
+            return
+        }
 
         // 1) 快速首图：RAW / 大图先出一张低质量图，避免几秒空屏。
         requestImage(asset: asset, maxEdge: maxEdge, mode: .fastFormat) { [weak self] image, _ in
@@ -322,7 +349,7 @@ final class EditorModel: ObservableObject {
         }
 
         // 2) 正式图：RAW（ProRAW / DNG）走 LibRaw 解调，其余交给系统解码后转像素缓冲。
-        if PhotoRaw.isRawAsset(asset) {
+        if isRaw {
             loadRawImage(asset: asset, token: token, maxEdge: maxEdge)
         } else {
             loadSystemImage(asset: asset, token: token, maxEdge: maxEdge)
@@ -356,8 +383,15 @@ final class EditorModel: ObservableObject {
                             return
                         }
                         self.finishLoading(buffer: buffer, original: original, token: token)
-                        // 后台再解一版细节缓冲（放大 1:1 / 区域细节复用）。
-                        self.prepareRawDetailBuffer(asset: asset)
+                        // 写进 RAW 帧缓存：退出编辑页再进来直接复用，不再重新取字节 / 解调。
+                        // 细节缓冲不在这里解：那是一次额外的解调，白占几秒 CPU 和一二百 MB 内存，
+                        // 等用户第一次放大（`requestDetailPreview`）时再解。
+                        if let buffer, let key = self.rawCacheKey {
+                            RawFrameCache.shared.store(
+                                RawFrameEntry(data: data, base: buffer),
+                                for: key
+                            )
+                        }
                     }
                 }
             }
@@ -423,12 +457,17 @@ final class EditorModel: ObservableObject {
     }
 
     /// RAW：后台解一版更精细的缓冲（≤2560）供放大 1:1 / 区域细节复用。
-    private func prepareRawDetailBuffer(asset: PHAsset) {
+    ///
+    /// 只在用户第一次放大时调用（进编辑页不再预解）：省掉进图时那次几秒的额外解调
+    /// 和一两百 MB 内存峰值，而真正需要细节帧时才付这笔成本。
+    /// 是否全尺寸解调沿用原来的像素上限（≤24MP 全尺寸、更大的走半尺寸）：
+    /// 12MP 的 ProRAW 半尺寸只有 2000×1500，低于 2560 的细节帧上限，会掉清晰度。
+    private func prepareRawDetailBuffer() {
         guard let data = rawData, rawDetailBuffer == nil, !rawDetailInFlight else { return }
         rawDetailToken &+= 1
         let token = rawDetailToken
         rawDetailInFlight = true
-        let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
+        let pixels = Double(asset?.pixelWidth ?? 0) * Double(asset?.pixelHeight ?? 0)
         let fullSize = pixels > 0 && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
         let maxEdge = EditorLimits.rawDetailMaxEdge
         renderQueue.async { [weak self] in
@@ -437,6 +476,12 @@ final class EditorModel: ObservableObject {
                 guard let self, self.rawDetailToken == token else { return }
                 self.rawDetailInFlight = false
                 self.rawDetailBuffer = buffer
+                // 细节缓冲也补进缓存：下次进图放大不再重新解。
+                if let buffer, let key = self.rawCacheKey,
+                   let cached = RawFrameCache.shared.entry(for: key) {
+                    cached.detail = buffer
+                    RawFrameCache.shared.store(cached, for: key)
+                }
                 // 用户已放大（有细节帧）：用更高精度缓冲重渲染一帧。
                 if buffer != nil, self.detailImage != nil {
                     self.requestDetailPreview(
@@ -652,6 +697,11 @@ final class EditorModel: ObservableObject {
                     self.detailInFlight = false
                     self.detailImage = output
                 }
+            }
+            // 先把这一帧（预览缓冲上采样）排在渲染队列前面，再解细节缓冲：
+            // 第一次放大立即可见，几秒后自动换成 2560 的精细帧。
+            if rawDetailBuffer == nil, !rawDetailInFlight {
+                prepareRawDetailBuffer()
             }
             return
         }

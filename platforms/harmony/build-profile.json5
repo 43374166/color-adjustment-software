@@ -1,6 +1,19 @@
 {
   "app": {
     "signingConfigs": [
+      {
+        "name": "default",
+        "type": "HarmonyOS",
+        "material": {
+          "certpath": "C:\\Users\\LicoLing\\.ohos\\config\\default_harmony_ZjqpW_7dPLQpnZXhsTAwaYT51J_HBg0GuuBINch5030=.cer",
+          "keyAlias": "debugKey",
+          "keyPassword": "0000001B07FE72FEF7642A6FC42B9248CC876E7EE75542D82D43B0EA8DC3139C6D54ADA9BC228F8870366E",
+          "profile": "C:\\Users\\LicoLing\\.ohos\\config\\default_harmony_ZjqpW_7dPLQpnZXhsTAwaYT51J_HBg0GuuBINch5030=.p7b",
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "C:\\Users\\LicoLing\\.ohos\\config\\default_harmony_ZjqpW_7dPLQpnZXhsTAwaYT51J_HBg0GuuBINch5030=.p12",
+          "storePassword": "0000001B4E2C8460AAC2A2AD51F7F809ECACB2C113DB8937EBB489159F6A302F0DB2B978046CF3C36BD051"
+        }
+      }
     ],
     "products": [
       {

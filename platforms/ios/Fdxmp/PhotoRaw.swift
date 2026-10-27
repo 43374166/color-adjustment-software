@@ -26,12 +26,15 @@ enum PhotoRaw {
     /// 而 UTI（`*-raw-image`）与文件名扩展名跨系统版本稳定。
     static func rawResource(for asset: PHAsset) -> PHAssetResource? {
         let resources = PHAssetResource.assetResources(for: asset)
-        let rawCandidates = resources.filter(isRaw)
+        let rawCandidates = resources.filter(isRawResource)
         return rawCandidates.first { $0.type == .alternatePhoto } ?? rawCandidates.first
     }
 
     /// 资源本身是否为 RAW（UTI 以 raw-image 结尾，或文件名是 RAW 扩展名）。
-    private static func isRaw(_ resource: PHAssetResource) -> Bool {
+    ///
+    /// 公开给索引层用：设备页批量建索引时只查一次 `assetResources`，
+    /// 同时拿到文件名和 RAW 判定（不再像以前那样分两次跨进程查）。
+    static func isRawResource(_ resource: PHAssetResource) -> Bool {
         if resource.uniformTypeIdentifier.lowercased().contains("raw-image") {
             return true
         }
