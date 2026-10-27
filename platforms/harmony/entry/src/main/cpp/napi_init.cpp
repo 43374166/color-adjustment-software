@@ -24,6 +24,12 @@ uint8_t *fdxmp_render_memory_rgba(const uint8_t *rgba, uint32_t width, uint32_t 
                                   const char *params_json, uint32_t *out_width,
                                   uint32_t *out_height, size_t *out_len);
 
+// 分块渲染整帧（原图分辨率、内存受控），返回格式同上。
+uint8_t *fdxmp_render_memory_tiled_rgba(const uint8_t *rgba, uint32_t width, uint32_t height,
+                                        const char *params_json, uint32_t strip_pixels,
+                                        uint32_t *out_width, uint32_t *out_height,
+                                        size_t *out_len);
+
 // 8bit sRGB → OkLCh（3 个 f32：L / C / 色相弧度）。
 int32_t fdxmp_color_oklch_from_srgb8(uint8_t r, uint8_t g, uint8_t b, float *out);
 
@@ -149,6 +155,76 @@ napi_value RenderMemoryRgba(napi_env env, napi_callback_info info) {
     return object;
 }
 
+// renderTiledRgba(rgba, width, height, paramsJson, stripPixels)
+//   -> { width, height, data }（分块渲染整帧：原图分辨率、内存受控）
+napi_value RenderTiledRgba(napi_env env, napi_callback_info info) {
+    size_t argc = 5;
+    napi_value argv[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    if (napi_get_cb_info(env, info, &argc, argv, nullptr, nullptr) != napi_ok || argc < 5) {
+        return Throw(env, "renderTiledRgba 需要 5 个参数");
+    }
+
+    void *pixels = nullptr;
+    size_t byte_length = 0;
+    if (napi_get_arraybuffer_info(env, argv[0], &pixels, &byte_length) != napi_ok) {
+        return Throw(env, "第 1 个参数必须是 ArrayBuffer");
+    }
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (napi_get_value_uint32(env, argv[1], &width) != napi_ok ||
+        napi_get_value_uint32(env, argv[2], &height) != napi_ok) {
+        return Throw(env, "宽高必须是整数");
+    }
+    const std::string params = ReadString(env, argv[3]);
+    if (params.empty()) {
+        return Throw(env, "参数 JSON 为空");
+    }
+    uint32_t strip_pixels = 4000000;
+    if (napi_get_value_uint32(env, argv[4], &strip_pixels) != napi_ok) {
+        return Throw(env, "stripPixels 必须是整数");
+    }
+
+    uint32_t out_width = 0;
+    uint32_t out_height = 0;
+    size_t out_len = 0;
+    uint8_t *payload = fdxmp_render_memory_tiled_rgba(
+        static_cast<const uint8_t *>(pixels), width, height, params.c_str(), strip_pixels,
+        &out_width, &out_height, &out_len);
+    if (payload == nullptr) {
+        return Throw(env, LastError());
+    }
+    if (out_len < 8) {
+        fdxmp_bytes_free(payload, out_len);
+        return Throw(env, "渲染结果长度异常");
+    }
+    uint32_t head_width = (uint32_t(payload[0]) << 24) | (uint32_t(payload[1]) << 16) |
+                          (uint32_t(payload[2]) << 8) | uint32_t(payload[3]);
+    uint32_t head_height = (uint32_t(payload[4]) << 24) | (uint32_t(payload[5]) << 16) |
+                           (uint32_t(payload[6]) << 8) | uint32_t(payload[7]);
+    const size_t data_len = out_len - 8;
+
+    napi_value object = nullptr;
+    napi_create_object(env, &object);
+
+    napi_value buffer = nullptr;
+    void *buffer_data = nullptr;
+    if (napi_create_arraybuffer(env, data_len, &buffer_data, &buffer) != napi_ok) {
+        fdxmp_bytes_free(payload, out_len);
+        return Throw(env, "分配输出缓冲区失败");
+    }
+    std::memcpy(buffer_data, payload + 8, data_len);
+    fdxmp_bytes_free(payload, out_len);
+
+    napi_value js_width = nullptr;
+    napi_value js_height = nullptr;
+    napi_create_uint32(env, head_width != 0 ? head_width : out_width, &js_width);
+    napi_create_uint32(env, head_height != 0 ? head_height : out_height, &js_height);
+    napi_set_named_property(env, object, "width", js_width);
+    napi_set_named_property(env, object, "height", js_height);
+    napi_set_named_property(env, object, "data", buffer);
+    return object;
+}
+
 // equalizerCurve(channel: number, paramsJson: string) -> ArrayBuffer（512 个 f32）
 napi_value EqualizerCurve(napi_env env, napi_callback_info info) {
     size_t argc = 2;
@@ -211,7 +287,9 @@ napi_value Init(napi_env env, napi_value exports) {
         {"version", nullptr, Version, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"abiVersion", nullptr, AbiVersion, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"lastError", nullptr, LastErrorValue, nullptr, nullptr, nullptr, napi_default, nullptr},
-        {"renderMemoryRgba", nullptr, RenderMemoryRgba, nullptr, nullptr, nullptr, napi_default,
+        {"renderTiledRgba", nullptr, RenderTiledRgba, nullptr, nullptr, nullptr, napi_default,
+        nullptr},
+    {"renderMemoryRgba", nullptr, RenderMemoryRgba, nullptr, nullptr, nullptr, napi_default,
          nullptr},
         {"equalizerCurve", nullptr, EqualizerCurve, nullptr, nullptr, nullptr, napi_default,
          nullptr},

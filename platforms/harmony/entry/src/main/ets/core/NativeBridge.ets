@@ -28,6 +28,13 @@ interface FdxmpNativeApi {
     height: number,
     paramsJson: string
   ): RenderResult;
+  renderTiledRgba(
+    rgba: ArrayBuffer,
+    width: number,
+    height: number,
+    paramsJson: string,
+    stripPixels: number
+  ): RenderResult;
   equalizerCurve(channel: number, paramsJson: string): ArrayBuffer;
   oklch(r: number, g: number, b: number): ArrayBuffer;
 }
@@ -57,6 +64,21 @@ export class NativeBridge {
    */
   static render(rgba: ArrayBuffer, width: number, height: number, paramsJson: string): RenderResult {
     const result: RenderResult = native.renderMemoryRgba(rgba, width, height, paramsJson);
+    const out: RenderResult = {
+      width: result.width,
+      height: result.height,
+      data: result.data
+    };
+    return out;
+  }
+
+  /**
+   * 分块渲染整帧（导出用）：原图分辨率，单次内存峰值按 stripPixels 控制。
+   * 几何非单位变换时核心内部回退整帧渲染。
+   */
+  static renderTiled(rgba: ArrayBuffer, width: number, height: number, paramsJson: string,
+    stripPixels: number): RenderResult {
+    const result: RenderResult = native.renderTiledRgba(rgba, width, height, paramsJson, stripPixels);
     const out: RenderResult = {
       width: result.width,
       height: result.height,

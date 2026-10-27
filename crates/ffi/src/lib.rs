@@ -675,6 +675,73 @@ pub unsafe extern "C" fn fdxmp_decode_raw_rgba8(
     })
 }
 
+/// 分块渲染整帧（原图分辨率、内存受控），返回格式同 [`fdxmp_render_memory_rgba`]。
+///
+/// `strip_pixels` 是每块的目标像素数（例如 4_000_000）；几何非单位变换时回退整帧。
+///
+/// # Safety
+///
+/// 同 [`fdxmp_render_memory_rgba`]。
+#[no_mangle]
+pub unsafe extern "C" fn fdxmp_render_memory_tiled_rgba(
+    rgba: *const u8,
+    width: u32,
+    height: u32,
+    params_json: *const c_char,
+    strip_pixels: u32,
+    out_width: *mut u32,
+    out_height: *mut u32,
+    out_len: *mut usize,
+) -> *mut u8 {
+    guard(ptr::null_mut(), || {
+        if rgba.is_null() || out_width.is_null() || out_height.is_null() || out_len.is_null() {
+            set_last_error("rgba / out_width / out_height / out_len 不能为空指针");
+            return ptr::null_mut();
+        }
+        let params_json = match cstr_to_str(params_json, "params_json") {
+            Ok(value) => value,
+            Err(message) => {
+                set_last_error(message);
+                return ptr::null_mut();
+            }
+        };
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4));
+        let Some(expected) = expected else {
+            set_last_error("图像尺寸溢出");
+            return ptr::null_mut();
+        };
+        // SAFETY: 调用方保证缓冲区至少 `width * height * 4` 字节。
+        let buffer = std::slice::from_raw_parts(rgba, expected);
+        match fdxmp_core::preview::render_memory_tiled_rgba(
+            buffer,
+            width,
+            height,
+            params_json,
+            strip_pixels.max(1),
+        ) {
+            Ok(preview) => {
+                let mut payload = Vec::with_capacity(8 + preview.rgba.len());
+                payload.extend_from_slice(&preview.width.to_be_bytes());
+                payload.extend_from_slice(&preview.height.to_be_bytes());
+                payload.extend_from_slice(&preview.rgba);
+                *out_width = preview.width;
+                *out_height = preview.height;
+                let mut boxed = payload.into_boxed_slice();
+                *out_len = boxed.len();
+                let pointer = boxed.as_mut_ptr();
+                std::mem::forget(boxed);
+                pointer
+            }
+            Err(err) => {
+                set_last_error(err.to_string());
+                ptr::null_mut()
+            }
+        }
+    })
+}
+
 /// 对调用方提供的内存 RGBA8 图像应用编辑参数，返回 RGBA8 像素缓冲区
 /// （调用方用 `fdxmp_bytes_free(ptr, len)` 释放）；失败返回 NULL。
 ///

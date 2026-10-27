@@ -121,6 +121,17 @@ uint8_t *fdxmp_render_memory_rgba(const uint8_t *rgba,
                                   uint32_t *out_height,
                                   size_t *out_len);
 
+/* 分块渲染整帧（原图分辨率、内存受控）：内部按 strip_pixels 切条走区域管线，
+ * 几何非单位变换时回退整帧。输出格式同 fdxmp_render_memory_rgba。 */
+uint8_t *fdxmp_render_memory_tiled_rgba(const uint8_t *rgba,
+                                        uint32_t width,
+                                        uint32_t height,
+                                        const char *params_json,
+                                        uint32_t strip_pixels,
+                                        uint32_t *out_width,
+                                        uint32_t *out_height,
+                                        size_t *out_len);
+
 /* ---- 区域渲染（放大 1:1 看细节）----
  *
  * 输入：区域像素（区域 = 可见矩形向外扩余量后夹到整帧内）+ 各矩形坐标；

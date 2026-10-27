@@ -95,6 +95,74 @@ pub fn render_memory_rgba(
     finish_preview(image, &params)
 }
 
+/// 分块渲染整帧：把大图切成长条逐块走区域管线，再把可见行拼回整帧。
+///
+/// 手机上整帧 f32 管线动辄几百 MB，这条路径把单次峰值压到「一条 + 余量」，
+/// 同时保留原图分辨率（导出用）。几何非单位变换时自动回退整帧渲染。
+pub fn render_memory_tiled_rgba(
+    rgba: &[u8],
+    width: u32,
+    height: u32,
+    params_json: &str,
+    strip_pixels: u32,
+) -> Result<PreviewRgba> {
+    let params: EditParams = serde_json::from_str(params_json)?;
+    if !geometry_is_identity(&params) {
+        return render_memory_rgba(rgba, width, height, params_json);
+    }
+    if width == 0 || height == 0 {
+        return Err(FdxmpError::InvalidArgument(
+            "RGBA 图像宽高必须大于 0".to_string(),
+        ));
+    }
+    let expected = width as usize * height as usize * 4;
+    if rgba.len() < expected {
+        return Err(FdxmpError::InvalidArgument(format!(
+            "RGBA 缓冲区大小不匹配：{width}×{height} 需要 {expected} 字节，实际 {}",
+            rgba.len()
+        )));
+    }
+    // 每块约 strip_pixels 像素（至少 1 行），再各加 16 行余量给细节模糊。
+    let strip_height = ((strip_pixels as usize) / (width as usize))
+        .max(1)
+        .min(height as usize);
+    const MARGIN: u32 = 16;
+    let mut out = vec![0u8; expected];
+    let mut y = 0u32;
+    while (y as usize) < height as usize {
+        let rows = strip_height.min((height - y) as usize);
+        let region_y = y.saturating_sub(MARGIN);
+        let region_bottom = (y + rows as u32 + MARGIN).min(height);
+        let region_height = region_bottom - region_y;
+        let row_bytes = width as usize * 4;
+        let start = region_y as usize * row_bytes;
+        let end = start + region_height as usize * row_bytes;
+        let strip = render_memory_rgba_region(
+            &rgba[start..end],
+            width,
+            region_height,
+            params_json,
+            0,
+            region_y,
+            0,
+            y,
+            width,
+            rows as u32,
+            width,
+            height,
+        )?;
+        let dst = y as usize * row_bytes;
+        let len = strip.rgba.len().min(row_bytes * rows);
+        out[dst..dst + len].copy_from_slice(&strip.rgba[..len]);
+        y += rows as u32;
+    }
+    Ok(PreviewRgba {
+        width,
+        height,
+        rgba: out,
+    })
+}
+
 /// 区域渲染（放大 1:1 看细节）：
 ///
 /// - 调用方传入**区域像素**（区域 = 可见矩形向外扩 `margin` 再夹到整帧内）；

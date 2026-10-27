@@ -485,6 +485,10 @@ struct EditorPage {
   /** 导出的进度浮层状态。 */
   @State exporting: boolean = false;
   @State exportProgress: number = 0;
+
+  /** 放大查看时的 1:1 细节图（2560 渲染，退出放大后丢弃）。 */
+  @State detailPreview: image.PixelMap | null = null;
+  private detailLoading: boolean = false;
   @State chromeVisible: boolean = true;
   /** 正在拖动的滑块 id（非空时进入「专注调色」：只留该滑块，面板背景透明）。 */
   @State focusRow: string = '';
@@ -1484,7 +1488,7 @@ struct EditorPage {
     Stack({ alignContent: Alignment.TopStart }) {
       // 1) 照片铺满整屏（Contain）；所有预览手势直接挂在图片上，
       //    面板 / 顶栏在图片上层，点它们不会误触发沉浸或缩放。
-      Image(this.preview !== null ? this.preview : this.photoUri)
+      Image(this.photoZoom >= 1.6 && this.detailPreview !== null ? this.detailPreview : (this.preview !== null ? this.preview : this.photoUri))
         .objectFit(ImageFit.Contain)
         .width('100%')
         .height('100%')
@@ -1526,6 +1530,8 @@ struct EditorPage {
               this.photoZoom = 1;
               this.panX = 0;
               this.panY = 0;
+            } else if (this.photoZoom >= 1.6) {
+              this.loadDetailPreview();
             }
             this.pinchBase = this.photoZoom;
             this.suppressTapUntil = Date.now() + 700;
@@ -1700,7 +1706,9 @@ struct EditorPage {
   private togglePhotoZoom(): void {
     const next = this.photoZoom > 1.5 ? 1 : 2.5;
     this.photoZoom = next;
+    if (next >= 1.6) {       this.loadDetailPreview();     }
     if (next <= 1.01) {
+      this.detailPreview = null;
       this.panX = 0;
       this.panY = 0;
     }
@@ -1713,9 +1721,40 @@ struct EditorPage {
   }
 
   private resetZoomPan(): void {
+    this.detailPreview = null;
     this.photoZoom = 1;
     this.panX = 0;
     this.panY = 0;
+  }
+
+  /** 放大到 ≥1.6× 时渲染一张 2560 的细节图，双击/捏合放大后看到的是高清而不是插值。 */
+  private async loadDetailPreview(): Promise<void> {
+    if (this.detailLoading || this.detailPreview !== null) {
+      return;
+    }
+    this.detailLoading = true;
+    try {
+      const buffer = await this.decode(this.photoUri, 2560);
+      if (buffer === null) {
+        return;
+      }
+      const result = NativeBridge.renderTiled(buffer.data, buffer.width, buffer.height,
+        this.paramsJson(), 1_000_000);
+      if (result.width <= 0 || result.height <= 0) {
+        return;
+      }
+      const options: image.InitializationOptions = {
+        size: { width: result.width, height: result.height },
+        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
+        pixelFormat: image.PixelMapFormat.RGBA_8888,
+        editable: false
+      };
+      const pixelMap = await image.createPixelMap(result.data, options);
+      this.detailPreview = pixelMap;
+    } catch (error) {
+    } finally {
+      this.detailLoading = false;
+    }
   }
 
   /** 点照片：取色模式下取色，否则切换沉浸模式。 */
@@ -3269,14 +3308,15 @@ struct EditorPage {
     this.exportProgress = 0.05;
     this.statusText = '导出中…';
     try {
-      // 内存边界：手机端按像素预算解码（约 6MP），避免核心的 f32 管线把内存打爆。
-      const buffer = await this.decodeWithBudget(6_000_000);
+      // 内存边界：按 16MP 预算解码（多数手机原图 ≤12MP，超出则等比降采样）。
+      const buffer = await this.decodeWithBudget(16_000_000);
       if (buffer === null) {
         throw new Error('无法解码原图');
       }
       this.exportProgress = 0.3;
-      const result = NativeBridge.render(buffer.data, buffer.width, buffer.height,
-        this.paramsJson());
+      // 分块渲染：保留原图分辨率，单次内存峰值只有一条 + 余量。
+      const result = NativeBridge.renderTiled(buffer.data, buffer.width, buffer.height,
+        this.paramsJson(), 2_000_000);
       if (result.width <= 0 || result.height <= 0 || result.data.byteLength <= 0) {
         throw new Error('渲染失败：' + NativeBridge.lastError());
       }
