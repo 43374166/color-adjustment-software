@@ -481,8 +481,11 @@ struct EditorPage {
   @State presetNames: string[] = [];
   /** 当前工具：-1 无 / 0 预设 / 1 裁切 / 2 编辑 / 3 蒙版。 */
   @State activeTool: number = -1;
-  /** 沉浸模式：点照片隐藏全部 UI。 */
+  /** 浸没模式：点照片隐藏全部 UI。 */
   @State chromeVisible: boolean = true;
+  /** 照片缩放（双指 / 双击），1 = 原始大小。 */
+  @State photoZoom: number = 1;
+  private pinchBase: number = 1;
   @State cropMode: boolean = false;
   /** 90° 旋转步数（0..3，解码时应用）。 */
   @State rotationStep: number = 0;
@@ -1455,11 +1458,13 @@ struct EditorPage {
           .objectFit(ImageFit.Contain)
           .width('100%')
           .height('100%')
+          .scale({ x: this.photoZoom, y: this.photoZoom })
       } else {
         Image(this.photoUri)
           .objectFit(ImageFit.Contain)
           .width('100%')
           .height('100%')
+          .scale({ x: this.photoZoom, y: this.photoZoom })
       }
 
       // 2) 裁切 / 蒙版叠加层；否则铺一层透明点击层（点照片切换沉浸 / 取色）。
@@ -1496,9 +1501,32 @@ struct EditorPage {
         }
         .width('100%')
         .height('100%')
-        .onClick((event: ClickEvent) => {
-          this.handlePreviewTap(event.x, event.y);
-        })
+        .gesture(GestureGroup(GestureMode.Exclusive,
+          TapGesture({ count: 2 })
+            .onAction(() => {
+              this.togglePhotoZoom();
+            }),
+          TapGesture({ count: 1 })
+            .onAction((event: GestureEvent) => {
+              let x = 0;
+              let y = 0;
+              if (event.fingerList.length > 0) {
+                x = event.fingerList[0].localX;
+                y = event.fingerList[0].localY;
+              }
+              this.handlePreviewTap(x, y);
+            })
+        ))
+        .parallelGesture(PinchGesture({ fingers: 2 })
+          .onActionStart(() => {
+            this.pinchBase = this.photoZoom;
+          })
+          .onActionUpdate((event: GestureEvent) => {
+            this.photoZoom = Math.min(Math.max(this.pinchBase * event.scale, 1), 8);
+          })
+          .onActionEnd(() => {
+            this.pinchBase = this.photoZoom;
+          }))
       }
 
       // 3) 顶部栏（半透明）
@@ -1564,6 +1592,17 @@ struct EditorPage {
         this.drawCropOverlay();
       }
     })
+  }
+
+  /** 双击滑块：恢复到默认值。 */
+  private resetSlider(index: number): void {
+    this.applyScalar(index, SLIDERS[index].value);
+    promptAction.showToast({ message: SLIDERS[index].label + ' 已复位' });
+  }
+
+  /** 双击照片：1× ↔ 2.5×。 */
+  private togglePhotoZoom(): void {
+    this.photoZoom = this.photoZoom > 1.5 ? 1 : 2.5;
   }
 
   /** 点照片：取色模式下取色，否则切换沉浸模式。 */
@@ -2074,6 +2113,9 @@ struct EditorPage {
           .fontColor('#4A9EFF')
           .onClick(() => {
             this.picking = !this.picking;
+            if (this.picking) {
+              this.photoZoom = 1;
+            }
           })
         Text('最多 4 个')
           .fontSize(10)
@@ -2877,6 +2919,7 @@ struct EditorPage {
   }
 
   private enterCrop(): void {
+    this.photoZoom = 1;
     this.cropSaved = this.cropRect.slice();
     this.cropMode = true;
     this.scheduleRender(false);
@@ -3393,6 +3436,7 @@ struct EditorPage {
 
   /** 进入蒙版模式：先记下全局参数，再载入选中蒙版。 */
   private enterMaskMode(): void {
+    this.photoZoom = 1;
     this.globalJson = JSON.stringify(this.buildPayload());
     if (this.masks.length === 0) {
       this.addMask(0);
@@ -3899,6 +3943,10 @@ struct EditorPage {
         .textAlign(TextAlign.End)
     }
     .width('100%')
+    .parallelGesture(TapGesture({ count: 2 })
+      .onAction(() => {
+        this.resetSlider(index);
+      }))
   }
 
   /** 色带滑块（HSL / 分级）。 */
