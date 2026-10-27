@@ -214,28 +214,29 @@ interface BrushStrokePayload {
   erase: boolean;
 }
 
-/** 画笔设置。 */
-interface BrushPayload {
-  size: number;
-  feather: number;
-  flow: number;
-  density: number;
-  auto_mask: boolean;
-  strokes: BrushStrokePayload[];
+/** 蒙版数据（画笔 / 线性 / 径向共用，按 type 取用可选字段）。 */
+interface MaskKindData {
+  size?: number;
+  feather?: number;
+  flow?: number;
+  density?: number;
+  auto_mask?: boolean;
+  strokes?: BrushStrokePayload[];
+  start?: number[];
+  end?: number[];
+  center?: number[];
+  radii?: number[];
+  rotation?: number;
+  inner?: number;
 }
 
-/** 蒙版类型（先只做画笔；Rust 侧是 `{"type": "brush", "data": {...}}`）。 */
+/** 蒙版类型：Rust 侧是 `{"type": "brush", "data": {...}}` 的内部标签结构。 */
 interface MaskKindPayload {
   type: string;
-  data: BrushPayload;
+  data: MaskKindData;
 }
 
-/** 蒙版内的调整（先只暴露曝光）。 */
-interface MaskAdjustPayload {
-  light: LightPayload;
-}
-
-/** 一个蒙版。 */
+/** 一个蒙版。`adjustments` 是一整份参数（Rust 的 `EditParams`），这里用动态对象透传。 */
 interface MaskPayload {
   id: string;
   name: string;
@@ -244,7 +245,7 @@ interface MaskPayload {
   inverted: boolean;
   feather: number;
   opacity: number;
-  adjustments: MaskAdjustPayload;
+  adjustments: ESObject;
 }
 
 /** 整份渲染参数。 */
@@ -413,7 +414,7 @@ class StrokeItem {
   erase: boolean = false;
 }
 
-/** 一个蒙版（先只支持画笔）。 */
+/** 一个蒙版（画笔 / 线性渐变 / 径向渐变）。 */
 class MaskItem {
   id: string = '';
   name: string = '';
@@ -421,9 +422,22 @@ class MaskItem {
   inverted: boolean = false;
   opacity: number = 100;
   feather: number = 0;
+  /** 0 画笔 / 1 线性 / 2 径向。 */
+  type: number = 0;
   size: number = 30;
-  exposure: number = 0.6;
   strokes: StrokeItem[] = [];
+  /** 线性渐变的起止点（归一化）。 */
+  startX: number = 0.5;
+  startY: number = 0.5;
+  endX: number = 0.5;
+  endY: number = 0.1;
+  /** 径向渐变的中心与半径（归一化）。 */
+  centerX: number = 0.5;
+  centerY: number = 0.5;
+  radiusX: number = 0.3;
+  radiusY: number = 0.3;
+  /** 该蒙版自己的调整参数（ParamsPayload JSON）。 */
+  adjustJson: string = '';
 }
 
 @Entry
@@ -462,7 +476,6 @@ struct EditorPage {
   @State maskMode: boolean = false;
   @State brushSize: number = 30;
   @State brushErase: boolean = false;
-  @State maskExposure: number = 0.6;
 
   // HSL（8 段）
   @State hslBand: number = 0;
@@ -500,6 +513,8 @@ struct EditorPage {
   private maskSettings: RenderingContextSettings = new RenderingContextSettings(true);
   private maskContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.maskSettings);
   private paintingMask: number = -1;
+  /** 进入蒙版模式前保存的全局参数（蒙版外的编辑）。 */
+  private globalJson: string = '';
 
   /** 上一帧渲染结果的尺寸（算裁剪框显示位置用）。 */
   private lastW: number = 0;
@@ -703,7 +718,7 @@ struct EditorPage {
     return payload;
   }
 
-  private paramsJson(): string {
+  private buildPayload(): ParamsPayload {
     const payload: ParamsPayload = {
       light: { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0 },
       color: {
@@ -793,7 +808,7 @@ struct EditorPage {
       curves: this.curvesPayload(),
       crop: { rect: this.cropMode ? [0, 0, 1, 1] : this.cropRect },
       point_colors: this.pointColorsPayload(),
-      masks: this.masksPayload(),
+      masks: [],
       equalizer: {
         enabled: true,
         threshold: this.num(I_EQ_THRESHOLD),
@@ -809,6 +824,74 @@ struct EditorPage {
         brightness: this.eqBri
       }
     };
+    return payload;
+  }
+
+  /** 渲染用的完整 JSON：根参数 + 所有蒙版（每个蒙版带自己的调整参数）。 */
+  private paramsJson(): string {
+    let root: ParamsPayload;
+    if (this.maskMode && this.globalJson.length > 0) {
+      root = JSON.parse(this.globalJson) as ParamsPayload;
+    } else {
+      root = this.buildPayload();
+    }
+    root.masks = this.masksPayload();
+    return JSON.stringify(root);
+  }
+
+  /** 恒等参数（新蒙版的起点）。 */
+  private identityPayloadJson(): string {
+    const payload = this.buildPayload();
+    const zone: GradingZonePayload = { hue: 0, saturation: 0, luminance: 0 };
+    const band: HslBandPayload = { hue: 0, saturation: 0, luminance: 0 };
+    payload.light = { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0 };
+    payload.color = { temperature: 0, tint: 0, vibrance: 0, saturation: 0, black_white: false };
+    payload.hsl = {
+      red: band, orange: band, yellow: band, green: band,
+      aqua: band, blue: band, purple: band, magenta: band
+    };
+    payload.grading = {
+      shadows: zone, midtones: zone, highlights: zone, global: zone,
+      blending: 50, balance: 0
+    };
+    payload.calibration = {
+      red_hue: 0, red_sat: 0, green_hue: 0, green_sat: 0,
+      blue_hue: 0, blue_sat: 0, shadows_tint: 0
+    };
+    payload.bw_mix = {
+      red: 0, orange: 0, yellow: 0, green: 0, aqua: 0, blue: 0, purple: 0, magenta: 0
+    };
+    payload.lens = {
+      profile_correction: false,
+      chromatic_aberration: 0,
+      vignette: 0,
+      geometry: { auto: false, distortion: 0, vertical: 0, horizontal: 0, rotate: 0, scale: 100 }
+    };
+    payload.effects = {
+      texture: 0, clarity: 0, dehaze: 0, vignette: 0,
+      vignette_midpoint: 50, vignette_feather: 50,
+      grain: 0, grain_size: 25, grain_roughness: 50
+    };
+    payload.detail = {
+      sharpen: { amount: 0, radius: 1, detail: 25, masking: 0 },
+      noise: {
+        luminance: 0, luminance_detail: 50, luminance_contrast: 0,
+        color: 25, color_detail: 50, color_smoothness: 50
+      }
+    };
+    const identity: ToneCurvePayload = { points: [{ x: 0, y: 0 }, { x: 1, y: 1 }] };
+    payload.curves = { rgb: identity, red: identity, green: identity, blue: identity };
+    payload.equalizer = {
+      enabled: true, threshold: 0.1, smoothing_hue: 1, contrast: 0,
+      white_level: 1, chroma_size: 1.5, param_size: 1, use_filter: false,
+      hue_shift: 0,
+      saturation: [1, 1, 1, 1, 1, 1, 1, 1],
+      hue: [0, 0, 0, 0, 0, 0, 0, 0],
+      brightness: [1, 1, 1, 1, 1, 1, 1, 1]
+    };
+    payload.point_colors = [];
+    payload.crop = { rect: [0, 0, 1, 1] };
+    payload.masks = [];
     return JSON.stringify(payload);
   }
 
@@ -1222,14 +1305,10 @@ struct EditorPage {
         .padding({ right: 10 })
         .onClick(() => {
           if (!this.maskMode) {
-            this.maskMode = true;
-            if (this.masks.length === 0) {
-              this.addMask();
-            }
+            this.enterMaskMode();
           } else {
-            this.maskMode = false;
+            this.exitMaskMode();
           }
-          this.drawMaskOverlay();
         })
       Text('预设')
         .fontSize(13)
@@ -1334,7 +1413,7 @@ struct EditorPage {
           .fontColor('#4A9EFF')
           .padding({ left: 8, right: 8 })
           .onClick(() => {
-            this.addMask();
+            this.addMask(0);
           })
         Text('删除')
           .fontSize(11)
@@ -1346,79 +1425,96 @@ struct EditorPage {
       .width('100%')
 
       Row({ space: 8 }) {
-        Text('笔刷大小')
+        Text('＋画笔')
           .fontSize(11)
-          .fontColor('#AAAAAA')
-          .width(64)
-        Slider({ value: this.brushSize, min: 2, max: 100, step: 1 })
-          .layoutWeight(1)
-          .blockColor('#E8E8E8')
-          .trackColor('#3A3A3A')
-          .selectedColor('#4A9EFF')
-          .onChange((value: number) => {
-            this.brushSize = value;
-            if (this.masks.length > 0) {
-              this.masks[Math.min(this.selectedMask, this.masks.length - 1)].size = value;
-              this.drawMaskOverlay();
-            }
+          .fontColor('#DDDDDD')
+          .backgroundColor('#2A2A2A')
+          .borderRadius(5)
+          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.addMask(0);
           })
-        Text(this.brushSize.toFixed(0))
+        Text('＋线性')
           .fontSize(11)
-          .fontColor('#CCCCCC')
-          .width(36)
-      }
-      .width('100%')
-
-      Row({ space: 8 }) {
-        Text('曝光')
-          .fontSize(11)
-          .fontColor('#AAAAAA')
-          .width(64)
-        Slider({ value: this.maskExposure, min: -2, max: 2, step: 0.05 })
-          .layoutWeight(1)
-          .blockColor('#E8E8E8')
-          .trackColor('#3A3A3A')
-          .selectedColor('#4A9EFF')
-          .onChange((value: number) => {
-            this.setMaskExposure(value);
+          .fontColor('#DDDDDD')
+          .backgroundColor('#2A2A2A')
+          .borderRadius(5)
+          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.addMask(1);
           })
-        Text(this.maskExposure.toFixed(2))
+        Text('＋径向')
           .fontSize(11)
-          .fontColor('#CCCCCC')
-          .width(36)
-      }
-      .width('100%')
-
-      Row({ space: 12 }) {
+          .fontColor('#DDDDDD')
+          .backgroundColor('#2A2A2A')
+          .borderRadius(5)
+          .padding({ left: 8, right: 8, top: 4, bottom: 4 })
+          .onClick(() => {
+            this.addMask(2);
+          })
+        Blank()
         Text(this.brushErase ? '擦除：开' : '擦除：关')
-          .fontSize(12)
+          .fontSize(11)
           .fontColor(this.brushErase ? '#F06060' : '#AAAAAA')
           .onClick(() => {
             this.brushErase = !this.brushErase;
           })
-        Text('清除笔画')
-          .fontSize(12)
+        Text('清除')
+          .fontSize(11)
           .fontColor('#AAAAAA')
           .onClick(() => {
             this.clearMaskStrokes();
           })
-        Blank()
+      }
+      .width('100%')
+
+      if (this.masks.length > 0 && this.masks[Math.min(this.selectedMask, this.masks.length - 1)].type === 0) {
+        Row({ space: 8 }) {
+          Text('笔刷大小')
+            .fontSize(11)
+            .fontColor('#AAAAAA')
+            .width(64)
+          Slider({ value: this.brushSize, min: 2, max: 100, step: 1 })
+            .layoutWeight(1)
+            .blockColor('#E8E8E8')
+            .trackColor('#3A3A3A')
+            .selectedColor('#4A9EFF')
+            .onChange((value: number) => {
+              this.brushSize = value;
+              if (this.masks.length > 0) {
+                this.masks[Math.min(this.selectedMask, this.masks.length - 1)].size = value;
+                this.drawMaskOverlay();
+              }
+            })
+          Text(this.brushSize.toFixed(0))
+            .fontSize(11)
+            .fontColor('#CCCCCC')
+            .width(36)
+        }
+        .width('100%')
+      }
+
+      Row({ space: 12 }) {
+        Text('蒙版内的调整：用下面任意分类的滑块（如颜色 → 曝光/对比，效果 → 清晰度）')
+          .fontSize(10)
+          .fontColor('#777777')
+          .layoutWeight(1)
+          .maxLines(2)
         Text('完成')
           .fontSize(13)
           .fontColor('#4A9EFF')
           .onClick(() => {
-            this.maskMode = false;
-            this.drawMaskOverlay();
+            this.exitMaskMode();
           })
       }
       .width('100%')
 
-      Text('在画面上涂抹：红色=蒙版区域，蓝色=擦除；曝光只作用在蒙版内')
+      Text('画笔：在画面上涂抹（红=区域，蓝=擦除）；线性/径向：在画面上拖出方向')
         .fontSize(10)
-        .fontColor('#777777')
+        .fontColor('#666666')
     }
     .width('100%')
-    .height(236)
+    .height(210)
     .padding({ left: 14, right: 14, top: 8 })
     .backgroundColor('#1A1A1A')
   }
@@ -2665,57 +2761,78 @@ struct EditorPage {
     const result: MaskPayload[] = [];
     for (let i = 0; i < this.masks.length; i++) {
       const mask = this.masks[i];
-      const strokes: BrushStrokePayload[] = [];
-      for (let j = 0; j < mask.strokes.length; j++) {
-        const stroke: BrushStrokePayload = {
-          points: mask.strokes[j].points,
-          erase: mask.strokes[j].erase
+      let type = 'brush';
+      let data: MaskKindData;
+      if (mask.type === 1) {
+        type = 'linear_gradient';
+        data = { start: [mask.startX, mask.startY], end: [mask.endX, mask.endY] };
+      } else if (mask.type === 2) {
+        type = 'radial_gradient';
+        data = {
+          center: [mask.centerX, mask.centerY],
+          radii: [mask.radiusX, mask.radiusY],
+          rotation: 0,
+          inner: 0.75
         };
-        strokes.push(stroke);
+      } else {
+        const strokes: BrushStrokePayload[] = [];
+        for (let j = 0; j < mask.strokes.length; j++) {
+          strokes.push({ points: mask.strokes[j].points, erase: mask.strokes[j].erase });
+        }
+        data = {
+          size: mask.size,
+          feather: 50,
+          flow: 100,
+          density: 100,
+          auto_mask: false,
+          strokes: strokes
+        };
       }
-      const light: LightPayload = {
-        exposure: mask.exposure,
-        contrast: 0,
-        highlights: 0,
-        shadows: 0,
-        whites: 0,
-        blacks: 0
-      };
+
+      let adjust: ESObject;
+      if (this.maskMode && i === this.selectedMask) {
+        adjust = JSON.parse(JSON.stringify(this.buildPayload())) as ESObject;
+      } else if (mask.adjustJson.length > 0) {
+        adjust = JSON.parse(mask.adjustJson) as ESObject;
+      } else {
+        adjust = JSON.parse(this.identityPayloadJson()) as ESObject;
+      }
+
       const payload: MaskPayload = {
         id: mask.id,
         name: mask.name,
-        kind: {
-          type: 'brush',
-          data: {
-            size: mask.size,
-            feather: 50,
-            flow: 100,
-            density: 100,
-            auto_mask: false,
-            strokes: strokes
-          }
-        },
+        kind: { type: type, data: data },
         visible: mask.visible,
         inverted: mask.inverted,
         feather: mask.feather,
         opacity: mask.opacity,
-        adjustments: { light: light }
+        adjustments: adjust
       };
       result.push(payload);
     }
     return result;
   }
 
-  private addMask(): void {
+  private addMask(type: number): void {
     const mask = new MaskItem();
     mask.id = 'mask-' + Date.now();
-    mask.name = '蒙版 ' + (this.masks.length + 1);
+    mask.type = type;
     mask.size = this.brushSize;
-    mask.exposure = this.maskExposure;
+    mask.adjustJson = this.identityPayloadJson();
+    if (type === 0) {
+      mask.name = '画笔 ' + (this.masks.length + 1);
+    } else if (type === 1) {
+      mask.name = '线性 ' + (this.masks.length + 1);
+    } else {
+      mask.name = '径向 ' + (this.masks.length + 1);
+    }
+    if (this.maskMode) {
+      this.saveMaskAdjustments();
+    }
     this.masks = this.masks.concat([mask]);
+    this.maskMode = true;
     this.selectedMask = this.masks.length - 1;
-    this.drawMaskOverlay();
-    this.scheduleRender(false);
+    this.loadMaskAt(this.selectedMask);
   }
 
   private removeMask(): void {
@@ -2730,8 +2847,70 @@ struct EditorPage {
       }
     }
     this.masks = next;
+    if (next.length === 0) {
+      this.selectedMask = 0;
+      this.exitMaskMode();
+      return;
+    }
     this.selectedMask = Math.max(0, Math.min(index, next.length - 1));
+    this.loadMaskAt(this.selectedMask);
+  }
+
+  /** 把当前 UI 状态存回正在编辑的蒙版。 */
+  private saveMaskAdjustments(): void {
+    if (!this.maskMode || this.masks.length === 0) {
+      return;
+    }
+    const index = Math.min(this.selectedMask, this.masks.length - 1);
+    this.masks[index].adjustJson = JSON.stringify(this.buildPayload());
+  }
+
+  /** 选中某个蒙版：先把当前状态存档，再载入目标蒙版的参数。 */
+  private selectMask(index: number): void {
+    if (this.masks.length === 0) {
+      return;
+    }
+    if (this.maskMode) {
+      this.saveMaskAdjustments();
+    }
+    this.maskMode = true;
+    this.selectedMask = index;
+    this.loadMaskAt(index);
+  }
+
+  /** 进入蒙版模式：先记下全局参数，再载入选中蒙版。 */
+  private enterMaskMode(): void {
+    this.globalJson = JSON.stringify(this.buildPayload());
+    if (this.masks.length === 0) {
+      this.addMask(0);
+      return;
+    }
+    this.maskMode = true;
+    this.selectedMask = Math.min(this.selectedMask, this.masks.length - 1);
+    this.loadMaskAt(this.selectedMask);
+  }
+
+  private loadMaskAt(index: number): void {
+    const mask = this.masks[Math.min(index, this.masks.length - 1)];
+    const source = mask.adjustJson.length > 0 ? mask.adjustJson : this.identityPayloadJson();
+    this.applyPayload(JSON.parse(source) as ParamsPayload);
     this.drawMaskOverlay();
+    this.drawGraph();
+    this.drawCurveEditor();
+    this.scheduleRender(false);
+  }
+
+  private exitMaskMode(): void {
+    if (this.maskMode) {
+      this.saveMaskAdjustments();
+    }
+    this.maskMode = false;
+    if (this.globalJson.length > 0) {
+      this.applyPayload(JSON.parse(this.globalJson) as ParamsPayload);
+    }
+    this.drawMaskOverlay();
+    this.drawGraph();
+    this.drawCurveEditor();
     this.scheduleRender(false);
   }
 
@@ -2742,16 +2921,6 @@ struct EditorPage {
     const index = Math.min(this.selectedMask, this.masks.length - 1);
     this.masks[index].strokes = [];
     this.drawMaskOverlay();
-    this.scheduleRender(false);
-  }
-
-  private setMaskExposure(value: number): void {
-    if (this.masks.length === 0) {
-      return;
-    }
-    this.maskExposure = value;
-    const index = Math.min(this.selectedMask, this.masks.length - 1);
-    this.masks[index].exposure = value;
     this.scheduleRender(false);
   }
 
@@ -2781,6 +2950,36 @@ struct EditorPage {
     for (let i = 0; i < this.masks.length; i++) {
       const mask = this.masks[i];
       if (!mask.visible) {
+        continue;
+      }
+      if (mask.type === 1) {
+        const sx = imageX + mask.startX * imageW;
+        const sy = imageY + mask.startY * imageH;
+        const ex = imageX + mask.endX * imageW;
+        const ey = imageY + mask.endY * imageH;
+        ctx.strokeStyle = 'rgba(255,64,64,0.55)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(sx, sy);
+        ctx.lineTo(ex, ey);
+        ctx.stroke();
+        ctx.fillStyle = '#FF4040';
+        ctx.fillRect(sx - 6, sy - 6, 12, 12);
+        ctx.fillRect(ex - 6, ey - 6, 12, 12);
+        continue;
+      }
+      if (mask.type === 2) {
+        const cx = imageX + mask.centerX * imageW;
+        const cy = imageY + mask.centerY * imageH;
+        const rx = Math.max(mask.radiusX * imageW, 1);
+        const ry = Math.max(mask.radiusY * imageH, 1);
+        ctx.strokeStyle = 'rgba(255,64,64,0.55)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.fillStyle = '#FF4040';
+        ctx.fillRect(cx - 5, cy - 5, 10, 10);
         continue;
       }
       const lineWidth = Math.max(2, (mask.size / 100) * Math.min(imageW, imageH));
@@ -2849,6 +3048,35 @@ struct EditorPage {
     }
     const index = Math.min(this.selectedMask, this.masks.length - 1);
     const mask = this.masks[index];
+
+    if (mask.type === 1) {
+      if (phase === TouchType.Down) {
+        mask.startX = nx;
+        mask.startY = ny;
+        mask.endX = nx;
+        mask.endY = ny;
+      } else if (phase === TouchType.Move) {
+        mask.endX = nx;
+        mask.endY = ny;
+      } else {
+        this.scheduleRender(false);
+      }
+      this.drawMaskOverlay();
+      return;
+    }
+    if (mask.type === 2) {
+      if (phase === TouchType.Down) {
+        mask.centerX = nx;
+        mask.centerY = ny;
+      } else if (phase === TouchType.Move) {
+        mask.radiusX = Math.max(Math.abs(nx - mask.centerX), 0.02);
+        mask.radiusY = Math.max(Math.abs(ny - mask.centerY), 0.02);
+      } else {
+        this.scheduleRender(false);
+      }
+      this.drawMaskOverlay();
+      return;
+    }
 
     if (phase === TouchType.Down) {
       const stroke = new StrokeItem();
