@@ -288,7 +288,9 @@ struct EqualizerGraph: View {
             var best = 0
             var bestDistance = CGFloat.greatestFiniteMagnitude
             for index in 0..<8 {
-                let distance = abs(location.x - nodeX(index, width: width))
+                let raw = abs(location.x - nodeX(index, width: width))
+                // 周期闭合：右边缘的红色半圆也要能点中（取环绕后的最短距离）。
+                let distance = min(raw, width - raw)
                 if distance < bestDistance {
                     bestDistance = distance
                     best = index
