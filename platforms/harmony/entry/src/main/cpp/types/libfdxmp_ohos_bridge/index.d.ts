@@ -35,6 +35,18 @@ export const renderMemoryRgba: (
 ) => RenderResult;
 
 /**
+ * 分块渲染整帧（原图分辨率、内存受控）。
+ * 阻塞调用，必须放到 TaskPool / Worker 里跑。
+ */
+export const renderTiledRgba: (
+  rgba: ArrayBuffer,
+  width: number,
+  height: number,
+  paramsJson: string,
+  stripPixels: number
+) => RenderResult;
+
+/**
  * 颜色均衡器曲线（512 个 float32，单位见 channel）。
  *
  * channel：0 色相（弧度）/ 1 饱和度增益 / 2 亮度增益；

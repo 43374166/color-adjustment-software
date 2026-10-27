@@ -12,6 +12,8 @@ import promptAction from '@ohos.promptAction';
 import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
 import photoAccessHelper from '@ohos.file.photoAccessHelper';
 import NativeBridge from '../core/NativeBridge';
+import { taskpool } from '@kit.ArkTS';
+import { encodeExport } from '../core/ExportWorker';
 
 /** 解码后的像素缓冲。 */
 interface PixelBuffer {
@@ -3300,6 +3302,7 @@ struct EditorPage {
     return await this.decode(this.photoUri, edge);
   }
 
+  /** 导出：TaskPool 里解码 + 分块渲染 + 编码，UI 线程只更新进度和写相册。 */
   private async exportPhoto(): Promise<void> {
     if (this.exporting) {
       return;
@@ -3308,29 +3311,7 @@ struct EditorPage {
     this.exportProgress = 0.05;
     this.statusText = '导出中…';
     try {
-      // 内存边界：按 16MP 预算解码（多数手机原图 ≤12MP，超出则等比降采样）。
-      const buffer = await this.decode(this.photoUri, 100000);
-      if (buffer === null) {
-        throw new Error('无法解码原图');
-      }
-      this.exportProgress = 0.3;
-      // 分块渲染：保留原图分辨率，单次内存峰值只有一条 + 余量。
-      const result = NativeBridge.renderTiled(buffer.data, buffer.width, buffer.height,
-        this.paramsJson(), 2_000_000);
-      if (result.width <= 0 || result.height <= 0 || result.data.byteLength <= 0) {
-        throw new Error('渲染失败：' + NativeBridge.lastError());
-      }
-      this.exportProgress = 0.6;
-      const options: image.InitializationOptions = {
-        size: { width: result.width, height: result.height },
-        srcPixelFormat: image.PixelMapFormat.RGBA_8888,
-        pixelFormat: image.PixelMapFormat.RGBA_8888,
-        editable: false
-      };
-      const pixelMap = await image.createPixelMap(result.data, options);
-      const packer = image.createImagePacker();
       const context = getContext(this) as common.UIAbilityContext;
-
       let format = 'jpeg';
       let quality = 100;
       try {
@@ -3339,13 +3320,12 @@ struct EditorPage {
         quality = Number(await settings.get('quality', '100'));
       } catch (error) {
       }
-      const packOptions: image.PackingOption = {
-        format: format === 'png' ? 'image/png' : 'image/jpeg',
-        quality: quality
-      };
-      const packed = await packer.packing(pixelMap, packOptions);
-      pixelMap.release();
-      packer.release();
+      const mime = format === 'png' ? 'image/png' : 'image/jpeg';
+      this.exportProgress = 0.15;
+
+      // 关键：解码 / 分块渲染 / 编码全部在 TaskPool 线程执行（原图尺寸）。
+      const packed = await taskpool.execute(encodeExport, this.photoUri, this.paramsJson(),
+        mime, quality, 0) as ArrayBuffer;
       this.exportProgress = 0.85;
 
       let savedToGallery = false;
@@ -3366,14 +3346,14 @@ struct EditorPage {
       }
 
       if (savedToGallery) {
-        this.statusText = '已保存到相册 ' + result.width + '×' + result.height;
+        this.statusText = '已保存到相册';
         promptAction.showToast({ message: '已保存到相册' });
       } else {
         const path = context.cacheDir + '/fdxmp_export_' + Date.now() + '.jpg';
         const file = fs.openSync(path, fs.OpenMode.READ_WRITE | fs.OpenMode.CREATE);
         fs.writeSync(file.fd, packed);
         fs.closeSync(file);
-        this.statusText = '已导出 ' + result.width + '×' + result.height;
+        this.statusText = '已导出到缓存';
         promptAction.showToast({ message: '已导出到缓存：' + path });
       }
       this.exportProgress = 1;
