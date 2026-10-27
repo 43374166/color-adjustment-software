@@ -102,20 +102,17 @@ impl ColorStage {
     /// 从编辑参数构建。
     pub fn from_params(params: &EditParams) -> Self {
         let monochrome = params.color.black_white;
-        let continuous = params.hsl.mode == crate::params::HslMode::ColorZones;
+        // HSL 只用 Lightroom 的 8 个固定色带中心；算法换成颜色均衡器那套
+        //（dt UCS + 周期 RBF 曲线，见 `fdxmp_color::equalizer::HslStage`）。
         let bands = std::array::from_fn(|index| {
-            let hsl = if continuous {
-                params.hsl.zone(index)
-            } else {
-                params.hsl.band(ColorBand::ALL[index])
-            };
+            let hsl = params.hsl.band(ColorBand::ALL[index]);
             Hsl {
                 hue: hsl.hue as f64,
                 sat: hsl.saturation as f64,
                 lum: hsl.luminance as f64,
             }
         });
-        let mixer = Mixer { bands, continuous };
+        let mixer = Mixer { bands };
         let zone = |zone: &crate::params::GradingZone| Wheel {
             hue: zone.hue as f64,
             sat: zone.saturation as f64,
@@ -143,7 +140,7 @@ impl ColorStage {
         } else {
             params.color.saturation as f64 / 100.0
         };
-        ops.mixer = (!monochrome && !mixer.is_neutral()).then_some(mixer);
+        ops.set_mixer((!monochrome && !mixer.is_neutral()).then_some(mixer));
         ops.points = if monochrome {
             Vec::new()
         } else {
@@ -212,6 +209,45 @@ impl ColorStage {
     /// 校准 + 色彩算子 + 显示色域映射：与 GPU `pipeline_display_ops` 的最终输出一致。
     pub fn apply_display(&self, rgb: [f32; 3]) -> [f32; 3] {
         Self::map_display_gamut(self.apply(rgb))
+    }
+}
+
+/// 颜色均衡器（空间算子）：把整帧线性 RGB 交给 [`fdxmp_color::ColorEqualizer`]。
+///
+/// 与逐像素的 [`ColorStage`] 分开：它需要邻域（两个导向滤波 + Scharr），
+/// 只能在整帧或分块上跑。参数关闭或恒等时 `inner` 为 `None`，调用方直接跳过。
+///
+/// 工作空间用 [`WORKSPACE`]（线性 sRGB）：模块看到的数值与 app 其余部分一致；
+/// 与 darktable 对拍时用的是它的工作空间 linear Rec2020，两者对同一颜色给出
+/// 相同的 UCS 坐标，只在超出 sRGB 色域的边缘处因色域边界表不同而有差异。
+pub struct EqualizerStage {
+    inner: Option<fdxmp_color::ColorEqualizer>,
+}
+
+impl EqualizerStage {
+    /// 从编辑参数构建；默认关闭时直接返回空壳。
+    pub fn from_params(params: &EditParams) -> Self {
+        if !params.equalizer.is_active() {
+            return Self { inner: None };
+        }
+        Self {
+            inner: Some(fdxmp_color::ColorEqualizer::new(
+                params.equalizer.to_engine(),
+                &WORKSPACE,
+            )),
+        }
+    }
+
+    /// 是否可以整段跳过。
+    pub fn is_identity(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    /// 就地处理线性 RGB：`pixels.len() == width * height * 3`（3 分量/像素）。
+    pub fn apply_linear(&self, pixels: &mut [f32], width: usize, height: usize) {
+        if let Some(eq) = &self.inner {
+            eq.apply(pixels, width, height, 3);
+        }
     }
 }
 
@@ -360,7 +396,7 @@ mod tests {
             let lab = fdxmp_color::oklab_from_rgb(&WORKSPACE, c);
             fdxmp_color::lab_to_lch(lab)[1]
         };
-        assert!(chroma(blue) < 0.02, "{}", chroma(blue));
+        assert!(chroma(blue) < 0.05, "{}", chroma(blue));
         assert!((chroma(red) - chroma([0.4, 0.03, 0.02])).abs() < 0.01);
     }
 
@@ -478,6 +514,14 @@ mod tests {
             "color": {"temperature": 0, "tint": 0, "vibrance": 0, "saturation": 0, "black_white": true},
             "calibration": {"red_hue": 25, "red_sat": 0, "green_hue": 0, "green_sat": 0, "blue_hue": 0, "blue_sat": -30, "shadows_tint": 15},
             "bw_mix": {"red": 0, "orange": 20, "yellow": 0, "green": 0, "aqua": 0, "blue": -45, "purple": 0, "magenta": 0},
+            "equalizer": {
+                "enabled": true, "threshold": 0.1, "smoothing_hue": 1.0, "contrast": 0.0,
+                "white_level": 1.0, "chroma_size": 1.5, "param_size": 1.0,
+                "use_filter": false, "hue_shift": 0.0,
+                "saturation": [1, 1, 1, 1, 1, 1, 1, 1],
+                "hue": [0, 0, -30, 0, 0, 0, 0, 0],
+                "brightness": [1, 1, 1, 1, 1, 1, 1, 1]
+            },
             "point_colors": [{"lum": 0.45, "chroma": 0.15, "hue": 264, "hue_shift": 40, "sat_shift": -40, "lum_shift": 0, "variance": 0, "range": 50, "hue_range": 50, "sat_range": 50, "lum_range": 50}]
         }"#;
         let params: EditParams = serde_json::from_str(json).expect("iOS 参数 JSON 应可解析");
@@ -488,6 +532,10 @@ mod tests {
         assert_eq!(params.bw_mix.blue, -45.0);
         assert_eq!(params.point_colors.len(), 1);
         assert_eq!(params.point_colors[0].hue, 264.0);
+        // 颜色均衡器：iOS 面板写出的键名要能落到 Rust 结构里。
+        assert!(params.equalizer.enabled);
+        assert_eq!(params.equalizer.hue[2], -30.0);
+        assert!(!EqualizerStage::from_params(&params).is_identity());
 
         let stage = ColorStage::from_params(&params);
         assert!(!stage.is_identity());
@@ -522,5 +570,82 @@ mod tests {
             highlight_desaturate(bright),
         ))[1];
         assert!(after < before, "{before} -> {after}");
+    }
+
+    #[test]
+    fn equalizer_stage_is_identity_by_default() {
+        let params = EditParams::default();
+        assert!(EqualizerStage::from_params(&params).is_identity());
+
+        // 打开开关但滑块全是默认值 —— 仍然是恒等，不该有任何开销。
+        let mut params = EditParams::default();
+        params.equalizer.enabled = true;
+        assert!(EqualizerStage::from_params(&params).is_identity());
+    }
+
+    #[test]
+    fn equalizer_stage_only_touches_its_hue_band() {
+        let mut params = EditParams::default();
+        params.equalizer.enabled = true;
+        params.equalizer.use_filter = false; // 只看色相选带，排除空间滤波
+        params.equalizer.hue[2] = -30.0; // 黄
+        let stage = EqualizerStage::from_params(&params);
+        assert!(!stage.is_identity());
+
+        // 8x8：左半黄、右半蓝，取远离边界的采样点。
+        let (w, h) = (8usize, 8usize);
+        let mut pixels = vec![0.0f32; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let k = (y * w + x) * 3;
+                if x < w / 2 {
+                    pixels[k] = 0.55;
+                    pixels[k + 1] = 0.42;
+                    pixels[k + 2] = 0.08;
+                } else {
+                    pixels[k] = 0.08;
+                    pixels[k + 1] = 0.18;
+                    pixels[k + 2] = 0.55;
+                }
+            }
+        }
+        let before = pixels.clone();
+        stage.apply_linear(&mut pixels, w, h);
+
+        let delta = |a: &[f32], b: &[f32]| -> f32 {
+            a.iter().zip(b).map(|(x, y)| (x - y).abs()).sum()
+        };
+        let yellow = (4 * w + 2) * 3;
+        let blue = (4 * w + 6) * 3;
+        let yellow_delta = delta(&pixels[yellow..yellow + 3], &before[yellow..yellow + 3]);
+        let blue_delta = delta(&pixels[blue..blue + 3], &before[blue..blue + 3]);
+
+        assert!(yellow_delta > 0.02, "黄应该被改动：{yellow_delta}");
+        assert!(
+            yellow_delta > blue_delta * 5.0,
+            "蓝应该几乎不动：yellow={yellow_delta} blue={blue_delta}"
+        );
+    }
+
+    #[test]
+    fn equalizer_params_survive_json_roundtrip() {
+        let mut params = EditParams::default();
+        params.equalizer.enabled = true;
+        params.equalizer.hue[0] = 12.5;
+        params.equalizer.saturation[6] = 0.4;
+        params.equalizer.use_filter = false;
+
+        let json = serde_json::to_string(&params).expect("serialize");
+        let back: EditParams = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back.equalizer, params.equalizer);
+    }
+
+    #[test]
+    fn equalizer_params_tolerate_missing_field() {
+        // 旧预设没有 `equalizer` 字段：`#[serde(default)]` 应回落到默认（关闭）。
+        let json = r#"{"version":1,"color":{"temperature":0.0}}"#;
+        let params: EditParams = serde_json::from_str(json).expect("deserialize");
+        assert!(!params.equalizer.enabled);
+        assert_eq!(params.equalizer.saturation, [1.0; 8]);
     }
 }

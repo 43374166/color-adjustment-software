@@ -29,6 +29,8 @@ pub struct EditParams {
     pub grading: ColorGradingParams,
     /// 相机校准（Calibration 面板：三基色色相 / 饱和度 + 阴影色调）。
     pub calibration: CalibrationParams,
+    /// 颜色均衡器（8 色相节点的饱和度 / 色相 / 亮度，dt UCS 空间，空间算子）。
+    pub equalizer: EqualizerParams,
     /// 黑白混色（8 色带，仅在黑白模式下生效）。
     pub bw_mix: BwMixParams,
     /// 点颜色采样（Point Color，最多 4 个，与 GPU uniform 槽位一致）。
@@ -58,6 +60,7 @@ impl Default for EditParams {
             hsl: HslParams::default(),
             grading: ColorGradingParams::default(),
             calibration: CalibrationParams::default(),
+            equalizer: EqualizerParams::default(),
             bw_mix: BwMixParams::default(),
             point_colors: Vec::new(),
             detail: DetailParams::default(),
@@ -112,6 +115,93 @@ pub struct ColorParams {
 
 fn default_wb_reference() -> f32 {
     5500.0
+}
+
+/// 颜色均衡器：按色相分 8 段调整饱和度 / 色相 / 亮度（红橙黄绿青蓝紫品红）。
+///
+/// 数学实现见 `fdxmp_color::equalizer`（dt UCS 2022 + 周期 RBF + 导向滤波），
+/// 与 darktable 5.6.2 对拍的平均误差 0.15/255。它是**空间算子**（需要邻域），
+/// 不能塞进逐像素的 `ColorOps`，因此单独走整帧的一遍。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EqualizerParams {
+    /// 总开关（默认关闭，关闭时不产生任何开销）。
+    pub enabled: bool,
+    /// 低饱和抑制拐点，0..=0.3（默认 0.1 ≈ 6% 饱和度）。
+    pub threshold: f32,
+    /// 色相曲线过渡宽度，0.05..=2.0（越小越窄）。
+    pub smoothing_hue: f32,
+    /// 低饱和过渡软硬，-1..=1（越负越软）。
+    pub contrast: f32,
+    /// 白点亮度的 2 的幂，默认 1.0（漫反射白）。
+    pub white_level: f32,
+    /// 色度导向滤波半径（1..=10）。
+    pub chroma_size: f32,
+    /// 修正量导向滤波半径（1..=128）。
+    pub param_size: f32,
+    /// 是否启用两个导向滤波（关掉更快，但彩噪与光晕会回来）。
+    pub use_filter: bool,
+    /// 8 个节点整体旋转，-23..=23 度。
+    pub hue_shift: f32,
+    /// 饱和度增益（1.0 = 不变）。
+    pub saturation: [f32; 8],
+    /// 色相偏移（度）。
+    pub hue: [f32; 8],
+    /// 亮度增益（1.0 = 不变）。
+    pub brightness: [f32; 8],
+}
+
+impl Default for EqualizerParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            threshold: 0.1,
+            smoothing_hue: 1.0,
+            contrast: 0.0,
+            white_level: 1.0,
+            chroma_size: 1.5,
+            param_size: 1.0,
+            // GPU 版（WGSL）目前只做逐像素 + 5x5 预滤波近似，关掉导向滤波可让
+            // 预览、导出、CPU 参考三边逐像素一致（实测最大 1 个 8bit LSB）。
+            // 需要 darktable 那种彩噪抑制时可在面板里打开（GPU 用近似实现）。
+            use_filter: false,
+            hue_shift: 0.0,
+            saturation: [1.0; 8],
+            hue: [0.0; 8],
+            brightness: [1.0; 8],
+        }
+    }
+}
+
+impl EqualizerParams {
+    /// 转成算法 crate 的参数（去掉 `enabled`）。
+    pub fn to_engine(&self) -> fdxmp_color::EqualizerParams {
+        fdxmp_color::EqualizerParams {
+            threshold: self.threshold,
+            smoothing_hue: self.smoothing_hue,
+            contrast: self.contrast,
+            white_level: self.white_level,
+            chroma_size: self.chroma_size,
+            param_size: self.param_size,
+            use_filter: self.use_filter,
+            saturation: self.saturation,
+            hue: self.hue,
+            brightness: self.brightness,
+            hue_shift: self.hue_shift,
+        }
+    }
+
+    /// 打开且参数不为恒等时才需要真的跑。
+    pub fn is_active(&self) -> bool {
+        self.enabled && !self.to_engine().is_identity()
+    }
+
+    /// 复位到默认（保留 `enabled`）。
+    pub fn reset(&mut self) {
+        let enabled = self.enabled;
+        *self = Self::default();
+        self.enabled = enabled;
+    }
 }
 
 impl Default for ColorParams {
@@ -659,25 +749,13 @@ pub struct HslBand {
     pub luminance: f32,
 }
 
-/// HSL 方案。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum HslMode {
-    /// Lightroom 固定 8 色带 + 重叠窗。
-    #[default]
-    Lightroom,
-    /// darktable 风格的连续色域：8 个节点之间线性插值。
-    ColorZones,
-}
-
-/// HSL 面板。
+/// HSL 面板（Lightroom 8 段）。
+///
+/// 算法已换成颜色均衡器那套（dt UCS + Lightroom 色带中心的周期 RBF 曲线，
+/// 逐像素、无空间滤波）；「连续色域」模式已删除，需要连续曲线请用颜色均衡器。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct HslParams {
-    /// 当前方案。
-    pub mode: HslMode,
-    /// 连续色域的 8 个节点（与 Lightroom 色带同序），独立于下面的固定色带。
-    pub zones: [HslBand; 8],
     /// 红。
     pub red: HslBand,
     /// 橙。
@@ -709,16 +787,6 @@ impl HslParams {
             ColorBand::Purple => &self.purple,
             ColorBand::Magenta => &self.magenta,
         }
-    }
-
-    /// 连续色域节点（0..7，与 [`ColorBand::ALL`] 同序）。
-    pub fn zone(&self, index: usize) -> &HslBand {
-        &self.zones[index.min(7)]
-    }
-
-    /// 连续色域节点（可变）。
-    pub fn zone_mut(&mut self, index: usize) -> &mut HslBand {
-        &mut self.zones[index.min(7)]
     }
 
     /// 按 [`ColorBand`] 写入。
@@ -1556,15 +1624,6 @@ impl EditParams {
             };
             *result.hsl.band_mut(band) = blended;
         }
-        for index in 0..8 {
-            let source = self.hsl.zone(index);
-            let target = preset.hsl.zone(index);
-            result.hsl.zones[index] = HslBand {
-                hue: lerp(source.hue, target.hue),
-                saturation: lerp(source.saturation, target.saturation),
-                luminance: lerp(source.luminance, target.luminance),
-            };
-        }
 
         if t < 0.5 {
             result.curves = self.curves.clone();
@@ -1645,15 +1704,6 @@ impl EditParams {
                 hue: clamp_slider(global_band.hue + local_band.hue),
                 saturation: clamp_slider(global_band.saturation + local_band.saturation),
                 luminance: clamp_slider(global_band.luminance + local_band.luminance),
-            };
-        }
-        for index in 0..8 {
-            let global_zone = self.hsl.zone(index).clone();
-            let local_zone = local.hsl.zone(index).clone();
-            out.hsl.zones[index] = HslBand {
-                hue: clamp_slider(global_zone.hue + local_zone.hue),
-                saturation: clamp_slider(global_zone.saturation + local_zone.saturation),
-                luminance: clamp_slider(global_zone.luminance + local_zone.luminance),
             };
         }
 

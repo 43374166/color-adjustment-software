@@ -6,6 +6,9 @@
 //! - [`transfer`]：sRGB / 纯 gamma / PQ / HLG 传递函数；
 //! - [`cct`]：黑体轨迹、色温 ↔ xy、色调（Duv）、mired、白平衡矩阵；
 //! - [`perceptual`]：OkLab / OkLCh、HSV / HSL（调色算子的工作空间）；
+//! - [`ucs`]：darktable UCS 2022（`L*` / `UV` / JCH / HSB 与色域边界 LUT）；
+//! - [`equalizer`]：8 节点色相均衡器（周期 RBF 插值 + 三张 LUT + 空间滤波）；
+//! - [`guided`]：高斯模糊、Scharr 梯度、2 通道导向滤波（颜色均衡器的空间部分）；
 //! - [`spline`]：单调三次曲线（曲线面板 / 色调曲线的数值基础）；
 //! - [`bands`]：8 色带（红橙黄绿青蓝紫洋红）中心色相与单位分解权重；
 //! - [`ops`]：自然饱和度 / 饱和度 / HSL 混色 / 点颜色 / 颜色分级 / 相机校准 / 黑白；
@@ -26,13 +29,16 @@
 pub mod bands;
 pub mod camera;
 pub mod cct;
+pub mod equalizer;
 pub mod gamut;
+pub mod guided;
 pub mod math;
 pub mod ops;
 pub mod perceptual;
 pub mod spline;
 pub mod tone;
 pub mod transfer;
+pub mod ucs;
 
 pub use camera::CameraProfile;
 pub use cct::{
@@ -42,6 +48,7 @@ pub use math::{
     bradford, luminance, Mat3, RgbSpace, Xy, ADOBE_RGB, D50, D65, DISPLAY_P3, PROPHOTO, REC2020,
     SRGB,
 };
+pub use equalizer::{Channel, ColorEqualizer, EqualizerParams, NODES};
 pub use ops::{
     calibrate, calibration_matrix, Calibration, ColorOps, Grading, Hsl, Mixer, PointColor, Wheel,
 };

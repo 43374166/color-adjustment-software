@@ -1,0 +1,185 @@
+================================================================================
+darktable「颜色均衡器 / color equalizer」调色算法分析
+源码：https://github.com/darktable-org/darktable （master，2026 版权头）
+分析日期：2026-10-27
+================================================================================
+
+一、代码位置（就这几个文件，别处没有算法）
+--------------------------------------------------------------------------------
+1. src/iop/colorequal.c          ← 全部 CPU 算法、参数、LUT、GUI（核心，约 2700 行）
+2. src/iop/colorequal.cl         ← OpenCL 版（内核名见 init_global()，L319：
+                                   init_covariance / finish_covariance /
+                                   prepare_prefilter / apply_prefilter /
+                                   prepare_correlations / finish_correlations /
+                                   final_guide / apply_guided / sample_input /
+                                   process_data / write_output / write_visual /
+                                   draw_weight）
+3. src/common/darktable_ucs_22_helpers.h   ← dt_UCS_JCH_to_HSB / HSB_to_XYZ /
+                                              gamut_map_HSB / dt_UCS_22_build_gamut_LUT
+4. src/common/colorspaces_inline_conversions.h ← dt_D65_XYZ_to_xyY / xyY_to_dt_UCS_UV /
+                                              dt_UCS_LUV_to_JCH / lookup_gamut / LUT_ELEM
+5. src/common/gaussian.c         ← dt_gaussian_mean_blur（快速高斯均值模糊）
+6. src/common/bilinear.h         ← interpolate_bilinear（降/升采样）
+7. src/iop/choleski.c            ← pseudo_solve（解 RBF 线性方程组 A·λ = y）
+
+模块名 "color equalizer"（别名 color zones / hsl），版本 4，输入输出都是 RGB，
+工作色彩空间是 darktable UCS 2022（不是 HSV/HSL，也不是 Lab）。
+
+
+二、总体数据流（process()，L996-1256）
+--------------------------------------------------------------------------------
+RGB(管道) 
+  → STEP0 乘 input_matrix 得到 XYZ D65（input_matrix = CAT16 · matrix_in）
+  → STEP1 xyY → dt UCS 的 UV 色度坐标 + L*（Lscharr 暂存）
+           同时用 HSV 式定义算 saturation = (max-min)/max，再做高斯模糊
+  → STEP2 可选：_prefilter_chromaticity() 用导向滤波平滑 UV（去色度噪点）
+  → STEP3 UV+L* → JCH → HSB（H 弧度、S 饱和度、B 亮度）
+           按 H 查 3 张 LUT 得到 hue 偏移 / 饱和增益 / 亮度增益
+  → STEP4 可选：_guide_with_chromaticity() 以 UV 为导向图对修正量做导向滤波
+           （保证空间连续、抑制彩噪），并用 Scharr 梯度抑制边缘光晕
+  → STEP5 施加修正 → gamut_map_HSB() 做色域映射 → HSB_to_XYZ
+           → 乘 output_matrix 回管道 RGB
+
+关键点：修正量只依赖“色调(hue)”一个维度，空间滤波只是把修正量在图像上抹平，
+不是按亮度/饱和度分区调色（那是 tone equalizer / color zones 的旧思路）。
+
+
+三、三张 LUT 是怎么建出来的（真正的“调色曲线”）
+--------------------------------------------------------------------------------
+commit_params()（L1868）里把 8 个滑块打包成数组，各跑一次
+_periodic_RBF_interpolate()（L1741），生成 3 张定长 LUT（LUT_ELEM 项，约 1°/项）：
+
+  LUT_saturation ← _pack_saturation()，smoothing = π，        clip = TRUE
+  LUT_hue        ← _pack_hue()（先 deg2rad），smoothing = π/smoothing_hue，clip = FALSE
+  LUT_brightness ← _pack_brightness()，smoothing = π，        clip = TRUE
+  gamut_LUT      ← dt_UCS_22_build_gamut_LUT()（工作色彩空间最大色度边界）
+
+节点：NODES = 8，等分色相环
+  red/orange/yellow/green/cyan/blue/lavender/magenta
+  第 k 个节点角度 = 20° + k·45° + hue_shift（_get_hue_node()，L1729）
+  20° 是 sRGB 红在 dt UCS 里的色相角，平移后 GUI 上“红”回到 0°（ANGLE_SHIFT，L464）
+
+周期 RBF 插值（Aurélien Pierre 2022 的 hue 插值法）：
+  m = ceil(3·sqrt(smoothing))                    余弦级数项数
+  A[i][j] = exp( Σ_{l=0..m-1} exp(-l²/smoothing)·cos(l·|θi-θj|) )     ← RBF 核矩阵
+  pseudo_solve(A, nodes, 8, 8, TRUE)             解 A·λ = y，得到 8 个权重 λ
+  LUT[h]  = Σ_k λ_k · exp( Σ_l exp(-l²/smoothing)·cos(l·|h-θk|) )
+  clip=TRUE 时 LUT = max(0, LUT)                 饱和/亮度增益不允许为负
+
+效果：8 个滑块值被平滑地“摊”到整个 360° 色相环上，保证周期连续、无接缝，
+且 smoothing_hue 控制色相曲线宽度（越小越窄、越“硬”）。
+
+色相 LUT 的定义域是 [-π, π)，与 atan2 输出一致；查表用 lookup_gamut(LUT, hue)。
+
+
+四、参数是怎么进算法的（commit_params + _prepare_process，L933）
+--------------------------------------------------------------------------------
+white_level  → white = Y_to_dt_UCS_L_star(exp2(white_level))   白点亮度
+chroma_size  → hue_sigma  = 0.5 · chroma_size · roi_scale      色相分析半径（导向滤波 σ）
+               且 chroma_feathering = 1e-5                     导向滤波正则 ε
+param_size   → par_sigma  = 0.5 · param_size · roi_scale       修正量导向滤波 σ
+               且 param_feathering = 1e-6
+use_filter   → 关掉即跳过 STEP2 / STEP4（快速预览 run_fast 也跳过）
+threshold    → d->threshold = -0.015 + 0.3·(5·threshold)²      低饱和抑制拐点（默认≈6% 饱和）
+contrast     → _init_satweights(contrast)（L474）：
+               预计算 2·SATSIZE+1 项 logistic 权重
+               w(s) = 1/(1+exp(factor·s))，factor = -60 - 40·contrast
+               contrast 越负 → 曲线越软，越大 → 过渡越硬（去色阶断层）
+               _get_satweight() 做线性插值查表（SATSIZE = 4096）
+max_brightness = max(1, 8 个亮度滑块)
+               → bright_shift = threshold + 0.01·max_brightness·min(5,√param_size)
+                 亮度修正的额外偏移，防止亮度外溢到无彩色区
+gradient_amp = 4·√max_brightness·roi_scale²                   Scharr 梯度归一化
+hue 滑块     → 直接是弧度偏移
+
+
+五、空间滤波：两个 3→2 通道导向滤波（和“调色”本身无关，但决定画质）
+--------------------------------------------------------------------------------
+A. _prefilter_chromaticity()（L615）— 平滑输入 UV
+   自导向（guided = UV 自己），把 a、b 用高斯均值模糊求局部平均，
+   即 He 的 fast guided filter（http://kaiminghe.com/eccv10/）降到 2 通道。
+   目的：UV 在低饱和处抖动 → 色相跳变，所以先把色度坐标抹平。
+   用 logistic 权重 _get_satweight(sat - sat_shift) 在“原 UV”和“滤波后 UV”间插值，
+   避免把有彩色糊进灰区（无彩色保持中性）。
+
+B. _guide_with_chromaticity()（L720）— 平滑修正量
+   导向图 = UV(2ch)，被滤波 = 修正量(饱和度 1ch + 亮度 1ch)
+   协方差矩阵 2×2：
+     Σ = cov(UV) + ε·I，  a = corr(correction,UV)·Σ⁻¹，  b = mean(corr) - a·mean(UV)
+   然后对 a、b 再做高斯均值模糊，双线性上采样回原尺寸，应用：
+     correction_sat  = 1 + (a_sat·U + a_sat'·V + b_sat - 1)·w_sat
+     b_correction    = (a_br·U + a_br'·V + b_br) · (1 - clip(Scharr 梯度)) · w_br
+   降采样加速：scaling = clamp(floor(σ-1.5), 1, 4)（_get_scaling()，L363），
+   σ' = max(0.2, σ/scaling)。
+
+C. 光晕抑制：用 Scharr 算子算 saturation 的梯度（scharr_gradient），
+   减去 0.02 死区后平方，乘 gradient_amp，再做一次高斯模糊得到 Lscharr，
+   作为亮度修正的权重 (1 - clip(Lscharr))：强边缘处减弱亮度修正，防光晕/黑边。
+
+
+六、修正量如何施加（STEP5，L1162-1186）—— 三个魔数
+--------------------------------------------------------------------------------
+  hue:        out_H = H + ΔH                    （LUT_hue 查表值，单位弧度，加性）
+  saturation: out_S = max(0, S·(1 + SAT_EFFECT·(g_sat - 1)))      SAT_EFFECT = 2.0
+  brightness: out_B = max(0, B·(1 + BRIGHT_EFFECT·b_corr))        BRIGHT_EFFECT = 8.0
+              其中 b_corr = S · (LUT_brightness(H) - 1)
+  → gamut_map_HSB() 按 gamut_LUT 压回可用色域
+  → dt_UCS_HSB_to_XYZ() → output_matrix → 管道 RGB
+
+也就是说：滑块本身是“增益”，实际视觉强度被放大 2×（饱和）和 8×（亮度）；
+亮度增益还乘了当前饱和度 S（低饱和像素亮度改动自动变小）。
+
+灰色/近中性像素（JCH[1] <= NORM_MIN）直接跳过：ΔH=0、g_sat=1、b_corr=0，
+所以中性灰不会被染色 —— 这也是它比旧 color zones 干净的原因。
+
+
+七、关键常量速查
+--------------------------------------------------------------------------------
+NODES            8         色相节点数（45° 一个）
+SATSIZE          4096      logistic 权重表半长
+SLIDER_BRIGHTNESS 0.65     GUI 预览梯度用亮度
+SAT_EFFECT       2.0       饱和度视觉放大
+BRIGHT_EFFECT    8.0       亮度视觉放大
+ANGLE_SHIFT      +20°      sRGB 红 → GUI 0°
+chroma_feathering 1e-5     UV 导向滤波 ε
+param_feathering  1e-6     修正量导向滤波 ε
+threshold 映射   -0.015 + 0.3·(5t)²
+contrast 映射    factor = -60 - 40·contrast
+默认参数         全部滑块 1.0（饱和/亮度）、0°（色相）→ 恒等变换
+
+
+八、复现/移植时的要点（按重要性排序）
+--------------------------------------------------------------------------------
+1. 色彩空间必须用 dt UCS 2022（JCH/HSB），用 HSV 或 Lab 得不到同样的色相分布；
+   HSB 里的 H 是 UCS 的极角，S、B 是极坐标半径与 L* 派生量。
+2. 8 节点 + 周期 RBF（余弦核 + 高斯型 exp）是整套手感的来源，
+   不要换成简单的分段线性；smoothing 参数控制过渡宽度。
+3. 三张 LUT 都是色相的纯函数，与像素位置无关；空间滤波只是把结果在图上抹平。
+4. 低饱和抑制靠 logistic 权重（threshold 定拐点，contrast 定软硬），
+   不是硬阈值，所以过渡自然。
+5. 亮度修正必须乘 S，并且要在边缘处乘 (1-梯度)，否则会出现光晕。
+6. 施加后必须 gamut_map_HSB，否则高饱和推拉会出色域外的荧光色。
+7. 想省算力：把两个导向滤波关掉（use_filter=FALSE）即可得到 90% 的效果，
+   剩下的只是彩噪和光晕。
+8. OpenCL 路径逻辑一一对应（colorequal.cl 的内核名见上），可对照移植。
+
+九、函数索引（colorequal.c 行号，master）
+--------------------------------------------------------------------------------
+L363  _get_scaling            降采样倍率
+L464  _conventional_hue_deg_to_ucs_rad   +20° 偏移
+L474  _init_satweights        logistic 权重预计算
+L487  _get_satweight          权重查表
+L496  _init_covariance        UV 协方差
+L542  _prepare_prefilter      UV 导向滤波 a/b
+L615  _prefilter_chromaticity STEP2 平滑 UV
+L720  _guide_with_chromaticity STEP4 平滑修正量
+L933  _prepare_process        σ、阈值、权重派生
+L996  process                 主流程（上面第二~六节）
+L1729 _get_hue_node           节点角度
+L1741 _periodic_RBF_interpolate  RBF → LUT
+L1825 _pack_saturation / L1838 _pack_hue / L1854 _pack_brightness
+L1868 commit_params           LUT 构建 + 参数落地
+L1937 _build_dt_UCS_HSB_gradients  滑块/背景渐变预览
+L2468 _iop_colorequalizer_draw     GUI 曲线绘制（用的也是同一套 LUT）
+
+（完）

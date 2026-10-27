@@ -1,17 +1,27 @@
 import SwiftUI
 
-/// 直方图数据：R / G / B / 亮度，各 256 个桶。
+/// 直方图数据：R / G / B / 亮度，各 256 个桶；外加 RGB 波形（每列 × 每桶）。
 struct HistogramData: Equatable {
     var red: [Int]
     var green: [Int]
     var blue: [Int]
     var luma: [Int]
+    /// 波形：`[通道][列][桶]`，通道顺序 R/G/B，列 256、桶 128。
+    /// GPU 统计路径拿不到列信息，这时为空数组，波形样式回退成填充样式。
+    var waveform: [UInt16]
 
-    init(red: [Int] = [], green: [Int] = [], blue: [Int] = [], luma: [Int] = []) {
+    init(
+        red: [Int] = [],
+        green: [Int] = [],
+        blue: [Int] = [],
+        luma: [Int] = [],
+        waveform: [UInt16] = []
+    ) {
         self.red = red
         self.green = green
         self.blue = blue
         self.luma = luma
+        self.waveform = waveform
     }
 
     /// 从 RGBA8 像素采样计算（最多约 25 万采样点）。
@@ -23,6 +33,7 @@ struct HistogramData: Equatable {
         var green = [Int](repeating: 0, count: 256)
         var blue = [Int](repeating: 0, count: 256)
         var luma = [Int](repeating: 0, count: 256)
+        var waveform = [UInt16](repeating: 0, count: 3 * 256 * 128)
         let count = width * height
         let step = max(1, count / 250_000)
         var index = 0
@@ -36,12 +47,21 @@ struct HistogramData: Equatable {
             blue[b] += 1
             let l = (r * 2126 + g * 7152 + b * 722) / 10_000
             luma[min(max(l, 0), 255)] += 1
+
+            let column = (index % width) * 256 / width
+            let base = column * 128
+            let plane = 256 * 128
+            waveform[base + r / 2] += 1
+            waveform[plane + base + g / 2] += 1
+            waveform[2 * plane + base + b / 2] += 1
+
             index += step
         }
         self.red = red
         self.green = green
         self.blue = blue
         self.luma = luma
+        self.waveform = waveform
     }
 
     /// 高光剪裁比例（任一通道 ≥ 254 的采样占比，0..1）。
@@ -73,41 +93,45 @@ struct HistogramData: Equatable {
     }
 }
 
-/// 直方图显示通道。
-enum HistogramMode: String, CaseIterable {
-    case rgb = "RGB"
-    case luma = "亮度"
-    case red = "红"
-    case green = "绿"
-    case blue = "蓝"
+/// 直方图显示样式（点一下切换）。
+enum HistogramStyle: String, CaseIterable {
+    case filled = "填充"
+    case waveform = "波形"
 
-    /// 点一下切下一个通道。
-    var next: HistogramMode {
-        let all = HistogramMode.allCases
+    var next: HistogramStyle {
+        let all = HistogramStyle.allCases
         let index = all.firstIndex(of: self) ?? 0
         return all[(index + 1) % all.count]
     }
 }
 
-/// Lightroom 风格的直方图叠加卡片。
+/// 直方图叠加卡片。
 ///
-/// 点一下：切换 RGB / 亮度 / 单通道；长按 0.5s：显示 / 隐藏剪裁警告。
+/// 点一下：切换填充 / RGB 波形；长按 0.5s：显示 / 隐藏剪裁警告。
 struct HistogramOverlay: View {
     let data: HistogramData?
 
-    @State private var mode: HistogramMode = .rgb
+    @State private var style: HistogramStyle = .filled
     @State private var showClipping = true
+
+    private let redColor = Color(red: 1.0, green: 0.27, blue: 0.27)
+    private let greenColor = Color(red: 0.27, green: 0.87, blue: 0.4)
+    private let blueColor = Color(red: 0.27, green: 0.53, blue: 1.0)
 
     var body: some View {
         Canvas { context, size in
             guard let data, !data.red.isEmpty else { return }
-            drawChannels(&context, size: size, data: data)
+            if style == .waveform, data.waveform.count == 3 * 256 * 128 {
+                drawWaveform(&context, size: size, data: data)
+            } else {
+                drawFilled(&context, size: size, data: data)
+            }
             if showClipping {
                 drawClippingWarnings(&context, size: size, data: data)
             }
-            // 通道标签（左下角小字）。
+            // 样式标签（左下角小字）。
             context.draw(
-                Text(mode.rawValue)
+                Text(style.rawValue)
                     .font(.system(size: 9))
                     .foregroundColor(Color.white.opacity(0.55)),
                 at: CGPoint(x: 18, y: size.height - 9)
@@ -117,7 +141,7 @@ struct HistogramOverlay: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
         .onTapGesture {
-            mode = mode.next
+            style = style.next
             Haptics.tick()
         }
         .onLongPressGesture(minimumDuration: 0.5) {
@@ -126,25 +150,60 @@ struct HistogramOverlay: View {
         }
     }
 
-    /// 按当前模式画通道。
-    private func drawChannels(_ context: inout GraphicsContext, size: CGSize, data: HistogramData) {
-        let red = Color(red: 1.0, green: 0.27, blue: 0.27)
-        let green = Color(red: 0.27, green: 0.87, blue: 0.4)
-        let blue = Color(red: 0.27, green: 0.53, blue: 1.0)
-        switch mode {
-        case .rgb:
-            drawChannel(&context, size: size, bins: data.luma, color: .white.opacity(0.18), fill: true)
-            drawChannel(&context, size: size, bins: data.blue, color: blue.opacity(0.85), fill: false)
-            drawChannel(&context, size: size, bins: data.green, color: green.opacity(0.85), fill: false)
-            drawChannel(&context, size: size, bins: data.red, color: red.opacity(0.85), fill: false)
-        case .luma:
-            drawChannel(&context, size: size, bins: data.luma, color: .white.opacity(0.7), fill: true)
-        case .red:
-            drawChannel(&context, size: size, bins: data.red, color: red.opacity(0.85), fill: true)
-        case .green:
-            drawChannel(&context, size: size, bins: data.green, color: green.opacity(0.85), fill: true)
-        case .blue:
-            drawChannel(&context, size: size, bins: data.blue, color: blue.opacity(0.85), fill: true)
+    /// 填充样式：灰底 + 三通道半透明色块 + 亮度白线。
+    private func drawFilled(_ context: inout GraphicsContext, size: CGSize, data: HistogramData) {
+        context.fill(
+            Path(CGRect(origin: .zero, size: size)),
+            with: .color(Color(white: 0.23))
+        )
+        drawChannel(&context, size: size, bins: data.red, color: redColor.opacity(0.55), fill: true)
+        drawChannel(&context, size: size, bins: data.green, color: greenColor.opacity(0.55), fill: true)
+        drawChannel(&context, size: size, bins: data.blue, color: blueColor.opacity(0.55), fill: true)
+        drawChannel(&context, size: size, bins: data.luma, color: .white.opacity(0.8), fill: false)
+    }
+
+    /// 波形样式：横轴画面列、纵轴亮度，颜色是各通道在该列该亮度上的占比。
+    private func drawWaveform(_ context: inout GraphicsContext, size: CGSize, data: HistogramData) {
+        context.fill(
+            Path(CGRect(origin: .zero, size: size)),
+            with: .color(Color(white: 0.05))
+        )
+        let columns = 256
+        let bins = 128
+        let cellWidth = size.width / CGFloat(columns)
+        let cellHeight = size.height / CGFloat(bins)
+        let colors = [redColor, greenColor, blueColor]
+
+        for channel in 0..<3 {
+            let plane = channel * columns * bins
+            for column in 0..<columns {
+                let base = plane + column * bins
+                var peak = 1
+                for bin in 0..<bins {
+                    peak = max(peak, Int(data.waveform[base + bin]))
+                }
+                let inverse = 1.0 / Double(peak)
+                var runStart: Int?
+                for bin in 0...bins {
+                    var lit = false
+                    if bin < bins {
+                        let intensity = (Double(data.waveform[base + bin]) * inverse).squareRoot()
+                        lit = intensity > 0.06
+                    }
+                    if lit, runStart == nil { runStart = bin }
+                    if !lit, let start = runStart {
+                        let top = size.height - CGFloat(bin) * cellHeight
+                        let rect = CGRect(
+                            x: CGFloat(column) * cellWidth,
+                            y: top,
+                            width: cellWidth + 0.5,
+                            height: CGFloat(bin - start) * cellHeight + 0.5
+                        )
+                        context.fill(Path(rect), with: .color(colors[channel].opacity(0.5)))
+                        runStart = nil
+                    }
+                }
+            }
         }
     }
 

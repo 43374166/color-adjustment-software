@@ -6,7 +6,12 @@ pub const BINS: usize = 256;
 /// 单次统计的最大采样像素数（大图按步长抽样，保证 UI 刷新速度）。
 pub const MAX_SAMPLES: usize = 2_000_000;
 
-/// RGB + 亮度直方图。
+/// 波形图列数（横向分辨率；显示时按控件宽度缩放）。
+pub const WAVE_COLUMNS: usize = 256;
+/// 波形图纵向桶数（比直方图粗，省内存：3×256×128×4 ≈ 384 KB）。
+pub const WAVE_BINS: usize = 128;
+
+/// RGB + 亮度直方图，外加 RGB 波形图（每列 × 每桶的样本数）。
 // 注意：serde 只实现了 ≤32 元素的数组，直方图不直接参与序列化
 //（如需持久化，导出为 Vec<u32> 或 base64）。
 #[derive(Debug, Clone, PartialEq)]
@@ -19,6 +24,8 @@ pub struct Histogram {
     pub blue: [u32; BINS],
     /// 亮度（Rec.709 权重）。
     pub luma: [u32; BINS],
+    /// 波形图：`[通道][列][桶]`，通道顺序 R/G/B。
+    pub waveform: Vec<u32>,
     /// 实际采样像素数。
     pub samples: u64,
 }
@@ -30,6 +37,7 @@ impl Default for Histogram {
             green: [0; BINS],
             blue: [0; BINS],
             luma: [0; BINS],
+            waveform: vec![0; 3 * WAVE_COLUMNS * WAVE_BINS],
             samples: 0,
         }
     }
@@ -67,10 +75,25 @@ impl Histogram {
             histogram.blue[b] += 1;
             let luma = 0.2126 * r as f32 + 0.7152 * g as f32 + 0.0722 * b as f32;
             histogram.luma[(luma as usize).min(BINS - 1)] += 1;
+
+            // 波形图：按列（x 方向）统计各通道的分布。
+            let column = (index % width) * WAVE_COLUMNS / width;
+            let base = column * WAVE_BINS;
+            let plane = WAVE_COLUMNS * WAVE_BINS;
+            histogram.waveform[base + r * WAVE_BINS / BINS] += 1;
+            histogram.waveform[plane + base + g * WAVE_BINS / BINS] += 1;
+            histogram.waveform[2 * plane + base + b * WAVE_BINS / BINS] += 1;
+
             histogram.samples += 1;
             index += stride;
         }
         histogram
+    }
+
+    /// 波形图单列数据（`channel`：0=红 / 1=绿 / 2=蓝）。
+    pub fn wave_column(&self, channel: usize, column: usize) -> &[u32] {
+        let base = (channel.min(2) * WAVE_COLUMNS + column.min(WAVE_COLUMNS - 1)) * WAVE_BINS;
+        &self.waveform[base..base + WAVE_BINS]
     }
 
     /// 所有通道中的最大分箱值（用于绘制归一化）。

@@ -42,6 +42,10 @@ struct Params {
     curve: array<vec4<f32>, 256>,
     // 电影曲线 LUT：4096 项，覆盖中灰 -14..+10 EV（与 `fdxmp_color::tone::LUT_N` 一致）。
     tone: array<vec4<f32>, 1024>,
+    // 颜色均衡器：8 个全局量 + 4 张 512 点表（色相 / 饱和 / 亮度 / 色域边界）。
+    eq: array<vec4<f32>, 514>,
+    // HSL 面板：4 个全局量（开关 / 白点）+ 3 张 512 点表（dt UCS 曲线）。
+    hsl: array<vec4<f32>, 385>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -217,43 +221,56 @@ fn wrap_tau(a: f32) -> f32 {
 ///
 /// 与 CPU `fdxmp-color::ops::ColorOps::apply` / `color_engine::ColorStage` 同序同公式；
 /// 色带中心与分级色轮向量在 CPU 侧换算成 OkLCh 后经 uniform 传入（108..195）。
+fn hsl_lut(kind: u32, index: u32) -> f32 {
+    let slot = 4u + kind * 512u + (index & 511u);
+    return params.hsl[slot / 4u][slot % 4u];
+}
+
+/// HSL 曲线查表：入参是 **sRGB HSL 色相（度）**，LUT 覆盖 0..360 共 512 点。
+fn hsl_lookup(kind: u32, hue_deg: f32) -> f32 {
+    let x = fract(hue_deg / 360.0) * 512.0;
+    let base = floor(x);
+    let i = u32(i32(base) & 511);
+    let j = (i + 1u) % 512u;
+    let y0 = hsl_lut(kind, i);
+    return y0 + (x - base) * (hsl_lut(kind, j) - y0);
+}
+
+/// HSL 面板：Lightroom 8 个色带中心 + 颜色均衡器的 UCS 曲线（逐像素，无空间滤波）。
+fn hsl_apply(rgb: vec3<f32>) -> vec3<f32> {
+    if (params.hsl[0u].x < 0.5) {
+        return rgb;
+    }
+    let l_white = max(params.hsl[0u].y, 1e-4);
+    let xyz = EQ_RGB2XYZ * rgb;
+    let xyy = eq_xyz_to_xyy(xyz);
+    let uv = eq_xy_to_uv(xyy.xy);
+    let l_star = eq_l_star(xyz.y);
+    let jch = eq_luv_to_jch(l_star, l_white, uv);
+    var hsb = eq_jch_to_hsb(jch);
+    if (jch.y > EQ_NORM_MIN) {
+        // 色带按 Lightroom 的 sRGB HSL 色相选，修正仍在 UCS 里施加。
+        let band_hue = rgb_to_hsl(linear_to_srgb(clamp(rgb, vec3<f32>(0.0), vec3<f32>(1.0)))).x * 360.0;
+        let hue = hsb.x;
+        hsb.x = hue + hsl_lookup(0u, band_hue);
+        hsb.y = max(hsb.y * hsl_lookup(1u, band_hue), 0.0);
+        hsb.z = max(hsb.z * hsl_lookup(2u, band_hue), 0.0);
+        hsb = eq_gamut_map(hsb, l_white);
+    }
+    return max(EQ_XYZ2RGB * eq_hsb_to_xyz(hsb, l_white), vec3<f32>(0.0));
+}
+
 fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
-    // HSL 面板：按像素的 HSL 色相选带，再在 HSL 中移动 H/S/L（与 CPU
-    // `ColorOps::apply_hsl_mixer` 同语义）。之后仍用 OkLCh 做点颜色/自然饱和度/分级。
-    var working = input_color;
-    let hsl_in = rgb_to_hsl(linear_to_srgb(clamp(input_color, vec3<f32>(0.0), vec3<f32>(1.0))));
-    var w = array<f32, 8>(0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
-    var hue_shift = 0.0;
-    var sat_scale = 0.0;
-    var lum_shift = 0.0;
+    // HSL 面板：与颜色均衡器同一套 dt UCS 曲线（Lightroom 8 个色带中心），逐像素。
+    var working = hsl_apply(input_color);
+
+    // 黑白混色仍按 Lightroom 色带权重分配（只在黑白模式下需要）。
     var bw_mix = 0.0;
-    var wsum = 0.0;
-    let tau = 6.283185307179586;
-    if (p(27) > 0.5) {
-        // Color Zones：节点之间线性插值（与 CPU `band_weights_continuous` 同语义）。
+    if (p(116) > 0.5) {
+        let hsl_in = rgb_to_hsl(linear_to_srgb(clamp(input_color, vec3<f32>(0.0), vec3<f32>(1.0))));
+        let tau = 6.283185307179586;
         let h = fract(hsl_in.x) * tau;
-        var nearest = 0u;
-        var nearest_distance = 1e9;
-        for (var i = 0u; i < 8u; i = i + 1u) {
-            let d = abs(wrap_pi(h - p(108u + i)));
-            if (d < nearest_distance) {
-                nearest_distance = d;
-                nearest = i;
-            }
-        }
-        let center = p(108u + nearest);
-        let delta = wrap_pi(h - center);
-        var neighbor = (nearest + 1u) % 8u;
-        var gap = wrap_tau(p(108u + neighbor) - center);
-        if (delta < 0.0) {
-            neighbor = (nearest + 7u) % 8u;
-            gap = wrap_tau(center - p(108u + neighbor));
-        }
-        let t = select(0.0, clamp(nearest_distance / max(gap, 1e-6), 0.0, 1.0), gap > 1e-6);
-        w[nearest] = 1.0 - t;
-        w[neighbor] = w[neighbor] + t;
-        wsum = 1.0;
-    } else {
+        var wsum = 0.0;
         for (var i = 0u; i < 8u; i = i + 1u) {
             let prev = (i + 7u) % 8u;
             let next = (i + 1u) % 8u;
@@ -261,34 +278,16 @@ fn pipeline_colour_ops(input_color: vec3<f32>) -> vec3<f32> {
             let left = wrap_tau(center - p(108u + prev));
             let right = wrap_tau(p(108u + next) - center);
             let half = 0.65 * max(left, right);
-            let d = abs(wrap_pi(hsl_in.x * tau - center));
+            let d = abs(wrap_pi(h - center));
             if (d < half && half > 1e-6) {
                 let weight = 0.5 + 0.5 * cos(3.14159265358979 * d / half);
-                w[i] = weight;
+                bw_mix = bw_mix + weight * p(117u + i) / 100.0;
                 wsum = wsum + weight;
             }
         }
-    }
-    if (wsum > 1e-6) {
-        for (var i = 0u; i < 8u; i = i + 1u) {
-            w[i] = w[i] / wsum;
-            hue_shift = hue_shift + w[i] * p(32u + i * 3u) / 100.0 * HSL_HUE_SCALE[i];
-            sat_scale = sat_scale + w[i] * p(33u + i * 3u) / 100.0;
-            lum_shift = lum_shift + w[i] * p(34u + i * 3u) / 100.0;
-            bw_mix = bw_mix + w[i] * p(117u + i) / 100.0;
+        if (wsum > 1e-6) {
+            bw_mix = bw_mix / wsum;
         }
-    }
-    if (hsl_in.y > 1e-4 && abs(hue_shift) + abs(sat_scale) + abs(lum_shift) > 0.0001) {
-        let adjusted_h = fract(hsl_in.x + hue_shift * (30.0 / 360.0));
-        let sat_gain = select(sat_scale, sat_scale * 0.60, sat_scale >= 0.0);
-        let adjusted_s = clamp(hsl_in.y * (1.0 + sat_gain), 0.0, 1.0);
-        let adjusted_l = clamp(
-            hsl_in.z + lum_shift * 0.12 * (1.0 - 0.35 * hsl_in.z),
-            0.0,
-            1.0
-        );
-        let adjusted = hsl_to_rgb(vec3<f32>(adjusted_h, adjusted_s, adjusted_l));
-        working = srgb_to_linear(clamp(adjusted, vec3<f32>(0.0), vec3<f32>(1.0)));
     }
 
     let lch = oklab_to_lch(oklab_from_linear(working));
@@ -797,17 +796,269 @@ fn cs_base(@builtin(global_invocation_id) gid: vec3<u32>) {
     textureStore(dst_tex, coord, vec4<f32>(pipeline_base(source), 1.0));
 }
 
+// ===================== 颜色均衡器（dt UCS 2022，8 色相节点） =====================
+// 与 Rust 侧 `fdxmp_color::equalizer` 同一套公式；GPU 侧近似：
+//   - 色度预滤波用单遍 5x5 窗口（CPU 是分离高斯 + 导向滤波，半径最大 3）
+//   - 修正量不做第二次导向滤波（省一遍窗口；只在强边缘 / 彩噪下与 CPU 有细微差别）
+// 三张 LUT 与色域边界表由 CPU 烘焙后放进 uniform，见 `pack_equalizer`。
+
+const EQ_PI: f32 = 3.141592653589793;
+const EQ_TAU: f32 = 6.283185307179586;
+const EQ_L_RANGE: f32 = 2.098883786377;
+const EQ_L_UPPER: f32 = 2.09885;
+const EQ_CHROMA: f32 = 15.932993652962535;
+const EQ_CHROMA_L: f32 = 0.6523997524738018;
+const EQ_CHROMA_M: f32 = 0.6007557017508491;
+const EQ_CHROMA_MI: f32 = 0.8322850678616855;
+const EQ_HSB_POWER: f32 = 1.33654221029386;
+const EQ_TINY: f32 = 1.1754944e-38;
+const EQ_NORM_MIN: f32 = 1.5258789e-5;
+
+const EQ_RGB2XYZ = mat3x3<f32>(
+    0.4124564, 0.2126729, 0.0193339,
+    0.3575761, 0.7151522, 0.1191920,
+    0.1804375, 0.0721750, 0.9503041);
+
+const EQ_XYZ2RGB = mat3x3<f32>(
+    3.2404542, -0.9692660, 0.0556434,
+    -1.5371385, 1.8760108, -0.2040259,
+    -0.4985314, 0.0415560, 1.0572252);
+
+fn eq_raw(index: u32) -> f32 {
+    return params.eq[index / 4u][index % 4u];
+}
+
+fn eq_lut(kind: u32, index: u32) -> f32 {
+    return eq_raw(8u + kind * 512u + (index & 511u));
+}
+
+fn eq_lookup(kind: u32, hue: f32) -> f32 {
+    let h = hue - EQ_TAU * floor((hue + EQ_PI) / EQ_TAU);
+    let x = 512.0 * (h + EQ_PI) / EQ_TAU;
+    let xp = floor(x);
+    let xi = i32(xp) & 511;
+    let xn = ceil(x);
+    let xii = i32(xn) & 511;
+    let y0 = eq_lut(kind, u32(xi));
+    if (xi == xii) {
+        return y0;
+    }
+    return y0 + (x - xp) * (eq_lut(kind, u32(xii)) - y0);
+}
+
+fn eq_soft_clip(x: f32, soft: f32, hard: f32) -> f32 {
+    let norm = max(hard - soft, EQ_TINY);
+    if (x > soft) {
+        return soft + (1.0 - exp(-(x - soft) / norm)) * norm;
+    }
+    return x;
+}
+
+fn eq_sign_min(v: f32) -> f32 {
+    if (v >= 0.0) {
+        return max(v, EQ_TINY);
+    }
+    return min(v, -EQ_TINY);
+}
+
+fn eq_xyz_to_xyy(xyz: vec3<f32>) -> vec3<f32> {
+    let c = max(xyz, vec3<f32>(0.0));
+    let s = c.x + c.y + c.z;
+    if (s <= 0.0) {
+        return vec3<f32>(0.3127, 0.3290, c.y);
+    }
+    return vec3<f32>(c.x / s, c.y / s, c.y);
+}
+
+fn eq_xyy_to_xyz(c: vec3<f32>) -> vec3<f32> {
+    if (c.y == 0.0) {
+        return vec3<f32>(0.0);
+    }
+    return vec3<f32>(c.z * c.x / c.y, c.z, c.z * (1.0 - c.x - c.y) / c.y);
+}
+
+fn eq_xy_to_uv(xy: vec2<f32>) -> vec2<f32> {
+    let uvd = vec3<f32>(
+        -0.783941002840055 * xy.x + 0.277512987809202 * xy.y + 0.153836578598858,
+        0.745273540913283 * xy.x - 0.205375866083878 * xy.y - 0.165478376301988,
+        0.318707282433486 * xy.x + 2.16743692732158 * xy.y + 0.291320554395942);
+    let div = eq_sign_min(uvd.z);
+    let u = uvd.x / div;
+    let v = uvd.y / div;
+    let us = 1.39656225667 * u / (abs(u) + 1.49217352929);
+    let vs = 1.4513954287 * v / (abs(v) + 1.52488637914);
+    return vec2<f32>(
+        -1.124983854323892 * us - 0.980483721769325 * vs,
+        1.86323315098672 * us + 1.971853092390862 * vs);
+}
+
+fn eq_uv_to_xy(uv: vec2<f32>) -> vec2<f32> {
+    let us = -5.037522385190711 * uv.x - 2.504856328185843 * uv.y;
+    let vs = 4.760029407436461 * uv.x + 2.874012963239247 * uv.y;
+    let u = -1.49217352929 * us / (abs(us) - 1.39656225667);
+    let v = -1.52488637914 * vs / (abs(vs) - 1.4513954287);
+    let xd = vec3<f32>(
+        0.167171472114775 * u + 0.141299802443708 * v - 0.00801531300850582,
+        -0.150959086409163 * u - 0.155185060382272 * v - 0.00843312433578007,
+        0.940254742367256 * u + v - 0.0256325967652889);
+    let div = eq_sign_min(xd.z);
+    return vec2<f32>(xd.x / div, xd.y / div);
+}
+
+fn eq_l_star(y: f32) -> f32 {
+    let yh = pow(max(y, 0.0), 0.631651345306265);
+    return EQ_L_RANGE * yh / (yh + 1.12426773749357);
+}
+
+fn eq_y_from_l_star(l: f32) -> f32 {
+    let x = clamp(l, 0.0, EQ_L_UPPER);
+    return pow(1.12426773749357 * x / (EQ_L_RANGE - x), 1.5831518565279648);
+}
+
+fn eq_luv_to_jch(l_star: f32, l_white: f32, uv: vec2<f32>) -> vec3<f32> {
+    let m2 = dot(uv, uv);
+    let j = l_star / l_white;
+    var c = 0.0;
+    if (m2 > 0.0) {
+        c = EQ_CHROMA * pow(l_star, EQ_CHROMA_L) * pow(m2, EQ_CHROMA_M) / l_white;
+    }
+    return vec3<f32>(j, c, atan2(uv.y, uv.x));
+}
+
+fn eq_jch_to_hsb(jch: vec3<f32>) -> vec3<f32> {
+    let c = max(jch.y, 0.0);
+    let b = jch.x * (pow(c, EQ_HSB_POWER) + 1.0);
+    let s = select(0.0, c / b, b > 0.0);
+    return vec3<f32>(jch.z, s, b);
+}
+
+fn eq_hsb_to_jch(hsb: vec3<f32>) -> vec3<f32> {
+    let c = hsb.y * hsb.z;
+    let j = select(hsb.z, hsb.z / (pow(c, EQ_HSB_POWER) + 1.0), c > 0.0);
+    return vec3<f32>(j, c, hsb.x);
+}
+
+fn eq_jch_to_xyy(jch: vec3<f32>, l_white: f32) -> vec3<f32> {
+    let l_star = clamp(jch.x * l_white, 0.0, EQ_L_UPPER);
+    var m = 0.0;
+    if (l_star > 0.0) {
+        m = pow(max(jch.y, 0.0) * l_white / (EQ_CHROMA * pow(l_star, EQ_CHROMA_L)), EQ_CHROMA_MI);
+    }
+    let uv = vec2<f32>(m * cos(jch.z), m * sin(jch.z));
+    let xy = eq_uv_to_xy(uv);
+    return vec3<f32>(xy.x, xy.y, eq_y_from_l_star(l_star));
+}
+
+fn eq_hsb_to_xyz(hsb: vec3<f32>, l_white: f32) -> vec3<f32> {
+    return eq_xyy_to_xyz(eq_jch_to_xyy(eq_hsb_to_jch(hsb), l_white));
+}
+
+fn eq_gamut_map(hsb: vec3<f32>, l_white: f32) -> vec3<f32> {
+    let jch = eq_hsb_to_jch(hsb);
+    let m2 = eq_lookup(3u, jch.z);
+    let max_chroma = EQ_CHROMA
+        * pow(max(jch.x, 0.0) * l_white, EQ_CHROMA_L)
+        * pow(max(m2, 0.0), EQ_CHROMA_M) / l_white;
+    let boundary = eq_jch_to_hsb(vec3<f32>(jch.x, max_chroma, jch.z));
+    let sb = boundary.y;
+    return vec3<f32>(hsb.x, eq_soft_clip(hsb.y, 0.8 * sb, sb), hsb.z);
+}
+
+fn eq_logistic(sat: f32, shift: f32, factor: f32) -> f32 {
+    return 1.0 / (1.0 + exp(factor * (sat - shift) * 0.5));
+}
+
+fn eq_apply(rgb_in: vec3<f32>, coord: vec2<i32>) -> vec3<f32> {
+    if (eq_raw(0u) < 0.5) {
+        return rgb_in;
+    }
+    let l_white = max(eq_raw(4u), 1e-4);
+    let sat_shift = eq_raw(1u);
+    let factor = eq_raw(2u);
+    let use_filter = eq_raw(3u) > 0.5;
+    let bright_shift = eq_raw(7u);
+
+    let xyz = EQ_RGB2XYZ * rgb_in;
+    let uv = eq_xy_to_uv(eq_xyz_to_xyy(xyz).xy);
+    let l_star = eq_l_star(xyz.y);
+    let mx = max(rgb_in.r, max(rgb_in.g, rgb_in.b));
+    let mn = min(rgb_in.r, min(rgb_in.g, rgb_in.b));
+    var sat = 0.0;
+    if (mx > EQ_NORM_MIN && (mx - mn) > EQ_NORM_MIN) {
+        sat = (mx - mn) / mx;
+    }
+
+    var uv_use = uv;
+    if (use_filter) {
+        let sigma = max(eq_raw(5u), 0.2);
+        let inv2s2 = 0.5 / (sigma * sigma);
+        let size = vec2<i32>(textureDimensions(src_tex));
+        let hi = size - vec2<i32>(1);
+        var wsum = 0.0;
+        var mu = vec2<f32>(0.0, 0.0);
+        var muu = 0.0;
+        var muv = 0.0;
+        var mvv = 0.0;
+        for (var dy = -2; dy <= 2; dy = dy + 1) {
+            for (var dx = -2; dx <= 2; dx = dx + 1) {
+                let c = clamp(coord + vec2<i32>(dx, dy), vec2<i32>(0, 0), hi);
+                let p = textureLoad(src_tex, c, 0).rgb;
+                let puv = eq_xy_to_uv(eq_xyz_to_xyy(EQ_RGB2XYZ * p).xy);
+                let w = exp(-f32(dx * dx + dy * dy) * inv2s2);
+                wsum += w;
+                mu += puv * w;
+                muu += puv.x * puv.x * w;
+                muv += puv.x * puv.y * w;
+                mvv += puv.y * puv.y * w;
+            }
+        }
+        let inv = 1.0 / max(wsum, EQ_TINY);
+        let mean_uv = mu * inv;
+        let eps = 1e-5;
+        let suu = max(muu * inv - mean_uv.x * mean_uv.x, 0.0) + eps;
+        let suv = muv * inv - mean_uv.x * mean_uv.y;
+        let svv = max(mvv * inv - mean_uv.y * mean_uv.y, 0.0) + eps;
+        let det = suu * svv - suv * suv;
+        if (abs(det) > 4.7773143e-7) {
+            let i00 = svv / det;
+            let i01 = -suv / det;
+            let i10 = -suv / det;
+            let i11 = suu / det;
+            let d = mean_uv - uv;
+            let uv_f = uv + eps * vec2<f32>(i00 * d.x + i01 * d.y, i10 * d.x + i11 * d.y);
+            let gate = eq_logistic(sat, sat_shift, factor);
+            uv_use = mix(uv, uv_f, gate);
+        }
+    }
+
+    let jch = eq_luv_to_jch(l_star, l_white, uv_use);
+    var hsb = eq_jch_to_hsb(jch);
+    if (jch.y > EQ_NORM_MIN) {
+        let hue = hsb.x;
+        hsb.x = hue + eq_lookup(0u, hue);
+        let gain = eq_lookup(1u, hue);
+        let bright = hsb.y * (eq_lookup(2u, hue) - 1.0);
+        let w_sat = eq_logistic(sat, sat_shift, factor);
+        let w_bri = eq_logistic(sat, bright_shift, factor);
+        hsb.y = max(hsb.y * (1.0 + 2.0 * (gain - 1.0) * w_sat), 0.0);
+        hsb.z = max(hsb.z * (1.0 + 8.0 * bright * w_bri), 0.0);
+    }
+    hsb = eq_gamut_map(hsb, l_white);
+    return max(EQ_XYZ2RGB * eq_hsb_to_xyz(hsb, l_white), vec3<f32>(0.0));
+}
+
 /// 细节链路 + 可选蒙版混合：基础调色结果 → 线性 f16 结果。
 @compute @workgroup_size(8, 8)
-fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let size = textureDimensions(dst_tex);
+fn cs_main(@builtin(global_invocation_id) gid: vec3<u32>) {    let size = textureDimensions(dst_tex);
     if (gid.x >= size.x || gid.y >= size.y) {
         return;
     }
     let coord = vec2<i32>(i32(gid.x), i32(gid.y));
     let uv = (vec2<f32>(gid.xy) + vec2<f32>(0.5)) / vec2<f32>(size);
 
-    let base = textureLoad(src_tex, coord, 0).rgb;
+    var base = textureLoad(src_tex, coord, 0).rgb;
+    // 颜色均衡器：空间算子，在色调映射之前、基础调色（白平衡/曝光）之后。
+    base = eq_apply(base, coord);
     let blurred_raw = textureLoad(blur_tex, coord, 0).rgb;
     // 色调段：局部基底层（大模糊参考的亮度）→ 局部色调 / 电影曲线 / 色域映射，
     // 然后才是显示段（曲线 + 调色算子）与细节链路。与 CPU `tone::ToneStage` /

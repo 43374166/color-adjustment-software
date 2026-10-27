@@ -24,6 +24,8 @@ full = ["gpu", "raw", "heif", "ai"]
 
 [dependencies]
 fdxmp-core.workspace = true
+# 颜色均衡器曲线图要用同一份 512 点 RBF LUT 采样（`Channel` / `curve()`）。
+fdxmp-color.workspace = true
 eframe.workspace = true
 egui.workspace = true
 rfd.workspace = true

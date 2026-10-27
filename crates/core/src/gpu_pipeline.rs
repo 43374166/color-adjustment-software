@@ -41,6 +41,13 @@ pub const TONE_ENTRIES: usize = 1024;
 /// 电影曲线 LUT 的 float 数。
 pub const TONE_LUT_FLOATS: usize = TONE_ENTRIES * 4;
 
+/// 颜色均衡器的 uniform 区：8 个全局量 + 4 张 512 点表
+///（色相偏移 / 饱和度增益 / 亮度增益 / 色域边界 `M²`）。
+pub const EQ_FLOATS: usize = 8 + 4 * 512;
+
+/// HSL 面板的 uniform 区：4 个全局量（开关）+ 3 张 512 点表。
+pub const HSL_FLOATS: usize = 4 + 3 * 512;
+
 /// 模糊半径（像素，9~13 抽头）。
 pub const BLUR_RADIUS: f32 = 4.0;
 
@@ -195,7 +202,10 @@ pub mod slot {
 
 /// 把 `EditParams` 打成 uniform 数组（[`PARAM_FLOATS`] + 1024 floats）。
 pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
-    let mut data = vec![0.0f32; PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS];
+    let mut data = vec![
+        0.0f32;
+        PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS + EQ_FLOATS + HSL_FLOATS
+    ];
     let light = &params.light;
     let color = &params.color;
     let effects = &params.effects;
@@ -243,14 +253,9 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
     data[slot::GRADING_BLENDING] = params.grading.blending;
     data[slot::GRADING_BALANCE] = params.grading.balance;
 
-    let continuous_hsl = params.hsl.mode == crate::params::HslMode::ColorZones;
-    data[slot::HSL_CONTINUOUS] = if continuous_hsl { 1.0 } else { 0.0 };
+    data[slot::HSL_CONTINUOUS] = 0.0;
     for (band_index, band) in crate::params::ColorBand::ALL.iter().enumerate() {
-        let hsl = if continuous_hsl {
-            params.hsl.zone(band_index)
-        } else {
-            params.hsl.band(*band)
-        };
+        let hsl = params.hsl.band(*band);
         let base = slot::HSL_START + band_index * 3;
         data[base] = hsl.hue;
         data[base + 1] = hsl.saturation;
@@ -324,7 +329,70 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
             0.0
         };
 
+    pack_equalizer(&mut data, params);
+    pack_hsl_curves(&mut data, params);
+
     data
+}
+
+/// 把 HSL 面板的三条曲线（Lightroom 8 段 → dt UCS 周期 RBF）写进 uniform。
+///
+/// 与 CPU `HslStage` 用的是同一份烘焙结果；全平（未调整）时只写 0 标志。
+fn pack_hsl_curves(data: &mut [f32], params: &EditParams) {
+    let base = PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS + EQ_FLOATS;
+    let bands = crate::params::ColorBand::ALL;
+    let hue: [f32; 8] = std::array::from_fn(|index| params.hsl.band(bands[index]).hue);
+    let saturation: [f32; 8] =
+        std::array::from_fn(|index| params.hsl.band(bands[index]).saturation);
+    let luminance: [f32; 8] =
+        std::array::from_fn(|index| params.hsl.band(bands[index]).luminance);
+
+    let neutral = hue.iter().all(|v| v.abs() < 1e-6)
+        && saturation.iter().all(|v| v.abs() < 1e-6)
+        && luminance.iter().all(|v| v.abs() < 1e-6);
+    data[base] = if neutral { 0.0 } else { 1.0 };
+    if neutral {
+        return;
+    }
+
+    let curves = fdxmp_color::equalizer::HslCurves::from_bands(hue, saturation, luminance);
+    data[base + 1] = fdxmp_color::ucs::l_white_of(1.0);
+    for index in 0..512 {
+        data[base + 4 + index] = curves.hue[index];
+        data[base + 4 + 512 + index] = curves.saturation[index];
+        data[base + 4 + 1024 + index] = curves.brightness[index];
+    }
+}
+
+/// 把颜色均衡器的全局参数与 3 张色相 LUT、色域边界表写进 uniform。
+///
+/// LUT 在 CPU 侧由 [`fdxmp_color::ColorEqualizer`] 烘焙（8 节点周期 RBF），
+/// 与 CPU 预览 / 导出用的是同一份数据；关闭时只写一个 0 标志。
+fn pack_equalizer(data: &mut [f32], params: &EditParams) {
+    let eq = &params.equalizer;
+    let base = PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS;
+    data[base] = if eq.is_active() { 1.0 } else { 0.0 };
+    data[base + 1] = -0.015 + 0.3 * (5.0 * eq.threshold).powi(2);
+    data[base + 2] = -60.0 - 40.0 * eq.contrast;
+    data[base + 3] = if eq.use_filter { 1.0 } else { 0.0 };
+    data[base + 4] = fdxmp_color::ucs::l_white_of(eq.white_level.exp2());
+    data[base + 5] = 0.5 * eq.chroma_size;
+    data[base + 6] = 0.5 * eq.param_size;
+    let max_brightness = eq.brightness.iter().fold(1.0f32, |acc, v| acc.max(*v));
+    data[base + 7] =
+        data[base + 1] + 0.01 * max_brightness * 5.0f32.min(eq.param_size.max(0.0).sqrt());
+
+    // 始终烘焙：HSL 面板要用同一张色域边界表（同一工作空间），
+    // 而且两张表的色域映射必须一致。关闭均衡器时只是把开关写 0。
+    let equalizer =
+        fdxmp_color::ColorEqualizer::new(eq.to_engine(), &crate::color_engine::WORKSPACE);
+    let (hue, saturation, brightness, gamut) = equalizer.luts();
+    for index in 0..512 {
+        data[base + 8 + index] = hue[index];
+        data[base + 8 + 512 + index] = saturation[index];
+        data[base + 8 + 1024 + index] = brightness[index];
+        data[base + 8 + 1536 + index] = gamut[index];
+    }
 }
 
 /// 把几何逆矩阵与启用开关写入参数包（下标见 [`slot::GEOMETRY_MATRIX`]）。
@@ -648,7 +716,7 @@ impl ColorPipeline {
 
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fdxmp-params"),
-            size: ((PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS)
+            size: ((PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS + EQ_FLOATS + HSL_FLOATS)
                 * std::mem::size_of::<f32>()) as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -2576,6 +2644,30 @@ mod tests {
     use super::*;
     use crate::params::{ColorBand, CurvePoint, GradingZone};
 
+    /// 用真实设备编译整条管线：WGSL 语法 / uniform 布局 / 绑定组不匹配都会在这里炸。
+    ///
+    /// 没有可用适配器时直接跳过（CI 无 GPU 也能绿）。
+    #[test]
+    #[cfg(feature = "gpu")]
+    fn gpu_pipeline_builds_with_equalizer_uniforms() {        let Ok(context) = crate::gpu::GpuContext::new_blocking() else {
+            return;
+        };
+        let _pipeline = ColorPipeline::new(&context.device);
+
+        let mut params = EditParams::default();
+        params.equalizer.enabled = true;
+        params.equalizer.hue[2] = -30.0;
+        let packed = pack_params(&params, 64, 64);
+        assert_eq!(
+            packed.len(),
+            PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS + EQ_FLOATS + HSL_FLOATS
+        );
+        // 均衡器开关 + 第一张 LUT 的第一个点。
+        let eq_base = PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS;
+        assert_eq!(packed[eq_base], 1.0);
+        assert!(packed[eq_base + 8].is_finite());
+    }
+
     #[test]
     fn identity_curve_is_identity() {
         let curve = ToneCurve::default();
@@ -2613,7 +2705,7 @@ mod tests {
         let packed = pack_params(&params, 800, 600);
         assert_eq!(
             packed.len(),
-            PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS
+            PARAM_FLOATS + CURVE_ENTRIES * 4 + TONE_LUT_FLOATS + EQ_FLOATS + HSL_FLOATS
         );
         assert_eq!(packed[slot::EXPOSURE], 1.25);
         assert_eq!(packed[slot::SATURATION], -30.0);
@@ -2687,5 +2779,114 @@ mod tests {
         assert!(
             (detail_blur_scale(&plan(256, 256, [16384.0, 16384.0])) - BLUR_SCALE_MAX).abs() < 1e-6
         );
+    }
+
+    /// GPU 颜色均衡器 vs CPU 同参数：逐像素比对（8bit sRGB），用于守住 WGSL 与 Rust 的一致性。
+    ///
+    /// `use_filter = false` 时两侧算的是同一套逐像素公式，差异只来自 f16 存储 + 8bit 量化；
+    /// 开滤波时 GPU 用 5x5 单遍近似，容差放宽到 3 级。
+    #[test]
+    #[cfg(feature = "gpu")]
+    #[ignore = "需要真实 GPU；手动 cargo test --features gpu -- --ignored"]
+    fn gpu_equalizer_matches_cpu() {
+        let Ok(context) = crate::gpu::GpuContext::new_blocking() else {
+            return;
+        };
+        let (w, h) = (24u32, 24u32);
+        let mut rgba = vec![0.0f32; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let hue = x as f32 / w as f32;
+                let rgb = fdxmp_color::perceptual::hsv_to_rgb([hue, 0.55, 0.62]);
+                let k = ((y * w + x) * 4) as usize;
+                for c in 0..3 {
+                    rgba[k + c] = fdxmp_color::transfer::srgb_to_linear(rgb[c]);
+                }
+                rgba[k + 3] = 1.0;
+            }
+        }
+
+        for use_filter in [false, true] {
+            let mut params = EditParams::default();
+            params.equalizer.enabled = true;
+            params.equalizer.use_filter = use_filter;
+            params.equalizer.hue[2] = -30.0;
+            params.equalizer.saturation[0] = 1.35;
+            params.equalizer.brightness[6] = 1.08;
+
+            let mut pipeline = ColorPipeline::new(&context.device);
+            let image = pipeline
+                .upload_linear_f32(&context.device, &context.queue, &rgba, w, h)
+                .expect("upload");
+            pipeline.render(&context.device, &context.queue, &image, &params);
+            let bytes = pipeline
+                .readback(&context.device, &context.queue, &image)
+                .expect("readback");
+
+            let stage = crate::color_engine::EqualizerStage::from_params(&params);
+            let mut flat: Vec<f32> = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .flat_map(|p| [p[0], p[1], p[2]])
+                .collect();
+            stage.apply_linear(&mut flat, w as usize, h as usize);
+
+            let mut max_diff = 0i32;
+            let mut sum = 0i64;
+            for index in 0..(w * h) as usize {
+                for c in 0..3 {
+                    let cpu = linear_to_srgb_u8(flat[index * 3 + c]) as i32;
+                    let gpu = bytes[index * 4 + c] as i32;
+                    let diff = (cpu - gpu).abs();
+                    max_diff = max_diff.max(diff);
+                    sum += diff as i64;
+                    if !use_filter {
+                        assert!(
+                            diff <= 2,
+                            "pixel {index} ch {c}: cpu={cpu} gpu={gpu}"
+                        );
+                    }
+                }
+            }
+            eprintln!(
+                "GPU vs CPU (use_filter={use_filter}): mean {:.3} max {max_diff}",
+                sum as f64 / (w * h * 3) as f64
+            );
+        }
+
+        // HSL 面板：蓝色带 -100 饱和度，GPU 与 CPU 必须一致（否则就是 HSL 段没生效）。
+        {
+            let mut params = EditParams::default();
+            params.hsl.blue.saturation = -100.0;
+            let mut pipeline = ColorPipeline::new(&context.device);
+            let image = pipeline
+                .upload_linear_f32(&context.device, &context.queue, &rgba, w, h)
+                .expect("upload");
+            pipeline.render(&context.device, &context.queue, &image, &params);
+            let bytes = pipeline
+                .readback(&context.device, &context.queue, &image)
+                .expect("readback");
+
+            let stage = crate::color_engine::ColorStage::from_params(&params);
+            let mut max_diff = 0i32;
+            let mut sum = 0i64;
+            for index in 0..(w * h) as usize {
+                let src = &rgba[index * 4..index * 4 + 3];
+                let cpu_rgb = stage.apply([src[0], src[1], src[2]]);
+                for c in 0..3 {
+                    let cpu = linear_to_srgb_u8(cpu_rgb[c]) as i32;
+                    let gpu = bytes[index * 4 + c] as i32;
+                    let diff = (cpu - gpu).abs();
+                    max_diff = max_diff.max(diff);
+                    sum += diff as i64;
+                }
+            }
+            eprintln!(
+                "HSL GPU vs CPU: mean {:.3} max {max_diff}",
+                sum as f64 / (w * h * 3) as f64
+            );
+            assert!(max_diff <= 3, "HSL GPU 与 CPU 不一致：max {max_diff}");
+        }
     }
 }

@@ -28,6 +28,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
 enum ColorTab: String, CaseIterable, Identifiable {
     case base = "颜色"
     case hsl = "HSL"
+    case equalizer = "均衡器"
     case grading = "分级"
     case pointColor = "点颜色"
     case calibration = "校准"
@@ -1424,8 +1425,19 @@ final class EditorModel: ObservableObject {
         }
     }
 
-    func updateGrading(_ zone: GradingZoneKind, _ value: GradingZone, commit: Bool) {
+    /// 颜色均衡器（整组参数一起改，面板按字段调用）。
+    func updateEqualizer(_ value: EqualizerState, commit: Bool) {
         beginEdit()
+        pendingLabel = "颜色均衡器"
+        state.equalizer = value
+        if commit {
+            commitEdit()
+        } else {
+            touchEdit()
+        }
+    }
+
+    func updateGrading(_ zone: GradingZoneKind, _ value: GradingZone, commit: Bool) {        beginEdit()
         pendingLabel = "分级 · \(zone.rawValue)"
         state.grading[zone] = value
         if commit {
@@ -2993,8 +3005,9 @@ final class EditorModel: ObservableObject {
                 for spec in EditorSpec.sliders where spec.category == .color {
                     copy.values[spec.key] = spec.defaultValue
                 }
-                // 颜色分类下还有 HSL / 颜色分级两个子页，一起归零。
+                // 颜色分类下还有 HSL / 颜色均衡器 / 颜色分级三个子页，一起归零。
                 copy.hsl.reset()
+                copy.equalizer.reset()
                 copy.grading.reset()
             case .effects:
                 for spec in EditorSpec.sliders where spec.category == .effects {

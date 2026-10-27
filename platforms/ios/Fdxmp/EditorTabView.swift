@@ -58,6 +58,10 @@ struct EditorTabView: View {
     @State private var compareSplit: CGFloat?
     /// HSL 色带选择样式：dots（Lightroom 色圆点）/ strip（彩虹色带）。
     @AppStorage("fdxmp_hsl_style") private var hslStyle = "dots"
+    /// 颜色均衡器当前页签：0 色相 / 1 饱和度 / 2 亮度。
+    @State private var eqChannel = 0
+    /// 颜色均衡器的 8 个色带名（与 Rust 的节点顺序一致）。
+    private let eqBandNames = ["红", "橙", "黄", "绿", "青", "蓝", "紫", "品红"]
     /// 预览区尺寸（用于按视口取放大细节帧分辨率）。
     @State private var previewAreaSize: CGSize = .zero
     /// 相册式左右滑动：内容偏移（手指跟随 / 回弹）。
@@ -1315,6 +1319,8 @@ struct EditorTabView: View {
             CurvePanelView(model: model)
         } else if model.category == .color, model.colorTab == .hsl {
             hslPanel
+        } else if model.category == .color, model.colorTab == .equalizer {
+            equalizerPanel
         } else if model.category == .color, model.colorTab == .grading {
             gradingPanel
         } else if model.category == .color, model.colorTab == .pointColor {
@@ -1556,6 +1562,220 @@ struct EditorTabView: View {
     }
 
     // MARK: - HSL
+
+    // MARK: - 颜色均衡器（对标 darktable color equalizer）
+
+    private var equalizerPanel: some View {
+        VStack(spacing: 0) {
+            Toggle(isOn: Binding(
+                get: { model.state.equalizer.enabled },
+                set: { value in
+                    var updated = model.state.equalizer
+                    updated.enabled = value
+                    model.updateEqualizer(updated, commit: true)
+                    Haptics.light()
+                }
+            )) {
+                Text("启用颜色均衡器")
+                    .font(.caption)
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 8)
+
+            Picker("", selection: $eqChannel) {
+                Text("色相").tag(0)
+                Text("饱和度").tag(1)
+                Text("亮度").tag(2)
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
+            .opacity(model.draggingSlider == nil ? 1 : 0)
+            .allowsHitTesting(model.draggingSlider == nil)
+
+            equalizerSliders
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var equalizerSliders: some View {
+        let eq = model.state.equalizer
+        return ScrollView {
+            VStack(spacing: 0) {
+                ForEach(0..<8, id: \.self) { index in
+                    equalizerRow(index)
+                }
+                Divider()
+                    .padding(.horizontal, 18)
+                    .padding(.vertical, 6)
+                ValueSliderRow(
+                    label: "阈值",
+                    value: eq.threshold,
+                    range: 0...0.3,
+                    neutral: 0.1,
+                    step: 0.01,
+                    decimals: 2,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.equalizer
+                        updated.threshold = value
+                        model.updateEqualizer(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("阈值") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("阈值"))
+                ValueSliderRow(
+                    label: "曲线宽度",
+                    value: eq.smoothingHue,
+                    range: 0.05...2,
+                    neutral: 1,
+                    step: 0.05,
+                    decimals: 2,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.equalizer
+                        updated.smoothingHue = value
+                        model.updateEqualizer(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("曲线宽度") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("曲线宽度"))
+                ValueSliderRow(
+                    label: "对比",
+                    value: eq.contrast,
+                    range: -1...1,
+                    step: 0.05,
+                    decimals: 2,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.equalizer
+                        updated.contrast = value
+                        model.updateEqualizer(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("对比") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("对比"))
+                ValueSliderRow(
+                    label: "色度半径",
+                    value: eq.chromaSize,
+                    range: 1...10,
+                    neutral: 1.5,
+                    step: 0.5,
+                    decimals: 1,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.equalizer
+                        updated.chromaSize = value
+                        model.updateEqualizer(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("色度半径") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("色度半径"))
+                ValueSliderRow(
+                    label: "修正半径",
+                    value: eq.paramSize,
+                    range: 1...128,
+                    neutral: 1,
+                    step: 1,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.equalizer
+                        updated.paramSize = value
+                        model.updateEqualizer(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("修正半径") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("修正半径"))
+                ValueSliderRow(
+                    label: "节点旋转",
+                    value: eq.hueShift,
+                    range: -23...23,
+                    step: 1,
+                    onBegin: { model.beginEdit() },
+                    onChange: { value in
+                        var updated = model.state.equalizer
+                        updated.hueShift = value
+                        model.updateEqualizer(updated, commit: false)
+                    },
+                    onCommit: { model.commitEdit() }
+                )
+                .opacity(model.sliderVisible("节点旋转") ? 1 : 0)
+                .allowsHitTesting(model.sliderVisible("节点旋转"))
+                Toggle(isOn: Binding(
+                    get: { model.state.equalizer.useFilter },
+                    set: { value in
+                        var updated = model.state.equalizer
+                        updated.useFilter = value
+                        model.updateEqualizer(updated, commit: true)
+                    }
+                )) {
+                    Text("导向滤波（更慢，但压彩噪）")
+                        .font(.caption)
+                }
+                .padding(.horizontal, 18)
+                .padding(.vertical, 6)
+            }
+        }
+        .scrollDisabled(model.draggingSlider != nil)
+    }
+
+    @ViewBuilder
+    private func equalizerRow(_ index: Int) -> some View {
+        let eq = model.state.equalizer
+        let label = eqBandNames[index]
+        switch eqChannel {
+        case 0:
+            ValueSliderRow(
+                label: label,
+                value: eq.hue[index],
+                range: -180...180,
+                onBegin: { model.beginEdit() },
+                onChange: { value in
+                    var updated = model.state.equalizer
+                    updated.hue[index] = value
+                    model.updateEqualizer(updated, commit: false)
+                },
+                onCommit: { model.commitEdit() }
+            )
+            .opacity(model.sliderVisible(label) ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible(label))
+        case 1:
+            ValueSliderRow(
+                label: label,
+                value: (eq.saturation[index] - 1) * 100,
+                range: -100...100,
+                onBegin: { model.beginEdit() },
+                onChange: { value in
+                    var updated = model.state.equalizer
+                    updated.saturation[index] = max(1 + value / 100, 0)
+                    model.updateEqualizer(updated, commit: false)
+                },
+                onCommit: { model.commitEdit() }
+            )
+            .opacity(model.sliderVisible(label) ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible(label))
+        default:
+            ValueSliderRow(
+                label: label,
+                value: (eq.brightness[index] - 1) * 100,
+                range: -100...100,
+                onBegin: { model.beginEdit() },
+                onChange: { value in
+                    var updated = model.state.equalizer
+                    updated.brightness[index] = max(1 + value / 100, 0)
+                    model.updateEqualizer(updated, commit: false)
+                },
+                onCommit: { model.commitEdit() }
+            )
+            .opacity(model.sliderVisible(label) ? 1 : 0)
+            .allowsHitTesting(model.sliderVisible(label))
+        }
+    }
 
     private var hslPanel: some View {
         VStack(spacing: 0) {

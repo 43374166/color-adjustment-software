@@ -37,7 +37,7 @@ use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use eframe::egui;
 use fdxmp_core::cache::CacheManager;
 use fdxmp_core::decode::DecodedImage;
-use fdxmp_core::histogram::Histogram;
+use fdxmp_core::histogram::{Histogram, BINS, WAVE_BINS, WAVE_COLUMNS};
 use fdxmp_core::params::{ColorBand, CurvePoint, EditParams, SliderId};
 use fdxmp_core::Engine;
 
@@ -641,6 +641,8 @@ struct FdxmpApp {
     #[cfg(feature = "gpu")]
     gpu: Option<GpuPreview>,
     params_dirty: bool,
+    /// 直方图显示样式（点击直方图切换）。
+    histogram_style: HistogramStyle,
     #[cfg(feature = "gpu")]
     histogram_dirty: bool,
     #[cfg(feature = "gpu")]
@@ -649,6 +651,10 @@ struct FdxmpApp {
     edit_target: EditTarget,
     curve_channel: usize,
     hsl_mode: usize,
+    /// 颜色均衡器的页签：0 饱和度 / 1 色相 / 2 亮度（对标 darktable 的三页）。
+    eq_tab: usize,
+    /// 曲线图里选中的色相节点（0..8，对应红橙黄绿青蓝紫品红）。
+    eq_selected: usize,
     brush_painting: bool,
     show_overlay: bool,
     overlay_texture: Option<(u64, egui::TextureHandle)>,
@@ -754,6 +760,7 @@ impl Default for FdxmpApp {
             #[cfg(feature = "gpu")]
             gpu: None,
             params_dirty: false,
+            histogram_style: HistogramStyle::Filled,
             #[cfg(feature = "gpu")]
             histogram_dirty: false,
             #[cfg(feature = "gpu")]
@@ -762,6 +769,8 @@ impl Default for FdxmpApp {
             edit_target: EditTarget::Global,
             curve_channel: 0,
             hsl_mode: 0,
+            eq_tab: 0,
+            eq_selected: 2,
             brush_painting: false,
             show_overlay: ui_state.show_overlay,
             overlay_texture: None,
@@ -1132,7 +1141,12 @@ impl FdxmpApp {
             .default_open(true)
             .show(ui, |ui| match &self.loaded {
                 Some(loaded) => {
-                    draw_histogram(ui, &loaded.histogram);
+                    let style = self.histogram_style;
+                    let response = draw_histogram(ui, &loaded.histogram, style)
+                        .on_hover_text("点击切换：填充直方图 / RGB 波形");
+                    if response.clicked() {
+                        self.histogram_style = style.next();
+                    }
                     ui.add_space(4.0);
                     ui.label(format!(
                         "{}×{} · {} · {} ms",
@@ -1384,6 +1398,9 @@ impl FdxmpApp {
         egui::CollapsingHeader::new("HSL / 颜色")
             .default_open(false)
             .show(ui, |ui| self.hsl_panel(ui));
+        egui::CollapsingHeader::new("颜色均衡器")
+            .default_open(false)
+            .show(ui, |ui| self.equalizer_panel(ui));
         egui::CollapsingHeader::new("颜色分级")
             .default_open(false)
             .show(ui, |ui| self.grading_panel(ui));
@@ -3959,23 +3976,8 @@ impl FdxmpApp {
         );
     }
 
-    /// HSL 面板：Lightroom 固定 8 段 / 连续色域两套方案。
+    /// HSL 面板：Lightroom 固定 8 段，算法走颜色均衡器那套（dt UCS 曲线）。
     fn hsl_panel(&mut self, ui: &mut egui::Ui) {
-        use fdxmp_core::params::HslMode;
-
-        ui.horizontal(|ui| {
-            for (label, scheme) in [
-                ("Lightroom 8 段", HslMode::Lightroom),
-                ("连续色域", HslMode::ColorZones),
-            ] {
-                let selected = self.read_params().hsl.mode == scheme;
-                if ui.selectable_label(selected, label).clicked() && !selected {
-                    self.edit_params_live("HSL 方案", move |params| {
-                        params.hsl.mode = scheme;
-                    });
-                }
-            }
-        });
         ui.horizontal(|ui| {
             for (index, label) in ["色相", "饱和度", "明亮度"].iter().enumerate() {
                 if ui
@@ -3988,27 +3990,16 @@ impl FdxmpApp {
         });
 
         let mode = self.hsl_mode;
-        let continuous = self.read_params().hsl.mode == HslMode::ColorZones;
-        ui.weak(if continuous {
-            "连续色域：8 个节点之间线性插值，类似 darktable 的 Color Zones。"
-        } else {
-            "Lightroom：8 个固定色带，带间使用重叠窗。"
-        });
-        if continuous {
-            self.hsl_zones_graph(ui, mode);
-        }
+        ui.weak("8 个 Lightroom 色带；曲线在 dt UCS 里过渡，色带边界不再有台阶。");
         for (index, band) in ColorBand::ALL.into_iter().enumerate() {
-            let hsl = if continuous {
-                self.read_params().hsl.zone(index).clone()
-            } else {
-                self.read_params().hsl.band(band).clone()
-            };
+            let hsl = self.read_params().hsl.band(band).clone();
             let value = match mode {
                 0 => hsl.hue,
                 1 => hsl.saturation,
                 _ => hsl.luminance,
             };
             let label = format!("  {}", band.label_zh());
+            let _ = index;
             self.param_slider(
                 ui,
                 &label,
@@ -4016,11 +4007,7 @@ impl FdxmpApp {
                 -100.0..=100.0,
                 "HSL",
                 move |params, v| {
-                    let hsl = if continuous {
-                        params.hsl.zone_mut(index)
-                    } else {
-                        params.hsl.band_mut(band)
-                    };
+                    let hsl = params.hsl.band_mut(band);
                     match mode {
                         0 => hsl.hue = v,
                         1 => hsl.saturation = v,
@@ -4036,93 +4023,428 @@ impl FdxmpApp {
         }
     }
 
-    /// Color Zones 的 8 节点曲线：横轴色相 0..360，纵轴当前通道 -100..100。
-    fn hsl_zones_graph(&mut self, ui: &mut egui::Ui, mode: usize) {
-        const CENTERS: [f32; 8] = [0.0, 30.0, 60.0, 120.0, 180.0, 225.0, 270.0, 315.0];
-        let width = ui.available_width().clamp(220.0, 420.0);
-        let (rect, response) =
-            ui.allocate_exact_size(egui::vec2(width, 120.0), egui::Sense::click_and_drag());
-        let painter = ui.painter_at(rect);
-        painter.rect_filled(rect, 4.0, egui::Color32::from_rgb(28, 30, 34));
-        for step in 0..=4 {
-            let y = rect.top() + rect.height() * step as f32 / 4.0;
-            let value = 100.0 - step as f32 * 50.0;
-            painter.line_segment(
-                [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                egui::Stroke::new(1.0, egui::Color32::from_gray(55)),
-            );
-            painter.text(
-                egui::pos2(rect.left() + 4.0, y),
-                egui::Align2::LEFT_TOP,
-                format!("{value:+.0}"),
-                egui::FontId::monospace(9.0),
-                egui::Color32::from_gray(150),
-            );
+    /// 颜色均衡器（对标 darktable 的 color equalizer）：三页 × 8 个色相节点 + 选项。
+    ///
+    /// 参数与 darktable 一一对应：饱和度 / 亮度是增益（面板显示 −100%..+100%），
+    /// 色相是角度偏移；阈值 / 曲线宽度 / 对比 / 半径 / 节点旋转在「选项」里。
+    /// 算法在 `fdxmp_color::equalizer`（dt UCS 2022 + 周期 RBF），GPU 在 `color_pipeline.wgsl`。
+    fn equalizer_panel(&mut self, ui: &mut egui::Ui) {
+        use fdxmp_core::params::ColorBand;
+
+        const BAND_COLORS: [egui::Color32; 8] = [
+            egui::Color32::from_rgb(220, 70, 60),
+            egui::Color32::from_rgb(230, 140, 45),
+            egui::Color32::from_rgb(215, 195, 55),
+            egui::Color32::from_rgb(90, 180, 85),
+            egui::Color32::from_rgb(65, 185, 185),
+            egui::Color32::from_rgb(75, 115, 220),
+            egui::Color32::from_rgb(145, 105, 205),
+            egui::Color32::from_rgb(205, 85, 165),
+        ];
+
+        let enabled = self.read_params().equalizer.enabled;
+        let mut checkbox = enabled;
+        if ui.checkbox(&mut checkbox, "启用").changed() {
+            self.edit_params_live("颜色均衡器开关", move |params| {
+                params.equalizer.enabled = checkbox;
+            });
+        }
+        if !enabled {
+            ui.weak("按色相分 8 段调整饱和度 / 色相 / 亮度；空间算子，GPU 实时。");
+            return;
         }
 
-        let params = self.read_params();
-        let values: [f32; 8] = std::array::from_fn(|index| {
-            let zone = params.hsl.zone(index);
-            match mode {
-                0 => zone.hue,
-                1 => zone.saturation,
-                _ => zone.luminance,
+        ui.horizontal(|ui| {
+            for (index, label) in ["色相", "饱和度", "亮度"].iter().enumerate() {
+                if ui.selectable_label(self.eq_tab == index, *label).clicked() {
+                    self.eq_tab = index;
+                }
             }
         });
-        let point = |index: usize, value: f32| {
-            egui::pos2(
-                rect.left() + rect.width() * CENTERS[index] / 360.0,
-                rect.center().y - value / 200.0 * rect.height(),
-            )
+
+        self.eq_graph(ui);
+
+        // 选中节点的精确调节（拖动曲线后这里会跟着变）。
+        let tab = self.eq_tab;
+        let index = self.eq_selected.min(7);
+        let band = ColorBand::ALL[index];
+        let current = {
+            let params = self.read_params();
+            match tab {
+                0 => params.equalizer.hue[index],
+                1 => params.equalizer.saturation[index],
+                _ => params.equalizer.brightness[index],
+            }
         };
-        let points: Vec<egui::Pos2> = values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| point(index, *value))
-            .collect();
-        painter.add(egui::Shape::line(
-            points.clone(),
-            egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 200, 255)),
-        ));
-        for (index, position) in points.iter().enumerate() {
-            painter.circle_filled(
-                *position,
-                4.5,
-                hsv_color(CENTERS[index], 0.65, 0.95),
-            );
-            painter.circle_stroke(*position, 5.0, egui::Stroke::new(1.0, egui::Color32::WHITE));
+        let label =
+            egui::RichText::new(format!("{}（精确）", band.label_zh())).color(BAND_COLORS[index]);
+        match tab {
+            0 => self.eq_slider(
+                ui,
+                label,
+                current,
+                -180.0..=180.0,
+                0.0,
+                1,
+                "颜色均衡器：色相",
+                move |params, v| params.equalizer.hue[index] = v,
+            ),
+            1 => self.eq_slider(
+                ui,
+                label,
+                current,
+                0.0..=2.0,
+                1.0,
+                0,
+                "颜色均衡器：饱和度",
+                move |params, v| params.equalizer.saturation[index] = v,
+            ),
+            _ => self.eq_slider(
+                ui,
+                label,
+                current,
+                0.0..=2.0,
+                1.0,
+                0,
+                "颜色均衡器：亮度",
+                move |params, v| params.equalizer.brightness[index] = v,
+            ),
         }
 
-        if response.dragged() || response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                let index = CENTERS
-                    .iter()
-                    .enumerate()
-                    .min_by(|(_, a), (_, b)| {
-                        (pos.x - (rect.left() + rect.width() * **a / 360.0))
-                            .abs()
-                            .partial_cmp(
-                                &(pos.x - (rect.left() + rect.width() * **b / 360.0)).abs(),
-                            )
-                            .unwrap_or(std::cmp::Ordering::Equal)
-                    })
-                    .map(|(index, _)| index)
-                    .unwrap_or(0);
-                let value = (100.0 - (pos.y - rect.top()) / rect.height() * 200.0)
-                    .clamp(-100.0, 100.0);
-                if (value - values[index]).abs() > 0.25 {
-                    self.edit_params_live("HSL 色域曲线", move |params| {
-                        let zone = params.hsl.zone_mut(index);
-                        match mode {
-                            0 => zone.hue = value,
-                            1 => zone.saturation = value,
-                            _ => zone.luminance = value,
-                        }
+        ui.add_space(4.0);
+        ui.collapsing("选项", |ui| {
+            let eq = self.read_params().equalizer.clone();
+            self.eq_slider(
+                ui,
+                "饱和度阈值",
+                eq.threshold,
+                0.0..=0.3,
+                0.1,
+                2,
+                "颜色均衡器：阈值",
+                |params, v| params.equalizer.threshold = v,
+            );
+            self.eq_slider(
+                ui,
+                "色相曲线宽度",
+                eq.smoothing_hue,
+                0.05..=2.0,
+                1.0,
+                2,
+                "颜色均衡器：曲线宽度",
+                |params, v| params.equalizer.smoothing_hue = v,
+            );
+            self.eq_slider(
+                ui,
+                "过渡对比",
+                eq.contrast,
+                -1.0..=1.0,
+                0.0,
+                2,
+                "颜色均衡器：对比",
+                |params, v| params.equalizer.contrast = v,
+            );
+            self.eq_slider(
+                ui,
+                "色度分析半径",
+                eq.chroma_size,
+                1.0..=10.0,
+                1.5,
+                2,
+                "颜色均衡器：色度半径",
+                |params, v| params.equalizer.chroma_size = v,
+            );
+            self.eq_slider(
+                ui,
+                "效果半径",
+                eq.param_size,
+                1.0..=128.0,
+                1.0,
+                2,
+                "颜色均衡器：效果半径",
+                |params, v| params.equalizer.param_size = v,
+            );
+            self.eq_slider(
+                ui,
+                "节点旋转",
+                eq.hue_shift,
+                -23.0..=23.0,
+                0.0,
+                1,
+                "颜色均衡器：节点旋转",
+                |params, v| params.equalizer.hue_shift = v,
+            );
+
+            let mut use_filter = eq.use_filter;
+            if ui
+                .checkbox(&mut use_filter, "导向滤波（彩噪抑制；GPU 为 5×5 近似）")
+                .changed()
+            {
+                self.edit_params_live("颜色均衡器：导向滤波", move |params| {
+                    params.equalizer.use_filter = use_filter;
+                });
+            }
+        });
+
+        ui.add_space(2.0);
+        ui.horizontal(|ui| {
+            if ui.small_button("重置").clicked() {
+                self.edit_params_live("重置颜色均衡器", |params| {
+                    let enabled = params.equalizer.enabled;
+                    params.equalizer = fdxmp_core::params::EqualizerParams::default();
+                    params.equalizer.enabled = enabled;
+                });
+            }
+            ui.weak("dt UCS 2022 · 8 节点周期 RBF · 与 darktable 5.6.2 实测差 0.15/255");
+        });
+    }
+
+    /// darktable 风格曲线图：横轴色相（红在 0°，到品红 315°），纵轴当前通道值。
+    ///
+    /// 背景按 dt 的 graph backgrounds 同构生成：色相页展示「旋转后的色相」，
+    /// 饱和度页展示「色相 × 饱和度」，亮度页展示「色相 × 亮度」；
+    /// 曲线本身用引擎同一份 512 点 RBF LUT 采样，所见即所调。
+    fn eq_graph(&mut self, ui: &mut egui::Ui) {
+        const NODE_COLORS: [egui::Color32; 8] = [
+            egui::Color32::from_rgb(220, 70, 60),
+            egui::Color32::from_rgb(230, 140, 45),
+            egui::Color32::from_rgb(215, 195, 55),
+            egui::Color32::from_rgb(90, 180, 85),
+            egui::Color32::from_rgb(65, 185, 185),
+            egui::Color32::from_rgb(75, 115, 220),
+            egui::Color32::from_rgb(145, 105, 205),
+            egui::Color32::from_rgb(205, 85, 165),
+        ];
+
+        let tab = self.eq_tab; // 0 色相 / 1 饱和度 / 2 亮度
+        let width = ui.available_width().clamp(240.0, 460.0);
+        let height = (width * 0.60).clamp(150.0, 250.0);
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(width, height + 16.0),
+            egui::Sense::click_and_drag(),
+        );
+        let graph = egui::Rect::from_min_size(rect.min, egui::vec2(width, height));
+        let painter = ui.painter_at(rect);
+
+        // 背景：x = 色相，y = 当前通道的效果预览。
+        const NX: usize = 48;
+        const NY: usize = 24;
+        let mut mesh = egui::Mesh::default();
+        for j in 0..NY {
+            let v = 1.0 - j as f32 / NY as f32;
+            for i in 0..NX {
+                let hue = (i as f32 + 0.5) / NX as f32 * 360.0;
+                let color = match tab {
+                    0 => hsv_color(hue - (v - 0.5) * 360.0, 0.62, 0.62),
+                    2 => hsv_color(hue, 0.62, (1.25 * 0.62 * v).clamp(0.03, 1.0)),
+                    _ => hsv_color(hue, v, 0.62),
+                };
+                let x0 = graph.left() + graph.width() * i as f32 / NX as f32;
+                let x1 = graph.left() + graph.width() * (i + 1) as f32 / NX as f32;
+                let y0 = graph.top() + graph.height() * j as f32 / NY as f32;
+                let y1 = graph.top() + graph.height() * (j + 1) as f32 / NY as f32;
+                let base = mesh.vertices.len() as u32;
+                for (x, y) in [(x0, y0), (x1, y0), (x1, y1), (x0, y1)] {
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: egui::pos2(x, y),
+                        uv: egui::Pos2::ZERO,
+                        color,
                     });
+                }
+                mesh.indices
+                    .extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+        }
+        painter.add(egui::Shape::mesh(mesh));
+
+        // 网格（8 列 = 8 个色相节点区间）与零线。
+        for step in 0..=8 {
+            let x = graph.left() + graph.width() * step as f32 / 8.0;
+            painter.line_segment(
+                [egui::pos2(x, graph.top()), egui::pos2(x, graph.bottom())],
+                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(38)),
+            );
+        }
+        for step in 0..=4 {
+            let y = graph.top() + graph.height() * step as f32 / 4.0;
+            painter.line_segment(
+                [egui::pos2(graph.left(), y), egui::pos2(graph.right(), y)],
+                egui::Stroke::new(1.0, egui::Color32::from_black_alpha(38)),
+            );
+        }
+        painter.line_segment(
+            [
+                egui::pos2(graph.left(), graph.center().y),
+                egui::pos2(graph.right(), graph.center().y),
+            ],
+            egui::Stroke::new(1.0, egui::Color32::from_white_alpha(80)),
+        );
+
+        let value_to_y = |value: f32| -> f32 {
+            let t = match tab {
+                0 => (value + 180.0) / 360.0,
+                _ => value * 0.5,
+            };
+            graph.bottom() - t.clamp(0.0, 1.0) * graph.height()
+        };
+        let y_to_value = |y: f32| -> f32 {
+            let t = ((graph.bottom() - y) / graph.height()).clamp(0.0, 1.0);
+            match tab {
+                0 => -180.0 + t * 360.0,
+                _ => t * 2.0,
+            }
+        };
+
+        let (values, shift, engine) = {
+            let params = self.read_params();
+            let values = match tab {
+                0 => params.equalizer.hue,
+                1 => params.equalizer.saturation,
+                _ => params.equalizer.brightness,
+            };
+            (values, params.equalizer.hue_shift, params.equalizer.to_engine())
+        };
+        let channel = match tab {
+            0 => fdxmp_color::Channel::Hue,
+            1 => fdxmp_color::Channel::Saturation,
+            _ => fdxmp_color::Channel::Brightness,
+        };
+        let lut = fdxmp_color::equalizer::curve(&engine, channel);
+
+        // 曲线：LUT 定义域是 UCS 色相（红在 20°），这里换算回 GUI 的常规色相。
+        let mut line = Vec::with_capacity(361);
+        for i in 0..=360 {
+            let deg = i as f32;
+            let index = (((deg + 20.0 + 180.0) / 360.0 * 512.0).floor() as i64).rem_euclid(512);
+            let raw = lut[index as usize];
+            let value = if tab == 0 { raw.to_degrees() } else { raw };
+            line.push(egui::pos2(
+                graph.left() + deg / 360.0 * graph.width(),
+                value_to_y(value),
+            ));
+        }
+        painter.add(egui::Shape::line(
+            line,
+            egui::Stroke::new(1.6, egui::Color32::from_gray(238)),
+        ));
+
+        // 8 个节点 + 右端的一个回绕点。
+        let mut node_positions = [egui::Pos2::ZERO; 8];
+        for k in 0..8 {
+            let deg = (k as f32 * 45.0 + shift).rem_euclid(360.0);
+            let position = egui::pos2(
+                graph.left() + deg / 360.0 * graph.width(),
+                value_to_y(values[k]),
+            );
+            node_positions[k] = position;
+            if k == self.eq_selected {
+                painter.line_segment(
+                    [
+                        egui::pos2(position.x, graph.center().y),
+                        egui::pos2(position.x, position.y),
+                    ],
+                    egui::Stroke::new(5.0, egui::Color32::from_white_alpha(55)),
+                );
+            }
+            painter.circle_filled(position, 5.0, egui::Color32::from_gray(30));
+            painter.circle_stroke(position, 5.0, egui::Stroke::new(2.0, NODE_COLORS[k]));
+            if k == self.eq_selected {
+                painter.circle_stroke(
+                    position,
+                    8.0,
+                    egui::Stroke::new(1.5, egui::Color32::from_gray(240)),
+                );
+            }
+        }
+        let ghost = egui::pos2(graph.right(), value_to_y(values[0]));
+        painter.circle_stroke(ghost, 4.0, egui::Stroke::new(1.5, NODE_COLORS[0]));
+
+        // 底部色相参考条。
+        let strip = egui::Rect::from_min_max(
+            egui::pos2(rect.left(), graph.bottom() + 3.0),
+            egui::pos2(rect.right(), graph.bottom() + 12.0),
+        );
+        painter.rect_filled(strip, 2.0, egui::Color32::from_gray(30));
+        for i in 0..72 {
+            let hue = (i as f32 + 0.5) / 72.0 * 360.0;
+            let x0 = strip.left() + strip.width() * i as f32 / 72.0;
+            let x1 = strip.left() + strip.width() * (i + 1) as f32 / 72.0;
+            painter.rect_filled(
+                egui::Rect::from_min_max(egui::pos2(x0, strip.top()), egui::pos2(x1, strip.bottom())),
+                0.0,
+                hsv_color(hue, 0.65, 0.78),
+            );
+        }
+
+        // 拖动 / 点击 / 双击节点。
+        if let Some(pos) = response.interact_pointer_pos() {
+            if (response.dragged() || response.clicked() || response.double_clicked())
+                && graph.contains(pos)
+            {
+                let mut best = 0usize;
+                let mut best_dist = f32::MAX;
+                for (k, node) in node_positions.iter().enumerate() {
+                    let dist = (pos.x - node.x).abs();
+                    if dist < best_dist {
+                        best_dist = dist;
+                        best = k;
+                    }
+                }
+                if best_dist < 24.0 {
+                    self.eq_selected = best;
+                    if response.double_clicked() {
+                        let default = if tab == 0 { 0.0 } else { 1.0 };
+                        self.edit_params_live("重置颜色均衡器节点", move |params| match tab {
+                            0 => params.equalizer.hue[best] = default,
+                            1 => params.equalizer.saturation[best] = default,
+                            _ => params.equalizer.brightness[best] = default,
+                        });
+                    } else {
+                        let value = y_to_value(pos.y);
+                        if (value - values[best]).abs() > 1e-3 {
+                            self.edit_params_live("颜色均衡器曲线", move |params| match tab {
+                                0 => params.equalizer.hue[best] = value,
+                                1 => params.equalizer.saturation[best] = value,
+                                _ => params.equalizer.brightness[best] = value,
+                            });
+                        }
+                    }
                 }
             }
         }
-        ui.weak("拖动节点编辑：横轴色相，纵轴当前通道值；双击滑杆可复位。");
+
+        ui.weak("拖动节点调曲线，双击节点复位；底部是色相参考。");
+    }
+
+    /// 颜色均衡器滑杆：`kind` 决定显示格式（0 增益百分比 / 1 角度 / 2 普通数值），
+    /// 双击回到该参数的默认值（增益的默认值是 1.0，不是 0）。
+    #[allow(clippy::too_many_arguments)]
+    fn eq_slider(
+        &mut self,
+        ui: &mut egui::Ui,
+        label: impl Into<egui::WidgetText>,
+        value: f32,
+        range: std::ops::RangeInclusive<f32>,
+        default: f32,
+        kind: u8,
+        history: &str,
+        mut apply: impl FnMut(&mut EditParams, f32),
+    ) {
+        let mut current = value;
+        let slider = egui::Slider::new(&mut current, range)
+            .text(label)
+            .custom_formatter(move |v, _| match kind {
+                0 => format!("{:+.0}%", (v - 1.0) * 100.0),
+                1 => format!("{v:+.1}°"),
+                _ => format!("{v:.3}"),
+            });
+        let response = ui.add(slider);
+        if response.changed() {
+            self.edit_params_live(history, |params| apply(params, current));
+        }
+        if response.double_clicked() {
+            self.edit_params_live(&format!("重置{history}"), |params| apply(params, default));
+        }
     }
 
     /// 颜色分级面板：阴影 / 中间调 / 高光 + 混合 / 平衡。
@@ -6407,47 +6729,169 @@ impl FdxmpApp {
 }
 
 /// 绘制 RGB 直方图（叠加显示）。
-fn draw_histogram(ui: &mut egui::Ui, histogram: &Histogram) {
+/// 直方图显示样式（点击直方图切换）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HistogramStyle {
+    /// 彩色填充（Lightroom 那种）。
+    Filled,
+    /// RGB 波形图（视频示波器那种）。
+    Waveform,
+}
+
+impl HistogramStyle {
+    fn next(self) -> Self {
+        match self {
+            Self::Filled => Self::Waveform,
+            Self::Waveform => Self::Filled,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Filled => "填充直方图",
+            Self::Waveform => "RGB 波形",
+        }
+    }
+}
+
+fn draw_histogram(
+    ui: &mut egui::Ui,
+    histogram: &Histogram,
+    style: HistogramStyle,
+) -> egui::Response {
     let height = 108.0;
     let width = ui.available_width().max(120.0);
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::click());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(
+
+    match style {
+        HistogramStyle::Waveform => draw_waveform(&painter, rect, histogram),
+        HistogramStyle::Filled => draw_filled_histogram(&painter, rect, histogram),
+    }
+
+    // 网格与边框，两种样式共用。
+    let grid = egui::Stroke::new(1.0, egui::Color32::from_white_alpha(18));
+    for step in 1..4 {
+        let x = rect.left() + rect.width() * step as f32 / 4.0;
+        painter.line_segment(
+            [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+            grid,
+        );
+    }
+    painter.rect_stroke(
         rect,
         egui::CornerRadius::ZERO,
-        egui::Color32::from_rgb(0x14, 0x14, 0x14),
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(40)),
+        egui::StrokeKind::Inside,
     );
+    painter.text(
+        egui::pos2(rect.right() - 4.0, rect.bottom() - 2.0),
+        egui::Align2::RIGHT_BOTTOM,
+        style.hint(),
+        egui::FontId::proportional(9.0),
+        egui::Color32::from_white_alpha(90),
+    );
+    response
+}
 
+/// 填充直方图：灰底 + 三通道半透明色块 + 亮度白线。
+fn draw_filled_histogram(painter: &egui::Painter, rect: egui::Rect, histogram: &Histogram) {
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_gray(0x3a));
     let peak = histogram.peak().max(1) as f32;
-    let step = rect.width() / 256.0;
+    let step = rect.width() / BINS as f32;
     let channels = [
-        (
-            &histogram.red,
-            egui::Color32::from_rgba_unmultiplied(0xF0, 0x60, 0x60, 0xB0),
-        ),
-        (
-            &histogram.green,
-            egui::Color32::from_rgba_unmultiplied(0x60, 0xD0, 0x70, 0xB0),
-        ),
-        (
-            &histogram.blue,
-            egui::Color32::from_rgba_unmultiplied(0x60, 0x90, 0xF0, 0xB0),
-        ),
+        (&histogram.red, egui::Color32::from_rgb(0xf0, 0x5a, 0x5a)),
+        (&histogram.green, egui::Color32::from_rgb(0x5c, 0xd0, 0x6e)),
+        (&histogram.blue, egui::Color32::from_rgb(0x5a, 0x8c, 0xf0)),
     ];
     for (bins, color) in channels {
+        let fill = color.gamma_multiply(0.55);
         for (index, value) in bins.iter().enumerate() {
-            let normalized = *value as f32 / peak;
-            let bar_height = normalized * (rect.height() - 4.0);
+            let normalized = (*value as f32 / peak).sqrt().clamp(0.0, 1.0);
+            let bar_height = normalized * (rect.height() - 2.0);
             if bar_height <= 0.5 {
                 continue;
             }
             let x = rect.left() + index as f32 * step + step * 0.5;
             painter.line_segment(
                 [
-                    egui::pos2(x, rect.bottom() - 2.0),
-                    egui::pos2(x, rect.bottom() - 2.0 - bar_height),
+                    egui::pos2(x, rect.bottom() - 1.0),
+                    egui::pos2(x, rect.bottom() - 1.0 - bar_height),
                 ],
-                egui::Stroke::new(step.max(1.0), color),
+                egui::Stroke::new(step.max(1.0), fill),
+            );
+        }
+    }
+
+    let mut points = Vec::with_capacity(BINS);
+    for (index, value) in histogram.luma.iter().enumerate() {
+        let normalized = (*value as f32 / peak).sqrt().clamp(0.0, 1.0);
+        points.push(egui::pos2(
+            rect.left() + (index as f32 + 0.5) * step,
+            rect.bottom() - 1.0 - normalized * (rect.height() - 2.0),
+        ));
+    }
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(1.0, egui::Color32::from_white_alpha(150)),
+    ));
+}
+
+/// RGB 波形：横轴是画面列，纵轴是亮度，颜色是各通道在该列该亮度上的占比。
+fn draw_waveform(painter: &egui::Painter, rect: egui::Rect, histogram: &Histogram) {
+    painter.rect_filled(rect, egui::CornerRadius::ZERO, egui::Color32::from_gray(0x0e));
+    const COLS: usize = 128;
+    const ROWS: usize = 52;
+    let col_step = WAVE_COLUMNS.div_ceil(COLS);
+    let bin_step = WAVE_BINS.div_ceil(ROWS);
+    let cell_w = rect.width() / COLS as f32;
+    let cell_h = rect.height() / ROWS as f32;
+
+    for col in 0..COLS {
+        // 每列单独归一化：波形看的是"这一列里各亮度的分布"。
+        let mut peak = 1u32;
+        for k in 0..col_step {
+            let c = (col * col_step + k).min(WAVE_COLUMNS - 1);
+            for channel in 0..3 {
+                for value in histogram.wave_column(channel, c) {
+                    peak = peak.max(*value);
+                }
+            }
+        }
+        let inv = 1.0 / peak as f32;
+        for row in 0..ROWS {
+            let mut rgb = [0.0f32; 3];
+            for (channel, slot) in rgb.iter_mut().enumerate() {
+                let mut best = 0u32;
+                for k in 0..col_step {
+                    let c = (col * col_step + k).min(WAVE_COLUMNS - 1);
+                    let bins = histogram.wave_column(channel, c);
+                    for j in 0..bin_step {
+                        let bin = (row * bin_step + j).min(WAVE_BINS - 1);
+                        best = best.max(bins[bin]);
+                    }
+                }
+                *slot = (best as f32 * inv).sqrt().clamp(0.0, 1.0);
+            }
+            let alpha = rgb[0].max(rgb[1]).max(rgb[2]);
+            if alpha < 0.03 {
+                continue;
+            }
+            let color = egui::Color32::from_rgba_unmultiplied(
+                (rgb[0] * 255.0) as u8,
+                (rgb[1] * 255.0) as u8,
+                (rgb[2] * 255.0) as u8,
+                (alpha * 235.0) as u8,
+            );
+            let x = rect.left() + col as f32 * cell_w;
+            let y = rect.bottom() - (row + 1) as f32 * cell_h;
+            painter.rect_filled(
+                egui::Rect::from_min_size(
+                    egui::pos2(x, y),
+                    egui::vec2(cell_w + 0.5, cell_h + 0.5),
+                ),
+                egui::CornerRadius::ZERO,
+                color,
             );
         }
     }

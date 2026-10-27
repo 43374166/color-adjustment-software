@@ -157,6 +157,42 @@ struct HslState: Equatable {
     }
 }
 
+// MARK: - 颜色均衡器
+
+/// 颜色均衡器（对标 darktable color equalizer）。
+///
+/// 8 个色相节点 × 三通道（色相偏移 / 饱和度增益 / 亮度增益）+ 一组选项，
+/// 与 Rust `crates/core/src/params.rs::EqualizerParams` 一一对应。
+struct EqualizerState: Equatable {
+    var enabled = false
+    /// 低饱和抑制拐点，0..0.3。
+    var threshold: Float = 0.1
+    /// 色相曲线过渡宽度，0.05..2。
+    var smoothingHue: Float = 1.0
+    /// 低饱和过渡软硬，-1..1。
+    var contrast: Float = 0
+    /// 白点亮度（2 的幂）。
+    var whiteLevel: Float = 1.0
+    /// 色度导向滤波半径，1..10。
+    var chromaSize: Float = 1.5
+    /// 修正量导向滤波半径，1..128。
+    var paramSize: Float = 1.0
+    /// 是否启用导向滤波（关掉更快）。
+    var useFilter = false
+    /// 8 个节点整体旋转，-23..23 度。
+    var hueShift: Float = 0
+    /// 饱和度增益（1 = 不变）。
+    var saturation: [Float] = Array(repeating: 1, count: 8)
+    /// 色相偏移（度）。
+    var hue: [Float] = Array(repeating: 0, count: 8)
+    /// 亮度增益（1 = 不变）。
+    var brightness: [Float] = Array(repeating: 1, count: 8)
+
+    mutating func reset() {
+        self = EqualizerState()
+    }
+}
+
 // MARK: - 颜色分级
 
 /// 分级区域。
@@ -992,6 +1028,7 @@ struct EditState: Equatable {
     var values: [String: Float] = EditorSpec.defaultValues()
     var curves = CurveState()
     var hsl = HslState()
+    var equalizer = EqualizerState()
     var grading = GradingState()
     /// 黑白模式（与 Rust `color.black_white` 对应）：打开后 8 色带混色生效，
     /// HSL / 点颜色 / 饱和度不再参与。
@@ -1029,6 +1066,7 @@ enum EditJSON {
         ]
         root["curves"] = curvesJson(state.curves)
         root["hsl"] = hslJson(state.hsl)
+        root["equalizer"] = equalizerJson(state.equalizer)
         root["grading"] = gradingJson(state.grading)
         root["calibration"] = calibrationJson(state.calibration)
         root["bw_mix"] = bwMixJson(state.bwMix)
@@ -1130,6 +1168,23 @@ enum EditJSON {
             ]
         }
         return result
+    }
+
+    private static func equalizerJson(_ equalizer: EqualizerState) -> [String: Any] {
+        [
+            "enabled": equalizer.enabled,
+            "threshold": Double(equalizer.threshold),
+            "smoothing_hue": Double(equalizer.smoothingHue),
+            "contrast": Double(equalizer.contrast),
+            "white_level": Double(equalizer.whiteLevel),
+            "chroma_size": Double(equalizer.chromaSize),
+            "param_size": Double(equalizer.paramSize),
+            "use_filter": equalizer.useFilter,
+            "hue_shift": Double(equalizer.hueShift),
+            "saturation": equalizer.saturation.map { Double($0) },
+            "hue": equalizer.hue.map { Double($0) },
+            "brightness": equalizer.brightness.map { Double($0) },
+        ]
     }
 
     private static func gradingJson(_ grading: GradingState) -> [String: Any] {
