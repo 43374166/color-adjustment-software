@@ -164,6 +164,25 @@ interface DetailPayload {
   noise: NoisePayload;
 }
 
+/** 曲线控制点。 */
+interface CurvePointPayload {
+  x: number;
+  y: number;
+}
+
+/** 单条曲线。 */
+interface ToneCurvePayload {
+  points: CurvePointPayload[];
+}
+
+/** 曲线参数。 */
+interface CurvesPayload {
+  rgb: ToneCurvePayload;
+  red: ToneCurvePayload;
+  green: ToneCurvePayload;
+  blue: ToneCurvePayload;
+}
+
 /** 整份渲染参数。 */
 interface ParamsPayload {
   light: LightPayload;
@@ -176,6 +195,18 @@ interface ParamsPayload {
   lens: LensPayload;
   effects: EffectsPayload;
   detail: DetailPayload;
+  curves: CurvesPayload;
+}
+
+/** 曲线控制点（可变）。 */
+class CurvePt {
+  x: number;
+  y: number;
+
+  constructor(x: number, y: number) {
+    this.x = x;
+    this.y = y;
+  }
 }
 
 /** 路由参数。 */
@@ -310,6 +341,7 @@ struct EditorPage {
   /** 所有标量滑块的值（下标见 I_* 常量）。 */
   @State nums: number[] = [];
   @State lensProfile: boolean = false;
+  @State curveChannel: number = 0;
 
   // HSL（8 段）
   @State hslBand: number = 0;
@@ -340,6 +372,14 @@ struct EditorPage {
   private context: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.settings);
   private histSettings: RenderingContextSettings = new RenderingContextSettings(true);
   private histContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.histSettings);
+  private curveSettings: RenderingContextSettings = new RenderingContextSettings(true);
+  private curveContext: CanvasRenderingContext2D = new CanvasRenderingContext2D(this.curveSettings);
+
+  /** 4 条曲线：0 RGB / 1 红 / 2 绿 / 3 蓝。 */
+  private curvePoints: CurvePt[][] = [];
+  private activeCurvePoint: number = -1;
+  private lastTapPoint: number = -1;
+  private lastTapPointTime: number = 0;
 
   private full: PixelBuffer | null = null;
   private fast: PixelBuffer | null = null;
@@ -365,6 +405,12 @@ struct EditorPage {
     this.histG = this.zeros(256);
     this.histB = this.zeros(256);
     this.histCols = this.zeros(HIST_COLUMNS * HIST_BINS * 3);
+    this.curvePoints = [
+      [new CurvePt(0, 0), new CurvePt(1, 1)],
+      [new CurvePt(0, 0), new CurvePt(1, 1)],
+      [new CurvePt(0, 0), new CurvePt(1, 1)],
+      [new CurvePt(0, 0), new CurvePt(1, 1)]
+    ];
     this.loadPhoto();
   }
 
@@ -496,6 +542,26 @@ struct EditorPage {
     return zone;
   }
 
+  private pointsJson(channel: number): CurvePointPayload[] {
+    const result: CurvePointPayload[] = [];
+    const points = this.curvePoints[channel];
+    for (let i = 0; i < points.length; i++) {
+      const point: CurvePointPayload = { x: points[i].x, y: points[i].y };
+      result.push(point);
+    }
+    return result;
+  }
+
+  private curvesPayload(): CurvesPayload {
+    const payload: CurvesPayload = {
+      rgb: { points: this.pointsJson(0) },
+      red: { points: this.pointsJson(1) },
+      green: { points: this.pointsJson(2) },
+      blue: { points: this.pointsJson(3) }
+    };
+    return payload;
+  }
+
   private paramsJson(): string {
     const payload: ParamsPayload = {
       light: { exposure: 0, contrast: 0, highlights: 0, shadows: 0, whites: 0, blacks: 0 },
@@ -583,6 +649,7 @@ struct EditorPage {
           color_smoothness: this.num(I_NOISE_COLOR_SMOOTH)
         }
       },
+      curves: this.curvesPayload(),
       equalizer: {
         enabled: true,
         threshold: this.num(I_EQ_THRESHOLD),
@@ -988,7 +1055,7 @@ struct EditorPage {
       if (this.categoryIndex === 0) {
         this.colorPanel()
       } else if (this.categoryIndex === 1) {
-        this.curvePlaceholder()
+        this.curvePanel()
       } else if (this.categoryIndex === 2) {
         this.opticsPanel()
       } else if (this.categoryIndex === 3) {
@@ -1002,6 +1069,56 @@ struct EditorPage {
     .width('100%')
     .height(400)
     .backgroundColor('#1A1A1A')
+  }
+
+  @Builder
+  curvePanel() {
+    Column() {
+      Row() {
+        ForEach(['RGB', '红', '绿', '蓝'], (label: string, index: number) => {
+          Text(label)
+            .fontSize(12)
+            .fontColor(this.curveChannel === index ? '#FFFFFF' : '#888888')
+            .backgroundColor(this.curveChannel === index ? '#3A3A3A' : '#242424')
+            .borderRadius(6)
+            .padding({ left: 10, right: 10, top: 4, bottom: 4 })
+            .margin({ right: 6 })
+            .onClick(() => {
+              this.curveChannel = index;
+              this.drawCurveEditor();
+            })
+        })
+        Text('重置')
+          .fontSize(12)
+          .fontColor('#4A9EFF')
+          .layoutWeight(1)
+          .textAlign(TextAlign.End)
+          .padding({ right: 4 })
+          .onClick(() => {
+            this.resetCurve();
+          })
+      }
+      .width('100%')
+      .padding({ left: 12, right: 12, top: 2, bottom: 6 })
+
+      Canvas(this.curveContext)
+        .width('100%')
+        .layoutWeight(1)
+        .margin({ left: 10, right: 10, bottom: 8 })
+        .onReady(() => {
+          this.drawCurveEditor();
+        })
+        .onTouch((event: TouchEvent) => {
+          if (event.touches.length === 0) {
+            return;
+          }
+          const touch = event.touches[0];
+          this.handleCurveTouch(touch.x, touch.y, this.curveContext.width,
+            this.curveContext.height, event.type);
+        })
+    }
+    .width('100%')
+    .layoutWeight(1)
   }
 
   @Builder
@@ -1359,6 +1476,218 @@ struct EditorPage {
     }
     .width('100%')
     .layoutWeight(1)
+  }
+
+  // MARK: - 曲线
+
+  /** 与 Rust `eval_curve` 同一套单调三次 Hermite。 */
+  private curveTangent(points: CurvePt[], index: number): number {
+    const count = points.length;
+    if (count < 2) {
+      return 0;
+    }
+    const secant = (i: number): number => {
+      const span = Math.max(points[i + 1].x - points[i].x, 1e-6);
+      return (points[i + 1].y - points[i].y) / span;
+    };
+    if (index === 0) {
+      return secant(0);
+    }
+    if (index + 1 >= count) {
+      return secant(count - 2);
+    }
+    const previous = secant(index - 1);
+    const next = secant(index);
+    if (previous * next <= 0) {
+      return 0;
+    }
+    const slope = (previous + next) * 0.5;
+    const limit = 3 * Math.min(Math.abs(previous), Math.abs(next));
+    return Math.min(Math.max(slope, -limit), limit);
+  }
+
+  private evalCurve(points: CurvePt[], x: number): number {
+    const count = points.length;
+    if (count === 0) {
+      return x;
+    }
+    if (count === 1) {
+      return points[0].y;
+    }
+    if (x <= points[0].x) {
+      return points[0].y;
+    }
+    const last = points[count - 1];
+    if (x >= last.x) {
+      return last.y;
+    }
+    let index = 0;
+    while (index + 2 < count && x > points[index + 1].x) {
+      index++;
+    }
+    const left = points[index];
+    const right = points[index + 1];
+    const span = Math.max(right.x - left.x, 1e-6);
+    const t = Math.min(Math.max((x - left.x) / span, 0), 1);
+    const m0 = this.curveTangent(points, index);
+    const m1 = this.curveTangent(points, index + 1);
+    const t2 = t * t;
+    const t3 = t2 * t;
+    const h00 = 2 * t3 - 3 * t2 + 1;
+    const h10 = t3 - 2 * t2 + t;
+    const h01 = -2 * t3 + 3 * t2;
+    const h11 = t3 - t2;
+    return h00 * left.y + h10 * span * m0 + h01 * right.y + h11 * span * m1;
+  }
+
+  private drawCurveEditor(): void {
+    const ctx = this.curveContext;
+    const width = ctx.width;
+    const height = ctx.height;
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+    ctx.fillStyle = '#141414';
+    ctx.fillRect(0, 0, width, height);
+
+    // 网格 + 对角线
+    ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 4; i++) {
+      const x = (width * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(x, 0);
+      ctx.lineTo(x, height);
+      ctx.stroke();
+      const y = (height * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(0, y);
+      ctx.lineTo(width, y);
+      ctx.stroke();
+    }
+    ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+    ctx.beginPath();
+    ctx.moveTo(0, height);
+    ctx.lineTo(width, 0);
+    ctx.stroke();
+
+    // 曲线
+    const points = this.curvePoints[this.curveChannel];
+    const color = this.curveChannel === 1 ? '#F06060' : (this.curveChannel === 2 ? '#60D070' : (this.curveChannel === 3 ? '#6090F0' : '#E8E8E8'));
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.8;
+    for (let i = 0; i <= 128; i++) {
+      const x = i / 128;
+      const value = Math.min(Math.max(this.evalCurve(points, x), 0), 1);
+      const px = x * width;
+      const py = (1 - value) * height;
+      if (i === 0) {
+        ctx.moveTo(px, py);
+      } else {
+        ctx.lineTo(px, py);
+      }
+    }
+    ctx.stroke();
+
+    // 控制点
+    for (let i = 0; i < points.length; i++) {
+      const px = points[i].x * width;
+      const py = (1 - points[i].y) * height;
+      ctx.beginPath();
+      ctx.arc(px, py, 5, 0, Math.PI * 2);
+      ctx.fillStyle = i === this.activeCurvePoint ? '#FFFFFF' : '#141414';
+      ctx.fill();
+      ctx.lineWidth = 2;
+      ctx.strokeStyle = color;
+      ctx.stroke();
+    }
+  }
+
+  private handleCurveTouch(x: number, y: number, width: number, height: number, phase: number): void {
+    if (width <= 0 || height <= 0) {
+      return;
+    }
+    const px = Math.min(Math.max(x / width, 0), 1);
+    const py = Math.min(Math.max(1 - y / height, 0), 1);
+    const points = this.curvePoints[this.curveChannel];
+
+    if (phase === TouchType.Down) {
+      let best = -1;
+      let bestDistance = 999;
+      for (let i = 0; i < points.length; i++) {
+        const dx = (points[i].x - px) * width;
+        const dy = (points[i].y - py) * height;
+        const distance = Math.sqrt(dx * dx + dy * dy);
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = i;
+        }
+      }
+      if (bestDistance <= 26) {
+        const now = Date.now();
+        const isEdge = best === 0 || best === points.length - 1;
+        if (this.lastTapPoint === best && now - this.lastTapPointTime < 400 && !isEdge) {
+          points.splice(best, 1);
+          this.lastTapPoint = -1;
+          this.activeCurvePoint = -1;
+          this.drawCurveEditor();
+          this.scheduleRender(false);
+          return;
+        }
+        this.activeCurvePoint = best;
+        this.lastTapPoint = best;
+        this.lastTapPointTime = now;
+        this.drawCurveEditor();
+        return;
+      }
+      // 空白处点击：加一个控制点
+      let index = points.length;
+      for (let i = 0; i < points.length; i++) {
+        if (points[i].x > px) {
+          index = i;
+          break;
+        }
+      }
+      points.splice(index, 0, new CurvePt(px, py));
+      this.activeCurvePoint = index;
+      this.drawCurveEditor();
+      this.scheduleRender(true);
+      return;
+    }
+
+    if (phase === TouchType.Move && this.activeCurvePoint >= 0 && this.activeCurvePoint < points.length) {
+      const point = points[this.activeCurvePoint];
+      if (this.activeCurvePoint === 0) {
+        point.x = 0;
+        point.y = py;
+      } else if (this.activeCurvePoint === points.length - 1) {
+        point.x = 1;
+        point.y = py;
+      } else {
+        const left = points[this.activeCurvePoint - 1].x + 0.01;
+        const right = points[this.activeCurvePoint + 1].x - 0.01;
+        point.x = Math.min(Math.max(px, left), Math.max(left, right));
+        point.y = py;
+      }
+      this.drawCurveEditor();
+      this.scheduleRender(true);
+      return;
+    }
+
+    if (phase === TouchType.Up || phase === TouchType.Cancel) {
+      if (this.activeCurvePoint >= 0) {
+        this.scheduleRender(false);
+      }
+      this.activeCurvePoint = -1;
+      this.drawCurveEditor();
+    }
+  }
+
+  private resetCurve(): void {
+    this.curvePoints[this.curveChannel] = [new CurvePt(0, 0), new CurvePt(1, 1)];
+    this.drawCurveEditor();
+    this.scheduleRender(false);
   }
 
   // MARK: - 滑块
