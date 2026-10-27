@@ -1336,7 +1336,8 @@ struct EditorPage {
   // MARK: - UI
 
   build() {
-    Column() {
+    Stack({ alignContent: Alignment.TopEnd }) {
+      Column() {
       if (this.chromeVisible) {
         this.topBar()
       }
@@ -1408,17 +1409,6 @@ struct EditorPage {
       .backgroundColor('#000000')
 
       if (this.chromeVisible) {
-        Canvas(this.histContext)
-          .width('100%')
-          .height(84)
-          .onReady(() => {
-            this.drawHistogram();
-          })
-          .onClick(() => {
-            this.histogramWaveform = !this.histogramWaveform;
-            this.drawHistogram();
-          })
-
         if (this.activeTool === 0) {
           this.presetPanel()
         } else if (this.activeTool === 1) {
@@ -1435,6 +1425,26 @@ struct EditorPage {
     .width('100%')
     .height('100%')
     .backgroundColor('#111111')
+
+      // 直方图浮在图片右上角（半透明卡片，点一下切换填充 / 波形）。
+      if (this.chromeVisible) {
+        Canvas(this.histContext)
+          .width(190)
+          .height(100)
+          .margin({ top: 56, right: 12 })
+          .borderRadius(8)
+          .clip(true)
+          .onReady(() => {
+            this.drawHistogram();
+          })
+          .onClick(() => {
+            this.histogramWaveform = !this.histogramWaveform;
+            this.drawHistogram();
+          })
+      }
+    }
+    .width('100%')
+    .height('100%')
   }
 
   /** 底部工具条：预设 / 裁切 / 编辑 / 蒙版。 */

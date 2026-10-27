@@ -298,7 +298,8 @@ struct Index {
     if (this.selectionMode) {
       this.toggleSelected(item.uri);
     } else {
-      this.previewIndex = index;
+      // 直接进调色界面（不再经过「编辑 / 分享」预览层）。
+      this.openEditor(item.uri, item.name);
     }
   }
 
@@ -464,7 +465,6 @@ struct Index {
         } else {
           this.photoList()
         }
-        this.bottomActions()
       }
     }
     .width('100%')
