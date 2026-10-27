@@ -1355,69 +1355,69 @@ struct EditorPage {
   // MARK: - UI
 
   build() {
-    Stack({ alignContent: Alignment.TopStart }) {
-      // 照片铺满整屏（面板浮在上面，不再挤压照片）。
-      if (this.preview !== null) {
-        Image(this.preview)
-          .objectFit(ImageFit.Contain)
-          .width('100%')
-          .height('100%')
-          .onClick((event: ClickEvent) => {
-            this.handlePreviewTap(event.x, event.y);
-          })
-      } else {
-        Image(this.photoUri)
-          .objectFit(ImageFit.Contain)
-          .width('100%')
-          .height('100%')
-      }
-
-      if (this.cropMode) {
-        Canvas(this.cropContext)
-          .width('100%')
-          .height('100%')
-          .onReady(() => {
-            this.drawCropOverlay();
-          })
-          .onTouch((event: TouchEvent) => {
-            if (event.touches.length === 0) {
-              return;
-            }
-            const touch = event.touches[0];
-            this.handleCropTouch(touch.x, touch.y, event.type);
-          })
-      }
-      if (this.maskMode) {
-        Canvas(this.maskContext)
-          .width('100%')
-          .height('100%')
-          .onReady(() => {
-            this.drawMaskOverlay();
-          })
-          .onTouch((event: TouchEvent) => {
-            if (event.touches.length === 0) {
-              return;
-            }
-            const touch = event.touches[0];
-            this.handleMaskTouch(touch.x, touch.y, event.type);
-          })
-      }
-      if (this.showPresets) {
-        this.presetOverlay()
-      }
-
-      // 顶部：返回栏（调色时隐藏，只留正在调的 UI）。
-      if (this.chromeVisible && this.activeTool < 0) {
+    Column() {
+      if (this.chromeVisible) {
         this.topBar()
       }
 
-      // 直方图：图片右上角浮卡（无面板时显示）。
-      if (this.chromeVisible && this.activeTool < 0) {
-        Row() {
-          Blank()
+      // 照片区：按 Contain 保持原始比例，完整显示（不放大、不裁切）；
+      // 直方图浮在右上角，面板在照片下方，不遮盖照片。
+      Stack({ alignContent: Alignment.TopEnd }) {
+        if (this.preview !== null) {
+          Image(this.preview)
+            .objectFit(ImageFit.Contain)
+            .width('100%')
+            .height('100%')
+            .onClick((event: ClickEvent) => {
+              this.handlePreviewTap(event.x, event.y);
+            })
+        } else {
+          Image(this.photoUri)
+            .objectFit(ImageFit.Contain)
+            .width('100%')
+            .height('100%')
+        }
+
+        if (this.cropMode) {
+          Canvas(this.cropContext)
+            .width('100%')
+            .height('100%')
+            .onReady(() => {
+              this.drawCropOverlay();
+            })
+            .onTouch((event: TouchEvent) => {
+              if (event.touches.length === 0) {
+                return;
+              }
+              const touch = event.touches[0];
+              this.handleCropTouch(touch.x, touch.y, event.type);
+            })
+        }
+        if (this.maskMode) {
+          Canvas(this.maskContext)
+            .width('100%')
+            .height('100%')
+            .onReady(() => {
+              this.drawMaskOverlay();
+            })
+            .onTouch((event: TouchEvent) => {
+              if (event.touches.length === 0) {
+                return;
+              }
+              const touch = event.touches[0];
+              this.handleMaskTouch(touch.x, touch.y, event.type);
+            })
+        }
+        if (this.showPresets) {
+          this.presetOverlay()
+        }
+
+        // 直方图：图片右上角浮卡，调色时也保留。
+        if (this.chromeVisible) {
           Canvas(this.histContext)
             .width(190)
             .height(100)
+            .margin({ top: 8, right: 8 })
             .borderRadius(8)
             .clip(true)
             .onReady(() => {
@@ -1428,43 +1428,34 @@ struct EditorPage {
               this.drawHistogram();
             })
         }
-        .width('100%')
-        .height(100)
-        .margin({ top: 52 })
-        .padding({ right: 12 })
-        .hitTestBehavior(HitTestMode.Transparent)
-      }
-
-      // 底部：面板（半透明浮层） + 工具条。
-      Column() {
-        Blank()
-        if (this.chromeVisible) {
-          if (this.activeTool === 0) {
-            this.presetPanel()
-          } else if (this.activeTool === 1) {
-            this.cropBar()
-          } else if (this.activeTool === 2) {
-            this.bottomPanel()
-          } else if (this.activeTool === 3) {
-            this.maskBar()
-          }
-          this.editorToolBar()
-        }
       }
       .width('100%')
-      .height('100%')
-      .hitTestBehavior(HitTestMode.Transparent)
+      .layoutWeight(1)
+      .backgroundColor('#000000')
+      .onAreaChange((oldArea: Area, newArea: Area) => {
+        this.areaW = Number(newArea.width);
+        this.areaH = Number(newArea.height);
+        if (this.cropMode) {
+          this.drawCropOverlay();
+        }
+      })
+
+      if (this.chromeVisible) {
+        if (this.activeTool === 0) {
+          this.presetPanel()
+        } else if (this.activeTool === 1) {
+          this.cropBar()
+        } else if (this.activeTool === 2) {
+          this.bottomPanel()
+        } else if (this.activeTool === 3) {
+          this.maskBar()
+        }
+        this.editorToolBar()
+      }
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#000000')
-    .onAreaChange((oldArea: Area, newArea: Area) => {
-      this.areaW = Number(newArea.width);
-      this.areaH = Number(newArea.height);
-      if (this.cropMode) {
-        this.drawCropOverlay();
-      }
-    })
+    .backgroundColor('#111111')
   }
 
   /** 点照片：取色模式下取色，否则切换沉浸模式。 */
