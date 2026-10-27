@@ -494,6 +494,8 @@ struct EditorPage {
   @State panX: number = 0;
   @State panY: number = 0;
   private pinchBase: number = 1;
+  /** 上一次多指/拖动交互的结束时间戳，用于抑制随后的误点击。 */
+  private suppressTapUntil: number = 0;
   private panBaseX: number = 0;
   private panBaseY: number = 0;
   @State cropMode: boolean = false;
@@ -1413,6 +1415,7 @@ struct EditorPage {
   }
 
   private handleGraphTouch(x: number, y: number, height: number, phase: number): void {
+    this.suppressTapUntil = Date.now() + 500;
     if (phase === TouchType.Down) {
       this.focusRow = 'eq';
     } else if (phase === TouchType.Up || phase === TouchType.Cancel) {
@@ -1519,10 +1522,16 @@ struct EditorPage {
         .gesture(GestureGroup(GestureMode.Exclusive,
           TapGesture({ count: 2 })
             .onAction(() => {
+              if (Date.now() < this.suppressTapUntil) {
+                return;
+              }
               this.togglePhotoZoom();
             }),
           TapGesture({ count: 1 })
             .onAction((event: GestureEvent) => {
+              if (Date.now() < this.suppressTapUntil) {
+                return;
+              }
               let x = 0;
               let y = 0;
               if (event.fingerList.length > 0) {
@@ -1535,8 +1544,10 @@ struct EditorPage {
         .parallelGesture(PinchGesture({ fingers: 2 })
           .onActionStart(() => {
             this.pinchBase = this.photoZoom;
+            this.suppressTapUntil = Date.now() + 700;
           })
           .onActionUpdate((event: GestureEvent) => {
+            this.suppressTapUntil = Date.now() + 700;
             this.photoZoom = Math.min(Math.max(this.pinchBase * event.scale, 1), 8);
           })
           .onActionEnd(() => {
@@ -1546,13 +1557,16 @@ struct EditorPage {
               this.panY = 0;
             }
             this.pinchBase = this.photoZoom;
+            this.suppressTapUntil = Date.now() + 700;
           }))
         .parallelGesture(PanGesture({ fingers: 1, distance: 8 })
           .onActionStart(() => {
             this.panBaseX = this.panX;
             this.panBaseY = this.panY;
+            this.suppressTapUntil = Date.now() + 500;
           })
           .onActionUpdate((event: GestureEvent) => {
+            this.suppressTapUntil = Date.now() + 500;
             if (this.photoZoom <= 1.01) {
               return;
             }
@@ -2884,6 +2898,7 @@ struct EditorPage {
     if (width <= 0 || height <= 0) {
       return;
     }
+    this.suppressTapUntil = Date.now() + 500;
     if (phase === TouchType.Down) {
       this.focusRow = 'curve';
     } else if (phase === TouchType.Up || phase === TouchType.Cancel) {
@@ -4022,6 +4037,7 @@ struct EditorPage {
 
   /** 拖动开始/结束：进入或退出「专注调色」。 */
   private touchAdjust(id: string, mode: SliderChangeMode): void {
+    this.suppressTapUntil = Date.now() + 400;
     if (mode === SliderChangeMode.Begin || mode === SliderChangeMode.Moving) {
       if (this.focusRow !== id) {
         this.focusRow = id;
