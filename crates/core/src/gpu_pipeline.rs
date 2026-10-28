@@ -322,12 +322,8 @@ pub fn pack_params(params: &EditParams, width: u32, height: u32) -> Vec<f32> {
         }
     }
     data[slot::TONE_ACTIVE] = if tone.is_identity() { 0.0 } else { 1.0 };
-    data[slot::EXPOSURE_CURVE_ACTIVE] =
-        if params.light.exposure != 0.0 {
-            1.0
-        } else {
-            0.0
-        };
+    // 曝光是场景线性纯增益（`apply_reference` 里乘 2^EV），GPU 侧不再叠显示域曝光曲线。
+    data[slot::EXPOSURE_CURVE_ACTIVE] = 0.0;
 
     pack_equalizer(&mut data, params);
     pack_hsl_curves(&mut data, params);

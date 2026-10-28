@@ -1614,11 +1614,11 @@ mod tests {
             render_memory_rgba(&rgba, 2, 2, r#"{"version":1,"light":{"exposure":1.0}}"#).unwrap();
         assert_eq!((out.width, out.height), (2, 2));
         assert_eq!(out.rgba.len(), 16);
-        // LR 的 +1EV 带高光肩部：64（sRGB）≈ 0.051 线性，参考输出约 102（sRGB），
-        // 不是纯线性 ×2 的 90。
+        // 曝光是场景线性纯增益（darktable 模型）：sRGB 64 ≈ 0.051 线性，
+        // +1EV → 0.102 → sRGB ≈ 90（不再叠显示域曲线的高光肩部）。
         assert!(
-            (96..=108).contains(&out.rgba[0]),
-            "曝光 +1EV 后应接近 LR 参考 ~102：{}",
+            (86..=94).contains(&out.rgba[0]),
+            "曝光 +1EV 应接近纯增益 ~90：{}",
             out.rgba[0]
         );
     }

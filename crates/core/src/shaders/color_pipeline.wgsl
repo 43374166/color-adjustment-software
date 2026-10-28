@@ -405,9 +405,11 @@ fn pipeline_base(input_color: vec3<f32>) -> vec3<f32> {
     if (p(6) != 0.0 || p(7) != 0.0) {
         let y = luminance(c);
         c = vec3<f32>(y) + (c - vec3<f32>(y)) * 0.80;
-        let warm = max(p(6), 0.0) * 90.0 / 1000.0;
-        let green = max(-p(7), 0.0) / 50.0;
-        c = c * clamp(1.0 + 0.13 * warm + 0.15 * green, 1.0, 2.0);
+        // 亮度补偿与 CPU `adaptation_gain` 同公式：拟合只到 ±1000K，
+        // 两项各自封顶，避免开到极端色温时把整张图（尤其高光）提亮一倍。
+        let warm = clamp(p(6) * 90.0 / 1000.0, 0.0, 1.0);
+        let green = clamp(-p(7) / 50.0, 0.0, 1.0);
+        c = c * clamp(1.0 + 0.13 * warm + 0.15 * green, 1.0, 1.28);
     }
 
     // 1b) 相机校准（场景线性，白平衡之后、曝光之前）：基色矩阵 + 阴影色调。
@@ -586,19 +588,21 @@ fn pipeline_tone(input_color: vec3<f32>) -> vec3<f32> {
         return c;
     }
 
-    // 曝光 LUT 在曝光前的亮度上查表；base 已经乘过 2^EV，先除回来。
+    // 曝光走场景线性纯增益（在 pipeline_base 里乘 2^EV），
+    // 曝光曲线标志恒为 0（保留分支只为兼容 uniform 布局）。
     let use_exposure = p(195) > 0.5;
     let base = select(c, c / exp2(p(0)), use_exposure);
-    let encoded = linear_to_srgb(base);
-    let y = display_luma(encoded);
+    // 曲线作用在**线性亮度**上（不用逐通道编码后的亮度）：后者对高饱和色偏低，
+    // 同一个滑杆会给高饱和色更大的增益，观感就是"一提曝光/阴影，颜色更艳了"。
+    let luma = max(dot(base, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0);
+    let y = linear_to_srgb(vec3<f32>(luma)).x;
     let mapped = map_basic_tone(y, use_exposure);
 
     var out: vec3<f32>;
-    if (y <= 1e-6) {
+    if (luma <= 1e-6) {
         out = vec3<f32>(srgb_to_linear(vec3<f32>(mapped)).x);
     } else {
-        let ratio = srgb_to_linear(vec3<f32>(mapped)).x /
-            max(srgb_to_linear(vec3<f32>(y)).x, 1e-6);
+        let ratio = srgb_to_linear(vec3<f32>(mapped)).x / luma;
         out = base * ratio;
     }
     return gamut_map(max(out, vec3<f32>(0.0)));

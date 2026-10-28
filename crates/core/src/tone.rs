@@ -233,9 +233,12 @@ pub fn blur_scale(long_edge: f32) -> f32 {
 #[derive(Clone, Debug)]
 pub struct ToneStage {
     contrast: f32,
-    exposure: f32,
+    /// 曝光曲线槽位（保留给 GPU uniform 布局，始终是单位映射）。
+    ///
+    /// 曝光按 darktable 的模型走**场景线性纯增益**（`pipeline::apply_reference`
+    /// 里乘 2^EV），不再叠一层显示域曲线：曲线放大会让暗部获得远大于亮部的
+    /// 增益，观感就是"一提曝光，颜色更艳/更糊"。
     exposure_lut: [f32; TONE_LUT_SIZE],
-    use_exposure_lut: bool,
     highlights_lut: [f32; TONE_LUT_SIZE],
     shadows_lut: [f32; TONE_LUT_SIZE],
     whites_lut: [f32; TONE_LUT_SIZE],
@@ -249,24 +252,19 @@ impl ToneStage {
     pub fn from_params(params: &EditParams) -> Self {
         let light = &params.light;
         let contrast = (light.contrast / 100.0).clamp(-1.0, 1.0);
-        let exposure = light.exposure;
-        let use_exposure_lut = exposure != 0.0;
-        let exposure_lut = exposure_tone_lut(exposure);
+        let exposure_lut = std::array::from_fn(|index| index as f32 / (TONE_LUT_SIZE - 1) as f32);
         let highlights_lut = reference_tone_lut(&HIGHLIGHT_CURVES, light.highlights);
         let shadows_lut = reference_tone_lut(&SHADOW_CURVES, light.shadows);
         let whites_lut = reference_tone_lut(&WHITE_CURVES, light.whites);
         let blacks_lut = reference_tone_lut(&BLACK_CURVES, light.blacks);
         Self {
             contrast,
-            exposure,
             exposure_lut,
-            use_exposure_lut,
             highlights_lut,
             shadows_lut,
             whites_lut,
             blacks_lut,
-            active: use_exposure_lut
-                || contrast != 0.0
+            active: contrast != 0.0
                 || light.highlights != 0.0
                 || light.shadows != 0.0
                 || light.whites != 0.0
@@ -301,30 +299,21 @@ impl ToneStage {
             return rgb;
         }
 
-        // 曝光 LUT 需要在“曝光前”的亮度上查表；apply_reference 已经乘过 2^EV，
-        // 因此在色调段内先除回来。|EV| > 1 时暂时走原来的线性曝光路径。
-        let gain = if self.use_exposure_lut {
-            self.exposure.exp2()
-        } else {
-            1.0
-        };
-        let base_rgb = if gain != 1.0 {
-            rgb.map(|value| value / gain)
-        } else {
-            rgb
-        };
-        let encoded = base_rgb.map(|value| linear_to_srgb(value.max(0.0)).clamp(0.0, 1.0));
-        let y = display_luma(encoded);
-
-        // 按 LR 顺序：曝光 → 对比度 → 高光 → 阴影 → 白色 → 黑色。
+        // 曝光已在 `apply_reference` 里按场景线性乘过 2^EV（darktable 模型），
+        // 色调段不再重复处理曝光。
+        // 关键：色调曲线作用在**线性亮度**上（先编码成显示域亮度再查表），
+        // 不用逐通道编码后的亮度——后者对高饱和色偏低，会让同一个滑杆
+        // 给高饱和色更大的增益（观感就是"一提曝光/阴影，颜色更艳了"）。
+        // 用亮度比缩放 RGB：色相与色度比例保持不变。
+        let luma = display_luma(rgb).max(0.0);
+        let y = linear_to_srgb(luma);
         let mapped = self.map_luminance(y);
 
-        // 按亮度比缩放 RGB（保持色相 / 通道比例）；纯黑单独处理。
-        let mut out = if y <= 1e-6 {
+        let mut out = if luma <= 1e-6 {
             [srgb_to_linear(mapped); 3]
         } else {
-            let ratio = srgb_to_linear(mapped) / srgb_to_linear(y).max(1e-6);
-            base_rgb.map(|value| value * ratio)
+            let ratio = srgb_to_linear(mapped) / luma.max(1e-6);
+            rgb.map(|value| value * ratio)
         };
         out = out.map(|value| value.max(0.0));
         map_to_gamut(out, self.luma).0
@@ -333,10 +322,6 @@ impl ToneStage {
     /// 显示亮度 `y` 的逐段映射。
     fn map_luminance(&self, y: f32) -> f32 {
         let mut v = y.clamp(0.0, 1.0);
-
-        if self.use_exposure_lut {
-            v = sample_tone_lut(&self.exposure_lut, v);
-        }
 
         // 对比度：端点固定的三次 S 曲线。曲线在 v = CONTRAST_PIVOT 处不动，
         // 0 / 1 也不动；该式由 LR 参考的灰阶映射拟合。
@@ -475,48 +460,38 @@ mod tests {
     }
 
     #[test]
-    fn exposure_above_one_ev_keeps_highlight_rolloff() {
-        // +2EV 以前会走线性路径直接削顶（死白），现在用复合曲线保留层次。
+    fn exposure_is_pure_linear_gain() {
+        // 曝光走场景线性纯增益（darktable 模型），不进色调段、不叠显示域曲线。
         let mut params = EditParams::default();
-        params.light.exposure = 2.0;
+        params.light.exposure = 3.0;
         let stage = ToneStage::from_params(&params);
-        assert!(stage.use_exposure_lut, "+2EV 应使用曝光曲线");
-
-        let mut prev = -1.0;
-        for index in 0..=100 {
-            let y = index as f32 / 100.0;
-            let value = stage.map_luminance(y);
-            assert!((0.0..=1.0).contains(&value), "{y} -> {value}");
-            assert!(value >= prev - 1e-5, "{y}: {value} < {prev}");
-            prev = value;
-        }
-        // 中高调仍有层次，而不是全白。
-        let mid = stage.map_luminance(0.3);
-        let high = stage.map_luminance(0.7);
-        assert!(mid < 0.98, "+2EV 中调不该直接到白: {mid}");
-        assert!(high > mid, "高调应更亮: {high} <= {mid}");
-
-        // +1EV 也比线性更收敛，且两者单调递增。
-        params.light.exposure = 1.0;
-        let one = ToneStage::from_params(&params);
-        assert!(one.map_luminance(0.3) < mid);
+        assert!(stage.is_identity(), "曝光不该进入色调段");
+        let out = crate::pipeline::apply_reference([0.1, 0.05, 0.02], &params);
+        assert!((out[0] - 0.8).abs() < 1e-5, "{out:?}");
+        assert!((out[1] - 0.4).abs() < 1e-5, "{out:?}");
+        assert!((out[2] - 0.16).abs() < 1e-5, "{out:?}");
     }
 
     #[test]
-    fn exposure_curve_matches_linear_for_fractional_steps() {
-        // 0EV 恒等；>1EV 的曲线在端点仍到白。
-        let identity = ToneStage::from_params(&EditParams::default());
-        assert!(!identity.use_exposure_lut);
-        for value in [0.0f32, 0.25, 0.5, 0.75, 1.0] {
-            assert!((identity.map_luminance(value) - value).abs() < 1e-4);
-        }
-
+    fn brightening_sliders_keep_chromaticity() {
+        // 阴影 / 高光这类提亮滑杆只改亮度：通道比例（色相 / 饱和度）不能被放大。
         let mut params = EditParams::default();
-        params.light.exposure = 3.5;
+        params.light.shadows = 100.0;
         let stage = ToneStage::from_params(&params);
-        assert!(stage.use_exposure_lut);
-        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-4);
-        assert!(stage.map_luminance(0.0) < 0.02);
+        let input = [0.04f32, 0.012, 0.006];
+        let out = stage.apply(input, 0.0);
+        let before = input[1] / input[0];
+        let after = out[1] / out[0];
+        assert!((before - after).abs() < 1e-3, "{input:?} -> {out:?}");
+
+        params.light.shadows = 0.0;
+        params.light.highlights = 100.0;
+        let stage = ToneStage::from_params(&params);
+        let input = [0.30f32, 0.10, 0.05];
+        let out = stage.apply(input, 0.0);
+        let before = input[1] / input[0];
+        let after = out[1] / out[0];
+        assert!((before - after).abs() < 1e-3, "{input:?} -> {out:?}");
     }
 
     #[test]

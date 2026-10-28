@@ -258,11 +258,14 @@ pub fn apply_matrix(matrix: &[[f32; 3]; 3], rgb: [f32; 3]) -> [f32; 3] {
 /// - +1000K ≈ +13% 线性亮度；
 /// - Tint -50 ≈ +15%；
 /// - 冷端 / 正 tint 不加。
+///
+/// 拟合只覆盖 ±1000K / ±50 的小范围：这里对两项各自封顶，避免按开尔文
+/// 线性外推（+100 滑杆 = +9000K 会算出 2.17×，整张图——尤其高光——直接过曝）。
 #[must_use]
 pub fn adaptation_gain(temperature: f32, tint: f32) -> f32 {
-    let warm = temperature.max(0.0) * KELVIN_PER_UNIT_WARM / 1000.0;
-    let green = (-tint).max(0.0) / 50.0;
-    (1.0 + 0.13 * warm + 0.15 * green).clamp(1.0, 2.0)
+    let warm = (temperature.max(0.0) * KELVIN_PER_UNIT_WARM / 1000.0).min(1.0);
+    let green = ((-tint).max(0.0) / 50.0).min(1.0);
+    (1.0 + 0.13 * warm + 0.15 * green).clamp(1.0, 1.28)
 }
 
 /// LR 的白平衡色度收束系数：纯 Bradford 的色彩偏移比 LR 大。
@@ -376,6 +379,15 @@ mod tests {
                 "{kelvin}K → 滑杆 → {back}K 往返偏差过大"
             );
         }
+    }
+
+    #[test]
+    fn extreme_warmth_gain_is_capped() {
+        // 拟合只覆盖 ±1000K；+100 滑杆 = +9000K，不能线性外推成 2.17×（高光会爆）。
+        assert!(adaptation_gain(100.0, 0.0) <= 1.14, "{}", adaptation_gain(100.0, 0.0));
+        // 小范围仍按拟合走：+1000K ≈ +13%。
+        assert!((adaptation_gain(11.0, 0.0) - 1.13).abs() < 0.02);
+        assert!((adaptation_gain(0.0, 0.0) - 1.0).abs() < 1e-6);
     }
 
     #[test]
