@@ -137,7 +137,12 @@ struct HistogramOverlay: View {
                 at: CGPoint(x: 18, y: size.height - 9)
             )
         }
-        .background(Color.black.opacity(0.55))
+        // 半透明毛玻璃底：不挡后面的画面，只提亮直方图的对比度。
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8)
+                .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
+        )
         .clipShape(RoundedRectangle(cornerRadius: 8))
         .contentShape(Rectangle())
         .onTapGesture {
@@ -150,11 +155,11 @@ struct HistogramOverlay: View {
         }
     }
 
-    /// 填充样式：灰底 + 三通道半透明色块 + 亮度白线。
+    /// 填充样式：半透明底 + 三通道半透明色块 + 亮度白线。
     private func drawFilled(_ context: inout GraphicsContext, size: CGSize, data: HistogramData) {
         context.fill(
             Path(CGRect(origin: .zero, size: size)),
-            with: .color(Color(white: 0.23))
+            with: .color(Color.black.opacity(0.22))
         )
         drawChannel(&context, size: size, bins: data.red, color: redColor.opacity(0.55), fill: true)
         drawChannel(&context, size: size, bins: data.green, color: greenColor.opacity(0.55), fill: true)
@@ -166,7 +171,7 @@ struct HistogramOverlay: View {
     private func drawWaveform(_ context: inout GraphicsContext, size: CGSize, data: HistogramData) {
         context.fill(
             Path(CGRect(origin: .zero, size: size)),
-            with: .color(Color(white: 0.05))
+            with: .color(Color.black.opacity(0.30))
         )
         let columns = 256
         let bins = 128

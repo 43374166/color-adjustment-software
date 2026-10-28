@@ -86,6 +86,17 @@ enum EditorLimits {
     static let rawFullSizePixelLimit = 24_000_000
 }
 
+/// 预览一帧实际走的渲染路径（顶栏标签用，方便判断 GPU 有没有参与）。
+///
+/// - `gpu`：零拷贝上屏（`fdxmp_gpu_preview_present`），不读回像素，耗时最短；
+/// - `gpuReadback`：GPU 渲染后读回像素（对比模式 / 未挂上图层等），耗时含回读 + 转 UIImage；
+/// - `cpu`：Rust CPU 渲染 + 转 UIImage（GPU 会话创建失败或本帧不适合 GPU）。
+enum RenderPath: String {
+    case cpu = "CPU"
+    case gpu = "GPU"
+    case gpuReadback = "GPU→CPU"
+}
+
 /// 编辑界面状态机：照片加载 → 防抖渲染 → 直方图 / 撤销重做 / 导出。
 ///
 /// 渲染走 Rust CPU 预览（`fdxmp_render_memory_rgba`）：
@@ -138,6 +149,8 @@ final class EditorModel: ObservableObject {
     @Published private(set) var canUndo = false
     @Published private(set) var canRedo = false
     @Published private(set) var renderMillis: Double?
+    /// 上一帧走的渲染路径（顶栏标签：GPU / GPU→CPU / CPU）。
+    @Published private(set) var renderPath: RenderPath = .cpu
     @Published private(set) var message: String?
 
     // MARK: 编辑状态
@@ -314,6 +327,7 @@ final class EditorModel: ObservableObject {
         redoStack.removeAll()
         publishHistory()
         renderMillis = nil
+        renderPath = .cpu
         message = nil
         if let json = EditStore.json(assetId: asset.localIdentifier) {
             state = EditJSON.parse(json)
@@ -1519,6 +1533,23 @@ final class EditorModel: ObservableObject {
         }
         scheduleRender(immediate: true)
         scheduleMaskAssetsRefresh(immediate: true)
+    }
+
+    /// 加载卡死时的自救入口：删掉落盘的编辑记录，按原片重新载入。
+    ///
+    /// 目前个别参数组合会让核心渲染卡住（后续单独修），这里先给用户一个逃生口：
+    /// 清掉这张图的调色记录 → 重新解码 → 用默认参数重新渲染。
+    func resetEditsAfterStuckLoad() {
+        guard let current = asset else { return }
+        EditStore.remove(assetId: current.localIdentifier)
+        state = EditState()
+        presetName = "原片"
+        presetRef = EditorSpec.presets.first?.ref
+        selectedMaskId = nil
+        // load() 遇到"同一张照片"会直接返回：先清掉当前资产，让整条链路重来。
+        self.asset = nil
+        load(asset: current)
+        message = "已重置全部编辑，正在按原片重新加载"
     }
 
     // MARK: - 曲线
@@ -3249,6 +3280,7 @@ final class EditorModel: ObservableObject {
                         self.histogram = histogram
                     }
                     self.renderMillis = millis
+                    self.renderPath = .gpu
                     self.message = nil
                     // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
                     self.scheduleMaskAssetsRefresh()
@@ -3262,6 +3294,8 @@ final class EditorModel: ObservableObject {
             }
             // GPU 优先（同一帧内失败 / 不适合时自动回退 CPU）。
             var result = gpu?.render(paramsJson: json)
+            // 这一帧是不是 GPU 算的（读回路径；零拷贝上屏走上面的分支）。
+            let usedGpu = result != nil
             if result == nil {
                 result = NativeCore.shared.render(buffer: source, paramsJson: json)
             }
@@ -3290,6 +3324,7 @@ final class EditorModel: ObservableObject {
                         self.histogram = histogram
                         self.previewOutputSize = outputSize
                         self.renderMillis = millis
+                        self.renderPath = usedGpu ? .gpuReadback : .cpu
                         self.message = nil
                         // 渲染输出尺寸（裁切后长宽比）确定后再生成叠加层，保证对齐。
                         self.scheduleMaskAssetsRefresh()

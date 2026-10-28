@@ -74,6 +74,10 @@ struct EditorTabView: View {
     @State private var sheetSelection: Set<String> = []
     @State private var sheetSyncScope: EditorModel.SyncScope = .all
     @State private var sheetEnhanceExport = false
+    /// 加载卡住超过 8 秒：露出「重置全部编辑」按钮。
+    @State private var showStuckResetButton = false
+    /// 已经点过重置：按钮换文案并提示正在重新加载。
+    @State private var didResetOnStuckLoad = false
 
     @Environment(\.displayScale) private var displayScale
 
@@ -178,6 +182,33 @@ struct EditorTabView: View {
         .sheet(isPresented: $showHistory) {
             historySheet
         }
+        // 首帧加载：层级最高，盖住顶栏 / 面板并吃掉所有点击 / 拖动。
+        // 卡住超过 8 秒才露出「重置全部编辑」和「退出编辑」两个逃生口。
+        .overlay {
+            if model.isLoading {
+                LoadingBlocker(
+                    text: loadingText,
+                    showReset: showStuckResetButton,
+                    didReset: didResetOnStuckLoad,
+                    onReset: resetEditsWhileStuck,
+                    onExit: { onClose() }
+                )
+                .transition(.opacity)
+            }
+        }
+        .animation(.easeOut(duration: 0.22), value: model.isLoading)
+        .task(id: model.isLoading) {
+            guard model.isLoading else {
+                showStuckResetButton = false
+                didResetOnStuckLoad = false
+                return
+            }
+            showStuckResetButton = false
+            // 8 秒还没出首帧：给一个自救入口（个别参数组合会让核心渲染卡住）。
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            guard !Task.isCancelled, model.isLoading else { return }
+            showStuckResetButton = true
+        }
         .sheet(isPresented: exportShareBinding) {
             if let url = model.exportShareURL {
                 ShareSheet(items: [url])
@@ -243,6 +274,13 @@ struct EditorTabView: View {
     private func loadIfNeeded() {
         guard let asset else { return }
         model.load(asset: asset)
+    }
+
+    /// 加载卡死时的自救：清掉这张图的编辑记录，按原片重新加载。
+    private func resetEditsWhileStuck() {
+        Haptics.light()
+        didResetOnStuckLoad = true
+        model.resetEditsAfterStuckLoad()
     }
 
     /// 预取相邻照片的低清预览（相册式滑动时随手指滑入）。
@@ -537,14 +575,13 @@ struct EditorTabView: View {
                 Text(model.project?.name ?? model.assetName)
                     .font(.footnote)
                     .lineLimit(1)
-                HStack(spacing: 6) {
-                    Text(model.presetName)
-                    if let millis = model.renderMillis {
-                        Text(String(format: "CPU · %.0f ms", millis))
-                    }
-                }
-                .font(.caption2)
-                .foregroundStyle(.secondary)
+                    .truncationMode(.middle)
+                // 顶栏只留预设名：渲染耗时挪到画面右上角（直方图下方），
+                // 顶栏宽度本来就紧，多一段文字会换行把图片挤下去。
+                Text(model.presetName)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
             Spacer()
             // 修图 / 调色一键切换（带工作台加载动画）。
@@ -784,38 +821,8 @@ struct EditorTabView: View {
                 // 手指跟随时整块内容平移（相册式滑动）。
                 .offset(x: pan.width + (zoom <= 1.01 ? swipeOffset : 0), y: pan.height)
             } else if model.isLoading {
-                // 首帧还没出来：占位保持布局，真正的加载提示由下面的居中弹框负责，
-                // 避免同时出现「居中转圈」和「弹框」两套加载 UI。
+                // 首帧还没出来：占位保持布局，加载提示由 body 最外层的 loadingBlocker 负责。
                 Color.clear
-            }
-            // 切图 / 首帧加载：居中弹框（半透明遮罩 + 圆角卡片）。
-            //
-            // 关键：它一直留到**带当前调色的首帧**真正上屏（EditorModel.finishLoadingOverlay）
-            // 才收起，否则就会"先看到没调色的原图，过一会才跳成调色结果"。
-            // 加载期间遮罩拦截所有点击。
-            if model.isLoading {
-                ZStack {
-                    Color.black.opacity(0.45).ignoresSafeArea()
-                    VStack(spacing: 14) {
-                        ProgressView()
-                            .controlSize(.large)
-                            .tint(.white)
-                        Text(loadingText)
-                            .font(.footnote)
-                            .foregroundStyle(.white.opacity(0.9))
-                            .multilineTextAlignment(.center)
-                    }
-                    .padding(.horizontal, 30)
-                    .padding(.vertical, 24)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
-                    .overlay {
-                        RoundedRectangle(cornerRadius: 18)
-                            .stroke(Color.white.opacity(0.10), lineWidth: 1)
-                    }
-                    .shadow(color: .black.opacity(0.35), radius: 18, y: 8)
-                }
-                .transition(.opacity)
-                .zIndex(30)
             }
             // 放大后的 1:1 区域帧（核心按帧外坐标渲染），按归一化矩形对齐贴上。
             if model.tool != .mask,
@@ -893,12 +900,23 @@ struct EditorTabView: View {
                         }
                         Spacer()
                         if model.tool != .crop && model.tool != .mask {
-                            HistogramOverlay(data: model.histogram)
-                                // 直方图加长：屏幕宽度的 2/3。
-                                .frame(
-                                    width: max(220, geo.size.width * 2 / 3),
-                                    height: 92
-                                )
+                            VStack(alignment: .trailing, spacing: 4) {
+                                HistogramOverlay(data: model.histogram)
+                                    // 直方图加长：屏幕宽度的 2/3；高度收一点，别挡画面。
+                                    .frame(
+                                        width: max(220, geo.size.width * 2 / 3),
+                                        height: 76
+                                    )
+                                // 渲染耗时贴在直方图下方（浮在画面上，不参与顶栏布局）。
+                                if let millis = model.renderMillis {
+                                    Text("\(model.renderPath.rawValue) · \(Int(millis.rounded())) ms")
+                                        .font(.system(size: 9, weight: .medium, design: .monospaced))
+                                        .foregroundStyle(.white.opacity(0.75))
+                                        .padding(.horizontal, 6)
+                                        .padding(.vertical, 2)
+                                        .background(.ultraThinMaterial, in: Capsule())
+                                }
+                            }
                         }
                     }
                     Spacer()
@@ -906,8 +924,6 @@ struct EditorTabView: View {
                 .padding(10)
             }
         }
-        // 加载框淡入淡出（首帧太快时由模型补足最短显示时间，不会闪一下）。
-        .animation(.easeOut(duration: 0.22), value: model.isLoading)
     }
 
     /// 加载框文案：修图阶段 > 恢复上次调色 > 普通加载。
@@ -2535,6 +2551,73 @@ private struct CompareSplitShape: Shape {
             CGRect(x: x, y: 0, width: max(rect.width - x, 0), height: rect.height)
         )
         return path
+    }
+}
+
+/// 首帧加载遮罩：整屏拦截交互（层级最高），卡死时可「重置全部编辑」或退出编辑。
+private struct LoadingBlocker: View {
+    let text: String
+    let showReset: Bool
+    let didReset: Bool
+    let onReset: () -> Void
+    let onExit: () -> Void
+
+    var body: some View {
+        ZStack {
+            // 这一层吃掉所有点击 / 拖动：加载期间下面的编辑器完全不可操作。
+            Color.black.opacity(0.55)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {}
+            VStack(spacing: 14) {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+                Text(text)
+                    .font(.footnote)
+                    .foregroundStyle(.white.opacity(0.9))
+                    .multilineTextAlignment(.center)
+                if showReset {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.12))
+                        .frame(width: 150, height: 1)
+                        .padding(.top, 2)
+                    Text(didReset ? "已重置，正在按原片重新加载…" : "卡住超过 8 秒？")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.7))
+                        .multilineTextAlignment(.center)
+                    Button(action: onReset) {
+                        Text(didReset ? "再次重置全部编辑" : "重置全部编辑")
+                            .font(.footnote.weight(.semibold))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 9)
+                            .background(Capsule().fill(Color.red.opacity(0.8)))
+                            .foregroundStyle(.white)
+                    }
+                    .buttonStyle(.plain)
+                    Button(action: onExit) {
+                        Text("退出编辑")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .padding(.vertical, 2)
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .padding(.horizontal, 26)
+            .padding(.vertical, 24)
+            .frame(maxWidth: 300)
+            .background(
+                RoundedRectangle(cornerRadius: 18)
+                    .fill(Color(white: 0.12).opacity(0.96))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(Color.white.opacity(0.08))
+            )
+        }
+        .transition(.opacity)
+        .zIndex(100)
     }
 }
 
