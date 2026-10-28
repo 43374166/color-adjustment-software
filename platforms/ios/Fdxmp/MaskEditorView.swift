@@ -266,7 +266,13 @@ struct MaskPanelView: View {
             Section("几何蒙版") {
                 ForEach(MaskKindUi.allCases.filter { !$0.isSmart }) { kind in
                     Button {
-                        model.addMask(kind)
+                        // 线性 / 径向：不直接创建，等手指在画面上拖出位置、方向与大小；
+                        // 画笔照旧（点一下就能画）。
+                        if kind == .linear || kind == .radial {
+                            model.requestMaskPlacement(kind)
+                        } else {
+                            model.addMask(kind)
+                        }
                     } label: {
                         Label(kind.rawValue, systemImage: kind.icon)
                     }
@@ -372,7 +378,15 @@ struct MaskPanelView: View {
 
     @ViewBuilder
     private var content: some View {
-        if let mask = model.selectedMask {
+        if let kind = model.maskPlacementKind {
+            // 正在拖动放置新蒙版：面板高度不变，只给一行操作提示（别让面板弹高挤动画面）。
+            Text(kind == .linear ? "在画面上拖动：从起点拖出渐变方向" : "在画面上拖动：从中心拖出大小")
+                .font(.caption)
+                .foregroundStyle(Color.accentColor)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 16)
+        } else if let mask = model.selectedMask {
             // 调整页（创建蒙版后才从底部弹起）：
             // 局部调色 → 子 nav（反转 / 复制 / 重置 / 重命名 / 删除）。
             // 羽化 / 叠加色 / 不透明度这些都在长按卡片的「蒙版设置」里。

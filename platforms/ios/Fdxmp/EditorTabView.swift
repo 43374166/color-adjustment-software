@@ -85,6 +85,8 @@ struct EditorTabView: View {
     @State private var showStuckResetButton = false
     /// 已经点过重置：按钮换文案并提示正在重新加载。
     @State private var didResetOnStuckLoad = false
+    /// 拖动放置新蒙版期间锁住的面板高度（nil = 不在放置态）。
+    @State private var placementPanelHeight: CGFloat?
 
     @Environment(\.displayScale) private var displayScale
 
@@ -160,6 +162,8 @@ struct EditorTabView: View {
             resetZoom()
             model.clearDetailPreview()
             maskController.reset()
+            model.cancelMaskPlacement()
+            placementPanelHeight = nil
             categoryCollapsed = false
             model.endCategoryPreview()
             compareSplit = nil
@@ -167,6 +171,14 @@ struct EditorTabView: View {
             model.setComparePreviewActive(false)
             if model.tool == .mask {
                 Haptics.prepare()
+            }
+        }
+        // 放置新蒙版：锁住当前面板高度，拖动期间画面不会被挤动。
+        .onChange(of: model.maskPlacementKind) { kind in
+            if kind == nil {
+                placementPanelHeight = nil
+            } else {
+                placementPanelHeight = model.selectedMask == nil ? 150 : 300
             }
         }
         .onChange(of: zoom) { value in
@@ -1292,7 +1304,13 @@ struct EditorTabView: View {
         case .crop: return 210
         // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
         // 分类行压矮后，把高度让给上面的参数（滑块）区。
-        case .mask: return model.selectedMask == nil ? 150 : 300
+        case .mask:
+            // 拖动放置新蒙版期间锁住高度：一按下面板就弹高 150pt 的话，
+            // 画面会被挤上去，拖动位置和最终蒙版就对不上了。
+            if let placement = placementPanelHeight {
+                return placement
+            }
+            return model.selectedMask == nil ? 150 : 300
         // 修图工作台：矮一些，把画面留给手动修图（预设 / 修复 / 液化）。
         case .retouch: return 246
         }

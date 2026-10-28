@@ -658,6 +658,10 @@ final class MaskCanvasController {
     private var drag: MaskDragSession?
     private var brushing = false
     private var dragging = false
+    /// 正在拖动放置新蒙版（线性 / 径向）。
+    private var placing = false
+    /// 放置起点（归一化图像坐标；线性 = 起点，径向 = 中心）。
+    private var placementStart: CGPoint = .zero
     private var rotationActive = false
     private var rotationAccumulated: Double = 0
     private var rotationApplied: Double = 0
@@ -671,9 +675,20 @@ final class MaskCanvasController {
     ) {
         switch event {
         case .singleBegan(let point):
-            guard let mask = model.selectedMask else { return }
             let content = geometry.contentPoint(point)
             let normalized = clampedNormalized(geometry.normalized(fromContent: content))
+            // 放置新蒙版：按下点 = 线性起点 / 径向中心，拖动决定方向与大小。
+            if model.maskPlacementKind != nil {
+                Haptics.light()
+                placementStart = normalized
+                placing = true
+                dragging = false
+                brushing = false
+                drag = nil
+                model.beginMaskPlacement(at: normalized)
+                return
+            }
+            guard let mask = model.selectedMask else { return }
             if mask.kind == .brush {
                 model.brushCursor = normalized
                 model.beginBrushStroke(at: normalized)
@@ -700,6 +715,10 @@ final class MaskCanvasController {
             dragging = true
             model.beginMaskDrag(label: Self.dragLabel(for: mode))
         case .singleMoved(let point):
+            if placing {
+                updatePlacement(to: geometry.contentPoint(point), geometry: geometry, model: model)
+                return
+            }
             if brushing {
                 let normalized = clampedNormalized(
                     geometry.normalized(fromContent: geometry.contentPoint(point))
@@ -715,6 +734,11 @@ final class MaskCanvasController {
             }
             model.updateSelectedMask { $0 = updated }
         case .singleEnded, .singleCancelled:
+            if placing {
+                placing = false
+                model.finishMaskPlacement()
+                return
+            }
             finishSingle(model: model)
         case .twoFingerPan(let delta):
             pan.wrappedValue = CGSize(
@@ -746,9 +770,42 @@ final class MaskCanvasController {
         drag = nil
         brushing = false
         dragging = false
+        placing = false
         rotationActive = false
         rotationAccumulated = 0
         rotationApplied = 0
+    }
+
+    /// 拖动放置：线性 = 起点到当前点；径向 = 起点为中心、拖动距离为半径（物理圆）。
+    private func updatePlacement(
+        to content: CGPoint,
+        geometry: MaskCanvasGeometry,
+        model: EditorModel
+    ) {
+        guard let kind = model.maskPlacementKind else { return }
+        let normalized = clampedNormalized(geometry.normalized(fromContent: content))
+        let fitted = geometry.fitted
+        let startContent = geometry.contentPoint(placementStart)
+        model.updateSelectedMask { mask in
+            switch kind {
+            case .linear:
+                // 按下点固定为 100% 一侧，手指方向 / 长度就是渐变方向与过渡带宽度。
+                mask.start = placementStart
+                mask.end = normalized
+            case .radial:
+                let dx = content.x - startContent.x
+                let dy = content.y - startContent.y
+                let radius = (dx * dx + dy * dy).squareRoot()
+                mask.center = placementStart
+                // 半径换成两个方向的归一化值：物理上是个圆。
+                mask.radii = CGSize(
+                    width: max(radius / max(fitted.width, 1), 0.02),
+                    height: max(radius / max(fitted.height, 1), 0.02)
+                )
+            default:
+                break
+            }
+        }
     }
 
     private func finishSingle(model: EditorModel) {

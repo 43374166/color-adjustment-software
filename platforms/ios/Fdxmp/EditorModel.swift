@@ -1871,6 +1871,20 @@ final class EditorModel: ObservableObject {
 
     /// 新建蒙版（线性 / 径向 / 画笔 / 智能），并选中它。
     func addMask(_ kind: MaskKindUi) {
+        maskPlacementKind = nil
+        let mask = makeMask(kind)
+        applyEdit("新建\(kind.rawValue)") { state in
+            state.masks.append(mask)
+        }
+        selectedMaskId = mask.id
+        brushErase = false
+        if kind.isSmart {
+            generateSmartMask(mask.id)
+        }
+    }
+
+    /// 按类型造一个带默认几何的蒙版（名字按同类序号）。
+    private func makeMask(_ kind: MaskKindUi) -> MaskUi {
         let count = state.masks.filter { $0.kind == kind }.count + 1
         var mask = MaskUi(
             id: UUID().uuidString,
@@ -1898,14 +1912,68 @@ final class EditorModel: ObservableObject {
             break
         }
         mask.values = EditorSpec.defaultValues()
-        applyEdit("新建\(kind.rawValue)") { state in
-            state.masks.append(mask)
+        return mask
+    }
+
+    // MARK: - 拖动放置几何蒙版（线性 / 径向）
+
+    /// 待放置的蒙版类型：点「线性渐变 / 径向渐变」后进入放置态，等用户在画面上拖出位置。
+    @Published private(set) var maskPlacementKind: MaskKindUi?
+
+    /// 点「线性渐变 / 径向渐变」：先不建蒙版，等手指在画面上按下再定位置 / 方向 / 大小。
+    func requestMaskPlacement(_ kind: MaskKindUi) {
+        guard kind == .linear || kind == .radial else { return }
+        maskPlacementKind = kind
+        Haptics.light()
+        showMessage("在画面上拖动：\(kind == .linear ? "从起点拖出渐变方向" : "从中心拖出大小")")
+    }
+
+    /// 画布按下：真正创建蒙版（先记快照，撤销时整步消失），起手给一个很小的几何。
+    func beginMaskPlacement(at point: CGPoint) {
+        guard let kind = maskPlacementKind else { return }
+        beginEdit()
+        pendingLabel = "新建\(kind.rawValue)"
+        var mask = makeMask(kind)
+        if kind == .linear {
+            mask.start = point
+            mask.end = CGPoint(x: point.x, y: point.y + 0.08)
+        } else {
+            mask.center = point
+            mask.radii = CGSize(width: 0.06, height: 0.06)
         }
+        state.masks.append(mask)
         selectedMaskId = mask.id
+        presetName = "自定义"
+        presetRef = nil
         brushErase = false
-        if kind.isSmart {
-            generateSmartMask(mask.id)
+        brushCursor = nil
+        maskInteracting = true
+        scheduleRender()
+        scheduleMaskAssetsRefresh(immediate: true)
+    }
+
+    /// 松手：拖得太短就给一个能继续拖的默认尺寸，然后整步提交。
+    func finishMaskPlacement() {
+        maskPlacementKind = nil
+        if let mask = selectedMask, mask.kind == .linear || mask.kind == .radial {
+            if mask.kind == .linear, mask.linearWidth < 0.06 {
+                updateSelectedMask { item in
+                    let end = CGPoint(x: item.start.x, y: item.start.y + 0.3)
+                    item.end = CGPoint(x: min(max(end.x, 0), 1), y: min(max(end.y, 0), 1))
+                }
+            } else if mask.kind == .radial,
+                      mask.radii.width < 0.06 || mask.radii.height < 0.06 {
+                updateSelectedMask { item in
+                    item.radii = CGSize(width: 0.28, height: 0.22)
+                }
+            }
         }
+        finishMaskInteraction()
+    }
+
+    /// 取消放置（切工具 / 切蒙版时调用）。
+    func cancelMaskPlacement() {
+        maskPlacementKind = nil
     }
 
     // MARK: - 智能蒙版（Vision）
@@ -2901,6 +2969,8 @@ final class EditorModel: ObservableObject {
     }
 
     func selectMask(_ id: String) {
+        // 选别的蒙版 = 放弃待放置的新蒙版。
+        maskPlacementKind = nil
         guard selectedMaskId != id else { return }
         selectedMaskId = id
         brushErase = false
