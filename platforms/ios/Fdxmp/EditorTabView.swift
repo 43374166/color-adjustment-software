@@ -87,6 +87,8 @@ struct EditorTabView: View {
     @State private var didResetOnStuckLoad = false
     /// 拖动放置新蒙版期间锁住的面板高度（nil = 不在放置态）。
     @State private var placementPanelHeight: CGFloat?
+    /// 90° 旋转的过渡角度（0 / 90 / -90…）：动画期间只转画面，动画完再真正换图。
+    @State private var previewSpin: Double = 0
 
     @Environment(\.displayScale) private var displayScale
 
@@ -305,6 +307,24 @@ struct EditorTabView: View {
         Haptics.light()
         didResetOnStuckLoad = true
         model.resetEditsAfterStuckLoad()
+    }
+
+    /// 顺时针旋转 90°：先用过渡角把画面转过去，0.28s 后再真正换图（无缝衔接）。
+    private func animateQuarterTurn() {
+        guard abs(previewSpin) < 1e-3 else { return }
+        Haptics.light()
+        withAnimation(.easeInOut(duration: 0.28)) {
+            previewSpin = 90
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) {
+            // 换图前把过渡角瞬间归零（不带动画），否则会再转回去。
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                previewSpin = 0
+            }
+            model.rotateCropQuarterTurn()
+        }
     }
 
     /// 预取相邻照片的低清预览（相册式滑动时随手指滑入）。
@@ -754,6 +774,8 @@ struct EditorTabView: View {
                 } else {
                     previewBody(geo: geo)
                         .contentShape(Rectangle())
+                        // 90° 旋转：先让画面转过去（过渡），动画结束再换真正旋转后的图。
+                        .rotationEffect(.degrees(previewSpin))
                         // 双指缩放：以手指中点为锚点（iOS 17+；更早系统退回居中缩放）。
                         .modifier(PinchZoomModifier(
                             onChanged: { magnification, anchor in
@@ -2472,7 +2494,7 @@ struct EditorTabView: View {
                 // 旋转 / 翻转（取代原来的比例选择行）。
                 HStack(spacing: 10) {
                     cropActionButton("旋转 90°", icon: "rotate.right") {
-                        model.rotateCropQuarterTurn()
+                        animateQuarterTurn()
                     }
                     cropActionButton("水平翻转", icon: "arrow.left.and.right") {
                         model.toggleCropFlip(horizontal: true)
@@ -2515,16 +2537,15 @@ struct EditorTabView: View {
             .scrollDisabled(model.draggingSlider != nil)
             .opacity(model.draggingSlider == nil ? 1 : 0)
             .allowsHitTesting(model.draggingSlider == nil)
-            ValueSliderRow(
-                label: "拉直",
-                value: model.state.crop.rotation,
-                range: -45...45,
-                neutral: 0,
-                step: 0.5,
-                decimals: 1,
+            CropRotationDial(
+                value: Double(model.state.crop.rotation),
                 onBegin: { model.beginEdit() },
-                onChange: { model.updateCropRotation($0, commit: false) },
-                onCommit: { model.commitEdit() }
+                onChange: { model.updateCropRotation(Float($0), commit: false) },
+                onCommit: { model.commitEdit() },
+                onReset: {
+                    Haptics.light()
+                    model.updateCropRotation(0, commit: true)
+                }
             )
             Group {
                 HStack(spacing: 16) {
@@ -2544,6 +2565,119 @@ struct EditorTabView: View {
             .opacity(model.draggingSlider == nil ? 1 : 0)
             .allowsHitTesting(model.draggingSlider == nil)
             Spacer(minLength: 0)
+        }
+    }
+
+    /// 裁切「拉直」半圆刻度盘：横向拖动改角度、灵敏度低、刻度哒哒声、双击归零。
+    private struct CropRotationDial: View {
+        let value: Double
+        let onBegin: () -> Void
+        let onChange: (Double) -> Void
+        let onCommit: () -> Void
+        let onReset: () -> Void
+
+        /// 刻度盘覆盖的角度范围（±度）。范围小 + 全宽拖动 = 低灵敏度。
+        private static let range: Double = 15
+        /// 每格刻度对应的角度（度）：跨格响一下。
+        private static let tickStep: Double = 0.5
+
+        @State private var dragStart: Double?
+        @State private var lastTick = Int.min
+
+        var body: some View {
+            GeometryReader { geo in
+                let width = max(geo.size.width, 1)
+                let clamped = min(max(value, -Self.range), Self.range)
+                let height = max(geo.size.height, 1)
+                let center = CGPoint(x: width / 2, y: height - 4)
+                let radius = min(width * 0.44, height - 16)
+                Canvas { context, _ in
+                    // 半圆刻度（左 -90° → 右 +90°）。
+                    var ticks = Path()
+                    let steps = max(Int(Self.range * 2 / Self.tickStep), 1)
+                    for index in 0...steps {
+                        let t = Double(index) / Double(steps)
+                        let degrees = -90 + (t - 0.5) * 180
+                        let radians = degrees * .pi / 180
+                        let major = index % 10 == 0
+                        let length: CGFloat = major ? 9 : 4.5
+                        let dir = CGPoint(x: sin(radians), y: -cos(radians))
+                        let outer = CGPoint(
+                            x: center.x + dir.x * radius,
+                            y: center.y + dir.y * radius
+                        )
+                        let inner = CGPoint(
+                            x: center.x + dir.x * (radius - length),
+                            y: center.y + dir.y * (radius - length)
+                        )
+                        ticks.move(to: inner)
+                        ticks.addLine(to: outer)
+                    }
+                    context.stroke(
+                        ticks,
+                        with: .color(Color.white.opacity(0.45)),
+                        style: StrokeStyle(lineWidth: 1, lineCap: .round)
+                    )
+                    // 指针
+                    let needleDegrees = clamped / Self.range * 90
+                    let needleRadians = needleDegrees * .pi / 180
+                    var needle = Path()
+                    needle.move(to: center)
+                    needle.addLine(
+                        to: CGPoint(
+                            x: center.x + sin(needleRadians) * (radius - 2),
+                            y: center.y - cos(needleRadians) * (radius - 2)
+                        )
+                    )
+                    context.stroke(
+                        needle,
+                        with: .color(Color.accentColor),
+                        style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                    )
+                    // 数值
+                    context.draw(
+                        Text(String(format: "%+.1f°", clamped))
+                            .font(.system(size: 11, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.8)),
+                        at: CGPoint(x: center.x, y: center.y - 4)
+                    )
+                }
+                .contentShape(Rectangle())
+                .gesture(
+                    DragGesture(minimumDistance: 0)
+                        .onChanged { gesture in
+                            if dragStart == nil {
+                                dragStart = clamped
+                                lastTick = Int((clamped / Self.tickStep).rounded())
+                                onBegin()
+                            }
+                            let start = dragStart ?? clamped
+                            let degreesPerPoint = (Self.range * 2) / Double(width)
+                            let target = min(
+                                max(start + Double(gesture.translation.width) * degreesPerPoint,
+                                    -Self.range),
+                                Self.range
+                            )
+                            let tick = Int((target / Self.tickStep).rounded())
+                            if tick != lastTick {
+                                lastTick = tick
+                                Haptics.tick()
+                            }
+                            onChange(target)
+                        }
+                        .onEnded { _ in
+                            dragStart = nil
+                            onCommit()
+                        }
+                )
+                // 双击归零
+                .simultaneousGesture(
+                    TapGesture(count: 2).onEnded {
+                        onReset()
+                    }
+                )
+            }
+            .frame(height: 78)
         }
     }
 
