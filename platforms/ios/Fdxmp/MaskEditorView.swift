@@ -279,7 +279,8 @@ struct MaskPanelView: View {
                 }
             }
             Section("智能蒙版（端侧识别）") {
-                ForEach(MaskKindUi.allCases.filter { $0.isSmart }) { kind in
+                // 暂时只保留「智能人像」：主体 / 五官先收起（枚举保留，旧记录仍能打开）。
+                ForEach([MaskKindUi.aiPortrait]) { kind in
                     Button {
                         model.addMask(kind)
                     } label: {

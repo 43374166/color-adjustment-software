@@ -164,6 +164,10 @@ impl PreviewSession {
     /// 渲染核心（几何 / 镜头 / 裁剪全部在 GPU 上完成）。
     fn render_pipeline(&mut self, params: &EditParams) -> Result<()> {
         let crop_active = params.crop.rect != [0.0, 0.0, 1.0, 1.0];
+        if params.crop.quarter_turn.rem_euclid(4) != 0 {
+            // 90° 整圈旋转要换输出宽高，GPU 几何趟按原尺寸采样对不上，交给 CPU 预览。
+            return Err(FdxmpError::Gpu("90° 旋转使用 CPU 预览".to_string()));
+        }
         if crop_active && !params.masks.is_empty() {
             // 裁剪 + 蒙版组合在 GPU 下坐标不一致，交给 CPU 预览保证正确性。
             return Err(FdxmpError::Gpu("裁剪与蒙版组合使用 CPU 预览".to_string()));

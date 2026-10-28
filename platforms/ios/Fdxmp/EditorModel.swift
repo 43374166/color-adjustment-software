@@ -867,6 +867,7 @@ final class EditorModel: ObservableObject {
         let crop = state.crop
         let identity = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
             && crop.rotation == 0
+            && crop.quarterTurns == 0
             && !crop.flipHorizontal
             && !crop.flipVertical
         // 光学（色差 / 配置文件校正）也算几何变换：区域渲染要求单位镜头模型。
@@ -1859,6 +1860,49 @@ final class EditorModel: ObservableObject {
                 state.crop.flipVertical.toggle()
             }
         }
+    }
+
+    /// 顺时针旋转 90°（整圈旋转：输出宽高互换，裁剪框 / 蒙版跟着转到新构图）。
+    func rotateCropQuarterTurn() {
+        applyEdit("旋转 90°") { state in
+            state.crop.quarterTurns = (state.crop.quarterTurns + 1) % 4
+            // 裁剪框：旧帧 → 新帧（顺时针 90°：(x, y, w, h) → (1-y-h, x, h, w)）。
+            let rect = state.crop.rect
+            state.crop.rect = clampedCropRect(
+                CGRect(
+                    x: 1 - rect.maxY,
+                    y: rect.minX,
+                    width: rect.height,
+                    height: rect.width
+                )
+            )
+            state.masks = state.masks.map(Self.rotatedQuarterTurn)
+        }
+        // 90° 整圈旋转 GPU 预览对不上（宽高变了）：先丢掉会话走 CPU，转回 0 圈再重建。
+        clearGpuSession()
+        if state.crop.quarterTurns == 0, let source = renderSource {
+            createGpuSession(for: source)
+        }
+        scheduleRender(immediate: true)
+    }
+
+    /// 蒙版几何顺时针转 90°（归一化坐标）：线性端点 / 径向中心与轴向 / 画笔点。
+    private static func rotatedQuarterTurn(_ mask: MaskUi) -> MaskUi {
+        var copy = mask
+        func turn(_ point: CGPoint) -> CGPoint {
+            CGPoint(x: 1 - point.y, y: point.x)
+        }
+        copy.start = turn(mask.start)
+        copy.end = turn(mask.end)
+        copy.center = turn(mask.center)
+        copy.radii = CGSize(width: mask.radii.height, height: mask.radii.width)
+        copy.rotation = mask.rotation + 90
+        copy.strokes = mask.strokes.map { stroke in
+            var item = stroke
+            item.points = stroke.points.map(turn)
+            return item
+        }
+        return copy
     }
 
     func resetCrop() {

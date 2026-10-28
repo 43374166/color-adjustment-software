@@ -214,7 +214,24 @@ impl Geometry {
         let center_out = translate(-cx, -cy);
         let center_back = translate(cx, cy);
 
-        let rotation = rotate(self.rotation_deg.to_radians());
+        // 旋转 + 覆盖缩放：与 CPU `rotate` 一致，转完自动放大到铺满整帧，不出黑角。
+        let rotation = {
+            let zoom = if self.rotation_deg.abs() < 1e-4 {
+                1.0
+            } else {
+                let (sin, cos) = self.rotation_deg.to_radians().sin_cos();
+                let w = width.max(1e-3);
+                let h = height.max(1e-3);
+                ((w * cos.abs() + h * sin.abs()) / w)
+                    .max((w * sin.abs() + h * cos.abs()) / h)
+                    .max(1.0)
+            };
+            if (zoom - 1.0).abs() < 1e-6 {
+                rotate(self.rotation_deg.to_radians())
+            } else {
+                mul(&scale(zoom, zoom), &rotate(self.rotation_deg.to_radians()))
+            }
+        };
         let perspective =
             if self.perspective_vertical.abs() < 1e-4 && self.perspective_horizontal.abs() < 1e-4 {
                 IDENTITY
@@ -356,10 +373,14 @@ pub fn plan_tiles(
 
 /// 裁剪输出尺寸（源图像素尺度，至少 1×1）。
 pub fn crop_output_size(crop: &CropParams, source_width: u32, source_height: u32) -> (u32, u32) {
-    let width = (crop.rect[2] * source_width.max(1) as f32).round().max(1.0) as u32;
-    let height = (crop.rect[3] * source_height.max(1) as f32)
-        .round()
-        .max(1.0) as u32;
+    // 90° 整圈旋转会交换宽高；裁剪矩形作用在转过的图上，所以基数也要跟着换。
+    let (base_width, base_height) = if crop.quarter_turn.rem_euclid(2) == 1 {
+        (source_height.max(1), source_width.max(1))
+    } else {
+        (source_width.max(1), source_height.max(1))
+    };
+    let width = (crop.rect[2] * base_width as f32).round().max(1.0) as u32;
+    let height = (crop.rect[3] * base_height as f32).round().max(1.0) as u32;
     (width, height)
 }
 
@@ -874,7 +895,8 @@ mod tests {
             assert!(mapped[0] >= -1.0 && mapped[0] <= 1001.0, "{mapped:?}");
             assert!(mapped[1] >= -1.0 && mapped[1] <= 801.0, "{mapped:?}");
         }
-        assert!(rect[2] > 0.3 && rect[2] < 1.0);
+        // 旋转自带覆盖放大（不出黑角）：整幅矩形四角已全部落在源图内，不再需要缩小。
+        assert!((rect[2] - 1.0).abs() < 1e-3, "{rect:?}");
     }
 
     #[test]
@@ -989,7 +1011,7 @@ mod tests {
     }
 
     #[test]
-    fn out_of_bounds_samples_are_transparent() {
+    fn rotation_covers_frame_without_transparent_corners() {
         let source = gradient(64, 32);
         let geometry = Geometry {
             rotation_deg: 90.0,
@@ -997,9 +1019,10 @@ mod tests {
         };
         let params = params_with(geometry);
         let rendered = render_geometry(&source, &params, GeometryMode::Full).unwrap();
-        // 90° 旋转后四角必然落在源图外，中心保持不透明。
-        assert_eq!(rendered.get_pixel(0, 0).0[3], 0);
-        assert_eq!(rendered.get_pixel(63, 31).0[3], 0);
+        // 旋转自动放大到铺满整帧：四角不再透出黑边（旧实现这里是 0）。
+        // 边缘仍可能有半像素的双线性衰减（191 而不是 255），但不是黑角。
+        assert!(rendered.get_pixel(0, 0).0[3] > 150);
+        assert!(rendered.get_pixel(63, 31).0[3] > 150);
         assert_eq!(rendered.get_pixel(32, 16).0[3], 255);
     }
 }

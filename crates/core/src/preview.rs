@@ -122,7 +122,8 @@ pub fn render_memory_tiled_rgba(
             rgba.len()
         )));
     }
-    let needs_resample = params.crop.rotation_deg.abs() > 1e-3
+    let needs_resample = params.crop.quarter_turn.rem_euclid(4) != 0
+        || params.crop.rotation_deg.abs() > 1e-3
         || params.lens.geometry.distortion.abs() > 1e-4
         || params.lens.geometry.vertical.abs() > 1e-4
         || params.lens.geometry.horizontal.abs() > 1e-4
@@ -407,7 +408,7 @@ pub fn apply_lens(source: &RgbaImage, lens: &LensParams) -> RgbaImage {
     out
 }
 
-/// 几何处理：翻转 → 旋转（自动放大避免黑角）→ 按归一化矩形裁剪。
+/// 几何处理：翻转 → 90° 整圈旋转 → 拉直（自动放大避免黑角）→ 按归一化矩形裁剪。
 pub fn apply_geometry(source: &RgbaImage, crop: &CropParams) -> RgbaImage {
     let mut image = source.clone();
     if crop.flip_horizontal {
@@ -416,10 +417,31 @@ pub fn apply_geometry(source: &RgbaImage, crop: &CropParams) -> RgbaImage {
     if crop.flip_vertical {
         image = flip_vertical(&image);
     }
+    let turns = crop.quarter_turn.rem_euclid(4) as u32;
+    if turns != 0 {
+        image = quarter_turn(&image, turns);
+    }
     if crop.rotation_deg.abs() > 0.01 {
         image = rotate(&image, crop.rotation_deg);
     }
     crop_rect(&image, crop.rect)
+}
+
+/// 顺时针 90° × `turns` 圈：宽高互换、像素整体搬位（不缩放、不裁剪）。
+fn quarter_turn(source: &RgbaImage, turns: u32) -> RgbaImage {
+    let mut image = source.clone();
+    for _ in 0..turns {
+        let (width, height) = (image.width(), image.height());
+        let mut out = RgbaImage::new(height, width);
+        for y in 0..height {
+            for x in 0..width {
+                // 顺时针：源 (x, y) → 目标 (height-1-y, x)。
+                out.put_pixel(height - 1 - y, x, *image.get_pixel(x, y));
+            }
+        }
+        image = out;
+    }
+    image
 }
 
 fn flip_horizontal(source: &RgbaImage) -> RgbaImage {
@@ -1688,6 +1710,22 @@ mod tests {
         let out = apply_geometry(&source, &crop);
         assert_eq!(out.width(), 4);
         assert_eq!(out.height(), 4);
+    }
+
+    #[test]
+    fn quarter_turn_swaps_dimensions_and_pixels() {
+        let mut source = RgbaImage::new(2, 1);
+        source.put_pixel(0, 0, Rgba([255, 0, 0, 255]));
+        source.put_pixel(1, 0, Rgba([0, 255, 0, 255]));
+        let crop = CropParams {
+            quarter_turn: 1,
+            ..CropParams::default()
+        };
+        let out = apply_geometry(&source, &crop);
+        assert_eq!(out.dimensions(), (1, 2));
+        // 顺时针 90°：原图左侧（红）转到顶部，右侧（绿）到底部。
+        assert_eq!(out.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(out.get_pixel(0, 1).0, [0, 255, 0, 255]);
     }
 
     #[test]

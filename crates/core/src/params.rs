@@ -1138,6 +1138,11 @@ pub struct CropParams {
     pub aspect: AspectRatio,
     /// 旋转，-45.0..=45.0。
     pub rotation_deg: f32,
+    /// 90° 整圈旋转次数（0..=3，顺时针）。
+    ///
+    /// 与 `rotation_deg`（拉直微调）分开：整圈旋转会真正交换输出宽高，
+    /// 不靠缩放裁剪（否则横图转竖图会裁掉大半画面）。
+    pub quarter_turn: i32,
     /// 水平翻转。
     pub flip_horizontal: bool,
     /// 垂直翻转。
@@ -1154,6 +1159,7 @@ impl Default for CropParams {
             rect: [0.0, 0.0, 1.0, 1.0],
             aspect: AspectRatio::Free,
             rotation_deg: 0.0,
+            quarter_turn: 0,
             flip_horizontal: false,
             flip_vertical: false,
             grid: CropGrid::Thirds,

@@ -2467,32 +2467,22 @@ struct EditorTabView: View {
 
     private var cropPanel: some View {
         VStack(spacing: 0) {
-            // 拖动「拉直」滑块时：上面两行只隐藏不位移（滑块保持原位）。
+            // 拖动「拉直」滑块时：上面几行只隐藏不位移（滑块保持原位）。
             Group {
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 8) {
-                        ForEach(CropAspect.allCases) { aspect in
-                            Button {
-                                model.setCropAspect(aspect, contentSize: previewImageSize)
-                            } label: {
-                                Text(aspect.rawValue)
-                                    .font(.caption2)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(
-                                        Capsule().fill(
-                                            model.state.crop.aspect == aspect
-                                                ? Color.accentColor.opacity(0.35)
-                                                : Color.white.opacity(0.08)
-                                        )
-                                    )
-                            }
-                            .buttonStyle(.plain)
-                        }
+                // 旋转 / 翻转（取代原来的比例选择行）。
+                HStack(spacing: 10) {
+                    cropActionButton("旋转 90°", icon: "rotate.right") {
+                        model.rotateCropQuarterTurn()
                     }
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
+                    cropActionButton("水平翻转", icon: "arrow.left.and.right") {
+                        model.toggleCropFlip(horizontal: true)
+                    }
+                    cropActionButton("垂直翻转", icon: "arrow.up.and.down") {
+                        model.toggleCropFlip(horizontal: false)
+                    }
                 }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
                 // 构图网格样式：关 / 三分 / 网格 / 对角 / 黄金。
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) {
@@ -2538,12 +2528,6 @@ struct EditorTabView: View {
             )
             Group {
                 HStack(spacing: 16) {
-                    Button("水平翻转") {
-                        model.toggleCropFlip(horizontal: true)
-                    }
-                    Button("垂直翻转") {
-                        model.toggleCropFlip(horizontal: false)
-                    }
                     Spacer()
                     Button("重置") {
                         model.resetCrop()
@@ -2561,6 +2545,33 @@ struct EditorTabView: View {
             .allowsHitTesting(model.draggingSlider == nil)
             Spacer(minLength: 0)
         }
+    }
+
+    /// 裁切工具行按钮（图标 + 文案，等宽）。
+    private func cropActionButton(
+        _ title: String,
+        icon: String,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button {
+            Haptics.light()
+            action()
+        } label: {
+            VStack(spacing: 5) {
+                Image(systemName: icon)
+                    .font(.system(size: 17, weight: .medium))
+                Text(title)
+                    .font(.caption2)
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 9)
+            .background(
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.white.opacity(0.08))
+            )
+            .foregroundStyle(.white.opacity(0.92))
+        }
+        .buttonStyle(.plain)
     }
 }
 

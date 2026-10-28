@@ -389,6 +389,11 @@ struct CropState: Equatable {
     var rect: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1)
     var aspect: CropAspect = .free
     var rotation: Float = 0
+    /// 90° 整圈旋转次数（0..3，顺时针）。
+    ///
+    /// 与 `rotation`（拉直微调）分开：整圈旋转会真正交换输出宽高，
+    /// 不靠缩放裁剪（否则横图转竖图会裁掉大半画面）。
+    var quarterTurns: Int = 0
     var flipHorizontal = false
     var flipVertical = false
     /// 构图网格样式（与核心 `CropGrid` 的 JSON 值对齐）。
@@ -396,7 +401,8 @@ struct CropState: Equatable {
 
     var isIdentity: Bool {
         rect == CGRect(x: 0, y: 0, width: 1, height: 1)
-            && rotation == 0 && !flipHorizontal && !flipVertical
+            && rotation == 0 && quarterTurns == 0
+            && !flipHorizontal && !flipVertical
     }
 
     mutating func reset() {
@@ -1216,6 +1222,7 @@ enum EditJSON {
             ],
             "aspect": crop.aspect.jsonName,
             "rotation_deg": Double(crop.rotation),
+            "quarter_turn": crop.quarterTurns,
             "flip_horizontal": crop.flipHorizontal,
             "flip_vertical": crop.flipVertical,
             "grid": crop.grid.jsonName,
@@ -1507,6 +1514,9 @@ enum EditJSON {
             crop.aspect = CropAspect.from(jsonName: aspect)
         }
         crop.rotation = (root["rotation_deg"] as? NSNumber)?.floatValue ?? 0
+        // 旧记录没有 quarter_turn：缺省 0（不旋转）。
+        let turns = (root["quarter_turn"] as? NSNumber)?.intValue ?? 0
+        crop.quarterTurns = ((turns % 4) + 4) % 4
         crop.flipHorizontal = (root["flip_horizontal"] as? NSNumber)?.boolValue ?? false
         crop.flipVertical = (root["flip_vertical"] as? NSNumber)?.boolValue ?? false
         if let grid = root["grid"] as? String {
