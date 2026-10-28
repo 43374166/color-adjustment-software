@@ -175,7 +175,7 @@ struct MeTabView: View {
                 Text("导出尺寸")
                     .font(.footnote)
                 Spacer()
-                Text("原图分辨率")
+                Text("最高 8MP（保持原比例）")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -208,7 +208,7 @@ struct MeTabView: View {
             Toggle("导出完成后分享", isOn: $exportShare)
                 .font(.footnote)
                 .tint(Color.accentColor)
-            Text("导出会把成品按此尺寸 / 格式渲染后保存到相册「fdxmp」。")
+            Text("导出按 8MP 像素预算渲染（更大的原图自动等比降采样），保存到相册「fdxmp」。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }

@@ -52,6 +52,10 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
     )
     /// 索引代际（换库 / 重新加载后旧的构建结果作废）。
     private var indexToken = 0
+    /// 是否已经取过相册列表：Tab 反复出现时不再整库重取（导出 / 返回编辑页会频繁 onAppear）。
+    private var hasLoaded = false
+    /// 相册变化合并：导出连续保存多张时会连续回调，合并成一次刷新，避免主线程被反复打满。
+    private var pendingReload: DispatchWorkItem?
     /// 已预取的缩略图批次（避免同一屏反复 startCaching）。
     private var cachedIds: [String] = []
     private var cachedSize = CGSize.zero
@@ -73,7 +77,11 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
         authorization = status
         switch status {
         case .authorized, .limited:
-            loadAssets()
+            // 已经取过列表就只靠 PHPhotoLibraryChangeObserver 增量刷新；
+            // 每次切回 Tab 都整库 fetch + 重建索引会在编辑页返回时抢主线程。
+            if !hasLoaded {
+                loadAssets()
+            }
         case .notDetermined:
             PHPhotoLibrary.requestAuthorization(for: .readWrite) { [weak self] newStatus in
                 DispatchQueue.main.async {
@@ -84,11 +92,13 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
                 }
             }
         default:
+            hasLoaded = false
             break
         }
     }
 
     func loadAssets() {
+        hasLoaded = true
         let options = PHFetchOptions()
         options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
         let result = PHAsset.fetchAssets(with: .image, options: options)
@@ -224,7 +234,14 @@ final class PhotoLibraryModel: NSObject, ObservableObject, PHPhotoLibraryChangeO
 
     func photoLibraryDidChange(_ changeInstance: PHChange) {
         DispatchQueue.main.async { [weak self] in
-            self?.loadAssets()
+            guard let self else { return }
+            // 批量导出会一张一次回调：合并到 0.6 秒后只刷新一次。
+            self.pendingReload?.cancel()
+            let item = DispatchWorkItem { [weak self] in
+                self?.loadAssets()
+            }
+            self.pendingReload = item
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: item)
         }
     }
 }

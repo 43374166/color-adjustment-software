@@ -103,29 +103,17 @@ struct EditorTabView: View {
             }
         }
         .background(Color(white: 0.08))
-        // 导出进度弹框：半透明遮罩 + 进度条 + 百分比。
+        // 导出进度：分段蓝条 + 循环白光 + 步骤文字（不显示百分比）。
+        // 单张 = 整条满蓝，白光循环扫过；多张 = 每张占一段，完成一张填满一段。
         .overlay {
-            if model.isExporting {
-                ZStack {
-                    Color.black.opacity(0.45).ignoresSafeArea()
-                    VStack(spacing: 12) {
-                        Text("正在导出…")
-                            .font(.subheadline)
-                            .foregroundStyle(.white)
-                        ProgressView(value: model.exportProgress ?? 0, total: 1)
-                            .progressViewStyle(.linear)
-                            .tint(Color.accentColor)
-                            .frame(width: 200)
-                        Text("\(Int(((model.exportProgress ?? 0) * 100).rounded()))%")
-                            .font(.caption.monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(24)
-                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+            if let status = model.exportStatus {
+                ExportProgressOverlay(status: status) {
+                    model.cancelExport()
                 }
                 .transition(.opacity)
             }
         }
+        .animation(.easeInOut(duration: 0.18), value: model.exportStatus)
         .onPreferenceChange(SliderDragPreferenceKey.self) { info in
             model.setDraggingSlider(info)
         }
@@ -134,6 +122,8 @@ struct EditorTabView: View {
             // 离开编辑页时丢掉排队的单击，避免在别的页面上突然切一次沉浸。
             pendingSingleTap?.cancel()
             pendingSingleTap = nil
+            // 导出不能跟着页面去后台继续烤 CPU：离开就取消（进度弹框同时收起）。
+            model.handleEditorDisappear()
         }
         .onAppear {
             // 预热触觉引擎，第一次操作就有反馈。
@@ -549,13 +539,15 @@ struct EditorTabView: View {
         if model.isLoading {
             return nil
         }
-        if let stage = model.retouchStage {
+        // 自动重算修图（进图恢复上次修图）不弹全屏遮罩：加载框已经在等首帧了，
+        // 修图算完会自己替换预览；只有用户真的在修图工作台里才显示阶段动画。
+        if model.tool == .retouch, let stage = model.retouchStage {
             return stage
         }
         if let stage = model.workbenchStage {
             return stage
         }
-        if !model.smartMaskGenerating.isEmpty {
+        if model.tool == .mask, !model.smartMaskGenerating.isEmpty {
             return "AI 识别中（智能蒙版）…"
         }
         return nil
@@ -689,12 +681,6 @@ struct EditorTabView: View {
                     .foregroundStyle(
                         compareSplit == nil ? Color.white.opacity(0.9) : Color.accentColor
                     )
-            }
-            // 导出进度（导出入口在「•••」菜单里）。
-            if let progress = model.exportProgress {
-                Text("\(Int(progress * 100))%")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(Color.accentColor)
             }
             // 最右边：••• 更多（从下往上弹框：导出 / 同步 / 重置）。
             Button {
@@ -1039,9 +1025,9 @@ struct EditorTabView: View {
         }
     }
 
-    /// 加载框文案：修图阶段 > 恢复上次调色 > 普通加载。
+    /// 加载框文案：当前在修图工作台 > 恢复上次调色 > 普通加载。
     private var loadingText: String {
-        if let stage = model.retouchStage {
+        if model.tool == .retouch, let stage = model.retouchStage {
             return stage
         }
         return model.isRestoringEdits ? "正在应用上次的调色…" : "正在加载照片…"
@@ -2927,6 +2913,134 @@ private struct CompareSplitShape: Shape {
             CGRect(x: x, y: 0, width: max(rect.width - x, 0), height: rect.height)
         )
         return path
+    }
+}
+
+/// 导出进度：分段蓝条 + 循环白光 + 步骤文字（不显示百分比）。
+private struct ExportProgressOverlay: View {
+    let status: ExportStatus
+    let onCancel: () -> Void
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.5)
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .onTapGesture {}
+            VStack(spacing: 12) {
+                Text(status.isSingle ? "正在导出照片" : "正在导出 \(status.total) 张照片")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                ExportProgressBar(status: status)
+                    .frame(width: 220, height: 7)
+                Text(stepText)
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.68))
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .frame(maxWidth: 240)
+                Button(action: onCancel) {
+                    Text("取消")
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.55))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 20)
+            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 18))
+            .overlay(
+                RoundedRectangle(cornerRadius: 18)
+                    .stroke(Color.white.opacity(0.08))
+            )
+        }
+        .transition(.opacity)
+        .zIndex(90)
+    }
+
+    private var stepText: String {
+        let indexPrefix = status.total > 1
+            ? "第 \(status.displayIndex)/\(status.total) 张 · "
+            : ""
+        return indexPrefix + status.step
+    }
+}
+
+/// 导出进度条：每张照片一段；当前段内按阶段填充，完成一张就整段变蓝。
+private struct ExportProgressBar: View {
+    let status: ExportStatus
+
+    private static let blue = Color(red: 0.16, green: 0.52, blue: 1.0)
+
+    var body: some View {
+        GeometryReader { geo in
+            let count = max(status.total, 1)
+            // 张数很多时自动收窄间隔，避免 50 张以上把进度条撑出容器。
+            let gap: CGFloat = count > 1
+                ? min(2, max(0.5, 60 / CGFloat(count)))
+                : 0
+            let segmentWidth = max(
+                (geo.size.width - gap * CGFloat(count - 1)) / CGFloat(count),
+                1
+            )
+            HStack(spacing: gap) {
+                ForEach(0..<count, id: \.self) { index in
+                    segment(index: index, width: segmentWidth)
+                }
+            }
+        }
+    }
+
+    private func segment(index: Int, width: CGFloat) -> some View {
+        let fraction: CGFloat = {
+            if status.isSingle { return 1 }
+            if index < status.index { return 1 }
+            if index == status.index { return CGFloat(status.clampedFraction) }
+            return 0
+        }()
+        return ZStack(alignment: .leading) {
+            Capsule(style: .continuous)
+                .fill(Color.white.opacity(0.16))
+            Capsule(style: .continuous)
+                .fill(Self.blue)
+                .frame(width: max(width * fraction, fraction > 0 ? 2 : 0))
+                .animation(.easeOut(duration: 0.26), value: fraction)
+            if status.isSingle || index == status.index {
+                ExportShimmer()
+                    .frame(width: width, height: 7)
+                    .clipShape(Capsule(style: .continuous))
+            }
+        }
+        .frame(width: width)
+        .clipShape(Capsule(style: .continuous))
+    }
+}
+
+/// 进度条上的透明白光：在蓝色进度里从 0 扫到 100，循环动画。
+private struct ExportShimmer: View {
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0 / 24.0)) { context in
+            GeometryReader { geo in
+                let band = max(geo.size.width * 0.45, 18)
+                let phase = context.date.timeIntervalSinceReferenceDate
+                    .truncatingRemainder(dividingBy: 1.45) / 1.45
+                LinearGradient(
+                    colors: [
+                        Color.white.opacity(0),
+                        Color.white.opacity(0.55),
+                        Color.white.opacity(0),
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: band, height: geo.size.height)
+                .offset(x: -band + (geo.size.width + band * 2) * CGFloat(phase))
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 

@@ -45,25 +45,57 @@ enum PhotoRaw {
     /// 读取原始 RAW 字节（iCloud 照片允许联网拉取）。
     ///
     /// 回调在后台线程；数据可能较大（几十 MB），调用方应转交工作线程解码。
-    static func requestData(for asset: PHAsset, completion: @escaping (Data?) -> Void) {
+    /// `timeout` 到点仍未完成（iCloud 卡住 / 资源服务异常）就回调 nil，
+    /// 让编辑页回退系统解码，而不是永远停在「正在加载照片」。
+    static func requestData(
+        for asset: PHAsset,
+        timeout: TimeInterval = 20,
+        completion: @escaping (Data?) -> Void
+    ) {
         guard let resource = rawResource(for: asset) else {
             completion(nil)
             return
         }
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
+        let lock = NSLock()
         var data = Data()
-        PHAssetResourceManager.default().requestData(
+        var finished = false
+
+        func finish(_ result: Data?) {
+            lock.lock()
+            guard !finished else {
+                lock.unlock()
+                return
+            }
+            finished = true
+            lock.unlock()
+            completion(result)
+        }
+
+        let requestId = PHAssetResourceManager.default().requestData(
             for: resource,
             options: options
         ) { chunk in
-            data.append(chunk)
-        } completionHandler: { error in
-            if error != nil || data.isEmpty {
-                completion(nil)
-            } else {
-                completion(data)
+            lock.lock()
+            if !finished {
+                data.append(chunk)
             }
+            lock.unlock()
+        } completionHandler: { error in
+            lock.lock()
+            let payload = data
+            lock.unlock()
+            finish(error != nil || payload.isEmpty ? nil : payload)
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + timeout) {
+            lock.lock()
+            let stillRunning = !finished
+            lock.unlock()
+            guard stillRunning else { return }
+            PHAssetResourceManager.default().cancelDataRequest(requestId)
+            finish(nil)
         }
     }
 }

@@ -50,9 +50,11 @@ enum EditorLimits {
     static let maskOverlayMaxEdge = 2048
     /// 蒙版列表缩略图最长边。
     static let maskThumbnailMaxEdge = 128
-    /// 导出按**原图分辨率**渲染（不再限制最长边）。
-    /// 导出像素预算：超过就按比例降采样。CPU 管线是 f32 多平面（约 40 字节/像素），
-    /// N MP 的峰值约 N × 40 MB；8MP ≈ 320MB，是 iPhone 上比较安全的上限。
+    /// 导出像素预算：原图更大时按比例降采样。
+    ///
+    /// CPU 管线是 f32 多平面（约 40 字节/像素），8MP ≈ 320MB 峰值，是 iPhone 上
+    /// 比较安全的上限。48MP ProRAW / 高像素相机图如果按原图整帧渲染，光中间缓冲
+    /// 就要一两 GB，表现为导出卡死、手机发烫甚至被系统杀掉。
     static let exportPixelLimit = 8_000_000
     /// 导出格式 / 质量 / 保留元数据 / 导出后分享（与「我的」页 @AppStorage 共用）。
     static let exportFormatKey = "fdxmp_export_format"
@@ -104,6 +106,42 @@ enum RenderPath: String {
     case gpuReadback = "GPU→CPU"
 }
 
+/// 导出进度（UI 只画分段蓝条 + 循环白光 + 步骤文案，不显示百分比）。
+struct ExportStatus: Equatable {
+    /// 本次导出的总张数。
+    var total: Int
+    /// 当前处理到第几张（0 起）。
+    var index: Int
+    /// 当前这一张的完成比例（0...1）。
+    var fraction: Double
+    /// 已经成功保存的张数。
+    var succeeded: Int
+    /// 当前步骤文案（例如「正在渲染调色…」）。
+    var step: String
+
+    var isSingle: Bool { total <= 1 }
+    var displayIndex: Int { min(index + 1, max(total, 1)) }
+    var clampedFraction: Double { min(max(fraction, 0), 1) }
+}
+
+/// 一次导出任务的取消标记：主线程置位，导出线程只读。
+private final class ExportCancellation {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
 /// 编辑界面状态机：照片加载 → 防抖渲染 → 直方图 / 撤销重做 / 导出。
 ///
 /// 渲染走 Rust CPU 预览（`fdxmp_render_memory_rgba`）：
@@ -146,11 +184,12 @@ final class EditorModel: ObservableObject {
     private var firstFrameWatchdog: DispatchWorkItem?
     /// 加载框最短显示时间（秒）。
     private static let loadingMinDuration: CFAbsoluteTime = 0.3
-    /// 首帧看门狗超时（秒）。
-    private static let loadingTimeout: TimeInterval = 30
+    /// 首帧看门狗超时（秒）。正常 2048 预览 1–5 秒；超过 15 秒基本是参数异常 /
+    /// 解码资源卡住，先露出原图并放开交互，不能一直盖着「正在加载」。
+    private static let loadingTimeout: TimeInterval = 15
     @Published private(set) var isExporting = false
-    /// 导出进度（0..1；nil = 未在导出）。
-    @Published private(set) var exportProgress: Double?
+    /// 导出进度（nil = 未在导出）。
+    @Published private(set) var exportStatus: ExportStatus?
     /// 导出完成后的分享文件（开了"导出后分享"才有值）。
     @Published var exportShareURL: URL?
     @Published private(set) var canUndo = false
@@ -275,6 +314,14 @@ final class EditorModel: ObservableObject {
     private let maskAssetQueue = DispatchQueue(label: "fdxmp.ios.mask-assets", qos: .userInitiated)
     private var maskAssetToken = 0
     private var maskAssetScheduled = false
+    /// 导出独立队列：不占用预览渲染队列，导出再久也不会把进图 / 滑块卡住。
+    private let exportQueue = DispatchQueue(label: "fdxmp.ios.export", qos: .userInitiated)
+    private var exportToken = 0
+    private var exportSession: ExportCancellation?
+    private var exportWatchdog: DispatchWorkItem?
+    /// Vision 人像蒙版 / 姿态是否已提交（只在修图需要时准备一次）。
+    private var visionPersonPrepared = false
+    private var visionPersonInFlight = false
     /// 进入曲线前的分类（曲线面板「完成」时恢复）。
     private var categoryBeforeCurves: EditCategory = .light
     /// 预设强度的混合快照（应用预设前 / 预设结果）。
@@ -336,6 +383,8 @@ final class EditorModel: ObservableObject {
         smartMaskGenerating.removeAll()
         smartMaskFailed.removeAll()
         resetRetouchState()
+        visionPersonPrepared = false
+        visionPersonInFlight = false
         // 智能蒙版栅格与图像内容绑定：切换图片时清空核心缓存（重新生成 / 重新提交）。
         NativeCore.shared.clearMaskRasters()
         maskInteracting = false
@@ -521,11 +570,11 @@ final class EditorModel: ObservableObject {
             finishLoadingOverlay()
         }
         // 有保存过修图参数的照片：后台重算修图缓冲。
+        // Vision 人像蒙版 / 姿态也只在修图真正需要时才准备（见 recomputeRetouch），
+        // 不再每次进图都跑一遍分割 + 关键点：每个动作都要几秒 CPU，是「进去就发烫」的来源之一。
         prepareRetouchAfterLoad()
-        // Vision 人像蒙版（MODNet 不随包）：后台算好提交给核心（身体塑形 / 人像路径用）。
-        prepareVisionPersonMask()
-        // 首帧之后预热原图细节源：第一次放大直接出 1:1 区域帧。
-        preloadDetailSourceIfUseful()
+        // 不在首帧后预热全分辨率细节源：24MP 原图解码 + 转 RGBA 约 100MB，
+        // 会和首帧 / 后续调色抢 CPU 与内存；第一次放大时 ensureDetailSource() 会按需准备。
     }
 
     // MARK: - 首帧加载框
@@ -686,18 +735,6 @@ final class EditorModel: ObservableObject {
                 zoom: lastDetailZoom,
                 force: true
             )
-        }
-    }
-
-    /// 首帧之后预热非 RAW 的原图细节源（≤24MP，避免 48MP 图在后台吃 200MB）。
-    private func preloadDetailSourceIfUseful() {
-        guard rawData == nil, let asset else { return }
-        let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
-        guard pixels > 0, pixels <= 24_000_000 else { return }
-        let token = loadToken
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self, self.loadToken == token, !self.detailZoomActive else { return }
-            self.ensureDetailSource()
         }
     }
 
@@ -2682,11 +2719,24 @@ final class EditorModel: ObservableObject {
 
     /// 准备 Vision 平台数据（MODNet 不随包）：
     /// 人像蒙版 α + 人脸 / 身体关键点（姿态），提交给核心供修图 / 塑形使用。
-    private func prepareVisionPersonMask() {
+    ///
+    /// 只在修图真正需要时跑一次（`force` = 用户刚点了一键修图 / 修图预设）。
+    /// 普通进图不再预跑：Vision 在每张图上都要几秒 CPU，是「进去就发烫」的来源之一。
+    private func prepareVisionPersonMaskIfNeeded(force: Bool = false) {
+        guard force || state.retouch.isActive else { return }
+        guard !visionPersonPrepared, !visionPersonInFlight else { return }
         guard let buffer = baseBuffer else { return }
-        guard let cgImage = SmartMaskEngine.makeCGImage(buffer: buffer) else { return }
+        let token = loadToken
+        visionPersonInFlight = true
         retouchQueue.async { [weak self] in
-            guard let self else { return }
+            guard self != nil else { return }
+            guard let cgImage = SmartMaskEngine.makeCGImage(buffer: buffer) else {
+                Task { @MainActor [weak self] in
+                    guard let self, self.loadToken == token else { return }
+                    self.visionPersonInFlight = false
+                }
+                return
+            }
             if let plane = SmartMaskEngine.personMaskPlane(cgImage: cgImage, buffer: buffer) {
                 _ = NativeCore.shared.retouchSubmitPersonMask(
                     buffer: buffer,
@@ -2698,7 +2748,11 @@ final class EditorModel: ObservableObject {
             if let pose = SmartMaskEngine.platformPoseJson(cgImage: cgImage) {
                 _ = NativeCore.shared.retouchSubmitPose(buffer: buffer, poseJson: pose)
             }
-            _ = self
+            Task { @MainActor [weak self] in
+                guard let self, self.loadToken == token else { return }
+                self.visionPersonInFlight = false
+                self.visionPersonPrepared = true
+            }
         }
     }
 
@@ -2734,15 +2788,21 @@ final class EditorModel: ObservableObject {
             retouchAppliedReady = false
             return
         }
-        // 新图第一次应用修图要重新识别五官：给一段加载动画。
-        startRetouchStages()
-        recomputeRetouch(completion: { self.stopRetouchStages() })
+        // 进图恢复修图时后台重算：在调色工作台不弹全屏「识别五官」（用户还在调色，
+        // 修图算完会自己替换预览）；已经在修图工作台里才给阶段动画。
+        if tool == .retouch {
+            startRetouchStages()
+            recomputeRetouch(completion: { self.stopRetouchStages() })
+        } else {
+            recomputeRetouch()
+        }
     }
 
     /// 一键修图：识别五官（加载动画）→ 应用默认强度。
     func oneTapRetouch() {
         guard let buffer = baseBuffer, retouchStage == nil else { return }
         Haptics.light()
+        prepareVisionPersonMaskIfNeeded(force: true)
         startRetouchStages()
         let source = buffer
         retouchQueue.async { [weak self] in
@@ -2822,6 +2882,7 @@ final class EditorModel: ObservableObject {
             state.values = values
         }
         // 首次要识别五官（加载动画），之后是纯参数重算。
+        prepareVisionPersonMaskIfNeeded(force: true)
         startRetouchStages()
         recomputeRetouch(completion: { self.stopRetouchStages() }, force: true)
     }
@@ -2984,6 +3045,10 @@ final class EditorModel: ObservableObject {
         if params == retouchApplied, !force {
             completion?()
             return
+        }
+        // 修图需要平台人像蒙版 / 姿态时，先排到 retouchQueue 前面（只跑一次）。
+        if !params.isIdentity {
+            prepareVisionPersonMaskIfNeeded()
         }
         if retouchWorkInFlight {
             retouchPending = true
@@ -3207,6 +3272,8 @@ final class EditorModel: ObservableObject {
         guard baseBuffer != nil else { return }
         let paramsJson = currentJson(applyCropRect: true)
         for mask in state.masks where mask.kind.isSmart {
+            // 隐藏的智能蒙版不参与渲染，先不推理；重新显示时会再触发。
+            guard mask.visible else { continue }
             guard !smartMaskGenerating.contains(mask.id) else { continue }
             guard smartMaskFailed[mask.id] == nil else { continue }
             if !NativeCore.shared.maskRasterReady(paramsJson: paramsJson, maskId: mask.id) {
@@ -3913,346 +3980,459 @@ final class EditorModel: ObservableObject {
 
     /// 按当前参数渲染高分辨率图片并保存到相册（fdxmp 相簿）。
     func export() {
-        guard let asset, !isExporting else { return }
-        isExporting = true
-        exportProgress = 0.05
-        exportShareURL = nil
-        message = nil
-        let format = EditorLimits.exportFormat
-        let quality = EditorLimits.exportQuality
-        let keepMetadata = EditorLimits.exportKeepMetadata
-        // 原图分辨率导出（内存由分块渲染控制，不再按像素上限降采样）。
-        let targetEdge = max(asset.pixelWidth, asset.pixelHeight)
-        let crop = state.crop
-        let identityGeometry = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
-            && crop.rotation == 0
-            && !crop.flipHorizontal
-            && !crop.flipVertical
-        let json = currentJson(applyCropRect: true, usePreview: false)
-        // 修图参数（在主线程快照；导出时按导出分辨率重算）。
-        let retouch = state.retouch
-        // 读取原图 EXIF / GPS 等元数据（保留拍摄信息）。
-        var metadata: [String: Any]?
-        if keepMetadata {
-            metadata = Self.loadExportMetadata(asset: asset)
-        }
-
-        // RAW：LibRaw 解调作为导出源（与预览同源）；像素量超限时自动用半尺寸解调。
-        if let rawData {
-            exportProgress = 0.25
-            let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
-            let fullSize = pixels > 0 && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
-            renderQueue.async { [weak self] in
-                guard let self else { return }
-                let buffer = NativeCore.shared.decodeRaw(
-                    data: rawData,
-                    maxEdge: targetEdge,
-                    fullSize: fullSize
-                )
-                self.finishExport(
-                    buffer: buffer,
-                    paramsJson: json,
-                    retouch: retouch,
-                    identityGeometry: identityGeometry,
-                    metadata: metadata,
-                    format: format,
-                    quality: quality
-                )
-            }
-            return
-        }
-
-        requestImage(
-            asset: asset,
-            maxEdge: targetEdge,
-            mode: .highQualityFormat
-        ) { [weak self] image, _ in
-            guard let self else { return }
-            guard let image else {
-                self.isExporting = false
-                self.exportProgress = nil
-                self.message = "导出失败：无法读取原图"
-                return
-            }
-            self.exportProgress = 0.25
-            self.renderQueue.async { [weak self] in
-                guard let self else { return }
-                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: targetEdge)
-                self.finishExport(
-                    buffer: buffer,
-                    paramsJson: json,
-                    retouch: retouch,
-                    identityGeometry: identityGeometry,
-                    metadata: metadata,
-                    format: format,
-                    quality: quality
-                )
-            }
-        }
+        guard let asset else { return }
+        startExport(assets: [asset], enhance: false)
     }
 
     /// 多选导出（底部弹框里选择照片）：当前张用当前状态，其余用各自保存的编辑记录。
     ///
-    /// `enhance` = 高清增强（Real-ESRGAN ×2 超分，输出 ≤ 6144；失败自动退回原尺寸）。
+    /// `enhance` = 高清增强（Real-ESRGAN ×2 超分，输出 ≤ 4096；失败自动退回原尺寸）。
     func exportAssets(_ assets: [PHAsset], enhance: Bool = false) {
+        startExport(assets: assets, enhance: enhance)
+    }
+
+    /// 统一导出入口：独立队列 + 逐张保存 + 超时 / 取消。
+    ///
+    /// 之前卡死的原因都在这里：
+    /// 1. 导出跑在 `renderQueue` 上：导出多久，进图 / 滑块预览就被堵多久；
+    /// 2. 原图分辨率整帧渲染：48MP 的 CPU 管线中间缓冲要一两 GB；
+    /// 3. PhotoKit 读取 / 元数据 / 保存没有超时，iCloud 或相册服务卡住就无限等；
+    /// 4. 多选时第一张保存完就重置 `isExporting`，后面的照片在无进度遮罩下继续跑。
+    private func startExport(assets: [PHAsset], enhance: Bool) {
         guard !assets.isEmpty, !isExporting else { return }
-        isExporting = true
-        exportProgress = 0.02
-        exportShareURL = nil
-        message = nil
         let format = EditorLimits.exportFormat
         let quality = EditorLimits.exportQuality
         let keepMetadata = EditorLimits.exportKeepMetadata
+        let shareAfterSave = EditorLimits.exportShareAfterSave
         let currentId = asset?.localIdentifier
         let currentJson = currentJson(applyCropRect: true, usePreview: false)
         let currentRetouch = state.retouch
+        let currentRaw = rawData
         let total = assets.count
-        renderQueue.async { [weak self] in
-            guard let self else { return }
-            var exported = 0
+        let currentIncluded = currentId.map { id in
+            assets.contains { $0.localIdentifier == id }
+        } ?? false
+
+        exportToken &+= 1
+        let token = exportToken
+        let session = ExportCancellation()
+        exportSession?.cancel()
+        exportSession = session
+        isExporting = true
+        exportShareURL = nil
+        message = nil
+        exportStatus = ExportStatus(
+            total: total,
+            index: 0,
+            fraction: 0,
+            succeeded: 0,
+            step: "准备导出…"
+        )
+        armExportWatchdog(token: token)
+        Haptics.light()
+
+        exportQueue.async { [weak self] in
+            guard self != nil else { return }
+            var succeeded = 0
+            var failed = 0
+            var shareURL: URL?
+
+            func report(_ index: Int, _ fraction: Double, _ step: String) {
+                let succeededSnapshot = succeeded
+                Task { @MainActor [weak self] in
+                    self?.updateExportStatus(
+                        token: token,
+                        total: total,
+                        index: index,
+                        fraction: fraction,
+                        succeeded: succeededSnapshot,
+                        step: step
+                    )
+                }
+            }
+
             for (index, item) in assets.enumerated() {
-                defer {
-                    let progress = 0.05 + 0.9 * Double(index + 1) / Double(total)
-                    Task { @MainActor in self.exportProgress = progress }
-                }
-                let id = item.localIdentifier
-                let isCurrent = id == currentId
-                let saved = isCurrent ? nil : EditStore.json(assetId: id)
-                let savedState = saved.map(EditJSON.parse) ?? EditState()
-                let json = isCurrent
-                    ? currentJson
-                    : EditJSON.build(state: savedState, applyCropRect: false)
-                let retouch = isCurrent ? currentRetouch : savedState.retouch
-                let targetEdge = max(item.pixelWidth, item.pixelHeight)
-                guard let image = Self.decodeAsset(item, maxEdge: targetEdge) else { continue }
-                guard let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: targetEdge) else {
-                    continue
-                }
-                var source = buffer
-                if retouch.isActive {
-                    source = Self.applyRetouchForExport(buffer: buffer, params: retouch) ?? buffer
-                }
-                guard let result = NativeCore.shared.render(buffer: source, paramsJson: json) else {
-                    continue
-                }
-                var rendered = RgbaBuffer(
-                    pixels: result.pixels,
-                    width: result.width,
-                    height: result.height
-                )
-                if enhance {
-                    Task { @MainActor in self.exportProgress = max(self.exportProgress ?? 0, 0.4) }
-                    if let enhanced = Self.enhancedExportBuffer(rendered) {
-                        rendered = enhanced
+                if session.isCancelled { break }
+                if index > 0 {
+                    Task { @MainActor [weak self] in
+                        guard let self, self.exportToken == token, self.isExporting else { return }
+                        self.armExportWatchdog(token: token)
                     }
                 }
-                guard let output = ImageUtil.image(from: rendered) else { continue }
-                let metadata = keepMetadata ? Self.loadExportMetadata(asset: item) : nil
-                guard
-                    let url = Self.writeExportFile(
+
+                let isCurrent = item.localIdentifier == currentId
+                let json: String
+                let retouch: RetouchUi
+                let raw: Data?
+                if isCurrent {
+                    json = currentJson
+                    retouch = currentRetouch
+                    raw = currentRaw
+                } else if let saved = EditStore.json(assetId: item.localIdentifier) {
+                    let savedState = EditJSON.parse(saved)
+                    // 导出要带裁切：保存记录里的 crop 是相对原图的有效编辑。
+                    json = EditJSON.build(state: savedState, applyCropRect: true)
+                    retouch = savedState.retouch
+                    raw = nil
+                } else {
+                    let fresh = EditState()
+                    json = EditJSON.build(state: fresh, applyCropRect: true)
+                    retouch = fresh.retouch
+                    raw = nil
+                }
+
+                let targetEdge = Self.exportTargetEdge(for: item)
+                report(index, 0.02, "正在读取原图…")
+
+                var buffer: RgbaBuffer?
+                if let raw, !raw.isEmpty {
+                    report(index, 0.08, "正在解调 RAW…")
+                    let pixels = Double(item.pixelWidth) * Double(item.pixelHeight)
+                    let fullSize = pixels > 0
+                        && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
+                    buffer = autoreleasepool {
+                        NativeCore.shared.decodeRaw(
+                            data: raw,
+                            maxEdge: targetEdge,
+                            fullSize: fullSize
+                        )
+                    }
+                } else {
+                    // UIImage / CGImage 的中间对象放进 autoreleasepool：多选导出几十张时
+                    // 不会在同一个 dispatch block 里越积越多。
+                    buffer = autoreleasepool { () -> RgbaBuffer? in
+                        guard let image = Self.requestExportImage(
+                            asset: item,
+                            maxEdge: targetEdge,
+                            timeout: 45,
+                            isCancelled: { session.isCancelled }
+                        ) else {
+                            return nil
+                        }
+                        report(index, 0.24, "正在准备像素…")
+                        return ImageUtil.rgbaBuffer(from: image, maxEdge: targetEdge)
+                    }
+                }
+
+                if session.isCancelled { break }
+                guard var source = buffer else {
+                    failed += 1
+                    report(index, 1, "读取失败，已跳过")
+                    continue
+                }
+                // 源缓冲已经交给 source：把外层引用放掉，修图产生新缓冲时旧图能及时释放。
+                buffer = nil
+
+                if retouch.isActive {
+                    report(index, 0.32, "正在应用修图…")
+                    if let retouched = Self.applyRetouchForExport(buffer: source, params: retouch) {
+                        source = retouched
+                    }
+                }
+                if session.isCancelled { break }
+
+                report(index, 0.46, "正在渲染调色…")
+                guard var outputBuffer = Self.renderForExport(
+                    buffer: source,
+                    paramsJson: json
+                ) else {
+                    failed += 1
+                    let reason = NativeCore.shared.lastError() ?? "渲染失败"
+                    report(index, 1, "渲染失败：\(reason)")
+                    continue
+                }
+
+                // 高清增强放在调色之后（与旧行为一致）：先按 8MP 预算渲染，
+                // 再对成品做超分；不要先放大到 12MP 再跑一遍完整调色，否则又慢又吃内存。
+                if enhance {
+                    report(index, 0.72, "正在高清增强…")
+                    if let enhanced = Self.enhancedExportBuffer(outputBuffer) {
+                        outputBuffer = enhanced
+                    }
+                }
+                if session.isCancelled { break }
+
+                report(index, 0.82, "正在生成 \(format.rawValue) 文件…")
+                let writtenURL: URL? = autoreleasepool {
+                    guard let output = ImageUtil.image(from: outputBuffer) else { return nil }
+                    let metadata = keepMetadata ? Self.loadExportMetadata(asset: item) : nil
+                    return Self.writeExportFile(
                         image: output,
                         format: format,
                         quality: quality,
                         metadata: metadata
                     )
-                else {
+                }
+                guard let fileURL = writtenURL else {
+                    failed += 1
+                    report(index, 1, "写入文件失败")
                     continue
                 }
-                exported += 1
-                Task { @MainActor in self.saveToLibrary(fileURL: url) }
+                if session.isCancelled {
+                    try? FileManager.default.removeItem(at: fileURL)
+                    break
+                }
+
+                report(index, 0.9, "正在保存到相册…")
+                if Self.saveExportFileToLibrary(fileURL) {
+                    succeeded += 1
+                    if total == 1, shareAfterSave {
+                        shareURL = fileURL
+                    } else {
+                        try? FileManager.default.removeItem(at: fileURL)
+                    }
+                    report(index, 1, "已保存 \(succeeded) 张")
+                } else {
+                    failed += 1
+                    try? FileManager.default.removeItem(at: fileURL)
+                    report(index, 1, "保存到相册失败")
+                }
+                if session.isCancelled { break }
             }
-            Task { @MainActor in
+
+            let cancelled = session.isCancelled
+            let succeededCount = succeeded
+            let failedCount = failed
+            let share = shareURL
+            Task { @MainActor [weak self] in
+                guard let self, self.exportToken == token else { return }
+                self.exportWatchdog?.cancel()
+                self.exportWatchdog = nil
+                self.exportSession = nil
                 self.isExporting = false
-                self.exportProgress = nil
-                self.showMessage(
-                    exported == total
-                        ? "已导出 \(exported) 张到 fdxmp 相簿"
-                        : "导出完成：\(exported)/\(total) 张（部分失败）"
-                )
+                self.exportStatus = nil
+                if cancelled {
+                    self.message = succeededCount > 0
+                        ? "已取消导出（已完成 \(succeededCount) 张）"
+                        : "已取消导出"
+                    return
+                }
+                if succeededCount == total {
+                    self.message = total == 1
+                        ? "已导出到相册「fdxmp」"
+                        : "已导出 \(succeededCount) 张到相册「fdxmp」"
+                    if currentIncluded {
+                        self.persist()
+                    }
+                } else if succeededCount == 0 {
+                    self.message = "导出失败：没有照片保存成功"
+                } else {
+                    self.message = "导出完成：\(succeededCount)/\(total) 张（\(failedCount) 张失败）"
+                    if currentIncluded {
+                        self.persist()
+                    }
+                }
+                if let share {
+                    self.exportShareURL = share
+                }
             }
         }
     }
 
-    /// 导出增强（Real-ESRGAN ×2 超分；输出最长边 ≤ 6144）。
-    ///
-    /// 输入超限（> 4096）或模型不可用时返回 nil，调用方退回原缓冲。
-    static func enhancedExportBuffer(_ buffer: RgbaBuffer) -> RgbaBuffer? {
-        let maxEdge = max(buffer.width, buffer.height)
-        guard maxEdge > 0, maxEdge <= 4096 else { return nil }
-        let target = min(max(maxEdge * 2, 2048), 6144)
-        return NativeCore.shared.retouchUpscale(buffer: buffer, targetMaxEdge: target)
+    /// 更新导出进度（主线程）并重置看门狗。
+    private func updateExportStatus(
+        token: Int,
+        total: Int,
+        index: Int,
+        fraction: Double,
+        succeeded: Int,
+        step: String
+    ) {
+        guard exportToken == token, isExporting else { return }
+        exportStatus = ExportStatus(
+            total: total,
+            index: index,
+            fraction: fraction,
+            succeeded: succeeded,
+            step: step
+        )
+        armExportWatchdog(token: token)
     }
 
-    /// 同步解码一张照片（后台线程用；系统解码路径）。
-    private static func decodeAsset(_ item: PHAsset, maxEdge: Int) -> UIImage? {
+    /// 单张照片的超时看门狗（秒）：核心渲染 / PhotoKit 某一阶段卡住时，
+    /// 不能把导出遮罩永远留在屏幕上。
+    private static let exportStageTimeout: TimeInterval = 120
+
+    private func armExportWatchdog(token: Int) {
+        exportWatchdog?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, self.exportToken == token, self.isExporting else { return }
+            self.exportSession?.cancel()
+            self.exportToken &+= 1
+            self.exportWatchdog = nil
+            self.exportSession = nil
+            self.isExporting = false
+            self.exportStatus = nil
+            self.message = "导出超时，已停止。可重试或减少一次导出的照片数量"
+        }
+        exportWatchdog = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.exportStageTimeout,
+            execute: item
+        )
+    }
+
+    /// 取消当前导出（离开编辑页 / 用户点取消）。
+    func cancelExport(announce: Bool = true) {
+        guard isExporting else { return }
+        exportSession?.cancel()
+        exportSession = nil
+        exportToken &+= 1
+        exportWatchdog?.cancel()
+        exportWatchdog = nil
+        isExporting = false
+        exportStatus = nil
+        if announce {
+            message = "已取消导出"
+        }
+    }
+
+    /// 离开编辑页：取消导出，避免在别的 Tab 里继续占用 CPU / 发热。
+    func handleEditorDisappear() {
+        cancelExport(announce: false)
+    }
+
+    /// 导出增强（Real-ESRGAN ×2 超分；输出最长边 ≤ 4096）。
+    ///
+    /// 输入先压到 2048：直接把 8MP 图放大到 6144 会生成 28MP 的中间缓冲，
+    /// 手机内存顶不住；2048 → 4096 仍然比原图大一倍。
+    static func enhancedExportBuffer(_ buffer: RgbaBuffer) -> RgbaBuffer? {
+        let maxEdge = max(buffer.width, buffer.height)
+        guard maxEdge > 0 else { return nil }
+        let prepared = maxEdge > 2048
+            ? (ImageUtil.downscaled(buffer: buffer, maxEdge: 2048) ?? buffer)
+            : buffer
+        let sourceEdge = max(prepared.width, prepared.height)
+        let target = min(max(sourceEdge * 2, 2048), 4096)
+        return NativeCore.shared.retouchUpscale(buffer: prepared, targetMaxEdge: target)
+    }
+
+    /// 导出的源图最长边：原图超过 8MP 预算时按比例降采样。
+    private static func exportTargetEdge(for asset: PHAsset) -> Int {
+        let width = max(asset.pixelWidth, 1)
+        let height = max(asset.pixelHeight, 1)
+        // 极少数照片在元数据未就绪时宽高为 0：给一个安全的预览尺寸，避免导出 1×1。
+        guard width > 1, height > 1 else { return EditorLimits.previewMaxEdge }
+        let longEdge = max(width, height)
+        let pixels = Double(width) * Double(height)
+        let limit = Double(EditorLimits.exportPixelLimit)
+        guard pixels > limit else { return longEdge }
+        let scale = (limit / pixels).squareRoot()
+        return max(1024, Int((Double(longEdge) * scale).rounded()))
+    }
+
+    /// 分块渲染整帧（导出用）。
+    ///
+    /// 8MP 预算 + 每条 1MP，单次中间缓冲约 40MB；比整帧 `render` 低一个数量级。
+    /// 核心内部对裁切 / 翻转 / 旋转 / 镜头校正会自动选择条带或整帧路径。
+    /// 带「依赖参考图」的蒙版（颜色范围 / 亮度范围 / AI）时区域管线不支持，
+    /// 这里回退一次整帧渲染，避免导出直接失败。
+    private static func renderForExport(buffer: RgbaBuffer, paramsJson: String) -> RgbaBuffer? {
+        if let result = NativeCore.shared.renderTiled(
+            buffer: buffer,
+            paramsJson: paramsJson,
+            stripPixels: 1_000_000
+        ) {
+            return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
+        }
+        guard
+            let result = NativeCore.shared.render(buffer: buffer, paramsJson: paramsJson)
+        else {
+            return nil
+        }
+        return RgbaBuffer(pixels: result.pixels, width: result.width, height: result.height)
+    }
+
+    /// 异步读取一张原图（带超时）：iCloud 资源卡住时不会把导出永远停在「读取原图」。
+    ///
+    /// 等待过程中每 0.2 秒检查一次取消：用户点「取消」后不必等满 45 秒超时，
+    /// 下一次导出也不会排在这条旧请求后面。
+    private static func requestExportImage(
+        asset: PHAsset,
+        maxEdge: Int,
+        timeout: TimeInterval,
+        isCancelled: () -> Bool = { false }
+    ) -> UIImage? {
         let options = PHImageRequestOptions()
-        options.isSynchronous = true
         options.deliveryMode = .highQualityFormat
-        options.resizeMode = .exact
+        options.resizeMode = .fast
         options.isNetworkAccessAllowed = true
         options.version = .current
+        let lock = NSLock()
+        let semaphore = DispatchSemaphore(value: 0)
+        var finished = false
+        var image: UIImage?
         let target = CGSize(width: maxEdge, height: maxEdge)
-        var output: UIImage?
-        PHImageManager.default().requestImage(
-            for: item,
+        let requestId = PHImageManager.default().requestImage(
+            for: asset,
             targetSize: target,
             contentMode: .aspectFit,
             options: options
-        ) { image, _ in
-            output = image
+        ) { result, info in
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            if degraded { return }
+            lock.lock()
+            if !finished {
+                finished = true
+                image = result
+                semaphore.signal()
+            }
+            lock.unlock()
         }
+        let deadline = Date().addingTimeInterval(timeout)
+        var gotResult = false
+        while Date() < deadline {
+            if semaphore.wait(timeout: .now() + 0.2) == .success {
+                gotResult = true
+                break
+            }
+            if isCancelled() { break }
+        }
+        guard gotResult else {
+            lock.lock()
+            finished = true
+            lock.unlock()
+            PHImageManager.default().cancelImageRequest(requestId)
+            return nil
+        }
+        lock.lock()
+        let output = image
+        lock.unlock()
         return output
     }
 
-    /// 导出第二阶段（在渲染线程调用）：条带分块渲染 → 编码 → 存相册。
-    private func finishExport(
-        buffer: RgbaBuffer?,
-        paramsJson json: String,
-        retouch: RetouchUi,
-        identityGeometry: Bool,
-        metadata: [String: Any]?,
-        format: ExportFormat,
-        quality: Double
-    ) {
-        // 修图开启：先在解码缓冲上应用修图（按导出分辨率），再走调色渲染。
-        var buffer = buffer
-        if let source = buffer, retouch.isActive {
-            buffer = Self.applyRetouchForExport(buffer: source, params: retouch) ?? source
-        }
-        // 大图优先按横向条带分块渲染（每块只跑区域管线，内存峰值明显低于整帧）。
-        let renderedBuffer: RgbaBuffer?
-        if let buffer,
-           let result = NativeCore.shared.renderTiled(buffer: buffer, paramsJson: json) {
-            renderedBuffer = RgbaBuffer(
-                pixels: result.pixels,
-                width: result.width,
-                height: result.height
-            )
-        } else if let buffer,
-                  let result = NativeCore.shared.render(buffer: buffer, paramsJson: json) {
-            renderedBuffer = RgbaBuffer(
-                pixels: result.pixels,
-                width: result.width,
-                height: result.height
-            )
-        } else {
-            renderedBuffer = nil
-        }
-        let failure = renderedBuffer == nil ? NativeCore.shared.lastError() : nil
-        let output = renderedBuffer.flatMap { ImageUtil.image(from: $0) }
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            guard let output else {
-                self.isExporting = false
-                self.exportProgress = nil
-                self.message = failure ?? (buffer == nil ? "导出失败：无法读取原图" : "导出失败")
-                return
-            }
-            self.exportProgress = 0.75
-            // 编码（JPEG/PNG/HEIC）放到工作线程，避免卡住界面。
-            self.renderQueue.async { [weak self] in
-                let fileURL = Self.writeExportFile(
-                    image: output,
-                    format: format,
-                    quality: quality,
-                    metadata: metadata
-                )
-                Task { @MainActor in
-                    guard let self else { return }
-                    guard let fileURL else {
-                        self.isExporting = false
-                        self.exportProgress = nil
-                        self.message = "导出失败：无法写入文件"
-                        return
-                    }
-                    self.exportProgress = 0.9
-                    self.saveToLibrary(fileURL: fileURL)
-                }
-            }
-        }
-    }
-
-    /// 读取原图的拍摄元数据（EXIF / TIFF / GPS / IPTC），并清掉会过期的尺寸字段。
-    /// 大图导出：按横向条带分块调用区域渲染，拼成整张原图分辨率结果。
-    ///
-    /// 返回 nil 表示条件不满足（有裁切 / 旋转，或核心拒绝——例如带非单位几何的镜头参数），
-    /// 调用方回退单次整帧渲染。
-    private func renderTiledExport(
-        buffer: RgbaBuffer,
-        paramsJson: String,
-        identityGeometry: Bool
-    ) -> RgbaBuffer? {
-        guard identityGeometry else { return nil }
-        let width = buffer.width
-        let height = buffer.height
-        guard width > 32, height > 32 else { return nil }
-        // 每条区域约 4MP（含余量），条带越矮内存越省、次数越多。
-        let margin = 12
-        let stripHeight = max(64, min(height, 4_000_000 / max(width, 1)))
-        let stripCount = Int(ceil(Double(height) / Double(stripHeight)))
-        var output = [UInt8](repeating: 0, count: width * height * 4)
-        var y = 0
-        var index = 0
-        while y < height {
-            let h = min(stripHeight, height - y)
-            let regionY = max(0, y - margin)
-            let regionBottom = min(height, y + h + margin)
-            let regionHeight = regionBottom - regionY
-            guard
-                let region = ImageUtil.cropped(
-                    buffer: buffer,
-                    x: 0,
-                    y: regionY,
-                    width: width,
-                    height: regionHeight
-                ),
-                let result = NativeCore.shared.renderRegion(
-                    buffer: region,
-                    originX: 0,
-                    originY: regionY,
-                    visibleX: 0,
-                    visibleY: y,
-                    visibleWidth: width,
-                    visibleHeight: h,
-                    fullWidth: width,
-                    fullHeight: height,
-                    paramsJson: paramsJson
-                ),
-                result.width == width,
-                result.height == h
-            else {
-                return nil
-            }
-            let targetStart = y * width * 4
-            let bytes = h * width * 4
-            output.replaceSubrange(
-                targetStart..<(targetStart + bytes),
-                with: result.pixels[0..<bytes]
-            )
-            index += 1
-            y += h
-            let progress = 0.3 + 0.5 * Double(index) / Double(max(stripCount, 1))
-            Task { @MainActor [weak self] in
-                self?.exportProgress = min(progress, 0.8)
-            }
-        }
-        return RgbaBuffer(pixels: output, width: width, height: height)
-    }
-
-    /// 读取原图的拍摄元数据（EXIF / TIFF / GPS / IPTC），并清掉会过期的尺寸字段。
+    /// 读取原图拍摄元数据（EXIF / TIFF / GPS / IPTC），带超时；失败返回 nil。
     private static func loadExportMetadata(asset: PHAsset) -> [String: Any]? {
         let options = PHImageRequestOptions()
         // 只读本地元数据：避免 iCloud 资源在同步回调里阻塞。
         options.isNetworkAccessAllowed = false
         options.version = .current
-        options.isSynchronous = true
+        let lock = NSLock()
+        let semaphore = DispatchSemaphore(value: 0)
+        var finished = false
         var data: Data?
-        imageManager.requestImageDataAndOrientation(for: asset, options: options) { result, _, _, _ in
-            data = result
+        let requestId = imageManager.requestImageDataAndOrientation(
+            for: asset,
+            options: options
+        ) { result, _, _, _ in
+            lock.lock()
+            if !finished {
+                finished = true
+                data = result
+                semaphore.signal()
+            }
+            lock.unlock()
         }
+        if semaphore.wait(timeout: .now() + 4) == .timedOut {
+            imageManager.cancelImageRequest(requestId)
+            return nil
+        }
+        lock.lock()
+        let payload = data
+        lock.unlock()
         guard
-            let data,
-            let source = CGImageSourceCreateWithData(data as CFData, nil),
+            let payload,
+            let source = CGImageSourceCreateWithData(payload as CFData, nil),
             let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any]
         else {
             return nil
@@ -4307,41 +4487,51 @@ final class EditorModel: ObservableObject {
             }
         }
         CGImageDestinationAddImage(destination, cgImage, properties as CFDictionary)
-        guard CGImageDestinationFinalize(destination) else { return nil }
+        guard CGImageDestinationFinalize(destination) else {
+            try? FileManager.default.removeItem(at: url)
+            return nil
+        }
         return url
     }
 
-    private func saveToLibrary(fileURL: URL) {
+    /// 同步保存到「fdxmp」相簿（带超时；导出线程逐张串行，避免并发 performChanges）。
+    private static func saveExportFileToLibrary(_ fileURL: URL) -> Bool {
+        let lock = NSLock()
+        let semaphore = DispatchSemaphore(value: 0)
+        var finished = false
+        var success = false
         PHPhotoLibrary.shared().performChanges({
             guard
-                let request = PHAssetChangeRequest.creationRequestForAssetFromImage(atFileURL: fileURL)
+                let request = PHAssetChangeRequest.creationRequestForAssetFromImage(
+                    atFileURL: fileURL
+                )
             else {
                 return
             }
             guard let placeholder = request.placeholderForCreatedAsset else { return }
-            if let album = Self.fdxmpAlbum() {
+            if let album = fdxmpAlbum() {
                 PHAssetCollectionChangeRequest(for: album)?.addAssets([placeholder] as NSArray)
             } else {
                 PHAssetCollectionChangeRequest
                     .creationRequestForAssetCollection(withTitle: "fdxmp")
                     .addAssets([placeholder] as NSArray)
             }
-        }) { [weak self] success, error in
-            Task { @MainActor in
-                guard let self else { return }
-                self.isExporting = false
-                self.exportProgress = nil
-                if success {
-                    self.message = "已导出到相册「fdxmp」"
-                    self.persist()
-                    if EditorLimits.exportShareAfterSave {
-                        self.exportShareURL = fileURL
-                    }
-                } else {
-                    self.message = "保存失败：\(error?.localizedDescription ?? "未知错误")"
-                }
+        }) { ok, _ in
+            lock.lock()
+            if !finished {
+                finished = true
+                success = ok
+                semaphore.signal()
             }
+            lock.unlock()
         }
+        if semaphore.wait(timeout: .now() + 20) == .timedOut {
+            return false
+        }
+        lock.lock()
+        let value = success
+        lock.unlock()
+        return value
     }
 
     private static func fdxmpAlbum() -> PHAssetCollection? {
