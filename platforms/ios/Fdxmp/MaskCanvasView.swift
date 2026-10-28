@@ -660,8 +660,12 @@ final class MaskCanvasController {
     private var dragging = false
     /// 正在拖动放置新蒙版（线性 / 径向）。
     private var placing = false
+    /// 这次放置是否已经真的建出蒙版（手指拖开阈值后才建）。
+    private var placementCreated = false
     /// 放置起点（归一化图像坐标；线性 = 起点，径向 = 中心）。
     private var placementStart: CGPoint = .zero
+    /// 放置阈值（内容点）：手指移动超过这个距离才建蒙版，避免按下瞬间闪一个默认形状。
+    private static let placementThreshold: CGFloat = 8
     private var rotationActive = false
     private var rotationAccumulated: Double = 0
     private var rotationApplied: Double = 0
@@ -677,15 +681,17 @@ final class MaskCanvasController {
         case .singleBegan(let point):
             let content = geometry.contentPoint(point)
             let normalized = clampedNormalized(geometry.normalized(fromContent: content))
-            // 放置新蒙版：按下点 = 线性起点 / 径向中心，拖动决定方向与大小。
+            // 放置新蒙版：按下点 = 线性起点 / 径向中心。
+            // 注意：按下时**先不建蒙版**（否则会闪一个默认方向的渐变），
+            // 等手指真的拖开一段距离再建。
             if model.maskPlacementKind != nil {
                 Haptics.light()
                 placementStart = normalized
                 placing = true
+                placementCreated = false
                 dragging = false
                 brushing = false
                 drag = nil
-                model.beginMaskPlacement(at: normalized)
                 return
             }
             guard let mask = model.selectedMask else { return }
@@ -716,7 +722,19 @@ final class MaskCanvasController {
             model.beginMaskDrag(label: Self.dragLabel(for: mode))
         case .singleMoved(let point):
             if placing {
-                updatePlacement(to: geometry.contentPoint(point), geometry: geometry, model: model)
+                let content = geometry.contentPoint(point)
+                if !placementCreated {
+                    // 手指还没真正拖开（只是按着）：不建蒙版，避免闪一下默认形状。
+                    let startContent = geometry.contentPoint(placementStart)
+                    let dx = content.x - startContent.x
+                    let dy = content.y - startContent.y
+                    guard (dx * dx + dy * dy).squareRoot() >= Self.placementThreshold else {
+                        return
+                    }
+                    placementCreated = true
+                    model.beginMaskPlacement(at: placementStart)
+                }
+                updatePlacement(to: content, geometry: geometry, model: model)
                 return
             }
             if brushing {
@@ -736,7 +754,11 @@ final class MaskCanvasController {
         case .singleEnded, .singleCancelled:
             if placing {
                 placing = false
-                model.finishMaskPlacement()
+                // 只点了一下没拖动：不建蒙版，留在放置态，用户可以再拖一次。
+                if placementCreated {
+                    placementCreated = false
+                    model.finishMaskPlacement()
+                }
                 return
             }
             finishSingle(model: model)
@@ -771,6 +793,7 @@ final class MaskCanvasController {
         brushing = false
         dragging = false
         placing = false
+        placementCreated = false
         rotationActive = false
         rotationAccumulated = 0
         rotationApplied = 0

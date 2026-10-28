@@ -1952,22 +1952,9 @@ final class EditorModel: ObservableObject {
         scheduleMaskAssetsRefresh(immediate: true)
     }
 
-    /// 松手：拖得太短就给一个能继续拖的默认尺寸，然后整步提交。
+    /// 松手：几何完全跟手（拖多大就是多大），整步提交。
     func finishMaskPlacement() {
         maskPlacementKind = nil
-        if let mask = selectedMask, mask.kind == .linear || mask.kind == .radial {
-            if mask.kind == .linear, mask.linearWidth < 0.06 {
-                updateSelectedMask { item in
-                    let end = CGPoint(x: item.start.x, y: item.start.y + 0.3)
-                    item.end = CGPoint(x: min(max(end.x, 0), 1), y: min(max(end.y, 0), 1))
-                }
-            } else if mask.kind == .radial,
-                      mask.radii.width < 0.06 || mask.radii.height < 0.06 {
-                updateSelectedMask { item in
-                    item.radii = CGSize(width: 0.28, height: 0.22)
-                }
-            }
-        }
         finishMaskInteraction()
     }
 
