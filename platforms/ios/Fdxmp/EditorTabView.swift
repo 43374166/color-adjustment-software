@@ -40,6 +40,12 @@ struct EditorTabView: View {
     @State private var lastPhotoTapAt = Date.distantPast
     /// 待执行的单击动作（双击时取消，保证双击不触发任何单击效果）。
     @State private var pendingSingleTap: DispatchWorkItem?
+    /// 双指缩放状态：锚点（视图坐标）+ 起手时的缩放 / 位移，用锚点公式算新位移，
+    /// 让手指中点下的画面保持不动（iOS 17 起能拿到中点；16 退回视图中心）。
+    @State private var pinchActive = false
+    @State private var pinchAnchor: CGPoint = .zero
+    @State private var pinchStartZoom: CGFloat = 1
+    @State private var pinchStartPan: CGSize = .zero
     /// 蒙版画布交互控制器（拖动 / 涂抹 / 双指手势）。
     @State private var maskController = MaskCanvasController()
     /// 分类参数面板是否收起（点同一个分类两次 = 收起 / 再展开）。
@@ -736,7 +742,19 @@ struct EditorTabView: View {
                 } else {
                     previewBody(geo: geo)
                         .contentShape(Rectangle())
-                        .gesture(previewGesture(viewWidth: geo.size.width))
+                        // 双指缩放：以手指中点为锚点（iOS 17+；更早系统退回居中缩放）。
+                        .modifier(PinchZoomModifier(
+                            onChanged: { magnification, anchor in
+                                handlePinch(
+                                    magnification: magnification,
+                                    anchor: anchor,
+                                    viewSize: geo.size
+                                )
+                            },
+                            onEnded: { endPinch() }
+                        ))
+                        // 单指拖动与双指缩放并行识别（和原来 SimultaneousGesture 的语义一致）。
+                        .simultaneousGesture(panSwipeGesture(viewSize: geo.size))
                         .simultaneousGesture(photoTouchGesture(viewSize: geo.size))
                 }
             }
@@ -957,29 +975,18 @@ struct EditorTabView: View {
         )
     }
 
-    /// 预览手势：双指缩放 + （放大后）单指平移；对比模式下单指拖动分割线。
-    private func previewGesture(viewWidth: CGFloat) -> some Gesture {
-        let magnify = MagnificationGesture()
-            .onChanged { value in
-                guard overlayEnabled else { return }
-                lastPinchAt = Date()
-                // 放到"能看到毛孔"的倍率（1:1 之上继续放大，细节帧按区域渲染）。
-                zoom = (baseZoom * value).clamped(to: 1...24)
-            }
-            .onEnded { _ in
-                guard overlayEnabled else { return }
-                baseZoom = zoom
-                if zoom <= 1.01 {
-                    resetZoom()
-                }
-            }
-        let drag = DragGesture(minimumDistance: 12)
+    /// 单指拖动：放大后平移；对比模式拖分割线；1x 时左右滑动切图。
+    private func panSwipeGesture(viewSize: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 12)
             .onChanged { value in
                 if compareSplit != nil {
-                    compareSplit = (value.location.x / max(viewWidth, 1)).clamped(to: 0.05...0.95)
+                    compareSplit = (value.location.x / max(viewSize.width, 1))
+                        .clamped(to: 0.05...0.95)
                     return
                 }
                 guard overlayEnabled else { return }
+                // 双指缩放进行中：位移由锚点公式算，别让单指拖动再改一次。
+                if pinchActive { return }
                 if zoom > 1 {
                     pan = CGSize(
                         width: basePan.width + value.translation.width,
@@ -1002,7 +1009,44 @@ struct EditorTabView: View {
                 guard overlayEnabled, compareSplit == nil else { return }
                 endSwipe(value)
             }
-        return SimultaneousGesture(magnify, drag)
+    }
+
+    /// 双指缩放：以手指中点（`anchor`）为锚点，锚点下的画面保持不动。
+    ///
+    /// 屏幕坐标 = 中心 + zoom × 内容坐标 + pan，所以保持锚点不动：
+    /// `pan = (anchor - center) - (新zoom / 起手zoom) × (anchor - center - 起手pan)`。
+    private func handlePinch(magnification: CGFloat, anchor: CGPoint?, viewSize: CGSize) {
+        guard overlayEnabled else { return }
+        lastPinchAt = Date()
+        if !pinchActive {
+            pinchActive = true
+            pinchStartZoom = zoom
+            pinchStartPan = pan
+            // iOS 17 之前拿不到手指中点：退回视图中心（等同于原来的居中缩放）。
+            pinchAnchor = anchor ?? CGPoint(x: viewSize.width / 2, y: viewSize.height / 2)
+        }
+        let newZoom = (pinchStartZoom * magnification).clamped(to: 1...24)
+        let center = CGPoint(x: viewSize.width / 2, y: viewSize.height / 2)
+        let ratio = newZoom / max(pinchStartZoom, 0.0001)
+        let offsetX = pinchAnchor.x - center.x
+        let offsetY = pinchAnchor.y - center.y
+        let targetX = offsetX - ratio * (offsetX - pinchStartPan.width)
+        let targetY = offsetY - ratio * (offsetY - pinchStartPan.height)
+        // 快回到 1x 时位移收敛到 0：否则松手回中会跳一下。
+        let fade = min(max((newZoom - 1) / 0.15, 0), 1)
+        zoom = newZoom
+        pan = CGSize(width: targetX * fade, height: targetY * fade)
+    }
+
+    /// 双指缩放结束：落定缩放 / 位移，缩回 1x 时回中。
+    private func endPinch() {
+        guard overlayEnabled else { return }
+        pinchActive = false
+        baseZoom = zoom
+        basePan = pan
+        if zoom <= 1.01 {
+            resetZoom()
+        }
     }
 
     /// 松手收尾：过半 / 快速甩动 → 切图（回弹动画），否则弹回原位。
@@ -1083,6 +1127,8 @@ struct EditorTabView: View {
                     photoTouchActive = true
                     photoTouchMoved = false
                     photoHoldActive = false
+                    // 新手势序列开始：清掉上一轮可能残留的双指缩放状态（系统打断时收不到 onEnded）。
+                    pinchActive = false
                     // 新的一次触摸开始：上一击排队的单击作废（双击 / 滑动 / 长按都不该触发它）。
                     pendingSingleTap?.cancel()
                     pendingSingleTap = nil
@@ -1131,7 +1177,7 @@ struct EditorTabView: View {
                     lastPhotoTapAt = .distantPast
                     pendingSingleTap?.cancel()
                     pendingSingleTap = nil
-                    toggleZoom()
+                    toggleZoom(at: value.startLocation, viewSize: viewSize)
                 } else {
                     // 单击：延迟到双击窗口之后再切沉浸（等不到第二击才算单击）。
                     lastPhotoTapAt = now
@@ -1180,19 +1226,33 @@ struct EditorTabView: View {
         .insetBy(dx: -6, dy: -6)
     }
 
-    /// 双击：放大 / 还原。
-    private func toggleZoom() {
+    /// 双击：放大 / 还原。放大时以双击点为锚点，双击点下的画面保持不动。
+    private func toggleZoom(at point: CGPoint, viewSize: CGSize) {
         guard overlayEnabled else { return }
-        withAnimation(.easeInOut(duration: 0.22)) {
-            if zoom > 1.01 {
-                zoom = 1
-                baseZoom = 1
-                pan = .zero
-                basePan = .zero
-            } else {
-                zoom = 2.5
-                baseZoom = 2.5
+        if zoom > 1.01 {
+            withAnimation(.easeInOut(duration: 0.22)) {
+                resetZoom()
             }
+            return
+        }
+        let target: CGFloat = 2.5
+        let center = CGPoint(x: viewSize.width / 2, y: viewSize.height / 2)
+        // 点在黑边上时夹到画面范围，避免放大到空白区。
+        let fitted = fittedRect(imageSize: previewImageSize, in: viewSize)
+        let anchor = CGPoint(
+            x: min(max(point.x, fitted.minX), fitted.maxX),
+            y: min(max(point.y, fitted.minY), fitted.maxY)
+        )
+        // 同双指缩放：让 anchor 下的内容停在 anchor 上。
+        let newPan = CGSize(
+            width: (anchor.x - center.x) * (1 - target),
+            height: (anchor.y - center.y) * (1 - target)
+        )
+        withAnimation(.easeInOut(duration: 0.22)) {
+            zoom = target
+            baseZoom = target
+            pan = newPan
+            basePan = newPan
         }
     }
 
@@ -2634,6 +2694,38 @@ private struct LoadingBlocker: View {
         }
         .transition(.opacity)
         .zIndex(100)
+    }
+}
+
+/// 双指缩放：iOS 17 起用 `MagnifyGesture` 拿手指中点做锚点；
+/// iOS 16 拿不到中点，退回居中缩放（等同原来的行为）。
+private struct PinchZoomModifier: ViewModifier {
+    /// (缩放倍率, 手指中点；nil = 当前系统拿不到中点)
+    let onChanged: (CGFloat, CGPoint?) -> Void
+    let onEnded: () -> Void
+
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, *) {
+            content.simultaneousGesture(
+                MagnifyGesture()
+                    .onChanged { value in
+                        onChanged(value.magnification, value.startLocation)
+                    }
+                    .onEnded { _ in
+                        onEnded()
+                    }
+            )
+        } else {
+            content.simultaneousGesture(
+                MagnificationGesture()
+                    .onChanged { value in
+                        onChanged(value, nil)
+                    }
+                    .onEnded { _ in
+                        onEnded()
+                    }
+            )
+        }
     }
 }
 
