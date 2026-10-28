@@ -800,6 +800,7 @@ fn compose_masks(
                 raster,
                 curves: CurveLuts::new(&mask.adjustments.curves),
                 color_stage: crate::color_engine::ColorStage::from_params(&mask.adjustments),
+                tone: crate::tone::ToneStage::from_params(&mask.adjustments),
                 params: (*mask.adjustments).clone(),
             })
         })
@@ -830,6 +831,7 @@ fn compose_masks(
                         let adjusted = adjust_with_reference(
                             rgb,
                             &context.params,
+                            &context.tone,
                             &context.curves,
                             &context.color_stage,
                         );
@@ -1076,6 +1078,9 @@ struct MaskContext {
     curves: CurveLuts,
     /// 该蒙版的调色段（构建一次，逐像素复用；与 GPU / `fdxmp-color` 同一份数学）。
     color_stage: crate::color_engine::ColorStage,
+    /// 该蒙版的显示域色调段（对比度 / 高光 / 阴影 / 白 / 黑）：
+    /// 与全局编辑同一条管线，蒙版的亮度滑杆才有和全局一致的效果。
+    tone: crate::tone::ToneStage,
     params: EditParams,
 }
 
@@ -1083,21 +1088,24 @@ struct MaskContext {
 fn adjust_with_reference(
     rgb: [f32; 3],
     params: &EditParams,
+    tone: &crate::tone::ToneStage,
     curves: &CurveLuts,
     color_stage: &crate::color_engine::ColorStage,
 ) -> [f32; 3] {
-    // 局部调整同样包含白平衡 / 曝光 / 对比度（参考实现）。
+    // 局部调整与全局完全同一条管线：参考基底（白平衡 / 校准 / 曝光）
+    // → 显示域色调段（对比度 / 高光 / 阴影 / 白 / 黑）→ 曲线 / 调色段。
     let linear = [
         srgb8_to_linear(to_u8(rgb[0])),
         srgb8_to_linear(to_u8(rgb[1])),
         srgb8_to_linear(to_u8(rgb[2])),
     ];
     let base = crate::pipeline::apply_reference(linear, params);
+    let toned = tone.apply(base, 0.0);
     adjust_pixel(
         [
-            f32::from(linear_to_srgb8(base[0])) / 255.0,
-            f32::from(linear_to_srgb8(base[1])) / 255.0,
-            f32::from(linear_to_srgb8(base[2])) / 255.0,
+            f32::from(linear_to_srgb8(toned[0])) / 255.0,
+            f32::from(linear_to_srgb8(toned[1])) / 255.0,
+            f32::from(linear_to_srgb8(toned[2])) / 255.0,
         ],
         curves,
         color_stage,
