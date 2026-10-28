@@ -357,6 +357,9 @@ enum MaskHitTester {
     ) -> MaskDragMode {
         let fitted = geometry.fitted
         guard fitted.width > 0, fitted.height > 0 else { return .none }
+        // 中心线附近拖动判定仍用原来的中心线半长（轴线只是视觉辅助）。
+        let center = canvasPoint(mask.linearCenter, fitted: fitted)
+        let halfSpan = min(fitted.width, fitted.height) * linearPinHalfSpanRatio
         // 中心线 / 过渡边界的共同方向 = 归一化空间垂线在内容空间的像。
         let dir = mask.linearDirection
         let across = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)

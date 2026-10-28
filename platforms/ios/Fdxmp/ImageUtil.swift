@@ -192,6 +192,80 @@ enum ImageUtil {
         return RgbaBuffer(pixels: pixels, width: w, height: h)
     }
 
+    /// 区域帧的几何变换（翻转 → 90° 旋转），与核心 `apply_geometry` 的顺序一致。
+    ///
+    /// 区域渲染在源坐标里做调色 / 效果 / 蒙版，裁切与翻转 / 旋转本身只是像素搬位；
+    /// 放到渲染之后做，能保证暗角 / 颗粒 / 蒙版仍按整帧源坐标计算。
+    static func transformed(
+        buffer: RgbaBuffer,
+        flipHorizontal: Bool,
+        flipVertical: Bool,
+        quarterTurns: Int
+    ) -> RgbaBuffer? {
+        guard buffer.width > 0, buffer.height > 0 else { return nil }
+        let turns = ((quarterTurns % 4) + 4) % 4
+        guard flipHorizontal || flipVertical || turns != 0 else { return buffer }
+
+        var source = buffer
+        if flipHorizontal {
+            var pixels = [UInt8](repeating: 0, count: source.pixels.count)
+            let rowBytes = source.width * 4
+            for y in 0..<source.height {
+                let row = y * rowBytes
+                for x in 0..<source.width {
+                    let from = row + (source.width - 1 - x) * 4
+                    let to = row + x * 4
+                    for channel in 0..<4 {
+                        pixels[to + channel] = source.pixels[from + channel]
+                    }
+                }
+            }
+            source = RgbaBuffer(pixels: pixels, width: source.width, height: source.height)
+        }
+        if flipVertical {
+            var pixels = [UInt8](repeating: 0, count: source.pixels.count)
+            let rowBytes = source.width * 4
+            for y in 0..<source.height {
+                let from = (source.height - 1 - y) * rowBytes
+                let to = y * rowBytes
+                pixels.replaceSubrange(
+                    to..<(to + rowBytes),
+                    with: source.pixels[from..<(from + rowBytes)]
+                )
+            }
+            source = RgbaBuffer(pixels: pixels, width: source.width, height: source.height)
+        }
+        if turns != 0 {
+            let outWidth = source.height
+            let outHeight = source.width
+            var pixels = [UInt8](repeating: 0, count: source.pixels.count)
+            for y in 0..<source.height {
+                for x in 0..<source.width {
+                    let outX: Int
+                    let outY: Int
+                    switch turns {
+                    case 1:
+                        outX = source.height - 1 - y
+                        outY = x
+                    case 2:
+                        outX = source.width - 1 - x
+                        outY = source.height - 1 - y
+                    default:
+                        outX = y
+                        outY = source.width - 1 - x
+                    }
+                    let from = (y * source.width + x) * 4
+                    let to = (outY * outWidth + outX) * 4
+                    for channel in 0..<4 {
+                        pixels[to + channel] = source.pixels[from + channel]
+                    }
+                }
+            }
+            source = RgbaBuffer(pixels: pixels, width: outWidth, height: outHeight)
+        }
+        return source
+    }
+
     /// 按最长边缩放并规范化方向（绘制一次同时完成方向校正与缩放）。
     private static func redraw(_ image: UIImage, maxEdge: Int) -> UIImage {
         let pixelWidth = image.size.width * image.scale

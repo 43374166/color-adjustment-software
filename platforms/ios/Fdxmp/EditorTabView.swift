@@ -185,10 +185,15 @@ struct EditorTabView: View {
         }
         .onChange(of: zoom) { value in
             // 放大时按缩放级别拉取"够用"的高分辨率帧，缩回 1x 释放。
+            model.setDetailZoomActive(value > 1.01)
             updateDetailRequest()
         }
         .onChange(of: pan) { _ in
             // 平移后可见范围变了：区域帧要跟着换（内部去抖）。
+            updateDetailRequest()
+        }
+        .onChange(of: model.tool) { _ in
+            // 裁切工具显示未裁切原图，工具切换后区域帧的几何映射也会变。
             updateDetailRequest()
         }
         .overlay(alignment: .bottom) {
@@ -435,21 +440,23 @@ struct EditorTabView: View {
 
     /// 按当前缩放 / 视口请求"够用"的高分辨率细节帧（缩到 1x 时释放）。
     private func updateDetailRequest() {
-        guard zoom > 1.05, previewAreaSize.width > 10 else {
+        guard zoom > 1.01, previewAreaSize.width > 10 else {
+            model.setDetailZoomActive(false)
             model.clearDetailPreview()
             model.clearDetailRegion()
             return
         }
+        model.setDetailZoomActive(true)
         let viewport = CGSize(
             width: previewAreaSize.width * displayScale,
             height: previewAreaSize.height * displayScale
         )
-        if model.canRenderRegionDetail {
+        if model.tool != .mask, model.canRenderRegionDetail {
             // 区域 1:1：只渲染可见范围（核心按帧外坐标保证与整帧一致）。
-            model.clearDetailPreview()
             model.scheduleDetailRegion(
                 visible: currentVisibleRect(viewSize: previewAreaSize),
-                viewport: viewport
+                viewport: viewport,
+                zoom: zoom
             )
         } else {
             model.clearDetailRegion()
@@ -475,15 +482,6 @@ struct EditorTabView: View {
         )
     }
 
-    /// 区域帧是否覆盖当前可见范围（不覆盖就不显示，避免贴错位置的接缝）。
-    private func detailRegionCovers(_ rect: CGRect, viewSize: CGSize) -> Bool {
-        let visible = currentVisibleRect(viewSize: viewSize)
-        let tolerance: CGFloat = 0.012
-        return visible.minX >= rect.minX - tolerance
-            && visible.minY >= rect.minY - tolerance
-            && visible.maxX <= rect.maxX + tolerance
-            && visible.maxY <= rect.maxY + tolerance
-    }
 
     // MARK: - 主布局
 
@@ -858,7 +856,12 @@ struct EditorTabView: View {
                 // 预览画面：Metal 图层常驻（零拷贝上屏用，未激活时透明不挡 Image），
                 // 回读画面盖在上面（零拷贝生效 / 看原图 / 对比模式下隐藏）。
                 let fitted = fittedRect(imageSize: previewImageSize, in: geo.size)
-                let metalActive = model.zeroCopyActive && !model.showOriginal && compareSplit == nil
+                // 放大时暂停零拷贝：Metal 里只有 2048 预览缓冲，会盖住下面的
+                // detailImage；改由 SwiftUI Image 显示全分辨率细节帧 / 区域帧。
+                let metalActive = model.zeroCopyActive
+                    && !model.showOriginal
+                    && compareSplit == nil
+                    && zoom <= 1.01
                 ZStack {
                     MetalPreviewView { pointer, token in
                         model.attachPreviewLayer(pointer, token: token)
@@ -883,10 +886,13 @@ struct EditorTabView: View {
                 Color.clear
             }
             // 放大后的 1:1 区域帧（核心按帧外坐标渲染），按归一化矩形对齐贴上。
+            // 平移时保留旧区域帧（不整块消失）；新区域帧到达后替换，衔接更稳。
             if model.tool != .mask,
+               !model.showOriginal,
+               compareSplit == nil,
+               abs(previewSpin) < 1e-3,
                let region = model.detailRegion,
-               zoom > 1.01,
-               detailRegionCovers(region.rect, viewSize: geo.size)
+               zoom > 1.01
             {
                 DetailRegionLayer(
                     image: region.image,

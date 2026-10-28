@@ -40,11 +40,14 @@ enum ColorTab: String, CaseIterable, Identifiable {
 /// 渲染尺寸上限（非 actor 隔离，可在后台渲染闭包中安全引用）。
 enum EditorLimits {
     /// 预览最长边（越大越清晰、渲染越慢）。
-    static let previewMaxEdge = 1440
+    ///
+    /// 2048 覆盖 3x 屏竖图铺满时的像素长边（约 1560–2048px），
+    /// 1x 显示时不会再因为预览只有 1440 而被放大。
+    static let previewMaxEdge = 2048
     /// 蒙版拖动 / 涂抹时的快速预览最长边（低分辨率缓冲，手感更跟手）。
     static let fastPreviewMaxEdge = 720
     /// 蒙版叠加层最长边（与预览一致：共用同一份蒙版栅格缓存，避免重复计算）。
-    static let maskOverlayMaxEdge = 1440
+    static let maskOverlayMaxEdge = 2048
     /// 蒙版列表缩略图最长边。
     static let maskThumbnailMaxEdge = 128
     /// 导出按**原图分辨率**渲染（不再限制最长边）。
@@ -80,8 +83,12 @@ enum EditorLimits {
     }
     /// 放大查看（原像素细节）用的最长边。
     static let detailMaxEdge = 4096
-    /// RAW 细节缓冲最长边（LibRaw 解一版备用，供放大 1:1 / 区域细节复用）。
-    static let rawDetailMaxEdge = 2560
+    /// 全分辨率细节源的最长边上限（PhotoKit 原图 / RAW 解调后的像素预算）。
+    static let detailSourceMaxEdge = 8192
+    /// 全分辨率细节源的像素上限（RGBA8：32MP ≈ 128MB）。
+    static let detailSourcePixelLimit = 32_000_000
+    /// 单次区域渲染的像素上限（含外扩余量；核心 CPU 管线约 40 字节/像素）。
+    static let detailRegionPixelLimit = 6_000_000
     /// RAW 全尺寸解调的像素上限（超过则用半尺寸，避免 48MP ProRAW 内存尖峰）。
     static let rawFullSizePixelLimit = 24_000_000
 }
@@ -215,10 +222,20 @@ final class EditorModel: ObservableObject {
     private(set) var rawData: Data?
     /// 当前 RAW 帧的缓存键（nil = 非 RAW / 无缓存）。
     private var rawCacheKey: String?
-    /// RAW 细节缓冲（LibRaw 解一版 ≤2560，供放大 1:1 / 区域细节复用；nil = 未就绪）。
+    /// RAW 细节缓冲（LibRaw 解一版，供整帧细节帧复用；nil = 未就绪）。
     private var rawDetailBuffer: RgbaBuffer?
-    private var rawDetailInFlight = false
-    private var rawDetailToken = 0
+    /// 全分辨率细节源：放大后的区域渲染 / 整帧细节帧都从这里取像素。
+    ///
+    /// 非 RAW 走 PhotoKit 原图，RAW 走 LibRaw；只在第一次需要时准备，
+    /// 与低分辨率的 `baseBuffer` 分开——后者只负责 1x 预览和交互。
+    private var detailSource: RgbaBuffer?
+    private var detailSourceInFlight = false
+    private var detailSourceFailed = false
+    private var detailSourceToken = 0
+    /// 细节源就绪前挂起的区域请求（源到位后补发，避免第一次放大落空）。
+    private var pendingDetailRegion: (visible: CGRect, viewport: CGSize)?
+    /// 放大状态：暂停零拷贝上屏，改走回读，保证 SwiftUI 侧拿到的是新帧。
+    private var detailZoomActive = false
     /// GPU 预览会话（nil = GPU 不可用 / 未就绪，预览自动走 CPU）。
     private var gpuSession: GpuPreviewSession?
     /// GPU 会话代际（换图 / 重建后旧回调作废）。
@@ -253,6 +270,8 @@ final class EditorModel: ObservableObject {
     private var renderBusy = false
     private var renderPending = false
     private let renderQueue = DispatchQueue(label: "fdxmp.ios.render", qos: .userInitiated)
+    /// 细节源 / 区域帧独立队列：不阻塞预览渲染（放大时滑块仍然跟手）。
+    private let detailQueue = DispatchQueue(label: "fdxmp.ios.detail", qos: .userInitiated)
     private let maskAssetQueue = DispatchQueue(label: "fdxmp.ios.mask-assets", qos: .userInitiated)
     private var maskAssetToken = 0
     private var maskAssetScheduled = false
@@ -303,8 +322,12 @@ final class EditorModel: ObservableObject {
         baseBuffer = nil
         rawData = nil
         rawDetailBuffer = nil
-        rawDetailInFlight = false
-        rawDetailToken &+= 1
+        detailSource = nil
+        detailSourceInFlight = false
+        detailSourceFailed = false
+        detailSourceToken &+= 1
+        pendingDetailRegion = nil
+        detailZoomActive = false
         fastBuffer = nil
         clearGpuSession()
         previewOutputSize = nil
@@ -322,7 +345,13 @@ final class EditorModel: ObservableObject {
         beforeImage = nil
         isPreparingBefore = false
         detailRegion = nil
+        detailRegionKey = ""
+        lastRegionVisible = .zero
         pendingRegion = nil
+        detailToken &+= 1
+        detailImage = nil
+        detailInFlight = false
+        detailEdgeUsed = 0
         undoStack.removeAll()
         redoStack.removeAll()
         publishHistory()
@@ -495,6 +524,8 @@ final class EditorModel: ObservableObject {
         prepareRetouchAfterLoad()
         // Vision 人像蒙版（MODNet 不随包）：后台算好提交给核心（身体塑形 / 人像路径用）。
         prepareVisionPersonMask()
+        // 首帧之后预热原图细节源：第一次放大直接出 1:1 区域帧。
+        preloadDetailSourceIfUseful()
     }
 
     // MARK: - 首帧加载框
@@ -547,40 +578,152 @@ final class EditorModel: ObservableObject {
         isRestoringEdits = false
     }
 
-    /// RAW：后台解一版更精细的缓冲（≤2560）供放大 1:1 / 区域细节复用。
+    /// 准备全分辨率细节源：放大后的区域渲染 / 整帧细节帧共用。
     ///
-    /// 只在用户第一次放大时调用（进编辑页不再预解）：省掉进图时那次几秒的额外解调
-    /// 和一两百 MB 内存峰值，而真正需要细节帧时才付这笔成本。
-    /// 是否全尺寸解调沿用原来的像素上限（≤24MP 全尺寸、更大的走半尺寸）：
-    /// 12MP 的 ProRAW 半尺寸只有 2000×1500，低于 2560 的细节帧上限，会掉清晰度。
-    private func prepareRawDetailBuffer() {
-        guard let data = rawData, rawDetailBuffer == nil, !rawDetailInFlight else { return }
-        rawDetailToken &+= 1
-        let token = rawDetailToken
-        rawDetailInFlight = true
-        let pixels = Double(asset?.pixelWidth ?? 0) * Double(asset?.pixelHeight ?? 0)
-        let fullSize = pixels > 0 && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
-        let maxEdge = EditorLimits.rawDetailMaxEdge
-        renderQueue.async { [weak self] in
-            let buffer = NativeCore.shared.decodeRaw(data: data, maxEdge: maxEdge, fullSize: fullSize)
+    /// - 非 RAW：PhotoKit 取原图（按 `detailSourcePixelLimit` 封顶），方向校正后转 RGBA8；
+    /// - RAW：LibRaw 全尺寸解调（≤24MP；更大的仍走半尺寸，避免 48MP ProRAW 内存尖峰）。
+    ///
+    /// 只在第一次放大时准备，进编辑页不预解；非 RAW 会在首帧后低优先级预热，
+    /// 这样第一次双指放大通常已经能直接出区域帧，而不是先看一版放大的预览。
+    private func ensureDetailSource() {
+        guard detailSource == nil, !detailSourceInFlight, !detailSourceFailed,
+              let asset
+        else {
+            return
+        }
+        let pixelWidth = asset.pixelWidth
+        let pixelHeight = asset.pixelHeight
+        let longEdge = max(pixelWidth, pixelHeight)
+        guard longEdge > 64 else { return }
+        let pixels = Double(pixelWidth) * Double(pixelHeight)
+        let budgetScale = min(
+            1.0,
+            (Double(EditorLimits.detailSourcePixelLimit) / max(pixels, 1)).squareRoot()
+        )
+        let maxEdge = min(
+            longEdge,
+            min(
+                EditorLimits.detailSourceMaxEdge,
+                max(64, Int((Double(longEdge) * budgetScale).rounded(.down)))
+            )
+        )
+        detailSourceToken &+= 1
+        let token = detailSourceToken
+        detailSourceInFlight = true
+
+        if let data = rawData {
+            let fullSize = pixels > 0 && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
+            detailQueue.async { [weak self] in
+                let buffer = NativeCore.shared.decodeRaw(
+                    data: data,
+                    maxEdge: maxEdge,
+                    fullSize: fullSize
+                )
+                Task { @MainActor in
+                    guard let self, self.detailSourceToken == token else { return }
+                    guard let buffer else {
+                        self.failDetailSource()
+                        return
+                    }
+                    self.detailSourceInFlight = false
+                    self.detailSource = buffer
+                    self.rawDetailBuffer = buffer
+                    self.didLoadDetailSource()
+                }
+            }
+            return
+        }
+
+        requestFullImage(asset: asset, maxEdge: maxEdge) { [weak self] image in
+            guard let self, self.detailSourceToken == token else { return }
+            guard let image else {
+                self.failDetailSource()
+                return
+            }
+            self.detailQueue.async { [weak self] in
+                let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: maxEdge)
+                Task { @MainActor in
+                    guard let self, self.detailSourceToken == token else { return }
+                    guard let buffer else {
+                        self.failDetailSource()
+                        return
+                    }
+                    self.detailSourceInFlight = false
+                    self.detailSource = buffer
+                    self.didLoadDetailSource()
+                }
+            }
+        }
+    }
+
+    /// 细节源失败：放出挂起的区域请求，退回整帧细节帧（不反复重试）。
+    private func failDetailSource() {
+        detailSourceInFlight = false
+        detailSourceFailed = true
+        if let pending = pendingDetailRegion {
+            pendingDetailRegion = nil
+            requestDetailPreview(viewport: pending.viewport, zoom: lastDetailZoom, force: true)
+        } else if detailZoomActive, detailImage == nil, !detailInFlight {
+            requestDetailPreview(viewport: lastDetailViewport, zoom: lastDetailZoom, force: true)
+        }
+    }
+
+    /// 细节源就绪：补发挂起的区域请求；已放大时用新源重渲染整帧细节帧。
+    private func didLoadDetailSource() {
+        if let pending = pendingDetailRegion {
+            pendingDetailRegion = nil
+            performDetailRegionRequest(visible: pending.visible, viewport: pending.viewport)
+        } else if detailRegion != nil, !lastRegionVisible.isEmpty {
+            // 之前用低分辨率源渲染过区域帧：源升级后重渲染一次。
+            performDetailRegionRequest(
+                visible: lastRegionVisible,
+                viewport: lastDetailViewport
+            )
+        }
+        if detailImage != nil, !detailInFlight {
+            requestDetailPreview(
+                viewport: lastDetailViewport,
+                zoom: lastDetailZoom,
+                force: true
+            )
+        }
+    }
+
+    /// 首帧之后预热非 RAW 的原图细节源（≤24MP，避免 48MP 图在后台吃 200MB）。
+    private func preloadDetailSourceIfUseful() {
+        guard rawData == nil, let asset else { return }
+        let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
+        guard pixels > 0, pixels <= 24_000_000 else { return }
+        let token = loadToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            guard let self, self.loadToken == token, !self.detailZoomActive else { return }
+            self.ensureDetailSource()
+        }
+    }
+
+    /// 取原图尺寸的 UIImage（只回调一次非降级结果；失败回调 nil）。
+    private func requestFullImage(
+        asset: PHAsset,
+        maxEdge: Int,
+        completion: @escaping @MainActor (UIImage?) -> Void
+    ) {
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        // `.fast` 保持原始比例；`.exact` 会按 targetSize 压成正方形导致比例失真。
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        options.version = .current
+        let target = CGSize(width: maxEdge, height: maxEdge)
+        Self.imageManager.requestImage(
+            for: asset,
+            targetSize: target,
+            contentMode: .aspectFit,
+            options: options
+        ) { image, info in
+            let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+            if degraded { return }
             Task { @MainActor in
-                guard let self, self.rawDetailToken == token else { return }
-                self.rawDetailInFlight = false
-                self.rawDetailBuffer = buffer
-                // 细节缓冲也补进缓存：下次进图放大不再重新解。
-                if let buffer, let key = self.rawCacheKey,
-                   let cached = RawFrameCache.shared.entry(for: key) {
-                    cached.detail = buffer
-                    RawFrameCache.shared.store(cached, for: key)
-                }
-                // 用户已放大（有细节帧）：用更高精度缓冲重渲染一帧。
-                if buffer != nil, self.detailImage != nil {
-                    self.requestDetailPreview(
-                        viewport: self.lastDetailViewport,
-                        zoom: self.lastDetailZoom,
-                        force: true
-                    )
-                }
+                completion(image)
             }
         }
     }
@@ -649,6 +792,16 @@ final class EditorModel: ObservableObject {
     /// 立即重渲染一帧预览（进入 / 退出对比模式等需要刷新回读画面时调用）。
     func refreshPreview() {
         scheduleRender(immediate: true)
+    }
+
+    /// 放大状态开关：放大后暂停零拷贝上屏，保证 `previewImage` 与画面同步刷新。
+    func setDetailZoomActive(_ active: Bool) {
+        guard detailZoomActive != active else { return }
+        detailZoomActive = active
+        // 避免在 SwiftUI 的 onChange 里同步改 `isRendering` 等 Published 状态。
+        DispatchQueue.main.async { [weak self] in
+            self?.refreshPreview()
+        }
     }
 
     /// 对比模式开关（视图切换分屏对比时调用；暂停零拷贝上屏，改用回读画面）。
@@ -756,12 +909,12 @@ final class EditorModel: ObservableObject {
         zoom: CGFloat = 2.5,
         force: Bool = false
     ) {
+        lastDetailViewport = viewport
+        lastDetailZoom = zoom
         guard let asset, !detailInFlight else { return }
         let needed = Int(max(viewport.width, viewport.height) * zoom * 1.15)
         let maxEdge = min(max(needed, 1200), EditorLimits.detailMaxEdge)
         // 已有一张分辨率相近的帧就不重复请求（避免每档缩放都重渲染）。
-        lastDetailViewport = viewport
-        lastDetailZoom = zoom
         if !force, detailImage != nil, abs(maxEdge - detailEdgeUsed) <= max(160, detailEdgeUsed / 8) {
             return
         }
@@ -769,34 +922,46 @@ final class EditorModel: ObservableObject {
         detailInFlight = true
         detailToken &+= 1
         let token = detailToken
-        let json = currentJson(applyCropRect: true)
+        let json = currentJson(applyCropRect: tool != .crop)
+        let retouchParams = state.retouch
 
-        // RAW：细节帧同源走 LibRaw 缓冲（避免混入系统渲染的观感差异）。
-        if rawData != nil {
-            let source = retouchBuffer ?? rawDetailBuffer ?? baseBuffer
-            renderQueue.async { [weak self] in
-                let result = source.flatMap {
-                    NativeCore.shared.render(buffer: $0, paramsJson: json)
-                }
-                let output = result.flatMap {
-                    ImageUtil.image(
-                        from: RgbaBuffer(pixels: $0.pixels, width: $0.width, height: $0.height)
-                    )
-                }
-                Task { @MainActor in
-                    guard let self, self.detailToken == token else { return }
-                    self.detailInFlight = false
-                    self.detailImage = output
-                }
-            }
-            // 先把这一帧（预览缓冲上采样）排在渲染队列前面，再解细节缓冲：
-            // 第一次放大立即可见，几秒后自动换成 2560 的精细帧。
-            if rawDetailBuffer == nil, !rawDetailInFlight {
-                prepareRawDetailBuffer()
-            }
+        // 手动污点 / 液化后的画面来自另一条像素链：细节帧也用它，避免和预览观感不一致。
+        if !retouchParams.isActive, let edited = liquifyBuffer ?? healBuffer {
+            finishDetailImage(source: edited, maxEdge: maxEdge, json: json, token: token)
             return
         }
 
+        // 已经有全分辨率细节源：整帧细节帧也从这里渲染，不再向 PhotoKit 要另一版。
+        if let source = detailSource {
+            if !retouchParams.isActive {
+                finishDetailImage(source: source, maxEdge: maxEdge, json: json, token: token)
+                return
+            }
+            // RAW 的修图缓冲是预览分辨率：继续用修图结果，保证与预览观感一致。
+            if rawData != nil {
+                let prepared = retouchBuffer ?? rawDetailBuffer ?? source
+                finishDetailImage(source: prepared, maxEdge: maxEdge, json: json, token: token)
+                return
+            }
+        }
+
+        // RAW：细节帧同源走 LibRaw 缓冲（避免混入系统渲染的观感差异）。
+        if rawData != nil {
+            if !retouchParams.isActive {
+                ensureDetailSource()
+            }
+            guard let source = retouchBuffer ?? rawDetailBuffer ?? baseBuffer else {
+                detailInFlight = false
+                return
+            }
+            finishDetailImage(source: source, maxEdge: maxEdge, json: json, token: token)
+            return
+        }
+
+        // 非 RAW：先让原图细节源在后台准备；当前这一帧仍按请求分辨率出图。
+        if !retouchParams.isActive {
+            ensureDetailSource()
+        }
         requestImage(
             asset: asset,
             maxEdge: maxEdge,
@@ -807,14 +972,14 @@ final class EditorModel: ObservableObject {
                 self.detailInFlight = false
                 return
             }
-            self.renderQueue.async { [weak self] in
+            self.detailQueue.async { [weak self] in
                 let buffer = ImageUtil.rgbaBuffer(from: image, maxEdge: maxEdge)
-                // 修图开启时：细节帧先在修图缓冲上算好再上采样（保证与预览一致）。
+                // 修图开启时：细节帧先在请求分辨率上算好，保证与预览一致。
                 let prepared = buffer.flatMap { buffer -> RgbaBuffer? in
-                    guard let self, self.state.retouch.isActive else { return buffer }
+                    guard retouchParams.isActive else { return buffer }
                     return Self.applyRetouchForExport(
                         buffer: buffer,
-                        params: self.state.retouch
+                        params: retouchParams
                     ) ?? buffer
                 }
                 let result = prepared.flatMap {
@@ -834,12 +999,43 @@ final class EditorModel: ObservableObject {
         }
     }
 
+    /// 整帧细节帧：降采样到 `maxEdge` → CPU 渲染 → UIImage（区域渲染不可用时的兜底）。
+    private func finishDetailImage(
+        source: RgbaBuffer,
+        maxEdge: Int,
+        json: String,
+        token: Int
+    ) {
+        detailQueue.async { [weak self] in
+            var prepared = source
+            if max(prepared.width, prepared.height) > maxEdge,
+               let scaled = ImageUtil.downscaled(buffer: prepared, maxEdge: maxEdge) {
+                prepared = scaled
+            }
+            let result = NativeCore.shared.render(buffer: prepared, paramsJson: json)
+            let output = result.flatMap {
+                ImageUtil.image(
+                    from: RgbaBuffer(pixels: $0.pixels, width: $0.width, height: $0.height)
+                )
+            }
+            Task { @MainActor in
+                guard let self, self.detailToken == token else { return }
+                self.detailInFlight = false
+                self.detailImage = output
+            }
+        }
+    }
+
     /// 缩回 1x 时释放高分辨率帧，省内存。
     func clearDetailPreview() {
         detailToken &+= 1
         detailInFlight = false
         detailImage = nil
         detailEdgeUsed = 0
+        // 细节源没取到（iCloud 瞬时失败等）：缩回后再放大允许重试一次。
+        if detailSource == nil {
+            detailSourceFailed = false
+        }
     }
 
     // MARK: - 放大细节（区域 1:1，核心"帧外坐标"渲染）
@@ -857,33 +1053,70 @@ final class EditorModel: ObservableObject {
     private var regionDebounceToken = 0
     private var pendingRegion: (visible: CGRect, viewport: CGSize)?
     private var lastRegionVisible: CGRect = .zero
+    private var detailRegionKey = ""
 
-    /// 是否可用区域渲染（核心要求单位几何；蒙版类型也要能重建）。
+    private static let unitCropRect = CGRect(x: 0, y: 0, width: 1, height: 1)
+
+    /// 区域渲染使用的裁切矩形（裁切工具显示未裁切原图）。
+    private var regionCropRect: CGRect {
+        tool == .crop ? Self.unitCropRect : state.crop.rect
+    }
+
+    /// 是否可用区域渲染。
+    ///
+    /// 核心按「源像素 + 帧外坐标」渲染，裁切 / 翻转 / 90° 旋转由 Swift 侧做几何映射；
+    /// 拉直、镜头校正、修图、内容相关蒙版仍回退整帧细节帧。
     var canRenderRegionDetail: Bool {
-        // RAW：区域帧若走系统渲染会与 LibRaw 基础帧观感不一致，先用整帧细节帧。
-        guard rawData == nil else { return false }
-        // 修图后：区域帧来自未修图的全分辨率源，会与修图预览不一致，先用整帧细节帧。
-        guard retouchBuffer == nil else { return false }
+        // 修图 / 污点 / 液化后的画面来自另一条像素链：区域帧若从原图取会不一致。
+        guard retouchBuffer == nil, liquifyBuffer == nil, healBuffer == nil else { return false }
         let crop = state.crop
-        let identity = crop.rect == CGRect(x: 0, y: 0, width: 1, height: 1)
-            && crop.rotation == 0
-            && crop.quarterTurns == 0
-            && !crop.flipHorizontal
-            && !crop.flipVertical
-        // 光学（色差 / 配置文件校正）也算几何变换：区域渲染要求单位镜头模型。
-        let lensIdentity = !state.removeChromaticAberration && !state.profileCorrection
-        guard identity, lensIdentity, let asset else { return false }
-        // 只对中等像素量走 1:1（全分辨率解码有内存尖峰，超大图仍用整帧细节帧）。
-        let pixels = Double(asset.pixelWidth) * Double(asset.pixelHeight)
-        return pixels > 0 && pixels <= 24_000_000
+        guard abs(crop.rotation) < 0.01 else { return false }
+        // 光学（色差 / 配置文件校正）也算几何变换：核心区域管线要求单位镜头模型。
+        guard !state.removeChromaticAberration, !state.profileCorrection else { return false }
+        // 智能蒙版依赖参考图，核心的区域管线无法重建栅格。
+        guard !state.masks.contains(where: { $0.visible && $0.kind.isSmart }) else { return false }
+        let hasVisibleMasks = state.masks.contains { $0.visible }
+        let nonIdentityGeometry = crop.flipHorizontal
+            || crop.flipVertical
+            || crop.quarterTurns % 4 != 0
+            || regionCropRect != Self.unitCropRect
+        if hasVisibleMasks, nonIdentityGeometry {
+            // 蒙版在核心是「几何之后」按输出坐标合成的；非单位几何时区域帧在源坐标渲染，
+            // 蒙版参数也要一起映射，当前先回退整帧（质量仍然来自全分辨率细节源）。
+            return false
+        }
+        return true
+    }
+
+    /// 当前区域帧对应的几何 / 源尺寸（用于判断平移后能否直接复用）。
+    private var regionGeometryKey: String {
+        let crop = state.crop
+        let rect = regionCropRect
+        return "\(detailSource?.width ?? 0)x\(detailSource?.height ?? 0)"
+            + "|\(rect.minX),\(rect.minY),\(rect.width),\(rect.height)"
+            + "|\(crop.flipHorizontal)|\(crop.flipVertical)|\(crop.quarterTurns % 4)"
+            + "|\(tool == .crop)"
     }
 
     /// 去抖地请求区域高清帧（缩放 / 平移时反复调用只保留最后一次）。
-    func scheduleDetailRegion(visible: CGRect, viewport: CGSize) {
+    func scheduleDetailRegion(visible: CGRect, viewport: CGSize, zoom: CGFloat) {
+        lastDetailViewport = viewport
+        lastDetailZoom = max(zoom, 1)
         pendingRegion = (visible, viewport)
+        // 已有区域帧且仍覆盖可见范围（留 2% 余量）：小幅平移不重渲染。
+        if let current = detailRegion, detailRegionKey == regionGeometryKey {
+            let inner = current.rect.insetBy(
+                dx: current.rect.width * 0.02,
+                dy: current.rect.height * 0.02
+            )
+            if inner.contains(visible) {
+                pendingRegion = nil
+                return
+            }
+        }
         regionDebounceToken &+= 1
         let token = regionDebounceToken
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.16) { [weak self] in
             guard let self, self.regionDebounceToken == token,
                   let pending = self.pendingRegion
             else {
@@ -899,101 +1132,165 @@ final class EditorModel: ObservableObject {
         detailRegionToken &+= 1
         regionDebounceToken &+= 1
         pendingRegion = nil
+        pendingDetailRegion = nil
         detailRegion = nil
+        detailRegionKey = ""
         lastRegionVisible = .zero
     }
 
     private func performDetailRegionRequest(visible: CGRect, viewport: CGSize) {
-        guard canRenderRegionDetail, let asset else { return }
-        let pixelWidth = CGFloat(asset.pixelWidth)
-        let pixelHeight = CGFloat(asset.pixelHeight)
-        guard pixelWidth > 32, pixelHeight > 32,
-              visible.width > 0.01, visible.height > 0.01
-        else {
+        guard canRenderRegionDetail else { return }
+        guard visible.width > 0.002, visible.height > 0.002 else { return }
+        lastRegionVisible = visible
+        lastDetailViewport = viewport
+
+        guard let source = detailSource else {
+            if detailSourceFailed {
+                requestDetailPreview(viewport: viewport, zoom: lastDetailZoom, force: true)
+            } else {
+                pendingDetailRegion = (visible, viewport)
+                ensureDetailSource()
+            }
             return
         }
-        // 源分辨率：让可见区域像素 ≥ 视口像素（上限 = 原图长边）。
-        let needed = max(viewport.width / visible.width, viewport.height / visible.height)
-        let originalLong = max(pixelWidth, pixelHeight)
-        let target = Int(min(originalLong, max(needed, 1400)))
-        // 可见矩形 → 源像素矩形（单位几何：输出 = 源），向外扩余量给细节模糊。
-        let margin: CGFloat = 12
-        let vx = (visible.minX * pixelWidth).rounded()
-        let vy = (visible.minY * pixelHeight).rounded()
-        let vw = (visible.width * pixelWidth).rounded()
-        let vh = (visible.height * pixelHeight).rounded()
-        let rx = max(vx - margin, 0)
-        let ry = max(vy - margin, 0)
-        let rw = min(vx + vw + margin, pixelWidth) - rx
-        let rh = min(vy + vh + margin, pixelHeight) - ry
-        guard rw > 8, rh > 8 else { return }
-        lastRegionVisible = visible
+        guard source.width > 32, source.height > 32 else { return }
+
+        let geometry = DetailRegionGeometry(
+            crop: regionCropRect,
+            flipHorizontal: state.crop.flipHorizontal,
+            flipVertical: state.crop.flipVertical,
+            quarterTurns: state.crop.quarterTurns
+        )
+        let sourceWidth = CGFloat(source.width)
+        let sourceHeight = CGFloat(source.height)
+
+        // 可渲染的整帧范围（裁切之后）：区域只在裁切内取样，避免把裁切外的像素
+        // 贴到输出边缘；翻转 / 旋转由输出矩形映射处理。
+        let allowed = geometry.sourceRect(fromOutput: Self.unitCropRect)
+        let allowedX0 = max(0, min(source.width - 1, Int((allowed.minX * sourceWidth).rounded(.down))))
+        let allowedY0 = max(0, min(source.height - 1, Int((allowed.minY * sourceHeight).rounded(.down))))
+        let allowedX1 = max(allowedX0 + 1, min(source.width, Int((allowed.maxX * sourceWidth).rounded(.up))))
+        let allowedY1 = max(allowedY0 + 1, min(source.height, Int((allowed.maxY * sourceHeight).rounded(.up))))
+
+        let sourceVisible = geometry.sourceRect(fromOutput: visible)
+        let vx0 = max(allowedX0, min(allowedX1 - 1, Int((sourceVisible.minX * sourceWidth).rounded(.down))))
+        let vy0 = max(allowedY0, min(allowedY1 - 1, Int((sourceVisible.minY * sourceHeight).rounded(.down))))
+        let vx1 = min(allowedX1, max(vx0 + 1, Int((sourceVisible.maxX * sourceWidth).rounded(.up))))
+        let vy1 = min(allowedY1, max(vy0 + 1, Int((sourceVisible.maxY * sourceHeight).rounded(.up))))
+        let visibleWidth = max(1, vx1 - vx0)
+        let visibleHeight = max(1, vy1 - vy0)
+
+        func expandedRegion(margin: Int) -> (x: Int, y: Int, width: Int, height: Int) {
+            let x = max(allowedX0, vx0 - margin)
+            let y = max(allowedY0, vy0 - margin)
+            let right = min(allowedX1, vx1 + margin)
+            let bottom = min(allowedY1, vy1 + margin)
+            return (x, y, max(1, right - x), max(1, bottom - y))
+        }
+
+        // 区域向外扩一点余量：平移几像素时可直接复用，不必每帧都重新渲染。
+        var margin = max(24, Int(Double(max(visibleWidth, visibleHeight)) * 0.18))
+        var region = expandedRegion(margin: margin)
+        let pixelLimit = EditorLimits.detailRegionPixelLimit
+        while region.width * region.height > pixelLimit, margin > 0 {
+            margin /= 2
+            region = expandedRegion(margin: margin)
+        }
+        guard region.width * region.height <= pixelLimit, region.width > 8, region.height > 8
+        else {
+            // 可见范围本身就超过区域预算：退回整帧细节帧。
+            detailRegion = nil
+            detailRegionKey = ""
+            requestDetailPreview(viewport: viewport, zoom: lastDetailZoom, force: true)
+            return
+        }
+
+        // 输出坐标：源区域 → 翻转 / 旋转 → 裁切。
+        let regionSource = CGRect(
+            x: CGFloat(region.x) / sourceWidth,
+            y: CGFloat(region.y) / sourceHeight,
+            width: CGFloat(region.width) / sourceWidth,
+            height: CGFloat(region.height) / sourceHeight
+        )
+        let outputRect = geometry.outputRect(fromSource: regionSource)
+
+        // 区域管线只负责调色 / 效果 / 蒙版；几何已由上面的映射和像素变换完成，
+        // 所以参数里的裁切必须置为单位几何（否则核心会拒绝或重复裁切）。
+        var regionState = renderState
+        regionState.crop = CropState()
+        let json = EditJSON.build(state: regionState, applyCropRect: false)
+        let flipHorizontal = state.crop.flipHorizontal
+        let flipVertical = state.crop.flipVertical
+        let quarterTurns = state.crop.quarterTurns
+
         detailRegionToken &+= 1
         let token = detailRegionToken
-        let json = currentJson(applyCropRect: true)
-        requestImage(asset: asset, maxEdge: target, mode: .highQualityFormat) { [weak self] image, degraded in
-            guard let self, self.detailRegionToken == token, !degraded, let image else { return }
-            self.renderQueue.async { [weak self] in
-                guard let self else { return }
-                // 方向校正后按比例把源像素矩形换算成请求图的像素矩形。
-                guard let full = ImageUtil.rgbaBuffer(from: image, maxEdge: target) else { return }
-                let scaleX = CGFloat(full.width) / pixelWidth
-                let scaleY = CGFloat(full.height) / pixelHeight
-                let cropX = Int((rx * scaleX).rounded())
-                let cropY = Int((ry * scaleY).rounded())
-                let cropW = max(8, Int((rw * scaleX).rounded()))
-                let cropH = max(8, Int((rh * scaleY).rounded()))
-                guard
-                    let region = ImageUtil.cropped(
-                        buffer: full,
-                        x: cropX,
-                        y: cropY,
-                        width: cropW,
-                        height: cropH
+        let key = regionGeometryKey
+        detailQueue.async { [weak self] in
+            guard let self else { return }
+            guard
+                let regionBuffer = ImageUtil.cropped(
+                    buffer: source,
+                    x: region.x,
+                    y: region.y,
+                    width: region.width,
+                    height: region.height
+                ),
+                let result = NativeCore.shared.renderRegion(
+                    buffer: regionBuffer,
+                    originX: region.x,
+                    originY: region.y,
+                    visibleX: region.x,
+                    visibleY: region.y,
+                    visibleWidth: region.width,
+                    visibleHeight: region.height,
+                    fullWidth: source.width,
+                    fullHeight: source.height,
+                    paramsJson: json
+                ),
+                let transformed = ImageUtil.transformed(
+                    buffer: RgbaBuffer(
+                        pixels: result.pixels,
+                        width: result.width,
+                        height: result.height
                     ),
-                    let result = NativeCore.shared.renderRegion(
-                        buffer: region,
-                        originX: cropX,
-                        originY: cropY,
-                        visibleX: Int((vx * scaleX).rounded()),
-                        visibleY: Int((vy * scaleY).rounded()),
-                        visibleWidth: max(8, Int((vw * scaleX).rounded())),
-                        visibleHeight: max(8, Int((vh * scaleY).rounded())),
-                        fullWidth: full.width,
-                        fullHeight: full.height,
-                        paramsJson: json
-                    ),
-                    let rendered = ImageUtil.image(
-                        from: RgbaBuffer(
-                            pixels: result.pixels,
-                            width: result.width,
-                            height: result.height
-                        )
-                    )
-                else {
-                    // 核心拒绝区域渲染（例如带非单位几何的镜头参数）：回退整帧细节帧。
-                    Task { @MainActor in
-                        guard self.detailRegionToken == token else { return }
-                        self.requestDetailPreview(viewport: viewport, zoom: self.lastDetailZoom)
-                    }
-                    return
-                }
+                    flipHorizontal: flipHorizontal,
+                    flipVertical: flipVertical,
+                    quarterTurns: quarterTurns
+                ),
+                let rendered = ImageUtil.image(from: transformed)
+            else {
+                // 核心拒绝区域渲染（非单位蒙版等）：回退整帧细节帧。
                 Task { @MainActor in
                     guard self.detailRegionToken == token else { return }
-                    self.detailRegion = DetailRegion(image: rendered, rect: visible)
+                    self.detailRegion = nil
+                    self.detailRegionKey = ""
+                    self.requestDetailPreview(
+                        viewport: viewport,
+                        zoom: self.lastDetailZoom,
+                        force: true
+                    )
                 }
+                return
+            }
+            Task { @MainActor in
+                guard self.detailRegionToken == token else { return }
+                self.detailRegion = DetailRegion(image: rendered, rect: outputRect)
+                self.detailRegionKey = key
             }
         }
     }
 
     /// 编辑提交后刷新（放大状态下保持像素级清晰）。
     private func refreshDetailIfNeeded() {
-        if detailRegion != nil {
-            if canRenderRegionDetail {
-                // 区域模式：按上次的可见矩形重渲染一块。
+        guard detailZoomActive || detailRegion != nil || detailImage != nil else { return }
+        if detailRegion != nil
+            || (detailZoomActive && canRenderRegionDetail && !lastRegionVisible.isEmpty)
+        {
+            if canRenderRegionDetail, !lastRegionVisible.isEmpty {
                 performDetailRegionRequest(visible: lastRegionVisible, viewport: lastDetailViewport)
             } else {
-                // 开了镜头校正 / 色差：区域渲染不可用，回落到整帧细节帧。
+                // 开了镜头校正 / 色差 / 修图：区域渲染不可用，回落到整帧细节帧。
                 clearDetailRegion()
                 requestDetailPreview(viewport: lastDetailViewport, zoom: lastDetailZoom, force: true)
             }
@@ -1003,11 +1300,133 @@ final class EditorModel: ObservableObject {
         }
     }
 
+    /// 区域帧的几何映射（归一化坐标）：裁切 → 翻转 → 90° 旋转，与核心 `apply_geometry` 同序。
+    private struct DetailRegionGeometry {
+        let crop: CGRect
+        let flipHorizontal: Bool
+        let flipVertical: Bool
+        let quarterTurns: Int
+
+        private var turns: Int {
+            ((quarterTurns % 4) + 4) % 4
+        }
+
+        /// 输出坐标（裁切后）→ 源坐标（原图）。
+        func sourceRect(fromOutput rect: CGRect) -> CGRect {
+            let safeCrop = CGRect(
+                x: crop.minX,
+                y: crop.minY,
+                width: max(crop.width, 0.0001),
+                height: max(crop.height, 0.0001)
+            )
+            var result = CGRect(
+                x: safeCrop.minX + rect.minX * safeCrop.width,
+                y: safeCrop.minY + rect.minY * safeCrop.height,
+                width: rect.width * safeCrop.width,
+                height: rect.height * safeCrop.height
+            )
+            // 反向 90° 旋转。
+            switch turns {
+            case 1:
+                result = CGRect(
+                    x: result.minY,
+                    y: 1 - result.maxX,
+                    width: result.height,
+                    height: result.width
+                )
+            case 2:
+                result = CGRect(
+                    x: 1 - result.maxX,
+                    y: 1 - result.maxY,
+                    width: result.width,
+                    height: result.height
+                )
+            case 3:
+                result = CGRect(
+                    x: 1 - result.maxY,
+                    y: result.minX,
+                    width: result.height,
+                    height: result.width
+                )
+            default:
+                break
+            }
+            // 反向翻转（翻转在旋转之前）。
+            if flipHorizontal {
+                result.origin.x = 1 - result.maxX
+            }
+            if flipVertical {
+                result.origin.y = 1 - result.maxY
+            }
+            return result
+        }
+
+        /// 源坐标 → 输出坐标（裁切后）。
+        func outputRect(fromSource rect: CGRect) -> CGRect {
+            var result = rect
+            // 正向翻转。
+            if flipHorizontal {
+                result.origin.x = 1 - result.maxX
+            }
+            if flipVertical {
+                result.origin.y = 1 - result.maxY
+            }
+            // 正向 90° 旋转。
+            switch turns {
+            case 1:
+                result = CGRect(
+                    x: 1 - result.maxY,
+                    y: result.minX,
+                    width: result.height,
+                    height: result.width
+                )
+            case 2:
+                result = CGRect(
+                    x: 1 - result.maxX,
+                    y: 1 - result.maxY,
+                    width: result.width,
+                    height: result.height
+                )
+            case 3:
+                result = CGRect(
+                    x: result.minY,
+                    y: 1 - result.maxX,
+                    width: result.height,
+                    height: result.width
+                )
+            default:
+                break
+            }
+            let safeCrop = CGRect(
+                x: crop.minX,
+                y: crop.minY,
+                width: max(crop.width, 0.0001),
+                height: max(crop.height, 0.0001)
+            )
+            let x = (result.minX - safeCrop.minX) / safeCrop.width
+            let y = (result.minY - safeCrop.minY) / safeCrop.height
+            let width = result.width / safeCrop.width
+            let height = result.height / safeCrop.height
+            return CGRect(
+                x: min(max(x, 0), 1),
+                y: min(max(y, 0), 1),
+                width: min(max(width, 0), 1 - min(max(x, 0), 1)),
+                height: min(max(height, 0), 1 - min(max(y, 0), 1))
+            )
+        }
+    }
+
     /// 切换工具（裁切时预览显示未裁切原图，其余工具显示裁切结果）。
     func selectTool(_ newTool: EditorTool) {
         guard tool != newTool else { return }
+        let previousTool = tool
         tool = newTool
         draggingSlider = nil
+        // 工具切换可能改变"裁切是否生效"的几何：区域帧必须按新映射重取。
+        clearDetailRegion()
+        if newTool == .crop || previousTool == .crop {
+            clearDetailPreview()
+        }
         if newTool == .mask {
             if selectedMaskId == nil {
                 selectedMaskId = state.masks.first?.id
@@ -1809,6 +2228,7 @@ final class EditorModel: ObservableObject {
         presetRef = nil
         persist()
         scheduleRender(immediate: true)
+        refreshDetailIfNeeded()
     }
 
     func updateCropRotation(_ value: Float, commit: Bool) {
@@ -1884,6 +2304,7 @@ final class EditorModel: ObservableObject {
             createGpuSession(for: source)
         }
         scheduleRender(immediate: true)
+        refreshDetailIfNeeded()
     }
 
     /// 蒙版几何顺时针转 90°（归一化坐标）：线性端点 / 径向中心与轴向 / 画笔点。
@@ -2583,6 +3004,7 @@ final class EditorModel: ObservableObject {
                 }
                 self.scheduleRender(immediate: true)
                 self.scheduleMaskAssetsRefresh(immediate: true)
+                self.refreshDetailIfNeeded()
                 completion?()
                 if self.retouchPending {
                     self.retouchPending = false
@@ -3356,8 +3778,9 @@ final class EditorModel: ObservableObject {
         let interactive = maskInteracting || draggingSlider != nil || fallback
         let source = interactive ? (fastBuffer ?? buffer) : buffer
         let gpu = gpuSession
-        // 零拷贝上屏：GPU 会话 + 图层就绪 + 非对比 / 非看原图时直接把画面推给 CAMetalLayer。
-        let zeroCopy = gpu != nil && zeroCopyActive && !comparePreviewActive && !showOriginal
+        // 零拷贝上屏：GPU 会话 + 图层就绪 + 非对比 / 非看原图 / 非放大查看时直接把画面推给 CAMetalLayer。
+        let zeroCopy = gpu != nil && zeroCopyActive && !comparePreviewActive
+            && !showOriginal && !detailZoomActive
         renderQueue.async { [weak self] in
             let started = CFAbsoluteTimeGetCurrent()
             if zeroCopy, let gpu, let size = gpu.present(paramsJson: json) {
