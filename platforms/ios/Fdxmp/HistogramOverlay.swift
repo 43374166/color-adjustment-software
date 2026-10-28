@@ -137,8 +137,8 @@ struct HistogramOverlay: View {
                 at: CGPoint(x: 18, y: size.height - 9)
             )
         }
-        // 半透明毛玻璃底：不挡后面的画面，只提亮直方图的对比度。
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+        // 半透明纯色底（不要毛玻璃）：透出后面的画面，又不至于看不清直方图。
+        .background(Color.black.opacity(0.30), in: RoundedRectangle(cornerRadius: 8))
         .overlay(
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.white.opacity(0.10), lineWidth: 0.5)
