@@ -357,17 +357,27 @@ enum MaskHitTester {
     ) -> MaskDragMode {
         let fitted = geometry.fitted
         guard fitted.width > 0, fitted.height > 0 else { return .none }
-        let center = canvasPoint(mask.linearCenter, fitted: fitted)
-        let halfSpan = min(fitted.width, fitted.height) * linearPinHalfSpanRatio
         // 中心线 / 过渡边界的共同方向 = 归一化空间垂线在内容空间的像。
         let dir = mask.linearDirection
         let across = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)
         let acrossLength = max(hypot(across.dx, across.dy), 1e-6)
         let normal = CGVector(dx: across.dx / acrossLength, dy: across.dy / acrossLength)
-        // 中心线端点（旋转手柄）。
+        // 旋转手柄：在连接两个点的轴线上、往两条边界外侧延伸（与绘制同一套公式）。
+        let startPoint = canvasPoint(mask.start, fitted: fitted)
+        let endPoint = canvasPoint(mask.end, fitted: fitted)
+        let gradient = canvasVector(dir, fitted: fitted)
+        let gradientLength = max(hypot(gradient.dx, gradient.dy), 1e-6)
+        let axis = CGVector(dx: gradient.dx / gradientLength, dy: gradient.dy / gradientLength)
+        let extensionLength = min(fitted.width, fitted.height) * 0.18
         let pins = [
-            CGPoint(x: center.x - normal.dx * halfSpan, y: center.y - normal.dy * halfSpan),
-            CGPoint(x: center.x + normal.dx * halfSpan, y: center.y + normal.dy * halfSpan),
+            CGPoint(
+                x: startPoint.x - axis.dx * extensionLength,
+                y: startPoint.y - axis.dy * extensionLength
+            ),
+            CGPoint(
+                x: endPoint.x + axis.dx * extensionLength,
+                y: endPoint.y + axis.dy * extensionLength
+            ),
         ]
         // 距离最近的手柄优先（旋转端点 vs 边界上的过渡手柄可能靠得很近）。
         var bestMode = MaskDragMode.none
@@ -970,7 +980,6 @@ struct MaskOverlayLayer: View {
     }
 
     private func drawLinear(_ context: inout GraphicsContext, mask: MaskUi, fitted: CGRect) {
-        let center = canvasPoint(mask.linearCenter, fitted: fitted)
         // 三条线的方向 = 归一化空间垂线在内容空间的像（核心按归一化投影算 alpha，
         // 直接取内容空间垂线在非正方形图片上会与实际渐变方向差一条斜线）。
         let dir = mask.linearDirection
@@ -986,15 +995,35 @@ struct MaskOverlayLayer: View {
             path.addLine(to: CGPoint(x: point.x + normal.dx * span, y: point.y + normal.dy * span))
             context.stroke(path, with: .color(.white.opacity(0.7)), lineWidth: 1.5)
         }
-        // 50% 中心线（虚线，端点可拖动旋转）。
-        let halfSpan = min(fitted.width, fitted.height) * MaskHitTester.linearPinHalfSpanRatio
-        let pinA = CGPoint(x: center.x - normal.dx * halfSpan, y: center.y - normal.dy * halfSpan)
-        let pinB = CGPoint(x: center.x + normal.dx * halfSpan, y: center.y + normal.dy * halfSpan)
-        var centerLine = Path()
-        centerLine.move(to: pinA)
-        centerLine.addLine(to: pinB)
+        // 连接两个点的「虚拟线」：沿渐变方向（= 垂直穿过两条边界线），虚线。
+        let startPoint = canvasPoint(mask.start, fitted: fitted)
+        let endPoint = canvasPoint(mask.end, fitted: fitted)
+        var connector = Path()
+        connector.move(to: startPoint)
+        connector.addLine(to: endPoint)
         context.stroke(
-            centerLine,
+            connector,
+            with: .color(.white.opacity(0.55)),
+            style: StrokeStyle(lineWidth: 1, dash: [4, 4])
+        )
+        // 旋转手柄：同一条线往两条边界外侧延伸一点（不挡住边界上的抓手）。
+        let gradient = canvasVector(dir, fitted: fitted)
+        let gradientLength = max(hypot(gradient.dx, gradient.dy), 1e-6)
+        let axis = CGVector(dx: gradient.dx / gradientLength, dy: gradient.dy / gradientLength)
+        let extensionLength = min(fitted.width, fitted.height) * 0.18
+        let pinA = CGPoint(
+            x: startPoint.x - axis.dx * extensionLength,
+            y: startPoint.y - axis.dy * extensionLength
+        )
+        let pinB = CGPoint(
+            x: endPoint.x + axis.dx * extensionLength,
+            y: endPoint.y + axis.dy * extensionLength
+        )
+        var axisLine = Path()
+        axisLine.move(to: pinA)
+        axisLine.addLine(to: pinB)
+        context.stroke(
+            axisLine,
             with: .color(.white.opacity(0.9)),
             style: StrokeStyle(lineWidth: 1.5, dash: [7, 5])
         )
