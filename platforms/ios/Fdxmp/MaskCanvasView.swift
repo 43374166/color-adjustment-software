@@ -820,10 +820,13 @@ final class MaskCanvasController {
                 let dy = content.y - startContent.y
                 let radius = (dx * dx + dy * dy).squareRoot()
                 mask.center = placementStart
-                // 半径换成两个方向的归一化值：物理上是个圆。
+                // 半径换成两个方向的归一化值：物理上是个圆；并夹在画面内，
+                // 手指拖到黑边上也不会做出超出照片的大蒙版。
+                let maxX = max(min(placementStart.x, 1 - placementStart.x), 0.02)
+                let maxY = max(min(placementStart.y, 1 - placementStart.y), 0.02)
                 mask.radii = CGSize(
-                    width: max(radius / max(fitted.width, 1), 0.02),
-                    height: max(radius / max(fitted.height, 1), 0.02)
+                    width: min(max(radius / max(fitted.width, 1), 0.02), maxX),
+                    height: min(max(radius / max(fitted.height, 1), 0.02), maxY)
                 )
             default:
                 break
@@ -929,7 +932,9 @@ struct MaskOverlayLayer: View {
                 // 叠加层与照片使用同一套几何（fittedRect：横图 / 方图整体上移），
                 // 否则横图蒙版会比照片低一截。
                 let fitted = fittedRect(imageSize: imageSize, in: viewSize)
-                if model.maskOverlayVisible, let overlay = model.maskOverlays[mask.id] {
+                // 拖动滑块调参数时隐藏红色叠加：否则看不到画面变化。
+                if model.maskOverlayVisible, model.draggingSlider == nil,
+                   let overlay = model.maskOverlays[mask.id] {
                     Image(uiImage: overlay)
                         .resizable()
                         .scaledToFit()

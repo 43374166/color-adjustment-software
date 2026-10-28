@@ -19,6 +19,13 @@ struct MaskPanelView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // 亮度 / 颜色 / 效果：放到面板最上面（居中、矮），先选大类再调滑块。
+            if showsMaskControls {
+                categoryRow
+                Divider()
+                    .overlay(Color.white.opacity(0.06))
+                    .opacity(model.draggingSlider == nil ? 1 : 0)
+            }
             content
             Divider()
                 .overlay(Color.white.opacity(0.08))
@@ -26,6 +33,14 @@ struct MaskPanelView: View {
             listRow
                 .opacity(model.draggingSlider == nil ? 1 : 0)
                 .allowsHitTesting(model.draggingSlider == nil)
+            // 反转 / 复制 / 重置 / 重命名 / 删除：放到蒙版列表下面。
+            if showsMaskControls {
+                Divider()
+                    .overlay(Color.white.opacity(0.06))
+                actionRow
+                    .opacity(model.draggingSlider == nil ? 1 : 0)
+                    .allowsHitTesting(model.draggingSlider == nil)
+            }
         }
         .alert("重命名蒙版", isPresented: renameAlertBinding) {
             TextField("名称", text: $renameText)
@@ -41,6 +56,11 @@ struct MaskPanelView: View {
         .sheet(isPresented: settingsBinding) {
             settingsSheet
         }
+    }
+
+    /// 是否显示「分类栏 + 蒙版操作栏」（放置新蒙版 / 没有选中蒙版时不显示）。
+    private var showsMaskControls: Bool {
+        model.selectedMask != nil && model.maskPlacementKind == nil
     }
 
     private var settingsBinding: Binding<Bool> {
@@ -396,7 +416,6 @@ struct MaskPanelView: View {
                     smartStatusRow(mask)
                 }
                 adjustControls
-                actionRow
             }
         } else {
             // 还没有蒙版：只留一句提示 + 新建行，创建后再弹起调整页。
@@ -737,12 +756,6 @@ struct MaskPanelView: View {
             }
             // 拖动滑块中：禁止面板上下滚动（只调值）。
             .scrollDisabled(model.draggingSlider != nil)
-            Divider()
-                .overlay(Color.white.opacity(0.08))
-                .opacity(model.draggingSlider == nil ? 1 : 0)
-            categoryRow
-                .opacity(model.draggingSlider == nil ? 1 : 0)
-                .allowsHitTesting(model.draggingSlider == nil)
         }
     }
 
@@ -757,15 +770,14 @@ struct MaskPanelView: View {
     }
 
     private var categoryRow: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 12) {
-                ForEach([EditCategory.light, .color, .effects]) { category in
-                    categoryButton(category)
-                }
+        // 居中 + 矮：把纵向空间留给滑块。
+        HStack(spacing: 8) {
+            ForEach([EditCategory.light, .color, .effects]) { category in
+                categoryButton(category)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 3)
         }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 2)
     }
 
     /// 分类按钮（自己判定触摸）：轻点切换分类，长按只做"这一类参数复原"对比。
@@ -780,14 +792,14 @@ struct MaskPanelView: View {
             Haptics.tick()
             model.setCategory(category)
         } label: {
-            VStack(spacing: 3) {
+            VStack(spacing: 2) {
                 Image(systemName: category.icon)
-                    .font(.system(size: 13))
+                    .font(.system(size: 12))
                 Text(category.rawValue)
                     .font(.caption2)
             }
-            .frame(width: 54)
-            .padding(.vertical, 3)
+            .frame(width: 46)
+            .padding(.vertical, 2)
             .background(
                 RoundedRectangle(cornerRadius: 10)
                     .fill(
