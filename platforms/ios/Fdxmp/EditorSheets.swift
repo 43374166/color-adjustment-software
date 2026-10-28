@@ -137,7 +137,7 @@ struct PhotoSelectionSheet: View {
                         VStack(alignment: .leading, spacing: 2) {
                             Text("高清增强（×2 超分）")
                                 .font(.footnote)
-                            Text("Real-ESRGAN 提升细节；耗时较长，大图建议关闭")
+                            Text("Real-ESRGAN 提升细节；长边超过 4096 自动跳过")
                                 .font(.caption2)
                                 .foregroundStyle(Color.white.opacity(0.45))
                         }

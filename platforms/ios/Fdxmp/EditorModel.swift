@@ -50,12 +50,26 @@ enum EditorLimits {
     static let maskOverlayMaxEdge = 2048
     /// 蒙版列表缩略图最长边。
     static let maskThumbnailMaxEdge = 128
+    /// 导出尺寸选项（MP，按像素预算近似；实际尺寸随长宽比 / 裁切变化）。
+    static let exportMegapixelsOptions = [8, 12, 18, 24, 48]
+    /// 默认 18MP：画质与速度的折中；8MP 最稳，24/48MP 更慢更烫。
+    static let exportMegapixelsDefault = 18
+    /// 「我的」页 @AppStorage 共用键。
+    static let exportMegapixelsKey = "fdxmp_export_megapixels"
+    /// 当前导出尺寸（MP）；非法值回退默认。
+    static var exportMegapixels: Int {
+        let stored = UserDefaults.standard.integer(forKey: exportMegapixelsKey)
+        return exportMegapixelsOptions.contains(stored) ? stored : exportMegapixelsDefault
+    }
     /// 导出像素预算：原图更大时按比例降采样。
     ///
-    /// CPU 管线是 f32 多平面（约 40 字节/像素），8MP ≈ 320MB 峰值，是 iPhone 上
-    /// 比较安全的上限。48MP ProRAW / 高像素相机图如果按原图整帧渲染，光中间缓冲
-    /// 就要一两 GB，表现为导出卡死、手机发烫甚至被系统杀掉。
-    static let exportPixelLimit = 8_000_000
+    /// CPU 管线是 f32 多平面（约 40 字节/像素）：8MP ≈ 320MB、18MP ≈ 720MB、
+    /// 24MP ≈ 960MB、48MP ≈ 1.9GB。24/48MP 的整帧回退路径（旋转 / 镜头校正 /
+    /// 内容相关蒙版）在手机上仍可能触发内存压力，所以默认停在 18MP。
+    /// 48MP 档允许 48.8MP 的 ProRAW 原图不被削掉。
+    static var exportPixelLimit: Int {
+        exportMegapixels >= 48 ? 50_000_000 : exportMegapixels * 1_000_000
+    }
     /// 导出格式 / 质量 / 保留元数据 / 导出后分享（与「我的」页 @AppStorage 共用）。
     static let exportFormatKey = "fdxmp_export_format"
     static let exportQualityKey = "fdxmp_export_quality"
@@ -71,7 +85,8 @@ enum EditorLimits {
     /// JPEG 质量（0.5..1，其它格式忽略）。
     static var exportQuality: Double {
         let stored = UserDefaults.standard.double(forKey: exportQualityKey)
-        return stored > 0 ? stored : 1.0
+        // 与「我的」页默认值保持一致：92% 在肉眼几乎无损，文件比 100% 小很多。
+        return stored > 0 ? stored : 0.92
     }
 
     /// 是否保留原图 EXIF / GPS 等拍摄信息。
@@ -91,7 +106,7 @@ enum EditorLimits {
     static let detailSourcePixelLimit = 32_000_000
     /// 单次区域渲染的像素上限（含外扩余量；核心 CPU 管线约 40 字节/像素）。
     static let detailRegionPixelLimit = 6_000_000
-    /// RAW 全尺寸解调的像素上限（超过则用半尺寸，避免 48MP ProRAW 内存尖峰）。
+    /// RAW 全尺寸解调的像素上限（预览 / 细节用；导出按所选 MP 动态放宽到 50MP）。
     static let rawFullSizePixelLimit = 24_000_000
 }
 
@@ -4009,6 +4024,9 @@ final class EditorModel: ObservableObject {
         let currentRetouch = state.retouch
         let currentRaw = rawData
         let total = assets.count
+        let selectedMegapixels = EditorLimits.exportMegapixels
+        let pixelLimit = EditorLimits.exportPixelLimit
+        let currentNeedsFullFrame = Self.needsFullFrameRender(state)
         let currentIncluded = currentId.map { id in
             assets.contains { $0.localIdentifier == id }
         } ?? false
@@ -4036,6 +4054,7 @@ final class EditorModel: ObservableObject {
             var succeeded = 0
             var failed = 0
             var shareURL: URL?
+            var lastFailure: String?
 
             func report(_ index: Int, _ fraction: Double, _ step: String) {
                 let succeededSnapshot = succeeded
@@ -4064,32 +4083,51 @@ final class EditorModel: ObservableObject {
                 let json: String
                 let retouch: RetouchUi
                 let raw: Data?
+                let needsFullFrame: Bool
                 if isCurrent {
                     json = currentJson
                     retouch = currentRetouch
                     raw = currentRaw
+                    needsFullFrame = currentNeedsFullFrame
                 } else if let saved = EditStore.json(assetId: item.localIdentifier) {
                     let savedState = EditJSON.parse(saved)
                     // 导出要带裁切：保存记录里的 crop 是相对原图的有效编辑。
                     json = EditJSON.build(state: savedState, applyCropRect: true)
                     retouch = savedState.retouch
                     raw = nil
+                    needsFullFrame = Self.needsFullFrameRender(savedState)
                 } else {
                     let fresh = EditState()
                     json = EditJSON.build(state: fresh, applyCropRect: true)
                     retouch = fresh.retouch
                     raw = nil
+                    needsFullFrame = false
                 }
 
-                let targetEdge = Self.exportTargetEdge(for: item)
+                // 整帧回退要按实际输出像素算：48MP 原图选 48MP 才是 ~2GB；
+                // 同一张图选 18MP 只需 ~720MB，不应被误拦。
+                let targetEdge = Self.exportTargetEdge(for: item, pixelLimit: pixelLimit)
+                let sourcePixels = Double(item.pixelWidth) * Double(item.pixelHeight)
+                let targetPixels = min(sourcePixels, Double(pixelLimit))
+                if needsFullFrame, targetPixels > 26_000_000 {
+                    failed += 1
+                    lastFailure = "该照片含旋转 / 智能蒙版且超过 26MP，请改选 18/24MP"
+                    report(index, 1, "该照片需整帧渲染且超过 26MP，请改选 18/24MP")
+                    continue
+                }
                 report(index, 0.02, "正在读取原图…")
 
                 var buffer: RgbaBuffer?
                 if let raw, !raw.isEmpty {
                     report(index, 0.08, "正在解调 RAW…")
                     let pixels = Double(item.pixelWidth) * Double(item.pixelHeight)
-                    let fullSize = pixels > 0
-                        && pixels <= Double(EditorLimits.rawFullSizePixelLimit)
+                    // 48MP ProRAW 的半尺寸只有 ~12MP：选 18/24/48MP 时必须全尺寸解调，
+                    // 否则导出尺寸会被卡在 12MP。12MP 及以下继续用半尺寸省内存；
+                    // 超过 50MP 的 RAW 仍只用半尺寸，避免解调本身把手机顶爆。
+                    let canFullDecode = pixels > 0 && pixels <= 50_000_000
+                    let wantsFullDecode = selectedMegapixels > 12
+                        || pixels <= Double(EditorLimits.rawFullSizePixelLimit)
+                    let fullSize = canFullDecode && wantsFullDecode
                     buffer = autoreleasepool {
                         NativeCore.shared.decodeRaw(
                             data: raw,
@@ -4117,6 +4155,7 @@ final class EditorModel: ObservableObject {
                 if session.isCancelled { break }
                 guard var source = buffer else {
                     failed += 1
+                    lastFailure = "读取原图失败"
                     report(index, 1, "读取失败，已跳过")
                     continue
                 }
@@ -4138,16 +4177,23 @@ final class EditorModel: ObservableObject {
                 ) else {
                     failed += 1
                     let reason = NativeCore.shared.lastError() ?? "渲染失败"
+                    lastFailure = "渲染失败：\(reason)"
                     report(index, 1, "渲染失败：\(reason)")
                     continue
                 }
 
-                // 高清增强放在调色之后（与旧行为一致）：先按 8MP 预算渲染，
-                // 再对成品做超分；不要先放大到 12MP 再跑一遍完整调色，否则又慢又吃内存。
+                // 高清增强放在调色之后（与旧行为一致）：先按所选 MP 预算渲染，
+                // 再对成品做超分；不要先放大到更高分辨率再跑一遍完整调色，否则又慢又吃内存。
                 if enhance {
-                    report(index, 0.72, "正在高清增强…")
-                    if let enhanced = Self.enhancedExportBuffer(outputBuffer) {
-                        outputBuffer = enhanced
+                    // 18MP 以上的成品长边已经超过 4096：再「降采样 → 超分」反而会丢细节，
+                    // 因此直接跳过（输出保持所选 MP），只在 12MP 及以下执行增强。
+                    if max(outputBuffer.width, outputBuffer.height) <= 4096 {
+                        report(index, 0.72, "正在高清增强…")
+                        if let enhanced = Self.enhancedExportBuffer(outputBuffer) {
+                            outputBuffer = enhanced
+                        }
+                    } else {
+                        report(index, 0.72, "尺寸较大，已跳过高清增强")
                     }
                 }
                 if session.isCancelled { break }
@@ -4165,6 +4211,7 @@ final class EditorModel: ObservableObject {
                 }
                 guard let fileURL = writtenURL else {
                     failed += 1
+                    lastFailure = "写入文件失败"
                     report(index, 1, "写入文件失败")
                     continue
                 }
@@ -4184,6 +4231,7 @@ final class EditorModel: ObservableObject {
                     report(index, 1, "已保存 \(succeeded) 张")
                 } else {
                     failed += 1
+                    lastFailure = "保存到相册失败"
                     try? FileManager.default.removeItem(at: fileURL)
                     report(index, 1, "保存到相册失败")
                 }
@@ -4194,6 +4242,7 @@ final class EditorModel: ObservableObject {
             let succeededCount = succeeded
             let failedCount = failed
             let share = shareURL
+            let failureReason = lastFailure
             Task { @MainActor [weak self] in
                 guard let self, self.exportToken == token else { return }
                 self.exportWatchdog?.cancel()
@@ -4215,7 +4264,7 @@ final class EditorModel: ObservableObject {
                         self.persist()
                     }
                 } else if succeededCount == 0 {
-                    self.message = "导出失败：没有照片保存成功"
+                    self.message = "导出失败：\(failureReason ?? "没有照片保存成功")"
                 } else {
                     self.message = "导出完成：\(succeededCount)/\(total) 张（\(failedCount) 张失败）"
                     if currentIncluded {
@@ -4294,11 +4343,12 @@ final class EditorModel: ObservableObject {
 
     /// 导出增强（Real-ESRGAN ×2 超分；输出最长边 ≤ 4096）。
     ///
-    /// 输入先压到 2048：直接把 8MP 图放大到 6144 会生成 28MP 的中间缓冲，
-    /// 手机内存顶不住；2048 → 4096 仍然比原图大一倍。
+    /// 长边超过 4096（18MP 及以上）直接返回 nil：先降到 2048 再超分到 4096，
+    /// 成品反而比所选 18/24/48MP 小，属于负优化。12MP 及以下会先压到 2048
+    /// 再放大到 4096，兼顾模型内存与细节。
     static func enhancedExportBuffer(_ buffer: RgbaBuffer) -> RgbaBuffer? {
         let maxEdge = max(buffer.width, buffer.height)
-        guard maxEdge > 0 else { return nil }
+        guard maxEdge > 0, maxEdge <= 4096 else { return nil }
         let prepared = maxEdge > 2048
             ? (ImageUtil.downscaled(buffer: buffer, maxEdge: 2048) ?? buffer)
             : buffer
@@ -4307,15 +4357,32 @@ final class EditorModel: ObservableObject {
         return NativeCore.shared.retouchUpscale(buffer: prepared, targetMaxEdge: target)
     }
 
-    /// 导出的源图最长边：原图超过 8MP 预算时按比例降采样。
-    private static func exportTargetEdge(for asset: PHAsset) -> Int {
+    /// 该组参数是否需要核心走整帧渲染（区域管线不支持）。
+    ///
+    /// 48MP 档下这类照片会退到 ~2GB 的整帧管线，手机上基本必被系统杀掉；
+    /// 导出前显式判断，让用户改选 18/24MP，而不是让 App 直接崩。
+    private static func needsFullFrameRender(_ state: EditState) -> Bool {
+        let crop = state.crop
+        // 与核心 `needs_resample` 的阈值保持一致：任何非零拉直都会走整帧重采样。
+        if abs(crop.rotation) > 0.001 || crop.quarterTurns % 4 != 0 {
+            return true
+        }
+        if state.removeChromaticAberration || state.profileCorrection {
+            return true
+        }
+        // 智能蒙版栅格依赖参考图，核心区域管线不支持；画笔 / 线性 / 径向仍可条带渲染。
+        return state.masks.contains { $0.visible && $0.kind.isSmart }
+    }
+
+    /// 导出的源图最长边：原图超过所选 MP 预算时按比例降采样。
+    private static func exportTargetEdge(for asset: PHAsset, pixelLimit: Int) -> Int {
         let width = max(asset.pixelWidth, 1)
         let height = max(asset.pixelHeight, 1)
         // 极少数照片在元数据未就绪时宽高为 0：给一个安全的预览尺寸，避免导出 1×1。
         guard width > 1, height > 1 else { return EditorLimits.previewMaxEdge }
         let longEdge = max(width, height)
         let pixels = Double(width) * Double(height)
-        let limit = Double(EditorLimits.exportPixelLimit)
+        let limit = Double(pixelLimit)
         guard pixels > limit else { return longEdge }
         let scale = (limit / pixels).squareRoot()
         return max(1024, Int((Double(longEdge) * scale).rounded()))
@@ -4323,7 +4390,8 @@ final class EditorModel: ObservableObject {
 
     /// 分块渲染整帧（导出用）。
     ///
-    /// 8MP 预算 + 每条 1MP，单次中间缓冲约 40MB；比整帧 `render` 低一个数量级。
+    /// 按所选 MP 预算 + 每条 1MP 分块渲染，单次中间缓冲约 40MB；
+    /// 比整帧 `render` 低一个数量级。24/48MP 的整帧回退仍可能较重。
     /// 核心内部对裁切 / 翻转 / 旋转 / 镜头校正会自动选择条带或整帧路径。
     /// 带「依赖参考图」的蒙版（颜色范围 / 亮度范围 / AI）时区域管线不支持，
     /// 这里回退一次整帧渲染，避免导出直接失败。

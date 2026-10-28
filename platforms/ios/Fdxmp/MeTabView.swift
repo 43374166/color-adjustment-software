@@ -5,6 +5,7 @@ import UIKit
 struct MeTabView: View {
     @AppStorage(EditorLimits.exportFormatKey) private var exportFormat = EditorModel.ExportFormat.jpeg.rawValue
     @AppStorage(EditorLimits.exportQualityKey) private var exportQuality = 0.92
+    @AppStorage(EditorLimits.exportMegapixelsKey) private var exportMegapixels = EditorLimits.exportMegapixelsDefault
     @AppStorage(EditorLimits.exportKeepMetadataKey) private var exportKeepMetadata = true
     @AppStorage(EditorLimits.exportShareKey) private var exportShare = false
     /// 颜色均衡器总开关（全局，默认开启）。
@@ -175,9 +176,26 @@ struct MeTabView: View {
                 Text("导出尺寸")
                     .font(.footnote)
                 Spacer()
-                Text("最高 8MP（保持原比例）")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                Picker("导出尺寸", selection: $exportMegapixels) {
+                    ForEach(EditorLimits.exportMegapixelsOptions, id: \.self) { megapixels in
+                        Text(
+                            megapixels == EditorLimits.exportMegapixelsDefault
+                                ? "\(megapixels)MP（默认）"
+                                : "\(megapixels)MP"
+                        )
+                        .tag(megapixels)
+                    }
+                }
+                .pickerStyle(.menu)
+                .tint(Color.white.opacity(0.6))
+            }
+            Text("按 \(exportMegapixels)MP 像素预算导出；更大的原图自动等比降采样。MP 是像素数，不是文件大小。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if exportMegapixels >= 24 {
+                Text("24MP / 48MP 会明显更慢、更烫；48MP 可能因内存不足失败。")
+                    .font(.caption2)
+                    .foregroundStyle(Color.orange.opacity(0.9))
             }
             HStack {
                 Text("格式")
@@ -201,6 +219,11 @@ struct MeTabView: View {
                         .foregroundStyle(.secondary)
                         .frame(width: 44, alignment: .trailing)
                 }
+                if exportQuality >= 0.97 {
+                    Text("100% 质量文件会明显变大；90–95% 通常肉眼无差别。")
+                        .font(.caption2)
+                        .foregroundStyle(Color.orange.opacity(0.9))
+                }
             }
             Toggle("保留拍摄信息（EXIF / GPS）", isOn: $exportKeepMetadata)
                 .font(.footnote)
@@ -208,7 +231,7 @@ struct MeTabView: View {
             Toggle("导出完成后分享", isOn: $exportShare)
                 .font(.footnote)
                 .tint(Color.accentColor)
-            Text("导出按 8MP 像素预算渲染（更大的原图自动等比降采样），保存到相册「fdxmp」。")
+            Text("成品保存到相册「fdxmp」。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
