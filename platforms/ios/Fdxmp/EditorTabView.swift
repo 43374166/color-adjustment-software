@@ -89,6 +89,8 @@ struct EditorTabView: View {
     @State private var placementPanelHeight: CGFloat?
     /// 90° 旋转的过渡角度（0 / 90 / -90…）：动画期间只转画面，动画完再真正换图。
     @State private var previewSpin: Double = 0
+    /// 正在拖动裁切「拉直」刻度盘：期间临时显示网格。
+    @State private var cropDialActive = false
 
     @Environment(\.displayScale) private var displayScale
 
@@ -169,6 +171,7 @@ struct EditorTabView: View {
             categoryCollapsed = false
             model.endCategoryPreview()
             compareSplit = nil
+            cropDialActive = false
             model.clearBeforeImage()
             model.setComparePreviewActive(false)
             if model.tool == .mask {
@@ -583,10 +586,11 @@ struct EditorTabView: View {
             || hslFocused
     }
 
-    /// 预设 / 修图下隐藏底部工具条：修图是独立工作台（子页签在面板里），
-    /// 不再需要底部那排工具；预设列表占满下方空间。
+    /// 预设 / 修图 / 裁切下隐藏底部工具条：修图是独立工作台（子页签在面板里），
+    /// 不再需要底部那排工具；预设列表占满下方空间；裁切把空间让给画面与刻度盘。
     private var hidesToolBar: Bool {
         hidesChrome || model.tool == .presets || model.tool == .retouch
+            || model.tool == .crop
     }
 
     private var emptyState: some View {
@@ -791,6 +795,17 @@ struct EditorTabView: View {
                 }
             }
             .frame(width: geo.size.width, height: geo.size.height)
+            // 拉直刻度盘：浮在预览区最上面（盖住裁切框手势），贴着照片下沿。
+            // 放在这里而不是底部面板里 —— 图片下沿的留白直接成为刻度盘的背景，
+            // 视觉上刻度盘就“贴”在照片下边，不再和照片隔着一整个面板。
+            .overlay(alignment: .topLeading) {
+                if model.tool == .crop, !immersive {
+                    cropDialOverlay(
+                        fitted: fittedRect(imageSize: previewImageSize, in: geo.size),
+                        viewSize: geo.size
+                    )
+                }
+            }
             .onAppear {
                 previewAreaSize = geo.size
             }
@@ -801,6 +816,36 @@ struct EditorTabView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // 放大后的图片不能盖住上面的导航栏：裁在预览区内。
         .clipped()
+    }
+
+    /// 裁切拉直刻度盘：贴着照片下沿，拖动时临时铺网格。
+    private func cropDialOverlay(fitted: CGRect, viewSize: CGSize) -> some View {
+        let height = CropRotationDial.preferredHeight
+        // 刻度盘顶部尽量对齐照片下沿；下方空间不足时往上收，
+        // 保证整块刻度盘都留在预览区内（会轻微压住照片底部，像 Lightroom 的浮层）。
+        let top = min(max(fitted.maxY - 1, 0), max(viewSize.height - height, 0))
+        let width = min(viewSize.width, 560)
+        return CropRotationDial(
+            value: Double(model.state.crop.rotation),
+            onBegin: {
+                cropDialActive = true
+                model.beginEdit()
+            },
+            onChange: { model.updateCropRotation(Float($0), commit: false) },
+            onCommit: {
+                cropDialActive = false
+                model.commitEdit()
+            },
+            onReset: {
+                cropDialActive = false
+                Haptics.light()
+                model.updateCropRotation(0, commit: true)
+            }
+        )
+        .frame(width: width, height: height)
+        // 用 offset 而不是 position：视图保持刻度盘自身大小，
+        // 透明区域不会撑满预览区、挡住裁切框手势。
+        .offset(x: (viewSize.width - width) / 2, y: top)
     }
 
     @ViewBuilder
@@ -904,7 +949,11 @@ struct EditorTabView: View {
                 )
             }
             if model.tool == .crop {
-                CropOverlayView(model: model, imageSize: previewImageSize)
+                CropOverlayView(
+                    model: model,
+                    imageSize: previewImageSize,
+                    forceGrid: cropDialActive
+                )
             }
             if model.tool == .mask {
                 MaskOverlayLayer(
@@ -1329,7 +1378,8 @@ struct EditorTabView: View {
                 return 380
             }
             return 288
-        case .crop: return 210
+        // 裁切：刻度盘已浮到照片下沿，面板只留旋转 / 网格 / 重置 / 完成。
+        case .crop: return 156
         // 蒙版：还没建蒙版时只留新建行（矮条）；创建后调整页才从底部弹起。
         // 分类行压矮后，把高度让给上面的参数（滑块）区。
         case .mask:
@@ -2495,7 +2545,6 @@ struct EditorTabView: View {
 
     private var cropPanel: some View {
         VStack(spacing: 0) {
-            // 拖动「拉直」滑块时：上面几行只隐藏不位移（滑块保持原位）。
             Group {
                 // 旋转 / 翻转（取代原来的比例选择行）。
                 HStack(spacing: 10) {
@@ -2543,16 +2592,8 @@ struct EditorTabView: View {
             .scrollDisabled(model.draggingSlider != nil)
             .opacity(model.draggingSlider == nil ? 1 : 0)
             .allowsHitTesting(model.draggingSlider == nil)
-            CropRotationDial(
-                value: Double(model.state.crop.rotation),
-                onBegin: { model.beginEdit() },
-                onChange: { model.updateCropRotation(Float($0), commit: false) },
-                onCommit: { model.commitEdit() },
-                onReset: {
-                    Haptics.light()
-                    model.updateCropRotation(0, commit: true)
-                }
-            )
+            // 重置 / 完成贴面板底部，和编辑面板的操作行同一位置。
+            Spacer(minLength: 0)
             Group {
                 HStack(spacing: 16) {
                     Spacer()
@@ -2570,11 +2611,11 @@ struct EditorTabView: View {
             }
             .opacity(model.draggingSlider == nil ? 1 : 0)
             .allowsHitTesting(model.draggingSlider == nil)
-            Spacer(minLength: 0)
         }
     }
 
-    /// 裁切「拉直」半圆刻度盘：横向拖动改角度、灵敏度低、刻度哒哒声、双击归零。
+    /// 裁切「拉直」刻度盘：倒扣在照片下沿的浅弧刻度（弧口朝上、弧底朝下），
+    /// 横向拖动改角度、灵敏度低、刻度哒哒声、双击归零。
     private struct CropRotationDial: View {
         let value: Double
         let onBegin: () -> Void
@@ -2586,6 +2627,8 @@ struct EditorTabView: View {
         private static let range: Double = 15
         /// 每格刻度对应的角度（度）：跨格响一下。
         private static let tickStep: Double = 0.5
+        /// 刻度盘高度：浅弧 + 底部刻度 + 顶部数值。
+        static let preferredHeight: CGFloat = 66
 
         @State private var dragStart: Double?
         @State private var lastTick = Int.min
@@ -2593,62 +2636,99 @@ struct EditorTabView: View {
         var body: some View {
             GeometryReader { geo in
                 let width = max(geo.size.width, 1)
-                let clamped = min(max(value, -Self.range), Self.range)
                 let height = max(geo.size.height, 1)
-                let center = CGPoint(x: width / 2, y: height - 4)
-                let radius = min(width * 0.44, height - 16)
+                let clamped = min(max(value, -Self.range), Self.range)
+                // 倒扣的浅弧：圆心在画面上方（负 y），弧顶贴着照片下沿，
+                // 刻度向下展开成 U 形 —— 弧口朝上，弧底朝下。
+                let bottomY = height - 14
+                let sagitta = max(bottomY * 0.62, 18)
+                let chord = min(width * 0.54, 560)
+                let radius = (chord * chord / 4 + sagitta * sagitta) / (2 * sagitta)
+                let halfSpan = CGFloat(
+                    asin(Double(min(chord / 2 / max(radius, 1), 0.999)))
+                )
+                let center = CGPoint(x: width / 2, y: bottomY - radius)
+                let steps = max(Int(Self.range * 2 / Self.tickStep), 1)
+
                 Canvas { context, _ in
-                    // 半圆刻度（左 -90° → 右 +90°）。
-                    var ticks = Path()
-                    let steps = max(Int(Self.range * 2 / Self.tickStep), 1)
                     for index in 0...steps {
                         let t = Double(index) / Double(steps)
-                        let degrees = -90 + (t - 0.5) * 180
-                        let radians = degrees * .pi / 180
+                        let degrees = (t - 0.5) * Self.range * 2
+                        let angle = CGFloat(degrees / Self.range) * halfSpan
+                        let direction = CGVector(
+                            dx: CGFloat(sin(Double(angle))),
+                            dy: CGFloat(cos(Double(angle)))
+                        )
                         let major = index % 10 == 0
-                        let length: CGFloat = major ? 9 : 4.5
-                        let dir = CGPoint(x: sin(radians), y: -cos(radians))
-                        let outer = CGPoint(
-                            x: center.x + dir.x * radius,
-                            y: center.y + dir.y * radius
-                        )
-                        let inner = CGPoint(
-                            x: center.x + dir.x * (radius - length),
-                            y: center.y + dir.y * (radius - length)
-                        )
-                        ticks.move(to: inner)
-                        ticks.addLine(to: outer)
+                        let medium = index % 2 == 0
+                        func point(at distance: CGFloat) -> CGPoint {
+                            CGPoint(
+                                x: center.x + direction.dx * distance,
+                                y: center.y + direction.dy * distance
+                            )
+                        }
+                        if major || medium {
+                            var tick = Path()
+                            tick.move(to: point(at: radius + 2))
+                            tick.addLine(to: point(at: radius + (major ? 11 : 5)))
+                            context.stroke(
+                                tick,
+                                with: .color(.white.opacity(major ? 0.75 : 0.4)),
+                                style: StrokeStyle(
+                                    lineWidth: major ? 1.5 : 1,
+                                    lineCap: .round
+                                )
+                            )
+                        } else {
+                            let dot = point(at: radius + 4)
+                            context.fill(
+                                Path(
+                                    ellipseIn: CGRect(
+                                        x: dot.x - 1.1,
+                                        y: dot.y - 1.1,
+                                        width: 2.2,
+                                        height: 2.2
+                                    )
+                                ),
+                                with: .color(.white.opacity(0.35))
+                            )
+                        }
                     }
-                    context.stroke(
-                        ticks,
-                        with: .color(Color.white.opacity(0.45)),
-                        style: StrokeStyle(lineWidth: 1, lineCap: .round)
+                    // 当前角度：加粗高亮对应刻度（不画长指针，保持参考图的刻度盘感）。
+                    let needleAngle = CGFloat(clamped / Self.range) * halfSpan
+                    let needleDirection = CGVector(
+                        dx: CGFloat(sin(Double(needleAngle))),
+                        dy: CGFloat(cos(Double(needleAngle)))
                     )
-                    // 指针
-                    let needleDegrees = clamped / Self.range * 90
-                    let needleRadians = needleDegrees * .pi / 180
                     var needle = Path()
-                    needle.move(to: center)
+                    needle.move(
+                        to: CGPoint(
+                            x: center.x + needleDirection.dx * (radius + 1),
+                            y: center.y + needleDirection.dy * (radius + 1)
+                        )
+                    )
                     needle.addLine(
                         to: CGPoint(
-                            x: center.x + sin(needleRadians) * (radius - 2),
-                            y: center.y - cos(needleRadians) * (radius - 2)
+                            x: center.x + needleDirection.dx * (radius + 13),
+                            y: center.y + needleDirection.dy * (radius + 13)
                         )
                     )
                     context.stroke(
                         needle,
                         with: .color(Color.accentColor),
-                        style: StrokeStyle(lineWidth: 2, lineCap: .round)
+                        style: StrokeStyle(lineWidth: 2.2, lineCap: .round)
                     )
-                    // 数值
+                    // 数值：贴在照片下沿（弧口内），0° 时显示 0°。
                     context.draw(
-                        Text(String(format: "%+.1f°", clamped))
+                        Text(Self.format(clamped))
                             .font(.system(size: 11, weight: .medium, design: .monospaced))
-                            .foregroundColor(.white.opacity(0.8)),
-                        at: CGPoint(x: center.x, y: center.y - 4)
+                            .foregroundColor(.white.opacity(0.85)),
+                        at: CGPoint(x: center.x, y: 12)
                     )
                 }
-                .contentShape(Rectangle())
+                .contentShape(
+                    CropDialHitShape(center: center, radius: radius, halfSpan: halfSpan)
+                )
                 .gesture(
                     DragGesture(minimumDistance: 0)
                         .onChanged { gesture in
@@ -2660,8 +2740,10 @@ struct EditorTabView: View {
                             let start = dragStart ?? clamped
                             let degreesPerPoint = (Self.range * 2) / Double(width)
                             let target = min(
-                                max(start + Double(gesture.translation.width) * degreesPerPoint,
-                                    -Self.range),
+                                max(
+                                    start + Double(gesture.translation.width) * degreesPerPoint,
+                                    -Self.range
+                                ),
                                 Self.range
                             )
                             let tick = Int((target / Self.tickStep).rounded())
@@ -2683,7 +2765,56 @@ struct EditorTabView: View {
                     }
                 )
             }
-            .frame(height: 78)
+        }
+
+        /// 数值文案：0 不带正负号 / 小数，其他保留一位。
+        private static func format(_ value: Double) -> String {
+            if abs(value) < 0.05 { return "0°" }
+            return String(format: "%+.1f°", value)
+        }
+    }
+
+    /// 刻度盘的触摸区：只覆盖弧形刻度带，避免挡住照片底部的裁切角点。
+    private struct CropDialHitShape: Shape {
+        let center: CGPoint
+        let radius: CGFloat
+        let halfSpan: CGFloat
+
+        func path(in rect: CGRect) -> Path {
+            let steps = 40
+            var outer: [CGPoint] = []
+            var inner: [CGPoint] = []
+            outer.reserveCapacity(steps + 1)
+            inner.reserveCapacity(steps + 1)
+            for index in 0...steps {
+                let angle = -halfSpan + halfSpan * 2 * CGFloat(index) / CGFloat(steps)
+                let direction = CGVector(
+                    dx: CGFloat(sin(Double(angle))),
+                    dy: CGFloat(cos(Double(angle)))
+                )
+                outer.append(
+                    CGPoint(
+                        x: center.x + direction.dx * (radius + 16),
+                        y: center.y + direction.dy * (radius + 16)
+                    )
+                )
+                inner.append(
+                    CGPoint(
+                        x: center.x + direction.dx * (radius - 14),
+                        y: center.y + direction.dy * (radius - 14)
+                    )
+                )
+            }
+            var path = Path()
+            path.move(to: outer[0])
+            for point in outer.dropFirst() {
+                path.addLine(to: point)
+            }
+            for point in inner.reversed() {
+                path.addLine(to: point)
+            }
+            path.closeSubpath()
+            return path
         }
     }
 

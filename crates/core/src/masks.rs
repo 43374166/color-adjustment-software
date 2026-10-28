@@ -308,21 +308,29 @@ pub fn generate_mask(
 
 /// 线性渐变：起点一侧权重 1 → 终点一侧 0，中间 smoothstep 平滑过渡。
 ///
-/// `start` / `end` 是过渡带的两条边界线锚点（垂直于渐变方向的两条线
-/// 分别过这两点）；50% 中心线过 `(start + end) / 2`。
+/// `start` / `end` 是过渡带的两条边界线锚点（归一化坐标），50% 中心线过
+/// `(start + end) / 2`。渐变方向与过渡边界在**像素空间**计算：边界线垂直于
+/// `start → end` 在屏幕上的连线，非正方形图片上也不会被归一化坐标拉成斜线
+/// （与各端画布上画出的轴线 / 边界线一致）。
 pub fn linear_mask(start: [f32; 2], end: [f32; 2], width: u32, height: u32) -> MaskRaster {
     let mut raster = MaskRaster::zeros(width, height);
-    let dir = [end[0] - start[0], end[1] - start[1]];
+    let w = width as f32;
+    let h = height as f32;
+    // 归一化坐标 → 像素坐标，渐变几何在像素空间里算。
+    let start_px = [start[0] * w, start[1] * h];
+    let end_px = [end[0] * w, end[1] * h];
+    let dir = [end_px[0] - start_px[0], end_px[1] - start_px[1]];
     let length_squared = (dir[0] * dir[0] + dir[1] * dir[1]).max(1e-6);
     raster
         .weights
         .par_chunks_mut(width as usize)
         .enumerate()
         .for_each(|(y, row)| {
-            let py = (y as f32 + 0.5) / height as f32;
+            let py = y as f32 + 0.5;
             for (x, weight) in row.iter_mut().enumerate() {
-                let px = (x as f32 + 0.5) / width as f32;
-                let t = ((px - start[0]) * dir[0] + (py - start[1]) * dir[1]) / length_squared;
+                let px = x as f32 + 0.5;
+                let t =
+                    ((px - start_px[0]) * dir[0] + (py - start_px[1]) * dir[1]) / length_squared;
                 *weight = 1.0 - smoothstep(0.0, 1.0, t);
             }
         });
@@ -695,6 +703,29 @@ mod tests {
         assert!((raster.get(0, 16) - 1.0).abs() < 0.05, "起点应接近 1");
         assert!(raster.get(63, 16) < 0.05, "终点应接近 0");
         assert!(raster.get(16, 16) > raster.get(48, 16), "应单调递减");
+    }
+
+    #[test]
+    fn linear_gradient_boundaries_are_perpendicular_in_pixel_space() {
+        // 200×100 的横图：start (0.25,0.25) → end (0.75,0.75)。
+        // 像素方向 (100,50)，等值线斜率 -2；中心线过像素 (100,50)。
+        // (80.5,90.5) 与 (120.5,10.5) 都在中心线上 → 权重都应是 50%。
+        let raster = linear_mask([0.25, 0.25], [0.75, 0.75], 200, 100);
+        let first = raster.get(80, 90);
+        let second = raster.get(120, 10);
+        assert!(
+            (first - 0.5).abs() < 0.02,
+            "像素空间中心线上的点应接近 50%：{first}"
+        );
+        assert!(
+            (second - 0.5).abs() < 0.02,
+            "像素空间中心线上的点应接近 50%：{second}"
+        );
+        // 归一化空间垂线会在这两点差很多（旧实现 (0.4,0.9) ≈ 10%、(0.6,0.1) ≈ 90%）。
+        assert!(
+            (first - second).abs() < 0.02,
+            "同一过渡线上的权重应一致：{first} vs {second}"
+        );
     }
 
     #[test]

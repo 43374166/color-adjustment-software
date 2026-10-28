@@ -247,11 +247,6 @@ func canvasPoint(_ normalized: CGPoint, fitted: CGRect) -> CGPoint {
     )
 }
 
-/// 归一化方向 → 内容坐标方向（保留长度比例，用于垂线 / 手柄布局）。
-func canvasVector(_ vector: CGVector, fitted: CGRect) -> CGVector {
-    CGVector(dx: vector.dx * fitted.width, dy: vector.dy * fitted.height)
-}
-
 // MARK: - 命中测试
 
 /// 蒙版画布控件拖动模式。
@@ -281,8 +276,6 @@ enum MaskHitTester {
     static let lineDistance: CGFloat = 30
     /// 径向旋转手柄外置距离（view 点）。
     static let rotateOffset: CGFloat = 46
-    /// 中心线两端点距中心的距离（内容点，比例于短边）。
-    static let linearPinHalfSpanRatio: CGFloat = 0.40
     /// 椭圆四向手柄角度。
     static let cardinalAngles: [CGFloat] = [0, .pi / 2, .pi, -.pi / 2]
 
@@ -357,20 +350,20 @@ enum MaskHitTester {
     ) -> MaskDragMode {
         let fitted = geometry.fitted
         guard fitted.width > 0, fitted.height > 0 else { return .none }
-        // 中心线附近拖动判定仍用原来的中心线半长（轴线只是视觉辅助）。
-        let center = canvasPoint(mask.linearCenter, fitted: fitted)
-        let halfSpan = min(fitted.width, fitted.height) * linearPinHalfSpanRatio
-        // 中心线 / 过渡边界的共同方向 = 归一化空间垂线在内容空间的像。
-        let dir = mask.linearDirection
-        let across = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)
-        let acrossLength = max(hypot(across.dx, across.dy), 1e-6)
-        let normal = CGVector(dx: across.dx / acrossLength, dy: across.dy / acrossLength)
-        // 旋转手柄：在连接两个点的轴线上、往两条边界外侧延伸（与绘制同一套公式）。
+        // 几何全部在内容（屏幕）坐标里算：与核心的像素空间投影、画布绘制一致，
+        // 非正方形图片上轴线与边界线才是真正垂直的。
         let startPoint = canvasPoint(mask.start, fitted: fitted)
         let endPoint = canvasPoint(mask.end, fitted: fitted)
-        let gradient = canvasVector(dir, fitted: fitted)
-        let gradientLength = max(hypot(gradient.dx, gradient.dy), 1e-6)
-        let axis = CGVector(dx: gradient.dx / gradientLength, dy: gradient.dy / gradientLength)
+        let axisVector = CGVector(dx: endPoint.x - startPoint.x, dy: endPoint.y - startPoint.y)
+        let width = hypot(axisVector.dx, axisVector.dy)
+        guard width > 1 else { return .none }
+        let axis = CGVector(dx: axisVector.dx / width, dy: axisVector.dy / width)
+        let normal = CGVector(dx: -axis.dy, dy: axis.dx)
+        let center = CGPoint(
+            x: (startPoint.x + endPoint.x) / 2,
+            y: (startPoint.y + endPoint.y) / 2
+        )
+        // 旋转手柄：在连接两个点的轴线上、往两条边界外侧延伸（与绘制同一套公式）。
         let extensionLength = min(fitted.width, fitted.height) * 0.18
         let pins = [
             CGPoint(
@@ -403,24 +396,21 @@ enum MaskHitTester {
         if bestMode != .none {
             return bestMode
         }
-        // 到三条线的距离用**归一化空间的投影参数 t** 度量（与核心 / 绘制完全一致，
-        // 不能直接拿内容空间的垂距，否则非正方形图片上会差一条斜线）。
-        let normalized = geometry.normalized(fromContent: point)
-        let t = MaskDragSession.parameter(mask, normalized)
-        let bandPixels = hypot(
-            (mask.end.x - mask.start.x) * fitted.width,
-            (mask.end.y - mask.start.y) * fitted.height
-        )
-        let centerDistance = abs(t - 0.5) * bandPixels
-        let boundaryDistance = min(abs(t), abs(t - 1)) * bandPixels
+        // 像素空间投影参数：0 = 100% 边界，1 = 0% 边界（与核心一致）。
+        let offset = CGVector(dx: point.x - startPoint.x, dy: point.y - startPoint.y)
+        let t = (offset.dx * axis.dx + offset.dy * axis.dy) / width
+        let centerDistance = abs(t - 0.5) * width
+        let boundaryDistance = min(abs(t), abs(t - 1)) * width
         // 靠近某条过渡边界（比中心线更近）→ 只移动那条边界。
         if boundaryDistance + 4 < centerDistance, boundaryDistance < 26 {
             return .linearFeather(t < 0.5 ? 0 : 1)
         }
         // 中心线附近 → 平移。
-        let offset = CGVector(dx: point.x - center.x, dy: point.y - center.y)
-        let along = abs(offset.dx * normal.dx + offset.dy * normal.dy)
-        if centerDistance < lineDistance, along < halfSpan + 40 {
+        let centerOffset = CGVector(dx: point.x - center.x, dy: point.y - center.y)
+        let across = abs(centerOffset.dx * axis.dx + centerOffset.dy * axis.dy)
+        let along = abs(centerOffset.dx * normal.dx + centerOffset.dy * normal.dy)
+        let halfSpan = min(width / 2 + 60, min(fitted.width, fitted.height) * 0.9)
+        if across < lineDistance, along < halfSpan {
             return .linearMove
         }
         // 兜底：拖动蒙版区域也平移。
@@ -522,23 +512,37 @@ struct MaskDragSession {
             let delta = Self.angleDelta(from: fromContent, to: content, around: centerContent)
             return Self.rotatedLinear(snapshot, byContentRadians: delta, fitted: geometry.fitted)
         case .linearFeather(let index):
-            // 只沿渐变方向移动被抓住的那条边界线（另一条保持不动）。
-            let dir = snapshot.linearDirection
-            let projected = Double(
-                (point.x - startPoint.x) * dir.dx + (point.y - startPoint.y) * dir.dy
+            // 只沿渐变方向（屏幕空间轴线）移动被抓住的那条边界线，另一条保持不动。
+            let maskStart = geometry.contentPoint(normalized: snapshot.start)
+            let maskEnd = geometry.contentPoint(normalized: snapshot.end)
+            let axisVector = CGVector(
+                dx: maskEnd.x - maskStart.x,
+                dy: maskEnd.y - maskStart.y
             )
+            let width = hypot(axisVector.dx, axisVector.dy)
+            guard width > 1e-6 else { return nil }
+            let axis = CGVector(dx: axisVector.dx / width, dy: axisVector.dy / width)
+            let movement = CGVector(
+                dx: content.x - startContent.x,
+                dy: content.y - startContent.y
+            )
+            let projected = movement.dx * axis.dx + movement.dy * axis.dy
             var copy = snapshot
             if index == 0 {
-                let limited = min(projected, snapshot.linearWidth - 0.02)
-                copy.start = CGPoint(
-                    x: snapshot.start.x + dir.dx * CGFloat(limited),
-                    y: snapshot.start.y + dir.dy * CGFloat(limited)
+                let limited = min(projected, width - 2)
+                copy.start = geometry.normalized(
+                    fromContent: CGPoint(
+                        x: maskStart.x + axis.dx * limited,
+                        y: maskStart.y + axis.dy * limited
+                    )
                 )
             } else {
-                let limited = max(projected, -(snapshot.linearWidth - 0.02))
-                copy.end = CGPoint(
-                    x: snapshot.end.x + dir.dx * CGFloat(limited),
-                    y: snapshot.end.y + dir.dy * CGFloat(limited)
+                let limited = max(projected, -(width - 2))
+                copy.end = geometry.normalized(
+                    fromContent: CGPoint(
+                        x: maskEnd.x + axis.dx * limited,
+                        y: maskEnd.y + axis.dy * limited
+                    )
                 )
             }
             return copy
@@ -594,15 +598,6 @@ struct MaskDragSession {
         }
     }
 
-    /// 归一化点的渐变投影参数：0 = 100% 边界（start），1 = 0% 边界（end）。
-    static func parameter(_ mask: MaskUi, _ normalized: CGPoint) -> CGFloat {
-        let dir = mask.linearDirection
-        let width = max(mask.linearWidth, 1e-6)
-        let dx = normalized.x - mask.start.x
-        let dy = normalized.y - mask.start.y
-        return (dx * dir.dx + dy * dir.dy) / CGFloat(width)
-    }
-
     // MARK: 工具函数
 
     static func clamped(_ point: CGPoint, delta: CGPoint) -> CGPoint {
@@ -619,36 +614,58 @@ struct MaskDragSession {
         return atan2(a.dx * b.dy - a.dy * b.dx, a.dx * b.dx + a.dy * b.dy)
     }
 
-    /// 旋转线性渐变：把手柄方向（归一化垂线的像）按手指转角旋转，再反解渐变方向——
-    /// 端点跟着手指走，三条线与实际过渡方向始终一致。
+    /// 旋转线性渐变：start / end 绕中心在**屏幕空间**旋转，过渡带宽度不变。
+    /// 轴线与两条边界线在任意角度都保持垂直；靠近水平 / 竖直时吸附到整 90°。
     static func rotatedLinear(
         _ mask: MaskUi,
         byContentRadians radians: CGFloat,
         fitted: CGRect
     ) -> MaskUi {
-        let dir = mask.linearDirection
-        var handle = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)
-        let handleLength = hypot(handle.dx, handle.dy)
-        guard handleLength > 1e-6 else { return mask }
-        handle = CGVector(dx: handle.dx / handleLength, dy: handle.dy / handleLength)
+        guard fitted.width > 1, fitted.height > 1 else { return mask }
+        let startPoint = canvasPoint(mask.start, fitted: fitted)
+        let endPoint = canvasPoint(mask.end, fitted: fitted)
+        let width = hypot(endPoint.x - startPoint.x, endPoint.y - startPoint.y)
+        guard width > 1e-6 else { return mask }
+        let center = CGPoint(
+            x: (startPoint.x + endPoint.x) / 2,
+            y: (startPoint.y + endPoint.y) / 2
+        )
         let cosR = cos(radians)
         let sinR = sin(radians)
-        let rotated = CGVector(
-            dx: handle.dx * cosR - handle.dy * sinR,
-            dy: handle.dx * sinR + handle.dy * cosR
+        var axis = CGVector(
+            dx: (endPoint.x - startPoint.x) / width,
+            dy: (endPoint.y - startPoint.y) / width
         )
-        // 反解：n = 归一化空间的垂线 → d = (n.y, -n.x)。
-        var normal = CGVector(dx: rotated.dx / fitted.width, dy: rotated.dy / fitted.height)
-        let normalLength = hypot(normal.dx, normal.dy)
-        guard normalLength > 1e-9 else { return mask }
-        normal = CGVector(dx: normal.dx / normalLength, dy: normal.dy / normalLength)
-        let newDir = CGVector(dx: normal.dy, dy: -normal.dx)
+        axis = CGVector(
+            dx: axis.dx * cosR - axis.dy * sinR,
+            dy: axis.dx * sinR + axis.dy * cosR
+        )
+        // 吸附：轴线接近水平 / 竖直时，直接对齐到最近的 90°（带 3° 容差）。
+        let angle = atan2(axis.dy, axis.dx)
+        let quarter = CGFloat.pi / 2
+        let snappedAngle = (angle / quarter).rounded() * quarter
+        if abs(normalizedRadians(angle - snappedAngle)) < 3 * CGFloat.pi / 180 {
+            axis = CGVector(dx: cos(snappedAngle), dy: sin(snappedAngle))
+        }
+        let half = width / 2
         var copy = mask
-        let half = CGFloat(mask.linearWidth / 2)
-        let center = mask.linearCenter
-        copy.start = CGPoint(x: center.x - newDir.dx * half, y: center.y - newDir.dy * half)
-        copy.end = CGPoint(x: center.x + newDir.dx * half, y: center.y + newDir.dy * half)
+        copy.start = normalizedPoint(
+            CGPoint(x: center.x - axis.dx * half, y: center.y - axis.dy * half),
+            fitted: fitted
+        )
+        copy.end = normalizedPoint(
+            CGPoint(x: center.x + axis.dx * half, y: center.y + axis.dy * half),
+            fitted: fitted
+        )
         return copy
+    }
+
+    /// 内容坐标 → 归一化图像坐标（只依赖预览图的 fitted 矩形）。
+    static func normalizedPoint(_ point: CGPoint, fitted: CGRect) -> CGPoint {
+        CGPoint(
+            x: (point.x - fitted.minX) / max(fitted.width, 1),
+            y: (point.y - fitted.minY) / max(fitted.height, 1)
+        )
     }
 
     static func normalizedRadians(_ radians: CGFloat) -> CGFloat {
@@ -826,8 +843,26 @@ final class MaskCanvasController {
             switch kind {
             case .linear:
                 // 按下点固定为 100% 一侧，手指方向 / 长度就是渐变方向与过渡带宽度。
+                // 接近水平 / 竖直时吸附到整 90°，方便做出严格竖直的渐变。
+                let dx = (normalized.x - placementStart.x) * fitted.width
+                let dy = (normalized.y - placementStart.y) * fitted.height
+                let length = hypot(dx, dy)
+                var end = normalized
+                if length > 1 {
+                    let angle = atan2(dy, dx)
+                    let quarter = CGFloat.pi / 2
+                    let snapped = (angle / quarter).rounded() * quarter
+                    if abs(angle - snapped) < 4 * CGFloat.pi / 180 {
+                        end = CGPoint(
+                            x: placementStart.x
+                                + cos(snapped) * length / max(fitted.width, 1),
+                            y: placementStart.y
+                                + sin(snapped) * length / max(fitted.height, 1)
+                        )
+                    }
+                }
                 mask.start = placementStart
-                mask.end = normalized
+                mask.end = clampedNormalized(end)
             case .radial:
                 let dx = content.x - startContent.x
                 let dy = content.y - startContent.y
@@ -983,24 +1018,25 @@ struct MaskOverlayLayer: View {
     }
 
     private func drawLinear(_ context: inout GraphicsContext, mask: MaskUi, fitted: CGRect) {
-        // 三条线的方向 = 归一化空间垂线在内容空间的像（核心按归一化投影算 alpha，
-        // 直接取内容空间垂线在非正方形图片上会与实际渐变方向差一条斜线）。
-        let dir = mask.linearDirection
-        let across = canvasVector(CGVector(dx: -dir.dy, dy: dir.dx), fitted: fitted)
-        let acrossLength = max(hypot(across.dx, across.dy), 1e-6)
-        let normal = CGVector(dx: across.dx / acrossLength, dy: across.dy / acrossLength)
+        // 几何全部在内容（屏幕）坐标里算：轴线 = start → end 的屏幕连线，
+        // 两条过渡边界垂直于它。核心的像素空间投影与此完全一致，
+        // 任意角度下虚线轴线与实线边界线都严格垂直。
+        let startPoint = canvasPoint(mask.start, fitted: fitted)
+        let endPoint = canvasPoint(mask.end, fitted: fitted)
+        let axisVector = CGVector(dx: endPoint.x - startPoint.x, dy: endPoint.y - startPoint.y)
+        let width = hypot(axisVector.dx, axisVector.dy)
+        guard width > 1 else { return }
+        let axis = CGVector(dx: axisVector.dx / width, dy: axisVector.dy / width)
+        let normal = CGVector(dx: -axis.dy, dy: axis.dx)
         let span = max(fitted.width, fitted.height) * 1.2
         // 过渡边界（100% / 0% 两条线）。
-        for anchor in [mask.start, mask.end] {
-            let point = canvasPoint(anchor, fitted: fitted)
+        for point in [startPoint, endPoint] {
             var path = Path()
             path.move(to: CGPoint(x: point.x - normal.dx * span, y: point.y - normal.dy * span))
             path.addLine(to: CGPoint(x: point.x + normal.dx * span, y: point.y + normal.dy * span))
             context.stroke(path, with: .color(.white.opacity(0.7)), lineWidth: 1.5)
         }
         // 连接两个点的「虚拟线」：沿渐变方向（= 垂直穿过两条边界线），虚线。
-        let startPoint = canvasPoint(mask.start, fitted: fitted)
-        let endPoint = canvasPoint(mask.end, fitted: fitted)
         var connector = Path()
         connector.move(to: startPoint)
         connector.addLine(to: endPoint)
@@ -1010,9 +1046,6 @@ struct MaskOverlayLayer: View {
             style: StrokeStyle(lineWidth: 1, dash: [4, 4])
         )
         // 旋转手柄：同一条线往两条边界外侧延伸一点（不挡住边界上的抓手）。
-        let gradient = canvasVector(dir, fitted: fitted)
-        let gradientLength = max(hypot(gradient.dx, gradient.dy), 1e-6)
-        let axis = CGVector(dx: gradient.dx / gradientLength, dy: gradient.dy / gradientLength)
         let extensionLength = min(fitted.width, fitted.height) * 0.18
         let pinA = CGPoint(
             x: startPoint.x - axis.dx * extensionLength,
@@ -1033,10 +1066,10 @@ struct MaskOverlayLayer: View {
         drawGrip(&context, at: pinA, color: .white, radius: 8)
         drawGrip(&context, at: pinB, color: .white, radius: 8)
         // 过渡 / 羽化手柄（黄色，落在两条边界线上）。
-        for anchor in [mask.start, mask.end] {
+        for point in [startPoint, endPoint] {
             drawGrip(
                 &context,
-                at: canvasPoint(anchor, fitted: fitted),
+                at: point,
                 color: Color(red: 1.0, green: 0.78, blue: 0.2),
                 radius: 6.5
             )

@@ -1323,7 +1323,7 @@ pub enum MaskKind {
     Brush(BrushSettings),
     /// 线性渐变。
     LinearGradient {
-        /// 起点（归一化）。
+        /// 起点（归一化）；边界线过该点、在像素空间垂直于 `start → end`。
         start: [f32; 2],
         /// 终点（归一化）。
         end: [f32; 2],

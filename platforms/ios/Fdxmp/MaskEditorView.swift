@@ -488,35 +488,44 @@ struct MaskPanelView: View {
         .padding(.vertical, 4)
     }
 
+    /// 蒙版几何使用的输出图像尺寸（与画布 / 核心同一坐标系）。
+    private var maskImageSize: CGSize {
+        model.previewOutputSize
+            ?? model.previewImage?.size
+            ?? model.originalImage?.size
+            ?? CGSize(width: 4, height: 3)
+    }
+
     @ViewBuilder
     private func linearControls(_ mask: MaskUi) -> some View {
-        hintText("拖中心线平移 · 拖端点旋转 · 拖黄色手柄只移动那条过渡边界（两条线独立）")
+        let imageSize = maskImageSize
+        hintText("拖中心线平移 · 拖端点旋转（靠近水平 / 竖直自动吸附）· 拖黄色手柄只移动那条过渡边界")
         maskSlider(
             "位置",
-            value: mask.linearPositionPercent,
+            value: mask.linearScreenPositionPercent(in: imageSize),
             range: -100...100,
             neutral: 0,
             step: 2
         ) { mask, value in
-            mask.settingLinearPosition(value)
+            mask.settingLinearScreenPosition(value, in: imageSize)
         }
         maskSlider(
             "角度",
-            value: mask.linearAngleWrapped,
+            value: mask.linearScreenAngleWrapped(in: imageSize),
             range: 0...180,
             neutral: 90,
             step: 1
         ) { mask, value in
-            mask.settingLinearAngle(value)
+            mask.settingLinearScreenAngle(value, in: imageSize)
         }
         maskSlider(
             "过渡",
-            value: Float(mask.linearWidth * 100),
+            value: mask.linearScreenWidthPercent(in: imageSize),
             range: 2...200,
             neutral: 30,
             step: 2
         ) { mask, value in
-            mask.settingLinearWidth(Double(value) / 100)
+            mask.settingLinearScreenWidth(value, in: imageSize)
         }
     }
 

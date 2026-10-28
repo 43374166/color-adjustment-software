@@ -5,6 +5,8 @@ struct CropOverlayView: View {
     @ObservedObject var model: EditorModel
     /// 预览图像的像素尺寸（未裁切）。
     let imageSize: CGSize
+    /// 拉直刻度盘拖动中：临时显示网格（不写回裁切参数，松手恢复原网格）。
+    var forceGrid = false
 
     private enum DragMode {
         case none
@@ -214,8 +216,11 @@ struct CropOverlayView: View {
     }
 
     private func drawGrid(_ context: inout GraphicsContext, rect: CGRect) {
+        // 拉直刻度盘拖动中默认铺 4×4 网格，方便对地平线 / 建筑垂线；
+        // 只在拖动期间覆盖显示，松手后仍回到用户选的构图网格。
+        let style: CropGridUi = forceGrid ? .grid : model.state.crop.grid
         var grid = Path()
-        switch model.state.crop.grid {
+        switch style {
         case .none:
             return
         case .thirds:
@@ -230,7 +235,11 @@ struct CropOverlayView: View {
             grid.move(to: CGPoint(x: rect.maxX, y: rect.minY))
             grid.addLine(to: CGPoint(x: rect.minX, y: rect.maxY))
         }
-        context.stroke(grid, with: .color(.white.opacity(0.35)), lineWidth: 1)
+        context.stroke(
+            grid,
+            with: .color(.white.opacity(forceGrid ? 0.5 : 0.35)),
+            lineWidth: 1
+        )
     }
 
     /// 按比例加横竖构图线。

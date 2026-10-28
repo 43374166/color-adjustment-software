@@ -917,7 +917,8 @@ struct MaskUi: Identifiable, Equatable {
     var strokes: [BrushStrokeUi] = []
 
     // 线性渐变
-    /// 过渡带 100% 一侧的锚点（归一化，边界线过该点、垂直于渐变方向）。
+    /// 过渡带 100% 一侧的锚点（归一化坐标；边界线过该点，在像素空间垂直于
+    /// `start → end` 的屏幕连线，任意角度都与虚线轴线垂直）。
     var start = CGPoint(x: 0.5, y: 0.3)
     /// 过渡带 0% 一侧的锚点。
     var end = CGPoint(x: 0.5, y: 0.7)
@@ -935,37 +936,62 @@ struct MaskUi: Identifiable, Equatable {
     }
 }
 
-// MARK: - 线性渐变几何（中心线 / 端点 / 过渡边界）
+// MARK: - 线性渐变几何（屏幕空间：与核心 / 画布绘制一致）
 
 extension MaskUi {
-    /// 过渡带中心（50% 中心线过该点）。
+    /// 过渡带中心（50% 中心线过该点，归一化坐标）。
     var linearCenter: CGPoint {
         CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
     }
 
-    /// 渐变方向单位向量（start → end）。
-    var linearDirection: CGVector {
-        let dx = end.x - start.x
-        let dy = end.y - start.y
-        let length = (dx * dx + dy * dy).squareRoot()
-        guard length > 1e-6 else { return CGVector(dx: 0, dy: 1) }
-        return CGVector(dx: dx / length, dy: dy / length)
+    /// 归一化坐标 → 图像像素空间坐标。
+    static func linearPoint(_ point: CGPoint, in imageSize: CGSize) -> CGPoint {
+        CGPoint(
+            x: point.x * max(imageSize.width, 1),
+            y: point.y * max(imageSize.height, 1)
+        )
     }
 
-    /// 过渡带宽度（归一化投影长度）。
-    var linearWidth: Double {
-        Double(hypot(end.x - start.x, end.y - start.y))
+    /// 图像像素空间坐标 → 归一化坐标。
+    static func linearNormalized(_ point: CGPoint, in imageSize: CGSize) -> CGPoint {
+        CGPoint(
+            x: point.x / max(imageSize.width, 1),
+            y: point.y / max(imageSize.height, 1)
+        )
     }
 
-    /// 渐变方向角（度，0 = 向右，顺时针为正 —— 与图像 y 轴向下一致）。
-    var linearAngleDegrees: Float {
-        let dir = linearDirection
-        return Float(atan2(dir.dy, dir.dx) * 180 / .pi)
+    /// 起点 / 终点在图像像素空间的坐标。
+    func linearStartPoint(in imageSize: CGSize) -> CGPoint {
+        Self.linearPoint(start, in: imageSize)
+    }
+
+    func linearEndPoint(in imageSize: CGSize) -> CGPoint {
+        Self.linearPoint(end, in: imageSize)
+    }
+
+    /// 起点 → 终点的屏幕空间向量（像素，未归一化）。
+    func linearScreenAxis(in imageSize: CGSize) -> CGVector {
+        let startPoint = linearStartPoint(in: imageSize)
+        let endPoint = linearEndPoint(in: imageSize)
+        return CGVector(dx: endPoint.x - startPoint.x, dy: endPoint.y - startPoint.y)
+    }
+
+    /// 过渡带在屏幕上的宽度（像素）。
+    func linearScreenWidth(in imageSize: CGSize) -> CGFloat {
+        let axis = linearScreenAxis(in: imageSize)
+        return hypot(axis.dx, axis.dy)
+    }
+
+    /// 屏幕空间的渐变方向角（度，0 = 向右，90 = 向下）。
+    func linearScreenAngleDegrees(in imageSize: CGSize) -> Float {
+        let axis = linearScreenAxis(in: imageSize)
+        guard hypot(axis.dx, axis.dy) > 1e-6 else { return 90 }
+        return Float(atan2(axis.dy, axis.dx) * 180 / .pi)
     }
 
     /// 显示用的角度（归一化到 0..<180，渐变方向本身对称）。
-    var linearAngleWrapped: Float {
-        var value = linearAngleDegrees.truncatingRemainder(dividingBy: 180)
+    func linearScreenAngleWrapped(in imageSize: CGSize) -> Float {
+        var value = linearScreenAngleDegrees(in: imageSize).truncatingRemainder(dividingBy: 180)
         if value < 0 {
             value += 180
         }
@@ -981,47 +1007,84 @@ extension MaskUi {
         return value
     }
 
-    /// 中心线在法线方向上的投影位置（-100..100，0 = 过画面中心）。
-    var linearPositionPercent: Float {
-        let normal = CGVector(dx: -linearDirection.dy, dy: linearDirection.dx)
-        let offset = linearCenter.x * normal.dx + linearCenter.y * normal.dy
-        return Float(offset * 100)
+    /// 中心线沿渐变方向的偏移（-100..100，0 = 过画面中心；按短边归一化）。
+    func linearScreenPositionPercent(in imageSize: CGSize) -> Float {
+        let axis = linearScreenAxis(in: imageSize)
+        let length = hypot(axis.dx, axis.dy)
+        guard length > 1e-6 else { return 0 }
+        let unit = CGVector(dx: axis.dx / length, dy: axis.dy / length)
+        let centerPoint = Self.linearPoint(linearCenter, in: imageSize)
+        let offset = (centerPoint.x - imageSize.width / 2) * unit.dx
+            + (centerPoint.y - imageSize.height / 2) * unit.dy
+        let shortSide = max(min(imageSize.width, imageSize.height), 1)
+        return Float(offset / shortSide * 100)
     }
 
-    /// 设置过渡带宽度（保持中心与方向不变）。
-    func settingLinearWidth(_ width: Double) -> MaskUi {
-        var copy = self
-        let clamped = min(max(width, 0.02), 2)
-        let dir = linearDirection
-        let center = linearCenter
-        let half = CGFloat(clamped / 2)
-        copy.start = CGPoint(x: center.x - dir.dx * half, y: center.y - dir.dy * half)
-        copy.end = CGPoint(x: center.x + dir.dx * half, y: center.y + dir.dy * half)
-        return copy
+    /// 过渡带宽度的显示值（屏幕像素 / 短边 × 100）。
+    func linearScreenWidthPercent(in imageSize: CGSize) -> Float {
+        let shortSide = max(min(imageSize.width, imageSize.height), 1)
+        return Float(linearScreenWidth(in: imageSize) / shortSide * 100)
     }
 
-    /// 绕中心旋转到指定角度（度）。
-    func settingLinearAngle(_ degrees: Float) -> MaskUi {
+    /// 设置过渡带宽度（屏幕像素 / 短边，保持中心与方向不变）。
+    func settingLinearScreenWidth(_ percent: Float, in imageSize: CGSize) -> MaskUi {
         var copy = self
-        let radians = Float(degrees) * .pi / 180
-        let half = CGFloat(linearWidth / 2)
-        let dir = CGVector(dx: CGFloat(cos(radians)), dy: CGFloat(sin(radians)))
-        let center = linearCenter
-        copy.start = CGPoint(x: center.x - dir.dx * half, y: center.y - dir.dy * half)
-        copy.end = CGPoint(x: center.x + dir.dx * half, y: center.y + dir.dy * half)
-        return copy
-    }
-
-    /// 平移中心线，使法线投影位置为 `percent`（-100..100）。
-    func settingLinearPosition(_ percent: Float) -> MaskUi {
-        var copy = self
-        let normal = CGVector(dx: -linearDirection.dy, dy: linearDirection.dx)
-        let current = Float(
-            (linearCenter.x * normal.dx + linearCenter.y * normal.dy) * 100
+        let axis = linearScreenAxis(in: imageSize)
+        let length = hypot(axis.dx, axis.dy)
+        guard length > 1e-6 else { return copy }
+        let unit = CGVector(dx: axis.dx / length, dy: axis.dy / length)
+        let shortSide = max(min(imageSize.width, imageSize.height), 1)
+        let width = CGFloat(min(max(percent, 2), 200)) / 100 * shortSide
+        let centerPoint = Self.linearPoint(linearCenter, in: imageSize)
+        let half = width / 2
+        copy.start = Self.linearNormalized(
+            CGPoint(x: centerPoint.x - unit.dx * half, y: centerPoint.y - unit.dy * half),
+            in: imageSize
         )
-        let delta = CGFloat((percent - current) / 100)
-        copy.start = CGPoint(x: start.x + normal.dx * delta, y: start.y + normal.dy * delta)
-        copy.end = CGPoint(x: end.x + normal.dx * delta, y: end.y + normal.dy * delta)
+        copy.end = Self.linearNormalized(
+            CGPoint(x: centerPoint.x + unit.dx * half, y: centerPoint.y + unit.dy * half),
+            in: imageSize
+        )
+        return copy
+    }
+
+    /// 绕中心旋转到指定屏幕角度（度，0 = 向右，90 = 向下）。
+    func settingLinearScreenAngle(_ degrees: Float, in imageSize: CGSize) -> MaskUi {
+        var copy = self
+        let width = max(linearScreenWidth(in: imageSize), 1)
+        let radians = Double(degrees) * .pi / 180
+        let unit = CGVector(dx: CGFloat(cos(radians)), dy: CGFloat(sin(radians)))
+        let centerPoint = Self.linearPoint(linearCenter, in: imageSize)
+        let half = width / 2
+        copy.start = Self.linearNormalized(
+            CGPoint(x: centerPoint.x - unit.dx * half, y: centerPoint.y - unit.dy * half),
+            in: imageSize
+        )
+        copy.end = Self.linearNormalized(
+            CGPoint(x: centerPoint.x + unit.dx * half, y: centerPoint.y + unit.dy * half),
+            in: imageSize
+        )
+        return copy
+    }
+
+    /// 平移中心线，使屏幕空间位置为 `percent`（-100..100）。
+    func settingLinearScreenPosition(_ percent: Float, in imageSize: CGSize) -> MaskUi {
+        var copy = self
+        let axis = linearScreenAxis(in: imageSize)
+        let length = hypot(axis.dx, axis.dy)
+        guard length > 1e-6 else { return copy }
+        let unit = CGVector(dx: axis.dx / length, dy: axis.dy / length)
+        let shortSide = max(min(imageSize.width, imageSize.height), 1)
+        let current = linearScreenPositionPercent(in: imageSize)
+        let delta = CGFloat((percent - current) / 100) * shortSide
+        copy.start = CGPoint(
+            x: start.x + unit.dx * delta / max(imageSize.width, 1),
+            y: start.y + unit.dy * delta / max(imageSize.height, 1)
+        )
+        copy.end = CGPoint(
+            x: end.x + unit.dx * delta / max(imageSize.width, 1),
+            y: end.y + unit.dy * delta / max(imageSize.height, 1)
+        )
         return copy
     }
 }
