@@ -29,16 +29,17 @@ struct EditorTabView: View {
     @State private var baseZoom: CGFloat = 1
     @State private var pan: CGSize = .zero
     @State private var basePan: CGSize = .zero
-    /// 照片触摸跟踪状态：轻点 / 长按自己判定（不再用「双击手势压制单击」，
-    /// 避免单击要等 0.3s 才有响应）。
+    /// 照片触摸跟踪状态：轻点 / 长按自己判定。
+    /// 单击的沉浸切换要等过双击窗口再执行（见 `pendingSingleTap`），
+    /// 否则双击的第一击会先把面板切一次，看起来"面板闪一下"。
     @State private var photoTouchActive = false
     @State private var photoTouchMoved = false
     @State private var photoHoldActive = false
     @State private var photoHoldWork: DispatchWorkItem?
     /// 上一次轻点的时间（300ms 内两次 = 双击放大 / 还原）。
     @State private var lastPhotoTapAt = Date.distantPast
-    /// 本次轻点前是否已沉浸（双击放大要把单击的沉浸切换还原）。
-    @State private var immersiveBeforeTap = false
+    /// 待执行的单击动作（双击时取消，保证双击不触发任何单击效果）。
+    @State private var pendingSingleTap: DispatchWorkItem?
     /// 蒙版画布交互控制器（拖动 / 涂抹 / 双指手势）。
     @State private var maskController = MaskCanvasController()
     /// 分类参数面板是否收起（点同一个分类两次 = 收起 / 再展开）。
@@ -117,6 +118,11 @@ struct EditorTabView: View {
             model.setDraggingSlider(info)
         }
         .onAppear(perform: loadIfNeeded)
+        .onDisappear {
+            // 离开编辑页时丢掉排队的单击，避免在别的页面上突然切一次沉浸。
+            pendingSingleTap?.cancel()
+            pendingSingleTap = nil
+        }
         .onAppear {
             // 预热触觉引擎，第一次操作就有反馈。
             Haptics.prepare()
@@ -1077,6 +1083,9 @@ struct EditorTabView: View {
                     photoTouchActive = true
                     photoTouchMoved = false
                     photoHoldActive = false
+                    // 新的一次触摸开始：上一击排队的单击作废（双击 / 滑动 / 长按都不该触发它）。
+                    pendingSingleTap?.cancel()
+                    pendingSingleTap = nil
                     // 直方图卡片自己收手势。
                     guard !histogramFrame(in: viewSize).contains(value.startLocation) else {
                         return
@@ -1116,19 +1125,26 @@ struct EditorTabView: View {
                 // 刚捏合完的瞬间不算轻点（捏合松手时两根手指的收拢）。
                 guard Date().timeIntervalSince(lastPinchAt) > 0.25 else { return }
                 let now = Date()
-                if now.timeIntervalSince(lastPhotoTapAt) < 0.35 {
-                    // 双击：放大 / 还原，并把第一击的沉浸切换还原。
+                if now.timeIntervalSince(lastPhotoTapAt) < 0.30 {
+                    // 双击：只做放大 / 还原。单击动作还排在队列里，先取消，
+                    // 这样面板不会"先隐一下再显示"。
                     lastPhotoTapAt = .distantPast
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        immersive = immersiveBeforeTap
-                    }
+                    pendingSingleTap?.cancel()
+                    pendingSingleTap = nil
                     toggleZoom()
                 } else {
+                    // 单击：延迟到双击窗口之后再切沉浸（等不到第二击才算单击）。
                     lastPhotoTapAt = now
-                    immersiveBeforeTap = immersive
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        immersive.toggle()
+                    pendingSingleTap?.cancel()
+                    let work = DispatchWorkItem { [self] in
+                        self.pendingSingleTap = nil
+                        guard self.overlayEnabled else { return }
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            self.immersive.toggle()
+                        }
                     }
+                    pendingSingleTap = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.32, execute: work)
                 }
             }
     }
