@@ -690,12 +690,22 @@ final class MaskCanvasController {
     private var dragging = false
     /// 正在拖动放置新蒙版（线性 / 径向）。
     private var placing = false
-    /// 这次放置是否已经真的建出蒙版（手指拖开阈值后才建）。
+    /// 这次放置是否已经真的建出蒙版（线性越过阈值 / 径向按下即建）。
     private var placementCreated = false
+    /// 本次放置新建的蒙版 id（取消时精确回滚）。
+    private var placementMaskId: String?
     /// 放置起点（归一化图像坐标；线性 = 起点，径向 = 中心）。
     private var placementStart: CGPoint = .zero
-    /// 放置阈值（内容点）：手指移动超过这个距离才建蒙版，避免按下瞬间闪一个默认形状。
+    /// 放置起点（内容坐标；径向按手指实际按下点量半径，避免黑边夹取放大）。
+    private var placementStartContent: CGPoint = .zero
+    /// 放置期间手指离按下点的最大距离（内容点）。
+    private var placementDistance: CGFloat = 0
+    /// 放置前选中的蒙版 id（取消时恢复）。
+    private var placementPreviousSelection: String?
+    /// 线性放置阈值（内容点）：手指移动超过这个距离才建蒙版。
     private static let placementThreshold: CGFloat = 8
+    /// 径向按下后几乎没移动就松手：回滚，避免顺手点一下就多一个蒙版。
+    private static let radialTapThreshold: CGFloat = 6
     private var rotationActive = false
     private var rotationAccumulated: Double = 0
     private var rotationApplied: Double = 0
@@ -712,16 +722,25 @@ final class MaskCanvasController {
             let content = geometry.contentPoint(point)
             let normalized = clampedNormalized(geometry.normalized(fromContent: content))
             // 放置新蒙版：按下点 = 线性起点 / 径向中心。
-            // 注意：按下时**先不建蒙版**（否则会闪一个默认方向的渐变），
-            // 等手指真的拖开一段距离再建。
             if model.maskPlacementKind != nil {
                 Haptics.light()
                 placementStart = normalized
+                placementStartContent = content
+                placementDistance = 0
+                placementPreviousSelection = model.selectedMaskId
+                placementMaskId = nil
                 placing = true
                 placementCreated = false
                 dragging = false
                 brushing = false
                 drag = nil
+                // 径向：按下就建一个极小的蒙版，尺寸完全由之后拖动的距离决定；
+                // 线性仍等手指越过阈值再建，避免闪一个默认方向。
+                if model.maskPlacementKind == .radial {
+                    model.beginMaskPlacement(at: normalized)
+                    placementMaskId = model.selectedMaskId
+                    placementCreated = true
+                }
                 return
             }
             guard let mask = model.selectedMask else { return }
@@ -753,8 +772,23 @@ final class MaskCanvasController {
         case .singleMoved(let point):
             if placing {
                 let content = geometry.contentPoint(point)
+                if model.maskPlacementKind == .radial {
+                    // 径向按下时已建好很小的蒙版：实时按手指离按下点的距离长大。
+                    if placementCreated {
+                        placementDistance = max(
+                            placementDistance,
+                            hypot(
+                                content.x - placementStartContent.x,
+                                content.y - placementStartContent.y
+                            )
+                        )
+                    }
+                    updatePlacement(to: content, geometry: geometry, model: model)
+                    return
+                }
                 if !placementCreated {
-                    // 手指还没真正拖开（只是按着）：不建蒙版，避免闪一下默认形状。
+                    // 线性：手指还没真正拖开（只是按着）时不建蒙版，
+                    // 避免闪一下默认方向的渐变。
                     let startContent = geometry.contentPoint(placementStart)
                     let dx = content.x - startContent.x
                     let dy = content.y - startContent.y
@@ -763,6 +797,7 @@ final class MaskCanvasController {
                     }
                     placementCreated = true
                     model.beginMaskPlacement(at: placementStart)
+                    placementMaskId = model.selectedMaskId
                 }
                 updatePlacement(to: content, geometry: geometry, model: model)
                 return
@@ -781,13 +816,42 @@ final class MaskCanvasController {
                 return
             }
             model.updateSelectedMask { $0 = updated }
-        case .singleEnded, .singleCancelled:
+        case .singleEnded:
             if placing {
-                placing = false
-                // 只点了一下没拖动：不建蒙版，留在放置态，用户可以再拖一次。
-                if placementCreated {
-                    placementCreated = false
-                    model.finishMaskPlacement()
+                let created = placementCreated
+                let maskId = placementMaskId
+                let previous = placementPreviousSelection
+                let distance = placementDistance
+                finishPlacementState()
+                if created {
+                    // 径向松手时几乎没移动：撤掉刚建的小蒙版，留在放置态，
+                    // 用户可以重新拖一次（避免点一下就留下一个蒙版）。
+                    if model.maskPlacementKind == .radial,
+                       distance < Self.radialTapThreshold,
+                       let maskId {
+                        model.cancelMaskPlacementCreation(
+                            maskId: maskId,
+                            restoreSelection: previous
+                        )
+                    } else {
+                        model.finishMaskPlacement()
+                    }
+                }
+                return
+            }
+            finishSingle(model: model)
+        case .singleCancelled:
+            if placing {
+                let created = placementCreated
+                let maskId = placementMaskId
+                let previous = placementPreviousSelection
+                finishPlacementState()
+                // 第二根手指打断：本次放置的几何作废，不记历史。
+                if created, let maskId {
+                    model.cancelMaskPlacementCreation(
+                        maskId: maskId,
+                        restoreSelection: previous
+                    )
                 }
                 return
             }
@@ -822,8 +886,9 @@ final class MaskCanvasController {
         drag = nil
         brushing = false
         dragging = false
-        placing = false
-        placementCreated = false
+        finishPlacementState()
+        placementStart = .zero
+        placementStartContent = .zero
         rotationActive = false
         rotationAccumulated = 0
         rotationApplied = 0
@@ -838,7 +903,9 @@ final class MaskCanvasController {
         guard let kind = model.maskPlacementKind else { return }
         let normalized = clampedNormalized(geometry.normalized(fromContent: content))
         let fitted = geometry.fitted
-        let startContent = geometry.contentPoint(placementStart)
+        // 半径从手指实际按下点量：按下点在黑边时中心会被夹进画面，
+        // 若仍从夹取后的中心量，会把黑边距离算进半径，一拖就很大。
+        let startContent = placementStartContent
         model.updateSelectedMask { mask in
             switch kind {
             case .linear:
@@ -866,20 +933,31 @@ final class MaskCanvasController {
             case .radial:
                 let dx = content.x - startContent.x
                 let dy = content.y - startContent.y
-                let radius = (dx * dx + dy * dy).squareRoot()
+                // 从按下点量半径；很小的时候也保持物理圆（不要按归一化轴各自夹
+                // 0.02，否则竖图上会先长成一个细长椭圆）。
+                let radius = max((dx * dx + dy * dy).squareRoot(), 2)
                 mask.center = placementStart
                 // 半径换成两个方向的归一化值：物理上是个圆；并夹在画面内，
                 // 手指拖到黑边上也不会做出超出照片的大蒙版。
                 let maxX = max(min(placementStart.x, 1 - placementStart.x), 0.02)
                 let maxY = max(min(placementStart.y, 1 - placementStart.y), 0.02)
                 mask.radii = CGSize(
-                    width: min(max(radius / max(fitted.width, 1), 0.02), maxX),
-                    height: min(max(radius / max(fitted.height, 1), 0.02), maxY)
+                    width: min(radius / max(fitted.width, 1), maxX),
+                    height: min(radius / max(fitted.height, 1), maxY)
                 )
             default:
                 break
             }
         }
+    }
+
+    /// 清掉这次放置的临时状态（提交 / 取消前调用）。
+    private func finishPlacementState() {
+        placing = false
+        placementCreated = false
+        placementMaskId = nil
+        placementDistance = 0
+        placementPreviousSelection = nil
     }
 
     private func finishSingle(model: EditorModel) {

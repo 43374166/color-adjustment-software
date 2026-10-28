@@ -2404,12 +2404,11 @@ final class EditorModel: ObservableObject {
             mask.end = CGPoint(x: point.x, y: point.y + 0.08)
         } else {
             mask.center = point
-            mask.radii = CGSize(width: 0.06, height: 0.06)
+            // 径向按下就先给一个极小的几何，之后完全由拖动距离决定大小。
+            mask.radii = CGSize(width: 0.01, height: 0.01)
         }
         state.masks.append(mask)
         selectedMaskId = mask.id
-        presetName = "自定义"
-        presetRef = nil
         brushErase = false
         brushCursor = nil
         maskInteracting = true
@@ -2421,6 +2420,20 @@ final class EditorModel: ObservableObject {
     func finishMaskPlacement() {
         maskPlacementKind = nil
         finishMaskInteraction()
+    }
+
+    /// 取消本次放置刚创建的蒙版（只点了一下 / 第二指打断）：
+    /// 从状态里移除、恢复之前的选中项，不落历史；放置态保留，方便再拖一次。
+    func cancelMaskPlacementCreation(maskId: String, restoreSelection: String?) {
+        if let index = state.masks.firstIndex(where: { $0.id == maskId }) {
+            state.masks.remove(at: index)
+        }
+        selectedMaskId = restoreSelection
+        dragSnapshot = nil
+        pendingLabel = nil
+        maskInteracting = false
+        scheduleRender(immediate: true)
+        scheduleMaskAssetsRefresh(immediate: true)
     }
 
     /// 取消放置（切工具 / 切蒙版时调用）。
