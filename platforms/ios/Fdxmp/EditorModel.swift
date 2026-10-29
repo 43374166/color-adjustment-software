@@ -4535,6 +4535,13 @@ final class EditorModel: ObservableObject {
             exif.removeValue(forKey: kCGImagePropertyExifPixelYDimension as String)
             keep[kCGImagePropertyExifDictionary as String] = exif
         }
+        // 关键：输出像素已经在 ImageUtil 里按 UIImage 方向转正，如果再把原图的
+        // Orientation 写回去，相册 / 预览会二次旋转（竖拍照片导出后横过来）。
+        // TIFF 字典里的 Orientation 就是 iPhone 竖拍照片的 90° 标记，必须清掉。
+        if var tiff = keep[kCGImagePropertyTIFFDictionary as String] as? [String: Any] {
+            tiff.removeValue(forKey: kCGImagePropertyTIFFOrientation as String)
+            keep[kCGImagePropertyTIFFDictionary as String] = tiff
+        }
         return keep.isEmpty ? nil : keep
     }
 
@@ -4559,12 +4566,23 @@ final class EditorModel: ObservableObject {
             return nil
         }
         var properties: [CFString: Any] = [:]
+        // 输出像素已是正向：显式写 1，避免任何来源的旧方向标记让相册再转一次。
+        properties[kCGImagePropertyOrientation] = 1
         if format == .jpeg {
             properties[kCGImageDestinationLossyCompressionQuality] =
                 quality.clamped(to: 0.5...1)
         }
         if let metadata {
             for (key, value) in metadata {
+                let name = key as String
+                if name == kCGImagePropertyOrientation as String { continue }
+                if name == kCGImagePropertyTIFFDictionary as String,
+                   var tiff = value as? [String: Any]
+                {
+                    tiff.removeValue(forKey: kCGImagePropertyTIFFOrientation as String)
+                    properties[key as CFString] = tiff
+                    continue
+                }
                 properties[key as CFString] = value
             }
         }
