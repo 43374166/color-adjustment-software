@@ -45,10 +45,12 @@ enum ProjectStore {
     @discardableResult
     static func create(assetIds: [String]) -> Project {
         var projects = load()
+        var seen = Set<String>()
+        let uniqueIds = assetIds.filter { seen.insert($0).inserted }
         let project = Project(
             id: UUID().uuidString,
             name: "项目 \(projects.count + 1)",
-            assetIds: assetIds,
+            assetIds: uniqueIds,
             createdAt: Date()
         )
         projects.insert(project, at: 0)
@@ -70,7 +72,7 @@ enum ProjectStore {
         }
     }
 
-    /// 把资产 id 解析成 PHAsset（顺序与 id 一致，找不到的跳过）。
+    /// 把资产 id 解析成 PHAsset（顺序与 id 一致，找不到的跳过，重复 id 只保留第一次）。
     static func assets(for project: Project) -> [PHAsset] {
         guard !project.assetIds.isEmpty else { return [] }
         let result = PHAsset.fetchAssets(withLocalIdentifiers: project.assetIds, options: nil)
@@ -78,7 +80,11 @@ enum ProjectStore {
         result.enumerateObjects { asset, _, _ in
             map[asset.localIdentifier] = asset
         }
-        return project.assetIds.compactMap { map[$0] }
+        var seen = Set<String>()
+        return project.assetIds.compactMap { id in
+            guard seen.insert(id).inserted else { return nil }
+            return map[id]
+        }
     }
 }
 
@@ -95,6 +101,8 @@ struct PhotoPickerView: UIViewControllerRepresentable {
         var configuration = PHPickerConfiguration(photoLibrary: .shared())
         configuration.filter = .images
         configuration.selectionLimit = 0 // 不限张数
+        // 按用户点选顺序返回结果（否则相册式左右滑动的顺序会和添加顺序不一致）。
+        configuration.selection = .ordered
         configuration.preferredAssetRepresentationMode = .current
         let controller = PHPickerViewController(configuration: configuration)
         controller.delegate = context.coordinator
@@ -114,12 +122,14 @@ struct PhotoPickerView: UIViewControllerRepresentable {
             picker.dismiss(animated: true)
             let identifiers = results.compactMap { $0.assetIdentifier }
             guard !identifiers.isEmpty else { return }
-            let fetched = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+            var seen = Set<String>()
+            let uniqueIdentifiers = identifiers.filter { seen.insert($0).inserted }
+            let fetched = PHAsset.fetchAssets(withLocalIdentifiers: uniqueIdentifiers, options: nil)
             var map: [String: PHAsset] = [:]
             fetched.enumerateObjects { asset, _, _ in
                 map[asset.localIdentifier] = asset
             }
-            let assets = identifiers.compactMap { map[$0] }
+            let assets = uniqueIdentifiers.compactMap { map[$0] }
             guard !assets.isEmpty else { return }
             onPicked(assets)
         }

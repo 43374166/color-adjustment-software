@@ -107,9 +107,14 @@ struct ContentView: View {
 
     /// 打开编辑会话：带上当前列表（设备页网格 / 列表 / 全屏预览、最近编辑列表）。
     private func openEditor(asset: PHAsset, queue: [PHAsset], origin: Tab) {
+        var unique = uniqueAssets(queue)
+        // 极端情况下调用方传进来的队列不含当前照片：补进去，避免“只能看一张”。
+        if !unique.contains(where: { $0.localIdentifier == asset.localIdentifier }) {
+            unique.insert(asset, at: 0)
+        }
         withAnimation(.easeInOut(duration: 0.25)) {
             editAsset = asset
-            editQueue = queue
+            editQueue = unique
             editOrigin = origin
             editProject = nil
             selection = .edit
@@ -118,14 +123,24 @@ struct ContentView: View {
 
     /// 打开项目编辑会话（队列 = 项目内照片，可左右切换 / 一键同步）。
     private func openProject(_ project: Project, assets: [PHAsset], startAt: PHAsset? = nil) {
-        guard let first = startAt ?? assets.first else { return }
+        let queue = uniqueAssets(assets)
+        let start = startAt.flatMap { target in
+            queue.first { $0.localIdentifier == target.localIdentifier }
+        } ?? queue.first
+        guard let first = start else { return }
         withAnimation(.easeInOut(duration: 0.25)) {
             editAsset = first
-            editQueue = assets
+            editQueue = queue
             editOrigin = .edit
             editProject = project
             selection = .edit
         }
+    }
+
+    /// 去掉重复的 asset id（项目 JSON / PHPicker 历史数据里可能有重复），保持原顺序。
+    private func uniqueAssets(_ assets: [PHAsset]) -> [PHAsset] {
+        var seen = Set<String>()
+        return assets.filter { seen.insert($0.localIdentifier).inserted }
     }
 
     private func closeEditor() {
@@ -137,13 +152,15 @@ struct ContentView: View {
     }
 
     /// 编辑器内滑动切上一张 / 下一张（offset = ±1）。
+    ///
+    /// 这里**不要**用 `withAnimation` 包住 asset 切换：左右滑动的位移动画由
+    /// EditorTabView 自己控制，父层再动画一次会让旧图淡出 / 新图淡入，
+    /// 表现为“先闪一下别的照片再跳回来”。
     private func stepEditor(by offset: Int) {
         guard let index = editIndex else { return }
         let target = index + offset
         guard editQueue.indices.contains(target) else { return }
-        withAnimation(.easeInOut(duration: 0.25)) {
-            editAsset = editQueue[target]
-        }
+        editAsset = editQueue[target]
     }
 }
 

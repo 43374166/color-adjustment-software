@@ -83,6 +83,8 @@ struct EditorTabView: View {
     @State private var sheetEnhanceExport = false
     /// 加载卡住超过 8 秒：露出「重置全部编辑」按钮。
     @State private var showStuckResetButton = false
+    /// 是否真正显示全屏加载框（快速左右切换时延迟 0.35s，避免闪一下）。
+    @State private var showLoadingBlocker = false
     /// 已经点过重置：按钮换文案并提示正在重新加载。
     @State private var didResetOnStuckLoad = false
     /// 拖动放置新蒙版期间锁住的面板高度（nil = 不在放置态）。
@@ -139,9 +141,11 @@ struct EditorTabView: View {
             resetZoom()
             immersive = false
             model.clearDetailPreview()
+            // 滑动交接时父层已经切好 asset：不要再把位移清零，否则新图会从中间跳出来。
+            if !swipeAnimating {
+                swipeOffset = 0
+            }
             loadIfNeeded()
-            prefetchNeighbors()
-            swipeOffset = 0
         }
         .onChange(of: prevAsset?.localIdentifier) { _ in prefetchNeighbors() }
         .onChange(of: nextAsset?.localIdentifier) { _ in prefetchNeighbors() }
@@ -207,9 +211,10 @@ struct EditorTabView: View {
             historySheet
         }
         // 首帧加载：层级最高，盖住顶栏 / 面板并吃掉所有点击 / 拖动。
-        // 卡住超过 8 秒才露出「重置全部编辑」和「退出编辑」两个逃生口。
+        // 快速左右切换时不马上弹全屏加载框（延迟 0.35s），先用相邻照片的预览顶上；
+        // 超过 8 秒还没出帧才露出「重置全部编辑」和「退出编辑」两个逃生口。
         .overlay {
-            if model.isLoading {
+            if showLoadingBlocker {
                 LoadingBlocker(
                     text: loadingText,
                     showReset: showStuckResetButton,
@@ -220,16 +225,22 @@ struct EditorTabView: View {
                 .transition(.opacity)
             }
         }
-        .animation(.easeOut(duration: 0.22), value: model.isLoading)
-        .task(id: model.isLoading) {
+        .animation(.easeOut(duration: 0.22), value: showLoadingBlocker)
+        .task(id: loadingTaskKey) {
             guard model.isLoading else {
+                showLoadingBlocker = false
                 showStuckResetButton = false
                 didResetOnStuckLoad = false
                 return
             }
+            showLoadingBlocker = false
             showStuckResetButton = false
+            // 快速切换：0.35 秒内加载完就完全不闪加载框。
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled, model.isLoading else { return }
+            showLoadingBlocker = true
             // 8 秒还没出首帧：给一个自救入口（个别参数组合会让核心渲染卡住）。
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            try? await Task.sleep(nanoseconds: 7_650_000_000)
             guard !Task.isCancelled, model.isLoading else { return }
             showStuckResetButton = true
         }
@@ -298,6 +309,8 @@ struct EditorTabView: View {
     private func loadIfNeeded() {
         guard let asset else { return }
         model.load(asset: asset)
+        // 首次进入时 prev/next 不会触发 onChange：这里主动预取，第一次滑动才有图。
+        prefetchNeighbors()
     }
 
     /// 加载卡死时的自救：清掉这张图的编辑记录，按原片重新加载。
@@ -336,8 +349,8 @@ struct EditorTabView: View {
             let id = neighbor.localIdentifier
             if neighborImages[id] != nil { continue }
             let options = PHImageRequestOptions()
-            // 高质量预览：fastFormat 会返回很糊的图，滑动时观感差（用户反馈）。
-            options.deliveryMode = .highQualityFormat
+            // opportunistic：先回调一张快速图让滑动立刻有内容，再回调清晰版替换。
+            options.deliveryMode = .opportunistic
             // 关键：.exact 会把照片压成正方形（比例被改，滑动时看着"被放大/变形"），
             // 用 .fast 保持原始比例、只按目标尺寸等比缩放。
             options.resizeMode = .fast
@@ -348,9 +361,13 @@ struct EditorTabView: View {
                 targetSize: target,
                 contentMode: .aspectFit,
                 options: options
-            ) { image, _ in
-                guard let image, image.size.width >= 320 else { return }
+            ) { image, info in
+                guard let image else { return }
+                let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
+                // 快速图可以小一点；清晰版仍然要求至少 320，避免把糊图当最终图。
+                guard image.size.width >= (degraded ? 120 : 320) else { return }
                 DispatchQueue.main.async {
+                    if degraded, neighborImages[id] != nil { return }
                     neighborImages[id] = image
                     if neighborImages.count > 8 {
                         // 只留最近用到的几张（避免缓存无限涨）。
@@ -602,6 +619,16 @@ struct EditorTabView: View {
 
     // MARK: - 顶栏
 
+    private var queuePosition: String? {
+        guard queue.count > 1,
+              let id = asset?.localIdentifier,
+              let index = queue.firstIndex(where: { $0.localIdentifier == id })
+        else {
+            return nil
+        }
+        return "\(index + 1)/\(queue.count)"
+    }
+
     private var topBar: some View {
         HStack(spacing: 14) {
             Button {
@@ -616,7 +643,7 @@ struct EditorTabView: View {
                     .truncationMode(.middle)
                 // 顶栏只留预设名：渲染耗时挪到画面右上角（直方图下方），
                 // 顶栏宽度本来就紧，多一段文字会换行把图片挤下去。
-                Text(model.presetName)
+                Text(queuePosition.map { "\(model.presetName) · \($0)" } ?? model.presetName)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -701,9 +728,23 @@ struct EditorTabView: View {
 
     // MARK: - 预览
 
+    /// 当前 asset 是否已经是 model 正在显示的那张。
+    ///
+    /// 父层切 asset 到 `model.load` 生效之间有一帧差：这一帧里绝不能继续画旧图，
+    /// 否则会看到“先闪一下上一张，再跳回新图”。
+    private var assetMatchesModel: Bool {
+        model.asset?.localIdentifier == asset?.localIdentifier
+    }
+
     private var previewImageSize: CGSize {
-        // 零拷贝上屏时 previewImage 可能是旧帧，布局几何以最近一帧输出尺寸为准。
-        model.previewOutputSize
+        // 切换的一帧差 / 首帧未出时 model 还是旧图或低清快图：改用预取尺寸，
+        // 避免布局先按旧图算、清晰预览再跳一下。
+        if (!assetMatchesModel || model.isLoading || model.previewImage == nil),
+           let id = asset?.localIdentifier,
+           let placeholder = neighborImages[id] {
+            return placeholder.size
+        }
+        return model.previewOutputSize
             ?? model.previewImage?.size
             ?? model.originalImage?.size
             ?? CGSize(width: 4, height: 3)
@@ -722,8 +763,10 @@ struct EditorTabView: View {
 
     /// 新照片的预取预览（切换瞬间先顶上，渲染好再替换——切换不再"先糊后清"）。
     private var placeholderImage: UIImage? {
-        guard model.previewImage == nil else { return nil }
         guard let asset else { return nil }
+        // 只要 model 还不是这张图、或这张图还在等首帧、或还没有真实预览，
+        // 就优先用预取图：不要把清晰邻居图换成 load() 里先到的低清快速图。
+        if assetMatchesModel, !model.isLoading, model.previewImage != nil { return nil }
         return neighborImages[asset.localIdentifier]
     }
 
@@ -836,6 +879,11 @@ struct EditorTabView: View {
 
     @ViewBuilder
     private func previewBody(geo: GeometryProxy) -> some View {
+        // 父层刚切到新 asset、model 还没 load 完时，旧 preview 不能再用。
+        let modelImage = assetMatchesModel ? shownImage : nil
+        let placeholder = placeholderImage
+        // 首帧未出时优先保留清晰的预取图，不要先用 load() 里的低清快速图。
+        let displayImage = (model.isLoading ? placeholder : nil) ?? modelImage ?? placeholder
         ZStack {
             Color.black
             // 相册式左右滑动：两侧邻居照片随手指滑入（低清预览，加载完成后替换）。
@@ -883,13 +931,16 @@ struct EditorTabView: View {
                             .foregroundStyle(.white)
                     )
                     .position(x: geo.size.width * split, y: geo.size.height / 2)
-            } else if shownImage != nil || model.zeroCopyActive || placeholderImage != nil {
+            } else if displayImage != nil
+                || (assetMatchesModel && model.zeroCopyActive)
+            {
                 // 预览画面：Metal 图层常驻（零拷贝上屏用，未激活时透明不挡 Image），
                 // 回读画面盖在上面（零拷贝生效 / 看原图 / 对比模式下隐藏）。
                 let fitted = fittedRect(imageSize: previewImageSize, in: geo.size)
                 // 放大时暂停零拷贝：Metal 里只有 2048 预览缓冲，会盖住下面的
                 // detailImage；改由 SwiftUI Image 显示全分辨率细节帧 / 区域帧。
-                let metalActive = model.zeroCopyActive
+                let metalActive = assetMatchesModel
+                    && model.zeroCopyActive
                     && !model.showOriginal
                     && compareSplit == nil
                     && zoom <= 1.01
@@ -900,12 +951,11 @@ struct EditorTabView: View {
                     .frame(width: fitted.width, height: fitted.height)
                     .position(x: fitted.midX, y: fitted.midY)
                     .opacity(metalActive ? 1 : 0)
-                    if !metalActive, let image = shownImage ?? placeholderImage {
+                    if !metalActive, let image = displayImage {
                         // 和 fittedRect / 叠加层几何一致；按图片自身比例定位（切换不错位）。
+                        // 不要再叠 opacity transition：滑动结束时是新图直接接管，
+                        // 淡入淡出会让上一张/下一张短暂混在一起。
                         photoLayer(image, in: geo.size)
-                            // 切换照片：新帧淡入（配合 ContentView 的 withAnimation）。
-                            .id(asset?.localIdentifier)
-                            .transition(.opacity)
                     }
                 }
                 .frame(width: geo.size.width, height: geo.size.height)
@@ -1025,6 +1075,11 @@ struct EditorTabView: View {
         }
     }
 
+    /// 加载框任务键：换图时即使 isLoading 仍为 true，也要重新走 0.35s 延迟。
+    private var loadingTaskKey: String {
+        "\(asset?.localIdentifier ?? "")|\(model.isLoading)"
+    }
+
     /// 加载框文案：当前在修图工作台 > 恢复上次调色 > 普通加载。
     private var loadingText: String {
         if model.tool == .retouch, let stage = model.retouchStage {
@@ -1070,6 +1125,10 @@ struct EditorTabView: View {
                     return
                 }
                 // 图库式左右滑动：内容跟着手指走，边缘带阻尼。
+                // 第一次拖动时补拉邻居（打开项目后立刻滑也能有图）。
+                if abs(swipeOffset) < 1 {
+                    prefetchNeighbors()
+                }
                 var offset = value.translation.width
                 if (offset > 0 && !canSwipePrev) || (offset < 0 && !canSwipeNext) {
                     offset *= 0.28
@@ -1152,14 +1211,17 @@ struct EditorTabView: View {
                 swipeOffset = direction * width
             }
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
-                if forward {
-                    onSwipeNext()
-                } else {
-                    onSwipePrev()
-                }
-                // 新照片从另一侧滑入。
-                swipeOffset = -direction * width * 0.3
-                withAnimation(.easeOut(duration: 0.18)) {
+                // 旧图已经完整滑出、新图已经在屏幕正中（邻居层）。
+                // 这里一次性把 asset 换掉并把位移归零，让主画面直接接管，
+                // 不能再从 -0.3 宽度滑入一次，否则会看到“闪一下再跳回来”。
+                var transaction = Transaction()
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    if forward {
+                        onSwipeNext()
+                    } else {
+                        onSwipePrev()
+                    }
                     swipeOffset = 0
                 }
                 swipeAnimating = false

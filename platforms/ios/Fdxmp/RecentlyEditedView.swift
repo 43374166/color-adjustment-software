@@ -140,7 +140,7 @@ struct RecentlyEditedView: View {
                         }
                     }
                 } label: {
-                    projectRow(project, expanded: expanded)
+                    projectRow(project, expanded: expanded, assetCount: assets.count)
                 }
                 .buttonStyle(.plain)
                 .contextMenu {
@@ -173,13 +173,18 @@ struct RecentlyEditedView: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                             .padding(.leading, 24)
+                    } else if project.assetIds.count > assets.count {
+                        Text("\(project.assetIds.count - assets.count) 张照片不可用（可能已从图库删除或权限受限）")
+                            .font(.caption2)
+                            .foregroundStyle(Color.orange.opacity(0.9))
+                            .padding(.leading, 24)
                     }
                 }
             }
         }
     }
 
-    private func projectRow(_ project: Project, expanded: Bool) -> some View {
+    private func projectRow(_ project: Project, expanded: Bool, assetCount: Int) -> some View {
         HStack(spacing: 12) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
@@ -193,7 +198,7 @@ struct RecentlyEditedView: View {
                 Text(project.name)
                     .font(.subheadline.weight(.medium))
                     .lineLimit(1)
-                Text("\(project.assetIds.count) 张照片 · \(Self.formatter.string(from: project.createdAt))")
+                Text("\(assetCount) 张照片 · \(Self.formatter.string(from: project.createdAt))")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
