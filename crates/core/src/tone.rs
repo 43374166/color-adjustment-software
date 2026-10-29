@@ -328,9 +328,9 @@ impl ToneStage {
         ]
     }
 
-    /// 场景线性 RGB → 场景线性 RGB。
+    /// 场景线性 RGB → 场景线性 RGB（全局 filmic 风格；蒙版走 legacy 显示域 LUT）。
     ///
-    /// 历史参数 `base_ev` 保留给后续局部色调；当前参考 LUT 是全局亮度曲线。
+    /// 历史参数 `base_ev` 保留给后续局部色调；高光 / 阴影在渲染后单独处理。
     pub fn apply(&self, rgb: [f32; 3], _base_ev: f32) -> [f32; 3] {
         if !self.active {
             return rgb;
@@ -338,41 +338,78 @@ impl ToneStage {
 
         // 曝光已在 `apply_reference` 里按场景线性乘过 2^EV（darktable 模型），
         // 色调段不再重复处理曝光。
-        // 关键：色调曲线作用在**线性亮度**上（先编码成显示域亮度再查表），
-        // 不用逐通道编码后的亮度——后者对高饱和色偏低，会让同一个滑杆
-        // 给高饱和色更大的增益（观感就是"一提曝光/阴影，颜色更艳了"）。
-        // 用亮度比缩放 RGB：色相与色度比例保持不变。
-        let luma = display_luma(rgb).max(0.0);
-        let y = linear_to_srgb(luma);
-        let mapped = self.map_luminance(y);
-
-        let mut out = if luma <= 1e-6 {
-            [srgb_to_linear(mapped); 3]
+        let scene_y = display_luma(rgb).max(0.0);
+        let (mapped, ratio) = if self.legacy_local_luts {
+            // 蒙版局部调整：保持旧显示域参考 LUT（局部高光 / 阴影不能丢）。
+            let display_y = linear_to_srgb(scene_y);
+            let mapped = self.map_luminance_legacy(display_y);
+            let ratio = if scene_y <= 1e-6 {
+                0.0
+            } else {
+                srgb_to_linear(mapped) / scene_y.max(1e-6)
+            };
+            (srgb_to_linear(mapped), ratio)
         } else {
-            let ratio = srgb_to_linear(mapped) / luma.max(1e-6);
+            // 全局：对比度改走对数场景亮度上的端点固定 S 曲线（更接近 filmic）；
+            // 白 / 黑场仍保留 Lightroom 的显示域端点 LUT 语义，避免把用户
+            // 熟悉的“白 + = 提亮近白 / 黑 + = 抬暗部”变成 darktable 的 EV 边界。
+            let contrast_linear = if self.contrast == 0.0 {
+                scene_y
+            } else {
+                self.map_scene_contrast(scene_y)
+            };
+            let mapped_display = linear_to_srgb(contrast_linear);
+            let mut v = sample_tone_lut(&self.whites_lut, mapped_display);
+            v = sample_tone_lut(&self.blacks_lut, v);
+            let mapped_linear = srgb_to_linear(v);
+            let ratio = if scene_y <= 1e-6 {
+                0.0
+            } else {
+                mapped_linear / scene_y.max(1e-6)
+            };
+            (mapped_linear, ratio)
+        };
+        let mut out = if scene_y <= 1e-6 {
+            [mapped; 3]
+        } else {
             rgb.map(|value| value * ratio)
         };
         out = out.map(|value| value.max(0.0));
         map_to_gamut(out, self.luma).0
     }
 
-    /// 显示亮度 `y` 的逐段映射。
-    fn map_luminance(&self, y: f32) -> f32 {
-        let mut v = y.clamp(0.0, 1.0);
+    /// 全局 filmic 风格对比度：输入场景线性亮度，输出显示线性亮度。
+    ///
+    /// 先把场景亮度换成相对 18% 中灰的 EV，在固定白场 2.47EV / 黑场 −8EV
+    /// 的归一化对数范围里做**端点固定 S 曲线**（锚点仍是 18% 中灰）。
+    /// 白 / 黑场不在这里移动，仍由后面的 Lightroom 端点 LUT 负责。
+    fn map_scene_contrast(&self, y: f32) -> f32 {
+        let x = (y.max(1e-8) / GREY).log2();
+        let z_white = 2.47;
+        let z_black = -8.0;
+        let span = z_white - z_black;
+        let t = ((x - z_black) / span).clamp(0.0, 1.0);
+        let pivot = ((-z_black) / span).clamp(0.2, 0.8);
+        let c = self.contrast;
+        // 导数在 pivot 处为 1 + c*0.8：+100 变陡、−100 变平；两端固定。
+        let s =
+            (t + c * 0.8 * (t - pivot) * t * (1.0 - t) / (pivot * (1.0 - pivot))).clamp(0.0, 1.0);
+        let z = z_black + s * span;
+        let y_white = GREY * 2f32.powf(z_white);
+        let y_black = GREY * 2f32.powf(z_black);
+        let denominator = (y_white - y_black).max(1e-6);
+        ((GREY * 2f32.powf(z) - y_black) / denominator).clamp(0.0, 1.0)
+    }
 
-        // 对比度：端点固定的三次 S 曲线。曲线在 v = CONTRAST_PIVOT 处不动，
-        // 0 / 1 也不动；该式由 LR 参考的灰阶映射拟合。
+    /// 蒙版 legacy 映射：显示域对比度 + 四张参考 LUT（旧行为）。
+    fn map_luminance_legacy(&self, y: f32) -> f32 {
+        let mut v = y.clamp(0.0, 1.0);
         if self.contrast != 0.0 {
             v += self.contrast * CONTRAST_STRENGTH * (v - CONTRAST_PIVOT) * v * (1.0 - v);
             v = v.clamp(0.0, 1.0);
         }
-
-        // 全局路径：高光 / 阴影已改为渲染后的局部曝光，这里只保留显示域端点曲线。
-        // 蒙版路径：仍使用旧参考 LUT，保证蒙版局部亮度滑杆继续生效。
-        if self.legacy_local_luts {
-            v = sample_tone_lut(&self.highlights_lut, v);
-            v = sample_tone_lut(&self.shadows_lut, v);
-        }
+        v = sample_tone_lut(&self.highlights_lut, v);
+        v = sample_tone_lut(&self.shadows_lut, v);
         v = sample_tone_lut(&self.whites_lut, v);
         v = sample_tone_lut(&self.blacks_lut, v);
         v.clamp(0.0, 1.0)
@@ -687,12 +724,15 @@ mod tests {
         assert!(black.iter().all(|value| *value <= 1e-6), "{black:?}");
         assert!(white.iter().all(|value| *value >= 1.0 - 1e-5), "{white:?}");
 
-        // 正对比度压暗阴影、提亮高光，但不把端点推走。
-        let dark = [0.05f32; 3];
+        // 正对比度压暗阴影、提亮高光，但不把端点推走；18% 中灰仍是锚点。
+        let mid = [0.18f32; 3];
+        let dark = [0.01f32; 3];
         let bright = [0.7f32; 3];
         let base = ToneStage::from_params(&EditParams::default());
+        let mid_out = stage.apply(mid, base.self_base_ev(mid));
         let dark_out = stage.apply(dark, base.self_base_ev(dark));
         let bright_out = stage.apply(bright, base.self_base_ev(bright));
+        assert!((mid_out[0] - 0.18).abs() < 0.01, "中灰应保持：{mid_out:?}");
         assert!(dark_out[0] < dark[0], "{dark:?} -> {dark_out:?}");
         assert!(bright_out[0] > bright[0], "{bright:?} -> {bright_out:?}");
     }
@@ -810,26 +850,30 @@ mod tests {
         assert!(bright_ev > 1.0, "亮区基底 EV 应明显为正：{bright_ev}");
     }
 
+    fn tone_out(stage: &ToneStage, y: f32) -> f32 {
+        stage.apply([y; 3], 0.0)[0]
+    }
+
     #[test]
     fn whites_and_blacks_follow_reference_curve() {
         let mut whites = EditParams::default();
         whites.light.whites = -100.0;
         let stage = ToneStage::from_params(&whites);
-        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-5);
-        assert!(stage.map_luminance(0.75) < 0.75);
-        assert!(stage.map_luminance(0.5) < 0.5);
+        assert!((tone_out(&stage, 1.0) - 1.0).abs() < 1e-5);
+        assert!(tone_out(&stage, 0.75) < 0.75);
+        assert!(tone_out(&stage, 0.5) < 0.5);
 
         let mut blacks = EditParams::default();
         blacks.light.blacks = 100.0;
         let stage = ToneStage::from_params(&blacks);
-        assert!((stage.map_luminance(0.0)).abs() < 1e-5);
-        assert!(stage.map_luminance(0.1) > 0.1);
-        assert!(stage.map_luminance(0.5) > 0.5);
+        assert!((tone_out(&stage, 0.0)).abs() < 1e-5);
+        assert!(tone_out(&stage, 0.03) > 0.03);
+        assert!(tone_out(&stage, 0.5) > 0.5);
 
         blacks.light.blacks = -100.0;
         let stage = ToneStage::from_params(&blacks);
-        assert!(stage.map_luminance(0.1) < 0.1);
-        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-5);
+        assert!(tone_out(&stage, 0.1) < 0.1);
+        assert!((tone_out(&stage, 1.0) - 1.0).abs() < 1e-5);
     }
 
     #[test]

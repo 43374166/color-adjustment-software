@@ -172,12 +172,15 @@ impl PreviewSession {
             // 裁剪 + 蒙版组合在 GPU 下坐标不一致，交给 CPU 预览保证正确性。
             return Err(FdxmpError::Gpu("裁剪与蒙版组合使用 CPU 预览".to_string()));
         }
-        if params.light.highlights.abs() > 1e-6 || params.light.shadows.abs() > 1e-6 {
-            // 高光 / 阴影现在是渲染后的 guided 局部曝光，GPU 管线尚未实现；
-            // 先回退 CPU，保证预览与导出一致。
-            return Err(FdxmpError::Gpu(
-                "高光 / 阴影局部影调使用 CPU 预览".to_string(),
-            ));
+        if params.light.highlights.abs() > 1e-6
+            || params.light.shadows.abs() > 1e-6
+            || params.light.contrast.abs() > 1e-6
+            || params.light.whites.abs() > 1e-6
+            || params.light.blacks.abs() > 1e-6
+        {
+            // 对比度 / 高光 / 阴影 / 白色 / 黑色已改为 CPU 的 filmic 色调段
+            // 与 guided 局部曝光，GPU 尚未实现；先回退 CPU，保证预览与导出一致。
+            return Err(FdxmpError::Gpu("影调滑块使用 CPU 预览".to_string()));
         }
         self.pipeline.render_with(
             &self.device,

@@ -418,7 +418,10 @@ fn gpu_mask_blend_applies_locally() {
     );
 }
 
-/// GPU 基础段（白平衡 / 曝光）+ 色调段（对比度 / 高光 / 阴影）应与 CPU 参考实现一致。
+/// GPU 基础段（白平衡 / 曝光）应与 CPU 参考实现一致。
+///
+/// 对比度 / 高光 / 阴影 / 白色 / 黑色已经改由 CPU 的 filmic 色调段与局部曝光处理，
+/// GPU 直接使用 `ColorPipeline` 的旧 LUT 路径不再参与这条对拍。
 #[test]
 fn gpu_base_stage_matches_cpu_reference() {
     let Some(context) = context() else {
@@ -439,42 +442,20 @@ fn gpu_base_stage_matches_cpu_reference() {
     params.color.tint = -25.0;
     params.color.wb_reference_kelvin = 5200.0;
     params.light.exposure = 0.4;
-    params.light.contrast = 30.0;
-    // 高光 / 阴影现在是 CPU 渲染后的局部曝光，GPU 不参与；这条对拍只验证
-    // 仍由 GPU 承担的曝光 / 对比度 / 白 / 黑。
-    params.light.whites = -30.0;
-    params.light.blacks = 20.0;
     pipeline.render(&context.device, &context.queue, &image, &params);
     let output = pipeline
         .readback(&context.device, &context.queue, &image)
         .unwrap();
 
-    // CPU 参考：场景线性基底 → 色调段（含基底层：与 GPU 同半径的大模糊参考）。
-    let count = (width * height) as usize;
-    let base_linear: Vec<[f32; 3]> = (0..count)
-        .map(|_| {
-            fdxmp_core::pipeline::apply_reference(
-                [
-                    srgb_to_linear(140),
-                    srgb_to_linear(120),
-                    srgb_to_linear(100),
-                ],
-                &params,
-            )
-        })
-        .collect();
-    let tone = fdxmp_core::tone::ToneStage::from_params(&params);
-    let blur_scale = fdxmp_core::tone::blur_scale(width.max(height) as f32);
-    let base = fdxmp_core::tone::ToneBase::build(
-        &base_linear,
-        width as usize,
-        height as usize,
-        fdxmp_core::tone::BASE_RADIUS * blur_scale,
+    // CPU 参考：场景线性基底（白平衡 / 校准 / 曝光）。
+    let expected = fdxmp_core::pipeline::apply_reference(
+        [
+            srgb_to_linear(140),
+            srgb_to_linear(120),
+            srgb_to_linear(100),
+        ],
+        &params,
     );
-    let luma = fdxmp_core::color_engine::WORKSPACE
-        .luma()
-        .map(|value| value as f32);
-    let expected = tone.apply(base_linear[0], base.ev_at(8, 8, luma));
     let gpu_pixel = pixel(&output, width, 8, 8);
     for channel in 0..3 {
         let reference = fdxmp_core::gpu_pipeline::linear_to_srgb_u8(expected[channel]) as i32;

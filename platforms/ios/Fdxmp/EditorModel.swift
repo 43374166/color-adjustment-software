@@ -3885,10 +3885,15 @@ final class EditorModel: ObservableObject {
         // CPU 渲染量降约 4 倍，手感更跟手；松手提交后自动回到全分辨率预览。
         let interactive = maskInteracting || draggingSlider != nil || fallback
         let source = interactive ? (fastBuffer ?? buffer) : buffer
-        // 高光 / 阴影现在是 CPU 的 guided 局部曝光；GPU 尚未实现，先按参数值切走 CPU，
-        // 避免 GPU 画面与导出不一致。两个值都归零后自动回到 GPU。
-        let localToneActive = value("highlights") != 0 || value("shadows") != 0
-        let gpu = localToneActive ? nil : gpuSession
+        // 对比度 / 高光 / 阴影 / 白色 / 黑色现在是 CPU 的 filmic 色调段与 guided
+        // 局部曝光；GPU 尚未实现，先按参数值切走 CPU，避免 GPU 画面与导出不一致。
+        // 五项都归零后自动回到 GPU（曝光仍走 GPU 的线性增益）。
+        let cpuToneActive = value("contrast") != 0
+            || value("highlights") != 0
+            || value("shadows") != 0
+            || value("whites") != 0
+            || value("blacks") != 0
+        let gpu = cpuToneActive ? nil : gpuSession
         // 零拷贝上屏：GPU 会话 + 图层就绪 + 非对比 / 非看原图 / 非放大查看时直接把画面推给 CAMetalLayer。
         let zeroCopy = gpu != nil && zeroCopyActive && !comparePreviewActive
             && !showOriginal && !detailZoomActive && !editorReadback
