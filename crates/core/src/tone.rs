@@ -21,6 +21,7 @@ use fdxmp_color::luminance;
 use fdxmp_color::transfer::{linear_to_srgb, srgb_to_linear};
 use image::RgbaImage;
 use rayon::prelude::*;
+use std::sync::OnceLock;
 
 use crate::params::EditParams;
 
@@ -465,9 +466,9 @@ impl LocalToneBase {
                     let row = y * width;
                     for x in x0..x1 {
                         let offset = (row + x) * 4;
-                        let r = srgb_to_linear(pixels[offset] as f32 / 255.0);
-                        let g = srgb_to_linear(pixels[offset + 1] as f32 / 255.0);
-                        let b = srgb_to_linear(pixels[offset + 2] as f32 / 255.0);
+                        let r = srgb_u8_to_linear(pixels[offset]);
+                        let g = srgb_u8_to_linear(pixels[offset + 1]);
+                        let b = srgb_u8_to_linear(pixels[offset + 2]);
                         sum += (r * 0.2126 + g * 0.7152 + b * 0.0722) as f64;
                         count += 1;
                     }
@@ -496,26 +497,91 @@ impl LocalToneBase {
 
     /// 全分辨率像素坐标处的基底 EV（双线性）。
     pub fn ev_at(&self, x: usize, y: usize) -> f32 {
-        let fx = (x.min(self.width.saturating_sub(1)) as f32
-            / self.width.saturating_sub(1).max(1) as f32)
-            * self.grid_width.saturating_sub(1) as f32;
-        let fy = (y.min(self.height.saturating_sub(1)) as f32
-            / self.height.saturating_sub(1).max(1) as f32)
-            * self.grid_height.saturating_sub(1) as f32;
-        let x0 = fx.floor() as usize;
-        let y0 = fy.floor() as usize;
-        let x1 = (x0 + 1).min(self.grid_width.saturating_sub(1));
-        let y1 = (y0 + 1).min(self.grid_height.saturating_sub(1));
-        let tx = fx - x0 as f32;
-        let ty = fy - y0 as f32;
-        let p00 = self.ev[y0 * self.grid_width + x0];
-        let p10 = self.ev[y0 * self.grid_width + x1];
-        let p01 = self.ev[y1 * self.grid_width + x0];
-        let p11 = self.ev[y1 * self.grid_width + x1];
-        let top = p00 + (p10 - p00) * tx;
-        let bottom = p01 + (p11 - p01) * tx;
-        top + (bottom - top) * ty
+        sample_grid(
+            &self.ev,
+            self.grid_width,
+            self.grid_height,
+            self.width,
+            self.height,
+            x,
+            y,
+        )
     }
+}
+
+/// 网格双线性采样。
+fn sample_grid(
+    grid: &[f32],
+    grid_width: usize,
+    grid_height: usize,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+) -> f32 {
+    let fx = (x.min(width.saturating_sub(1)) as f32 / width.saturating_sub(1).max(1) as f32)
+        * grid_width.saturating_sub(1) as f32;
+    let fy = (y.min(height.saturating_sub(1)) as f32 / height.saturating_sub(1).max(1) as f32)
+        * grid_height.saturating_sub(1) as f32;
+    let x0 = fx.floor() as usize;
+    let y0 = fy.floor() as usize;
+    let x1 = (x0 + 1).min(grid_width.saturating_sub(1));
+    let y1 = (y0 + 1).min(grid_height.saturating_sub(1));
+    let tx = fx - x0 as f32;
+    let ty = fy - y0 as f32;
+    let p00 = grid[y0 * grid_width + x0];
+    let p10 = grid[y0 * grid_width + x1];
+    let p01 = grid[y1 * grid_width + x0];
+    let p11 = grid[y1 * grid_width + x1];
+    let top = p00 + (p10 - p00) * tx;
+    let bottom = p01 + (p11 - p01) * tx;
+    top + (bottom - top) * ty
+}
+
+/// 局部曝光的 gain → 8bit sRGB 查找表。
+///
+/// 先按 EV 量化增益，再查 256 级 sRGB 表；每像素只做一次双线性采样和 3 次查表，
+/// 不再做线性 ↔ sRGB 的 pow。单次构建约 131k 项，之后全局复用。
+const LOCAL_GAIN_MIN_EV: f32 = -1.6;
+const LOCAL_GAIN_MAX_EV: f32 = 1.6;
+const LOCAL_GAIN_LEVELS: usize = 512;
+
+/// 8bit sRGB → 线性亮度查表（构建基底时每像素要算三次，不能反复 pow）。
+fn srgb_u8_to_linear(value: u8) -> f32 {
+    static LUT: OnceLock<[f32; 256]> = OnceLock::new();
+    LUT.get_or_init(|| std::array::from_fn(|index| srgb_to_linear(index as f32 / 255.0)))
+        [value as usize]
+}
+
+fn local_gain_lut() -> &'static [u8] {
+    static LUT: OnceLock<Vec<u8>> = OnceLock::new();
+    LUT.get_or_init(|| {
+        let mut table = vec![0u8; LOCAL_GAIN_LEVELS * 256];
+        for level in 0..LOCAL_GAIN_LEVELS {
+            let t = level as f32 / (LOCAL_GAIN_LEVELS - 1) as f32;
+            let ev = LOCAL_GAIN_MIN_EV + (LOCAL_GAIN_MAX_EV - LOCAL_GAIN_MIN_EV) * t;
+            let gain = 2f32.powf(ev);
+            for value in 0..256 {
+                let linear = srgb_to_linear(value as f32 / 255.0) * gain;
+                table[level * 256 + value] =
+                    (linear_to_srgb(linear.clamp(0.0, 1.0)) * 255.0).round() as u8;
+            }
+        }
+        table
+    })
+}
+
+fn axis_weights(len: usize, grid_len: usize) -> Vec<(usize, usize, f32)> {
+    let last = len.saturating_sub(1).max(1) as f32;
+    let grid_last = grid_len.saturating_sub(1) as f32;
+    (0..len)
+        .map(|index| {
+            let position = index as f32 / last * grid_last;
+            let lower = position.floor() as usize;
+            let upper = (lower + 1).min(grid_len.saturating_sub(1));
+            (lower, upper, position - lower as f32)
+        })
+        .collect()
 }
 
 /// 在最终输出上应用高光 / 阴影局部曝光。
@@ -531,33 +597,44 @@ pub fn apply_local_tone(image: &mut RgbaImage, params: &EditParams) {
     let Some(base) = LocalToneBase::build(image) else {
         return;
     };
+    // 每个网格只算一次 EV；像素级只做双线性采样 + 3 次查表。
+    let gains: Vec<f32> = base
+        .ev
+        .iter()
+        .map(|ev| local_gain_ev(*ev, highlights, shadows))
+        .collect();
+    let lut = local_gain_lut();
     let width = image.width() as usize;
+    let height = image.height() as usize;
+    let grid_width = base.grid_width;
+    let grid_height = base.grid_height;
+    let x_weights = axis_weights(width, grid_width);
+    let y_weights = axis_weights(height, grid_height);
     let pixels = image.as_mut();
     pixels
-        .par_chunks_mut(4)
+        .par_chunks_mut(width * 4)
         .enumerate()
-        .for_each(|(index, pixel)| {
-            let x = index % width;
-            let y = index / width;
-            let gain_ev = local_gain_ev(base.ev_at(x, y), highlights, shadows);
-            if gain_ev.abs() < 1e-5 {
-                return;
-            }
-            let gain = 2f32.powf(gain_ev);
-            let mut linear = [0.0f32; 3];
-            for (channel_index, channel) in pixel.iter().take(3).enumerate() {
-                linear[channel_index] = srgb_to_linear(*channel as f32 / 255.0) * gain;
-            }
-            // 高光正向增益可能把某个通道推出 1.0；按最大通道等比收回来，
-            // 比逐通道硬夹更不容易偏色（暗部不受影响）。
-            let max_channel = linear.iter().copied().fold(0.0f32, f32::max);
-            if max_channel > 1.0 {
-                for value in &mut linear {
-                    *value /= max_channel;
+        .for_each(|(y, row)| {
+            let (y0, y1, ty) = y_weights[y];
+            for (x, (x0, x1, tx)) in x_weights.iter().copied().enumerate() {
+                let top =
+                    gains[y0 * grid_width + x0] * (1.0 - tx) + gains[y0 * grid_width + x1] * tx;
+                let bottom =
+                    gains[y1 * grid_width + x0] * (1.0 - tx) + gains[y1 * grid_width + x1] * tx;
+                let gain_ev = top + (bottom - top) * ty;
+                if gain_ev.abs() < 1e-5 {
+                    continue;
                 }
-            }
-            for (channel, value) in pixel.iter_mut().take(3).zip(linear) {
-                *channel = (linear_to_srgb(value.clamp(0.0, 1.0)) * 255.0).round() as u8;
+                let level =
+                    (((gain_ev - LOCAL_GAIN_MIN_EV) / (LOCAL_GAIN_MAX_EV - LOCAL_GAIN_MIN_EV))
+                        * (LOCAL_GAIN_LEVELS - 1) as f32)
+                        .round()
+                        .clamp(0.0, (LOCAL_GAIN_LEVELS - 1) as f32) as usize;
+                let base_index = level * 256;
+                let pixel = &mut row[x * 4..x * 4 + 4];
+                pixel[0] = lut[base_index + pixel[0] as usize];
+                pixel[1] = lut[base_index + pixel[1] as usize];
+                pixel[2] = lut[base_index + pixel[2] as usize];
             }
         });
 }

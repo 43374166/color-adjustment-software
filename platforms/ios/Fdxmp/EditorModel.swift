@@ -45,7 +45,7 @@ enum EditorLimits {
     /// 1x 显示时不会再因为预览只有 1440 而被放大。
     static let previewMaxEdge = 2048
     /// 蒙版拖动 / 涂抹时的快速预览最长边（低分辨率缓冲，手感更跟手）。
-    static let fastPreviewMaxEdge = 720
+    static let fastPreviewMaxEdge = 512
     /// 蒙版叠加层最长边（与预览一致：共用同一份蒙版栅格缓存，避免重复计算）。
     static let maskOverlayMaxEdge = 2048
     /// 蒙版列表缩略图最长边。
@@ -310,7 +310,7 @@ final class EditorModel: ObservableObject {
     @Published private(set) var previewOutputSize: CGSize?
     /// 视图侧要求暂停零拷贝上屏（对比模式等；由视图在切换时设置）。
     private var comparePreviewActive = false
-    /// 拖动蒙版控件 / 涂抹时的低分辨率缓冲（长边 720，预览更跟手）。
+    /// 拖动蒙版控件 / 涂抹 / 滑块时的低分辨率缓冲（长边 512，预览更跟手）。
     private var fastBuffer: RgbaBuffer?
     /// 蒙版交互进行中（用快速缓冲渲染，结束时回落到全分辨率）。
     private(set) var maskInteracting = false
@@ -329,6 +329,8 @@ final class EditorModel: ObservableObject {
     private var pendingLabel: String?
     private var renderBusy = false
     private var renderPending = false
+    /// 滑块 / 曲线正在拖动：即使沉浸状态的 PreferenceKey 还没刷新，也先用快速缓冲出图。
+    private var sliderEditing = false
     private let renderQueue = DispatchQueue(label: "fdxmp.ios.render", qos: .userInitiated)
     /// 细节源 / 区域帧独立队列：不阻塞预览渲染（放大时滑块仍然跟手）。
     private let detailQueue = DispatchQueue(label: "fdxmp.ios.detail", qos: .userInitiated)
@@ -1507,6 +1509,7 @@ final class EditorModel: ObservableObject {
 
     /// 开始一次编辑（滑块按下 / 拖动开始）：记录快照。
     func beginEdit() {
+        sliderEditing = true
         if suppressPresetStrengthReset {
             suppressPresetStrengthReset = false
         } else {
@@ -1526,6 +1529,7 @@ final class EditorModel: ObservableObject {
 
     /// 编辑结束：记录一步历史、持久化并立即渲染。
     func commitEdit() {
+        sliderEditing = false
         if let before = dragSnapshot, before != state {
             pushUndo(before)
         }
@@ -1541,6 +1545,7 @@ final class EditorModel: ObservableObject {
 
     /// 一次性参数修改（点按类操作）：自动记一步历史。
     func applyEdit(_ label: String = "编辑", _ mutate: (inout EditState) -> Void) {
+        sliderEditing = false
         presetBase = nil
         presetTarget = nil
         let before = state
@@ -3881,9 +3886,9 @@ final class EditorModel: ObservableObject {
         // 这一帧属于哪次载入：换图后在途的旧帧不能覆盖新图，也不能算作新图的"首帧"。
         let generation = loadToken
         let json = currentJson()
-        // 蒙版拖动 / 涂抹、以及沉浸拖动滑块时用低分辨率缓冲：
-        // CPU 渲染量降约 4 倍，手感更跟手；松手提交后自动回到全分辨率预览。
-        let interactive = maskInteracting || draggingSlider != nil || fallback
+        // 蒙版拖动 / 涂抹、以及拖动滑块时用 512 快速缓冲：CPU 像素量约为
+        // 2048 预览的 1/16，松手提交后自动回到全分辨率预览。
+        let interactive = maskInteracting || sliderEditing || draggingSlider != nil || fallback
         let source = interactive ? (fastBuffer ?? buffer) : buffer
         // 对比度 / 高光 / 阴影 / 白色 / 黑色现在是 CPU 的 filmic 色调段与 guided
         // 局部曝光；GPU 尚未实现，先按参数值切走 CPU，避免 GPU 画面与导出不一致。

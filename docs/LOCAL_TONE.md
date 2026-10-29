@@ -33,6 +33,14 @@
 GPU 直接使用 `ColorPipeline` 的路径（Windows UI）尚未接入新的 filmic / 局部影调，
 它的这五项仍走旧 LUT，属于后续工作。
 
+## 性能
+
+- 局部曝光先按 EV 量化 gain，再查 512×256 的 gain→sRGB 表；每像素只做双线性采样
+  和 3 次查表，不再逐像素做线性/sRGB 的 pow。
+- 基底构建用 256 项 sRGB→线性表，避免每像素三次 pow。
+- iOS 拖动滑块时用 512 长边快速缓冲，松手后回 2048；`beginEdit` 会立刻置
+  `sliderEditing`，不等沉浸状态 PreferenceKey 刷新。
+
 ## 测试
 
 - `tone.rs`：局部高光只压亮区、局部阴影只提暗区、中灰 / 纯黑不动、
