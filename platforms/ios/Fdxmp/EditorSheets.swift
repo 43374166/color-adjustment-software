@@ -167,6 +167,9 @@ struct PhotoSelectionSheet: View {
                                     Text(item.displayName)
                                         .font(.footnote)
                                         .lineLimit(1)
+                                    Text("\(item.pixelDescription) · \(item.megapixelDescription)")
+                                        .font(.caption2)
+                                        .foregroundStyle(Color.white.opacity(0.45))
                                     if id == currentAssetId {
                                         Text("当前照片")
                                             .font(.caption2)

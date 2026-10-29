@@ -256,6 +256,12 @@ extension PHAsset {
         "\(pixelWidth) × \(pixelHeight)"
     }
 
+    /// 实际像素数（MP；用于导出选图弹框显示原图分辨率）。
+    var megapixelDescription: String {
+        let megapixels = Double(pixelWidth) * Double(pixelHeight) / 1_000_000
+        return String(format: "%.1fMP", megapixels)
+    }
+
     var createdDescription: String {
         guard let date = creationDate else { return "时间未知" }
         let formatter = DateFormatter()

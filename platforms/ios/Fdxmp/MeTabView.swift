@@ -179,8 +179,8 @@ struct MeTabView: View {
                 Picker("导出尺寸", selection: $exportMegapixels) {
                     ForEach(EditorLimits.exportMegapixelsOptions, id: \.self) { megapixels in
                         Text(
-                            megapixels == EditorLimits.exportMegapixelsDefault
-                                ? "\(megapixels)MP（默认）"
+                            megapixels == 0
+                                ? "原图（默认）"
                                 : "\(megapixels)MP"
                         )
                         .tag(megapixels)
@@ -189,13 +189,22 @@ struct MeTabView: View {
                 .pickerStyle(.menu)
                 .tint(Color.white.opacity(0.6))
             }
-            Text("按 \(exportMegapixels)MP 像素预算导出；更大的原图自动等比降采样。MP 是像素数，不是文件大小。")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-            if exportMegapixels >= 24 {
-                Text("24MP / 48MP 会明显更慢、更烫；48MP 可能因内存不足失败。")
+            if exportMegapixels == 0 {
+                Text("原图模式：按每张照片实际像素导出，不放大也不降采样。MP 是像素数，不是文件大小。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                Text("原图越大越慢、越烫；带旋转或智能蒙版且超过 26MP 时，会提示改选 18/24MP。")
                     .font(.caption2)
                     .foregroundStyle(Color.orange.opacity(0.9))
+            } else {
+                Text("按 \(exportMegapixels)MP 像素预算导出；更大的原图自动等比降采样。MP 是像素数，不是文件大小。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                if exportMegapixels >= 24 {
+                    Text("24MP / 48MP 会明显更慢、更烫；48MP 可能因内存不足失败。")
+                        .font(.caption2)
+                        .foregroundStyle(Color.orange.opacity(0.9))
+                }
             }
             HStack {
                 Text("格式")

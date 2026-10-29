@@ -50,25 +50,28 @@ enum EditorLimits {
     static let maskOverlayMaxEdge = 2048
     /// 蒙版列表缩略图最长边。
     static let maskThumbnailMaxEdge = 128
-    /// 导出尺寸选项（MP，按像素预算近似；实际尺寸随长宽比 / 裁切变化）。
-    static let exportMegapixelsOptions = [8, 12, 18, 24, 48]
-    /// 默认 18MP：画质与速度的折中；8MP 最稳，24/48MP 更慢更烫。
-    static let exportMegapixelsDefault = 18
+    /// 导出尺寸选项（MP；0 = 原图，按每张照片实际像素导出）。
+    static let exportMegapixelsOptions = [0, 8, 12, 18, 24, 48]
+    /// 默认原图：按每张照片实际分辨率导出（不放大、不降采样）；8/12/18MP 更省内存。
+    static let exportMegapixelsDefault = 0
     /// 「我的」页 @AppStorage 共用键。
     static let exportMegapixelsKey = "fdxmp_export_megapixels"
-    /// 当前导出尺寸（MP）；非法值回退默认。
+    /// 当前导出尺寸（MP；0 = 原图）；非法值回退默认。
     static var exportMegapixels: Int {
         let stored = UserDefaults.standard.integer(forKey: exportMegapixelsKey)
         return exportMegapixelsOptions.contains(stored) ? stored : exportMegapixelsDefault
     }
-    /// 导出像素预算：原图更大时按比例降采样。
+    /// 导出像素预算：原图模式不主动降采样（100MP 以上仍封顶，避免极端全景把手机顶爆）。
     ///
     /// CPU 管线是 f32 多平面（约 40 字节/像素）：8MP ≈ 320MB、18MP ≈ 720MB、
-    /// 24MP ≈ 960MB、48MP ≈ 1.9GB。24/48MP 的整帧回退路径（旋转 / 镜头校正 /
-    /// 内容相关蒙版）在手机上仍可能触发内存压力，所以默认停在 18MP。
+    /// 24MP ≈ 960MB、48MP ≈ 1.9GB。原图 / 24 / 48MP 的整帧回退路径（旋转 /
+    /// 镜头校正 / 内容相关蒙版）在手机上仍可能触发内存压力，导出前会拦截超大图。
     /// 48MP 档允许 48.8MP 的 ProRAW 原图不被削掉。
     static var exportPixelLimit: Int {
-        exportMegapixels >= 48 ? 50_000_000 : exportMegapixels * 1_000_000
+        if exportMegapixels == 0 {
+            return 100_000_000
+        }
+        return exportMegapixels >= 48 ? 50_000_000 : exportMegapixels * 1_000_000
     }
     /// 导出格式 / 质量 / 保留元数据 / 导出后分享（与「我的」页 @AppStorage 共用）。
     static let exportFormatKey = "fdxmp_export_format"
@@ -4121,11 +4124,12 @@ final class EditorModel: ObservableObject {
                 if let raw, !raw.isEmpty {
                     report(index, 0.08, "正在解调 RAW…")
                     let pixels = Double(item.pixelWidth) * Double(item.pixelHeight)
-                    // 48MP ProRAW 的半尺寸只有 ~12MP：选 18/24/48MP 时必须全尺寸解调，
+                    // 48MP ProRAW 的半尺寸只有 ~12MP：选原图 / 18 / 24 / 48MP 时必须全尺寸解调，
                     // 否则导出尺寸会被卡在 12MP。12MP 及以下继续用半尺寸省内存；
                     // 超过 50MP 的 RAW 仍只用半尺寸，避免解调本身把手机顶爆。
                     let canFullDecode = pixels > 0 && pixels <= 50_000_000
-                    let wantsFullDecode = selectedMegapixels > 12
+                    let wantsFullDecode = selectedMegapixels == 0
+                        || selectedMegapixels > 12
                         || pixels <= Double(EditorLimits.rawFullSizePixelLimit)
                     let fullSize = canFullDecode && wantsFullDecode
                     buffer = autoreleasepool {
