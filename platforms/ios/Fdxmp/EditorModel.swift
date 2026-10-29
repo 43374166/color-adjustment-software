@@ -303,6 +303,9 @@ final class EditorModel: ObservableObject {
     private var previewLayerToken: UUID?
     /// 零拷贝上屏是否生效（视图据此显示 Metal 图层或 UIImage）。
     @Published private(set) var zeroCopyActive = false
+    /// 是否强制回读预览（项目内左右切图后，零拷贝图层偶发只更新直方图不更新画面；
+    /// 项目编辑统一走 GPU 回读，保证 previewImage 每帧同步。单张设备编辑仍可零拷贝）。
+    @Published private(set) var editorReadback = false
     /// 最近一帧的输出尺寸（零拷贝时 previewImage 可能是旧帧，布局几何以它为准）。
     @Published private(set) var previewOutputSize: CGSize?
     /// 视图侧要求暂停零拷贝上屏（对比模式等；由视图在切换时设置）。
@@ -2509,6 +2512,13 @@ final class EditorModel: ObservableObject {
     /// 绑定 / 解除项目上下文（进入项目编辑 / 回到单张编辑时调用）。
     func configureProject(_ project: Project?) {
         self.project = project
+        // 项目内会左右切图：零拷贝图层在换图后偶发只更新直方图、画面不刷新。
+        // 项目编辑统一走 GPU 回读（previewImage 每帧同步），单张设备编辑保持零拷贝。
+        let readback = project != nil
+        if editorReadback != readback {
+            editorReadback = readback
+            scheduleRender(immediate: true)
+        }
     }
 
     // MARK: - AI 修图（v1.5.0）
@@ -3878,7 +3888,7 @@ final class EditorModel: ObservableObject {
         let gpu = gpuSession
         // 零拷贝上屏：GPU 会话 + 图层就绪 + 非对比 / 非看原图 / 非放大查看时直接把画面推给 CAMetalLayer。
         let zeroCopy = gpu != nil && zeroCopyActive && !comparePreviewActive
-            && !showOriginal && !detailZoomActive
+            && !showOriginal && !detailZoomActive && !editorReadback
         renderQueue.async { [weak self] in
             let started = CFAbsoluteTimeGetCurrent()
             if zeroCopy, let gpu, let size = gpu.present(paramsJson: json) {

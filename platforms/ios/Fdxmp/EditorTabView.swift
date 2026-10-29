@@ -117,9 +117,15 @@ struct EditorTabView: View {
         }
         .animation(.easeInOut(duration: 0.18), value: model.exportStatus)
         .onPreferenceChange(SliderDragPreferenceKey.self) { info in
+            // 兜底：如果滑块的 view 已经切到新 asset，但 model 还停在上一张，
+            // 先立刻把 model 拉回来；否则会只改旧图（直方图动、画面不动）。
+            if info != nil,
+               let asset,
+               model.asset?.localIdentifier != asset.localIdentifier {
+                model.load(asset: asset)
+            }
             model.setDraggingSlider(info)
         }
-        .onAppear(perform: loadIfNeeded)
         .onDisappear {
             // 离开编辑页时丢掉排队的单击，避免在别的页面上突然切一次沉浸。
             pendingSingleTap?.cancel()
@@ -137,7 +143,11 @@ struct EditorTabView: View {
         .onChange(of: project?.id) { _ in
             model.configureProject(project)
         }
-        .onChange(of: asset?.localIdentifier) { _ in
+        // 用 task(id:) 而不是 onChange 加载：切图时这个闭包一定拿到当前 asset，
+        // 不会出现“界面已经换图、model 还停在上一张”的错位（错位时滑块只改旧图，
+        // 直方图在动但画面不动）。
+        .task(id: asset?.localIdentifier) {
+            guard let target = asset, !Task.isCancelled else { return }
             resetZoom()
             immersive = false
             model.clearDetailPreview()
@@ -145,7 +155,19 @@ struct EditorTabView: View {
             if !swipeAnimating {
                 swipeOffset = 0
             }
-            loadIfNeeded()
+            // 快速连续滑动时旧 task 可能已被取消但还没退出：别再让它把 model
+            // 拉回上一张（那会表现为直方图在变、画面不动）。
+            guard !Task.isCancelled else { return }
+            model.configureProject(project)
+            model.load(asset: target)
+            prefetchNeighbors()
+            // 兜底：切图瞬间若有旧的 load 竞争，0.6s 后 model 仍停在别的照片就再拉一次。
+            // 这修的是“直方图在变、画面不动”——滑块改到了上一张的 state。
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            guard !Task.isCancelled else { return }
+            if model.asset?.localIdentifier != target.localIdentifier {
+                model.load(asset: target)
+            }
         }
         .onChange(of: prevAsset?.localIdentifier) { _ in prefetchNeighbors() }
         .onChange(of: nextAsset?.localIdentifier) { _ in prefetchNeighbors() }
@@ -304,13 +326,6 @@ struct EditorTabView: View {
             .listStyle(.plain)
         }
         .presentationDetents([.medium, .large])
-    }
-
-    private func loadIfNeeded() {
-        guard let asset else { return }
-        model.load(asset: asset)
-        // 首次进入时 prev/next 不会触发 onChange：这里主动预取，第一次滑动才有图。
-        prefetchNeighbors()
     }
 
     /// 加载卡死时的自救：清掉这张图的编辑记录，按原片重新加载。
@@ -739,7 +754,7 @@ struct EditorTabView: View {
     private var previewImageSize: CGSize {
         // 切换的一帧差 / 首帧未出时 model 还是旧图或低清快图：改用预取尺寸，
         // 避免布局先按旧图算、清晰预览再跳一下。
-        if (!assetMatchesModel || model.isLoading || model.previewImage == nil),
+        if (!assetMatchesModel || model.previewImage == nil),
            let id = asset?.localIdentifier,
            let placeholder = neighborImages[id] {
             return placeholder.size
@@ -882,8 +897,10 @@ struct EditorTabView: View {
         // 父层刚切到新 asset、model 还没 load 完时，旧 preview 不能再用。
         let modelImage = assetMatchesModel ? shownImage : nil
         let placeholder = placeholderImage
-        // 首帧未出时优先保留清晰的预取图，不要先用 load() 里的低清快速图。
-        let displayImage = (model.isLoading ? placeholder : nil) ?? modelImage ?? placeholder
+        // 有当前 model 的帧就用它（CPU / GPU 回读都会更新 previewImage）；
+        // 只有 model 还没有图（或还是上一张）时才用预取图。
+        // 不能因为 isLoading 一直优先 placeholder，否则滑块只改 model、画面停在预取图上。
+        let displayImage = modelImage ?? placeholder
         ZStack {
             Color.black
             // 相册式左右滑动：两侧邻居照片随手指滑入（低清预览，加载完成后替换）。
@@ -941,6 +958,7 @@ struct EditorTabView: View {
                 // detailImage；改由 SwiftUI Image 显示全分辨率细节帧 / 区域帧。
                 let metalActive = assetMatchesModel
                     && model.zeroCopyActive
+                    && !model.editorReadback
                     && !model.showOriginal
                     && compareSplit == nil
                     && zoom <= 1.01
