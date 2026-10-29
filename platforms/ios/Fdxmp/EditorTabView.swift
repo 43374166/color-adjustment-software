@@ -958,6 +958,7 @@ struct EditorTabView: View {
                 // detailImage；改由 SwiftUI Image 显示全分辨率细节帧 / 区域帧。
                 let metalActive = assetMatchesModel
                     && model.zeroCopyActive
+                    && model.renderPath == .gpu
                     && !model.editorReadback
                     && !model.showOriginal
                     && compareSplit == nil

@@ -128,8 +128,7 @@ pub fn render_memory_tiled_rgba(
         || params.lens.geometry.vertical.abs() > 1e-4
         || params.lens.geometry.horizontal.abs() > 1e-4
         || params.lens.geometry.rotate.abs() > 1e-3
-        || (params.lens.geometry.scale > 0.0
-            && (params.lens.geometry.scale - 1.0).abs() > 1e-4)
+        || (params.lens.geometry.scale > 0.0 && (params.lens.geometry.scale - 1.0).abs() > 1e-4)
         || params.lens.profile_correction;
     if needs_resample {
         return render_memory_rgba(rgba, width, height, params_json);
@@ -141,8 +140,14 @@ pub fn render_memory_tiled_rgba(
     let top = (rect[1].clamp(0.0, 1.0) * height as f32).round() as u32;
     let right = ((rect[0] + rect[2]).clamp(0.0, 1.0) * width as f32).round() as u32;
     let bottom = ((rect[1] + rect[3]).clamp(0.0, 1.0) * height as f32).round() as u32;
-    let out_width = right.saturating_sub(left).max(1).min(width.saturating_sub(left));
-    let out_height = bottom.saturating_sub(top).max(1).min(height.saturating_sub(top));
+    let out_width = right
+        .saturating_sub(left)
+        .max(1)
+        .min(width.saturating_sub(left));
+    let out_height = bottom
+        .saturating_sub(top)
+        .max(1)
+        .min(height.saturating_sub(top));
     let flip_h = params.crop.flip_horizontal;
     let flip_v = params.crop.flip_vertical;
 
@@ -195,7 +200,7 @@ pub fn render_memory_tiled_rgba(
             }
         }
 
-        let strip = render_memory_rgba_region(
+        let strip = render_memory_rgba_region_internal(
             &region,
             out_width,
             region_height,
@@ -208,17 +213,25 @@ pub fn render_memory_tiled_rgba(
             rows as u32,
             out_width,
             out_height,
+            false,
         )?;
         let dst = y as usize * out_stride;
         let len = strip.rgba.len().min(out_stride * rows);
         out[dst..dst + len].copy_from_slice(&strip.rgba[..len]);
         y += rows as u32;
     }
-    Ok(PreviewRgba {
-        width: out_width,
-        height: out_height,
-        rgba: out,
-    })
+    // 分块只负责把像素拼回整帧；局部影调必须在整帧上做，否则条带边界会不一样。
+    if let Some(mut image) = RgbaImage::from_raw(out_width, out_height, out) {
+        crate::tone::apply_local_tone(&mut image, &params);
+        return Ok(PreviewRgba {
+            width: image.width(),
+            height: image.height(),
+            rgba: image.into_raw(),
+        });
+    }
+    Err(FdxmpError::InvalidArgument(
+        "无法从分块结果创建整帧图像".to_string(),
+    ))
 }
 
 /// 区域渲染（放大 1:1 看细节）：
@@ -243,6 +256,39 @@ pub fn render_memory_rgba_region(
     visible_height: u32,
     full_width: u32,
     full_height: u32,
+) -> Result<PreviewRgba> {
+    render_memory_rgba_region_internal(
+        rgba,
+        region_width,
+        region_height,
+        params_json,
+        region_x,
+        region_y,
+        visible_x,
+        visible_y,
+        visible_width,
+        visible_height,
+        full_width,
+        full_height,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_memory_rgba_region_internal(
+    rgba: &[u8],
+    region_width: u32,
+    region_height: u32,
+    params_json: &str,
+    region_x: u32,
+    region_y: u32,
+    visible_x: u32,
+    visible_y: u32,
+    visible_width: u32,
+    visible_height: u32,
+    full_width: u32,
+    full_height: u32,
+    apply_local_tone: bool,
 ) -> Result<PreviewRgba> {
     let params: EditParams = serde_json::from_str(params_json)?;
     if !geometry_is_identity(&params) {
@@ -280,8 +326,12 @@ pub fn render_memory_rgba_region(
             "区域渲染：可见矩形不在提供的像素范围内".to_string(),
         ));
     }
-    let cropped =
+    let mut cropped =
         image::imageops::crop_imm(&rendered, left, top, right - left, bottom - top).to_image();
+    // 放大查看的区域帧也走同一套局部影调；区域自带余量，基底在可见范围内足够平滑。
+    if apply_local_tone {
+        crate::tone::apply_local_tone(&mut cropped, &params);
+    }
     Ok(PreviewRgba {
         width: cropped.width(),
         height: cropped.height(),
@@ -310,10 +360,19 @@ fn geometry_is_identity(params: &EditParams) -> bool {
 
 /// 调色 → 镜头 → 几何 → 蒙版 的公共后处理（解码路径与内存路径共用）。
 fn finish_preview(image: RgbaImage, params: &EditParams) -> Result<PreviewRgba> {
-    let rendered = render_preview_image(&image, params);
+    // 这里用 at() 而不是 render_preview_image()：局部高光 / 阴影必须等几何和蒙版
+    // 都完成后再做，否则裁切 / 翻转后的亮区坐标会错位。
+    let rendered = render_preview_image_at(
+        &image,
+        params,
+        FrameOrigin::full(image.width(), image.height()),
+    );
     let corrected = apply_lens(&rendered, &params.lens);
     let mut geometry = apply_geometry(&corrected, &params.crop);
     apply_masks(&mut geometry, params);
+    // 高光 / 阴影是渲染后的局部曝光（guided 基底），放在几何 / 蒙版之后：
+    // 这样裁切、翻转、局部调整看到的都是最终画面上的亮度分区。
+    crate::tone::apply_local_tone(&mut geometry, params);
     Ok(PreviewRgba {
         width: geometry.width(),
         height: geometry.height(),
@@ -563,13 +622,15 @@ fn crop_rect(source: &RgbaImage, rect: [f32; 4]) -> RgbaImage {
     image::imageops::crop_imm(source, left, top, crop_width, crop_height).to_image()
 }
 
-/// 把编辑参数应用到 sRGB RGBA 图像。
+/// 把编辑参数应用到 sRGB RGBA 图像（含局部高光 / 阴影）。
 pub fn render_preview_image(source: &RgbaImage, params: &EditParams) -> RgbaImage {
-    render_preview_image_at(
+    let mut image = render_preview_image_at(
         source,
         params,
         FrameOrigin::full(source.width(), source.height()),
-    )
+    );
+    crate::tone::apply_local_tone(&mut image, params);
+    image
 }
 
 /// 帧外坐标：告诉管线"当前这段像素在整帧里从哪开始、整帧多大"。
@@ -800,7 +861,7 @@ fn compose_masks(
                 raster,
                 curves: CurveLuts::new(&mask.adjustments.curves),
                 color_stage: crate::color_engine::ColorStage::from_params(&mask.adjustments),
-                tone: crate::tone::ToneStage::from_params(&mask.adjustments),
+                tone: crate::tone::ToneStage::from_params_mask(&mask.adjustments),
                 params: (*mask.adjustments).clone(),
             })
         })
@@ -1961,6 +2022,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn local_tone_tiled_matches_full_render() {
+        let (width, height) = (128u32, 96u32);
+        let mut source = RgbaImage::new(width, height);
+        for (x, y, pixel) in source.enumerate_pixels_mut() {
+            *pixel = Rgba([
+                (x * 255 / width) as u8,
+                (y * 255 / height) as u8,
+                ((x * 3 + y * 5) % 256) as u8,
+                255,
+            ]);
+        }
+        let mut params = EditParams::default();
+        params.light.highlights = -50.0;
+        params.light.shadows = 35.0;
+        let json = serde_json::to_string(&params).unwrap();
+        let full = render_memory_rgba(source.as_raw(), width, height, &json).unwrap();
+        let tiled = render_memory_tiled_rgba(source.as_raw(), width, height, &json, 4096).unwrap();
+        assert_eq!((tiled.width, tiled.height), (width, height));
+        let mut max_diff = 0i32;
+        for (a, b) in full.rgba.iter().zip(tiled.rgba.iter()) {
+            max_diff = max_diff.max((*a as i32 - *b as i32).abs());
+        }
+        assert!(max_diff <= 2, "分块与整帧的局部影调差异过大：{max_diff}");
     }
 
     #[test]

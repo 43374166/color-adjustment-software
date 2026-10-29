@@ -1,19 +1,26 @@
-//! 显示域基本色调段：曝光之后，对比度 → 高光 → 阴影 → 白色 → 黑色。
+//! 显示域色调段与局部高光 / 阴影。
 //!
-//! 与 GPU `color_pipeline.wgsl` 的 `pipeline_tone` 同公式：
+//! 管线分两层：
 //!
-//! 1. 把场景线性 RGB 编码到 sRGB 显示域，取显示亮度 `Y`；
-//! 2. 按 Lightroom 的顺序依次做对比度 S 曲线、高光、阴影、白色、黑色；
-//! 3. 高光 / 阴影的**区域权重**取自基底层（大半径模糊后的亮度），
-//!    而不是像素自己的亮度——小面积高光不会被“顺手”压暗，大面积天空才会被恢复；
-//! 4. 用“亮度比”缩放 RGB（保持色相 / 通道比例），再做色域映射。
+//! 1. [`ToneStage`]：曝光之后，对比度 → 白色 → 黑色（显示域端点锚定曲线）；
+//! 2. [`apply_local_tone`]：渲染完成后，用低分辨率 guided 亮度基底做局部曝光补偿，
+//!    高光 / 阴影不再用全局 1D LUT，而是按“区域亮度”提亮 / 压暗：
+//!    - 大面积天空、逆光背景会被整体压 / 提；
+//!    - 同一区域内的细节保留局部对比；
+//!    - 纯黑乘增益仍为黑，纯白会被高光负向压到显示白以内。
 //!
-//! 这一版是**端点锚定**的：对比度 / 高光 / 阴影不会把纯黑 / 纯白整体推走；
-//! 只有白色（负方向）和黑色（正方向）按 LR 的端点语义移动黑 / 白场。
+//! 局部基底在显示域构建（在最终输出上取亮度），因为本版仍以 RGBA8 预览 / 导出；
+//! 这样可以避免为局部影调再引入一套全分辨率浮点缓冲。后续若升级到场景线性浮点，
+//! 只需把基底构建移到 tone 之前，局部增益公式不变。
+//!
+//! 这一版仍是**端点锚定**的：对比度不会把纯黑 / 纯白整体推走；
+//! 白色（负方向）和黑色（正方向）按 LR 的端点语义移动黑 / 白场。
 
 use fdxmp_color::gamut::map_to_gamut;
 use fdxmp_color::luminance;
 use fdxmp_color::transfer::{linear_to_srgb, srgb_to_linear};
+use image::RgbaImage;
+use rayon::prelude::*;
 
 use crate::params::EditParams;
 
@@ -27,6 +34,13 @@ pub const DISPLAY_LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
 pub const CONTRAST_STRENGTH: f32 = 1.3155;
 /// 对比度 S 曲线的固定点（显示域亮度）。
 pub const CONTRAST_PIVOT: f32 = 0.7215;
+
+/// 高光 / 阴影在 +100 / −100 时的最大局部曝光量（EV）。
+///
+/// 1.8 EV 足够处理逆光天空和背光人脸，又不至于把整块区域推成死白 / 死黑。
+pub const LOCAL_HIGHLIGHT_MAX_EV: f32 = 1.2;
+/// 阴影方向的最大局部曝光量（EV），与高光分开调。
+pub const LOCAL_SHADOW_MAX_EV: f32 = 1.2;
 /// LR 参考曲线：曝光 -1EV / 0 / +1EV。
 ///
 /// 曝光不是单纯的线性 ×2：LR 在 +1 时有高光肩部，在 -1 时也保留白点。
@@ -154,7 +168,10 @@ fn sample_curve(curve: &[f32; TONE_CURVE_POINTS], x: f32) -> f32 {
 }
 
 /// 按滑杆值在 5 档参考曲线之间插值，生成 256 项亮度 LUT。
-pub fn reference_tone_lut(curves: &[[f32; TONE_CURVE_POINTS]; 5], value: f32) -> [f32; TONE_LUT_SIZE] {
+pub fn reference_tone_lut(
+    curves: &[[f32; TONE_CURVE_POINTS]; 5],
+    value: f32,
+) -> [f32; TONE_LUT_SIZE] {
     let position = ((value.clamp(-100.0, 100.0) + 100.0) / 50.0).clamp(0.0, 4.0);
     let low = position.floor() as usize;
     let high = (low + 1).min(4);
@@ -229,7 +246,11 @@ pub fn blur_scale(long_edge: f32) -> f32 {
     (long_edge / REFERENCE_EDGE).clamp(1.0, SCALE_MAX)
 }
 
-/// 显示域基本色调段（构建一次，逐像素应用）。
+/// 显示域色调段（对比度 / 白色 / 黑色）。
+///
+/// 高光 / 阴影的**有效实现**已移到 [`apply_local_tone`]：CPU 路径不再用
+/// `highlights_lut` / `shadows_lut`；两张表仍保留，只为 GPU 旧 5 槽布局与
+/// Windows 直接使用 `ColorPipeline` 的路径兼容。
 #[derive(Clone, Debug)]
 pub struct ToneStage {
     contrast: f32,
@@ -243,16 +264,31 @@ pub struct ToneStage {
     shadows_lut: [f32; TONE_LUT_SIZE],
     whites_lut: [f32; TONE_LUT_SIZE],
     blacks_lut: [f32; TONE_LUT_SIZE],
+    /// 蒙版局部调整仍走旧的高光 / 阴影 LUT（逐蒙版做 guided 基底成本高，
+    /// 且蒙版本身就是空间局部的）；全局路径为 false，由 `apply_local_tone` 负责。
+    legacy_local_luts: bool,
     active: bool,
     luma: [f32; 3],
 }
 
 impl ToneStage {
-    /// 从编辑参数构建；曝光 ±1EV 和四个基本滑块各生成一张 256 项参考曲线 LUT。
+    /// 全局色调段：高光 / 阴影不在这里，交给 [`apply_local_tone`]。
     pub fn from_params(params: &EditParams) -> Self {
+        Self::build(params, false)
+    }
+
+    /// 蒙版局部色调段：保留旧的高光 / 阴影参考 LUT，避免蒙版局部亮度滑杆失效。
+    pub fn from_params_mask(params: &EditParams) -> Self {
+        Self::build(params, true)
+    }
+
+    fn build(params: &EditParams, legacy_local_luts: bool) -> Self {
         let light = &params.light;
         let contrast = (light.contrast / 100.0).clamp(-1.0, 1.0);
         let exposure_lut = std::array::from_fn(|index| index as f32 / (TONE_LUT_SIZE - 1) as f32);
+        // GPU 仍按旧 5 槽布局读取 LUT；CPU 预览 / 导出已经不走这两张表，
+        // 高光 / 阴影改由 `apply_local_tone` 做局部曝光。保留旧表是为了
+        // Windows 直接使用 `ColorPipeline` 时不至于突然失去这两个滑杆。
         let highlights_lut = reference_tone_lut(&HIGHLIGHT_CURVES, light.highlights);
         let shadows_lut = reference_tone_lut(&SHADOW_CURVES, light.shadows);
         let whites_lut = reference_tone_lut(&WHITE_CURVES, light.whites);
@@ -264,11 +300,12 @@ impl ToneStage {
             shadows_lut,
             whites_lut,
             blacks_lut,
+            legacy_local_luts,
+            // 全局：对比度 / 白 / 黑才触发本段；蒙版：高光 / 阴影也走旧 LUT。
             active: contrast != 0.0
-                || light.highlights != 0.0
-                || light.shadows != 0.0
                 || light.whites != 0.0
-                || light.blacks != 0.0,
+                || light.blacks != 0.0
+                || (legacy_local_luts && (light.highlights != 0.0 || light.shadows != 0.0)),
             luma: crate::color_engine::WORKSPACE
                 .luma()
                 .map(|value| value as f32),
@@ -326,16 +363,16 @@ impl ToneStage {
         // 对比度：端点固定的三次 S 曲线。曲线在 v = CONTRAST_PIVOT 处不动，
         // 0 / 1 也不动；该式由 LR 参考的灰阶映射拟合。
         if self.contrast != 0.0 {
-            v += self.contrast
-                * CONTRAST_STRENGTH
-                * (v - CONTRAST_PIVOT)
-                * v
-                * (1.0 - v);
+            v += self.contrast * CONTRAST_STRENGTH * (v - CONTRAST_PIVOT) * v * (1.0 - v);
             v = v.clamp(0.0, 1.0);
         }
 
-        v = sample_tone_lut(&self.highlights_lut, v);
-        v = sample_tone_lut(&self.shadows_lut, v);
+        // 全局路径：高光 / 阴影已改为渲染后的局部曝光，这里只保留显示域端点曲线。
+        // 蒙版路径：仍使用旧参考 LUT，保证蒙版局部亮度滑杆继续生效。
+        if self.legacy_local_luts {
+            v = sample_tone_lut(&self.highlights_lut, v);
+            v = sample_tone_lut(&self.shadows_lut, v);
+        }
         v = sample_tone_lut(&self.whites_lut, v);
         v = sample_tone_lut(&self.blacks_lut, v);
         v.clamp(0.0, 1.0)
@@ -350,6 +387,207 @@ impl ToneStage {
 #[inline]
 fn display_luma(rgb: [f32; 3]) -> f32 {
     rgb[0] * DISPLAY_LUMA[0] + rgb[1] * DISPLAY_LUMA[1] + rgb[2] * DISPLAY_LUMA[2]
+}
+
+/// 局部影调基底：低分辨率显示域 EV 网格，经 guided filter 平滑。
+///
+/// 只看最终输出的亮度，不依赖 RAW 线性数据；因此预览、区域帧、导出都复用同一套
+/// 构建逻辑。网格长边约 128–512，`ev_at` 双线性采样，单帧构建成本很低。
+#[derive(Clone, Debug)]
+pub struct LocalToneBase {
+    width: usize,
+    height: usize,
+    grid_width: usize,
+    grid_height: usize,
+    ev: Vec<f32>,
+}
+
+impl LocalToneBase {
+    /// 从最终 sRGB8 输出构建。
+    pub fn build(image: &RgbaImage) -> Option<Self> {
+        let width = image.width() as usize;
+        let height = image.height() as usize;
+        if width < 16 || height < 16 {
+            return None;
+        }
+        let long = width.max(height) as f32;
+        let edge = (long / 8.0).clamp(128.0, 512.0);
+        let grid_width = ((width as f32 * edge / long).round() as usize).max(8);
+        let grid_height = ((height as f32 * edge / long).round() as usize).max(8);
+        let mut grid = vec![0.0f32; grid_width * grid_height];
+        let pixels = image.as_raw();
+        for gy in 0..grid_height {
+            let y0 = gy * height / grid_height;
+            let y1 = ((gy + 1) * height / grid_height).max(y0 + 1).min(height);
+            for gx in 0..grid_width {
+                let x0 = gx * width / grid_width;
+                let x1 = ((gx + 1) * width / grid_width).max(x0 + 1).min(width);
+                let mut sum = 0.0f64;
+                let mut count = 0usize;
+                for y in y0..y1 {
+                    let row = y * width;
+                    for x in x0..x1 {
+                        let offset = (row + x) * 4;
+                        let r = srgb_to_linear(pixels[offset] as f32 / 255.0);
+                        let g = srgb_to_linear(pixels[offset + 1] as f32 / 255.0);
+                        let b = srgb_to_linear(pixels[offset + 2] as f32 / 255.0);
+                        sum += (r * 0.2126 + g * 0.7152 + b * 0.0722) as f64;
+                        count += 1;
+                    }
+                }
+                let luma = if count == 0 {
+                    0.0
+                } else {
+                    (sum / count as f64) as f32
+                };
+                grid[gy * grid_width + gx] = (luma.max(1e-6) / GREY).log2().clamp(-12.0, 6.0);
+            }
+        }
+        // 半径约短边的 4%：足够跨过肤色 / 天空的大块区域，又不会把边缘糊平。
+        let radius = ((grid_width.min(grid_height) as f32) * 0.04)
+            .round()
+            .max(2.0) as usize;
+        let ev = guided_filter(&grid, grid_width, grid_height, radius, 0.02);
+        Some(Self {
+            width,
+            height,
+            grid_width,
+            grid_height,
+            ev,
+        })
+    }
+
+    /// 全分辨率像素坐标处的基底 EV（双线性）。
+    pub fn ev_at(&self, x: usize, y: usize) -> f32 {
+        let fx = (x.min(self.width.saturating_sub(1)) as f32
+            / self.width.saturating_sub(1).max(1) as f32)
+            * self.grid_width.saturating_sub(1) as f32;
+        let fy = (y.min(self.height.saturating_sub(1)) as f32
+            / self.height.saturating_sub(1).max(1) as f32)
+            * self.grid_height.saturating_sub(1) as f32;
+        let x0 = fx.floor() as usize;
+        let y0 = fy.floor() as usize;
+        let x1 = (x0 + 1).min(self.grid_width.saturating_sub(1));
+        let y1 = (y0 + 1).min(self.grid_height.saturating_sub(1));
+        let tx = fx - x0 as f32;
+        let ty = fy - y0 as f32;
+        let p00 = self.ev[y0 * self.grid_width + x0];
+        let p10 = self.ev[y0 * self.grid_width + x1];
+        let p01 = self.ev[y1 * self.grid_width + x0];
+        let p11 = self.ev[y1 * self.grid_width + x1];
+        let top = p00 + (p10 - p00) * tx;
+        let bottom = p01 + (p11 - p01) * tx;
+        top + (bottom - top) * ty
+    }
+}
+
+/// 在最终输出上应用高光 / 阴影局部曝光。
+///
+/// 高光：只压 / 提基底 EV > 1.2 的区域；阴影：只压 / 提基底 EV < −1.5 的区域。
+/// 中灰附近权重为 0，因此不会像原来的全局 LUT 那样把中间调整体推亮 / 推暗。
+pub fn apply_local_tone(image: &mut RgbaImage, params: &EditParams) {
+    let highlights = (params.light.highlights / 100.0).clamp(-1.0, 1.0);
+    let shadows = (params.light.shadows / 100.0).clamp(-1.0, 1.0);
+    if highlights.abs() < 1e-6 && shadows.abs() < 1e-6 {
+        return;
+    }
+    let Some(base) = LocalToneBase::build(image) else {
+        return;
+    };
+    let width = image.width() as usize;
+    let pixels = image.as_mut();
+    pixels
+        .par_chunks_mut(4)
+        .enumerate()
+        .for_each(|(index, pixel)| {
+            let x = index % width;
+            let y = index / width;
+            let gain_ev = local_gain_ev(base.ev_at(x, y), highlights, shadows);
+            if gain_ev.abs() < 1e-5 {
+                return;
+            }
+            let gain = 2f32.powf(gain_ev);
+            let mut linear = [0.0f32; 3];
+            for (channel_index, channel) in pixel.iter().take(3).enumerate() {
+                linear[channel_index] = srgb_to_linear(*channel as f32 / 255.0) * gain;
+            }
+            // 高光正向增益可能把某个通道推出 1.0；按最大通道等比收回来，
+            // 比逐通道硬夹更不容易偏色（暗部不受影响）。
+            let max_channel = linear.iter().copied().fold(0.0f32, f32::max);
+            if max_channel > 1.0 {
+                for value in &mut linear {
+                    *value /= max_channel;
+                }
+            }
+            for (channel, value) in pixel.iter_mut().take(3).zip(linear) {
+                *channel = (linear_to_srgb(value.clamp(0.0, 1.0)) * 255.0).round() as u8;
+            }
+        });
+}
+
+/// 局部曝光量（EV）：中灰附近为 0，高光 / 阴影两端平滑过渡。
+#[inline]
+fn local_gain_ev(base_ev: f32, highlights: f32, shadows: f32) -> f32 {
+    let highlight_weight = smoothstep(1.2, 3.2, base_ev);
+    let shadow_weight = 1.0 - smoothstep(-4.5, -1.5, base_ev);
+    (highlights * LOCAL_HIGHLIGHT_MAX_EV * highlight_weight
+        + shadows * LOCAL_SHADOW_MAX_EV * shadow_weight)
+        .clamp(-3.5, 3.5)
+}
+
+#[inline]
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// 自引导 guided filter（网格尺寸很小，积分图 O(N)）。
+fn guided_filter(src: &[f32], width: usize, height: usize, radius: usize, eps: f32) -> Vec<f32> {
+    let mean = box_mean(src, width, height, radius);
+    let squared: Vec<f32> = src.iter().map(|value| value * value).collect();
+    let mean_squared = box_mean(&squared, width, height, radius);
+    let mut a = vec![0.0f32; src.len()];
+    let mut b = vec![0.0f32; src.len()];
+    for index in 0..src.len() {
+        let variance = (mean_squared[index] - mean[index] * mean[index]).max(0.0);
+        let ai = variance / (variance + eps);
+        a[index] = ai;
+        b[index] = mean[index] * (1.0 - ai);
+    }
+    let mean_a = box_mean(&a, width, height, radius);
+    let mean_b = box_mean(&b, width, height, radius);
+    (0..src.len())
+        .map(|index| mean_a[index] * src[index] + mean_b[index])
+        .collect()
+}
+
+/// 积分图盒式均值（边界夹取）。
+fn box_mean(src: &[f32], width: usize, height: usize, radius: usize) -> Vec<f32> {
+    let stride = width + 1;
+    let mut integral = vec![0.0f64; stride * (height + 1)];
+    for y in 0..height {
+        let mut row_sum = 0.0f64;
+        for x in 0..width {
+            row_sum += src[y * width + x] as f64;
+            integral[(y + 1) * stride + x + 1] = integral[y * stride + x + 1] + row_sum;
+        }
+    }
+    let mut out = vec![0.0f32; src.len()];
+    for y in 0..height {
+        let y0 = y.saturating_sub(radius);
+        let y1 = (y + radius).min(height - 1);
+        for x in 0..width {
+            let x0 = x.saturating_sub(radius);
+            let x1 = (x + radius).min(width - 1);
+            let sum = integral[(y1 + 1) * stride + x1 + 1]
+                - integral[y0 * stride + x1 + 1]
+                - integral[(y1 + 1) * stride + x0]
+                + integral[y0 * stride + x0];
+            let count = (x1 - x0 + 1) * (y1 - y0 + 1);
+            out[y * width + x] = (sum / count as f64) as f32;
+        }
+    }
+    out
 }
 
 /// 基底层：大半径模糊后的场景线性图像（取亮度后转成相对中灰的 EV）。
@@ -474,57 +712,102 @@ mod tests {
 
     #[test]
     fn brightening_sliders_keep_chromaticity() {
-        // 阴影 / 高光这类提亮滑杆只改亮度：通道比例（色相 / 饱和度）不能被放大。
+        // 局部曝光只乘亮度增益：线性通道比例（色相 / 饱和度）不能被改变。
+        let mut image = RgbaImage::new(48, 48);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgba([64, 32, 16, 255]);
+        }
         let mut params = EditParams::default();
         params.light.shadows = 100.0;
-        let stage = ToneStage::from_params(&params);
-        let input = [0.04f32, 0.012, 0.006];
-        let out = stage.apply(input, 0.0);
-        let before = input[1] / input[0];
-        let after = out[1] / out[0];
-        assert!((before - after).abs() < 1e-3, "{input:?} -> {out:?}");
-
-        params.light.shadows = 0.0;
-        params.light.highlights = 100.0;
-        let stage = ToneStage::from_params(&params);
-        let input = [0.30f32, 0.10, 0.05];
-        let out = stage.apply(input, 0.0);
-        let before = input[1] / input[0];
-        let after = out[1] / out[0];
-        assert!((before - after).abs() < 1e-3, "{input:?} -> {out:?}");
+        apply_local_tone(&mut image, &params);
+        let after = image.get_pixel(24, 24).0;
+        let before_ratio = srgb_to_linear(32.0 / 255.0) / srgb_to_linear(64.0 / 255.0);
+        let after_ratio =
+            srgb_to_linear(after[1] as f32 / 255.0) / srgb_to_linear(after[0] as f32 / 255.0);
+        assert!(
+            (before_ratio - after_ratio).abs() < 0.02,
+            "线性通道比例应保持：{before_ratio} -> {after_ratio}（{after:?}）"
+        );
     }
 
     #[test]
-    fn highlights_follow_reference_curve() {
+    fn local_highlights_target_bright_regions() {
+        let mut image = split_image(64, 64, 32, 32, 224);
+        let before_left = image.get_pixel(8, 32).0[0];
+        let before_right = image.get_pixel(56, 32).0[0];
         let mut params = EditParams::default();
         params.light.highlights = -100.0;
-        let stage = ToneStage::from_params(&params);
-        let high = stage.map_luminance(0.7);
-        let white = stage.map_luminance(1.0);
-        assert!(high < 0.7 && high > 0.5, "高光 -100: {high}");
-        assert!((white - 0.94).abs() < 0.01, "白场应收敛到 ~0.94: {white}");
-
-        params.light.highlights = 100.0;
-        let stage = ToneStage::from_params(&params);
-        assert!(stage.map_luminance(0.7) > 0.75);
-        assert!((stage.map_luminance(1.0) - 1.0).abs() < 1e-5);
+        apply_local_tone(&mut image, &params);
+        let after_left = image.get_pixel(8, 32).0[0];
+        let after_right = image.get_pixel(56, 32).0[0];
+        assert!(
+            after_right + 12 < before_right,
+            "高光 -100 应压暗亮区：{before_right} -> {after_right}"
+        );
+        assert!(
+            after_left.abs_diff(before_left) <= 2,
+            "高光 -100 不应明显改变暗区：{before_left} -> {after_left}"
+        );
     }
 
     #[test]
-    fn shadows_follow_reference_curve() {
+    fn local_shadows_target_dark_regions() {
+        let mut image = split_image(64, 64, 32, 32, 224);
+        let before_left = image.get_pixel(8, 32).0[0];
+        let before_right = image.get_pixel(56, 32).0[0];
         let mut params = EditParams::default();
         params.light.shadows = 100.0;
-        let stage = ToneStage::from_params(&params);
-        let black = stage.map_luminance(0.0);
-        let dark = stage.map_luminance(0.1);
-        let high = stage.map_luminance(0.7);
-        assert!((black - 0.012).abs() < 0.01, "纯黑轻微抬起：{black}");
-        assert!(dark > 0.2, "暗部 +100 应大幅提亮：{dark}");
-        assert!(high > 0.7, "LR shadows 会轻微抬亮高调：{high}");
+        apply_local_tone(&mut image, &params);
+        let after_left = image.get_pixel(8, 32).0[0];
+        let after_right = image.get_pixel(56, 32).0[0];
+        assert!(
+            after_left > before_left + 12,
+            "阴影 +100 应提亮暗区：{before_left} -> {after_left}"
+        );
+        assert!(
+            after_right.abs_diff(before_right) <= 4,
+            "阴影 +100 不应明显改变亮区：{before_right} -> {after_right}"
+        );
+    }
 
-        params.light.shadows = -100.0;
-        let stage = ToneStage::from_params(&params);
-        assert!(stage.map_luminance(0.1) < 0.1);
+    #[test]
+    fn local_tone_leaves_midgray_and_black_alone() {
+        let mut image = RgbaImage::new(32, 32);
+        for pixel in image.pixels_mut() {
+            *pixel = image::Rgba([128, 128, 128, 255]);
+        }
+        let mut params = EditParams::default();
+        params.light.shadows = 100.0;
+        params.light.highlights = -100.0;
+        apply_local_tone(&mut image, &params);
+        let mid = image.get_pixel(16, 16).0[0];
+        assert!(mid.abs_diff(128) <= 2, "中灰不应被局部影调推走：{mid}");
+
+        let mut black = RgbaImage::new(32, 32);
+        for pixel in black.pixels_mut() {
+            *pixel = image::Rgba([0, 0, 0, 255]);
+        }
+        apply_local_tone(&mut black, &params);
+        assert_eq!(black.get_pixel(16, 16).0[0], 0, "纯黑乘增益仍为黑");
+    }
+
+    fn split_image(width: u32, height: u32, split: u32, dark: u8, bright: u8) -> RgbaImage {
+        let mut image = RgbaImage::new(width, height);
+        for (x, _, pixel) in image.enumerate_pixels_mut() {
+            let value = if x < split { dark } else { bright };
+            *pixel = image::Rgba([value, value, value, 255]);
+        }
+        image
+    }
+
+    #[test]
+    fn local_base_tracks_brightness_regions() {
+        let image = split_image(128, 128, 64, 24, 240);
+        let base = LocalToneBase::build(&image).expect("base");
+        let dark_ev = base.ev_at(8, 64);
+        let bright_ev = base.ev_at(120, 64);
+        assert!(dark_ev < -2.0, "暗区基底 EV 应明显为负：{dark_ev}");
+        assert!(bright_ev > 1.0, "亮区基底 EV 应明显为正：{bright_ev}");
     }
 
     #[test]
@@ -553,7 +836,12 @@ mod tests {
     fn reference_luts_are_monotone_at_every_stop() {
         for value in (-100..=100).step_by(25) {
             let value = value as f32;
-            for curves in [&HIGHLIGHT_CURVES, &SHADOW_CURVES, &WHITE_CURVES, &BLACK_CURVES] {
+            for curves in [
+                &HIGHLIGHT_CURVES,
+                &SHADOW_CURVES,
+                &WHITE_CURVES,
+                &BLACK_CURVES,
+            ] {
                 let lut = reference_tone_lut(curves, value);
                 let mut previous = -1.0f32;
                 for sample in lut {

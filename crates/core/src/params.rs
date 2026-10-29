@@ -81,9 +81,9 @@ pub struct LightParams {
     pub exposure: f32,
     /// 对比度，-100..=100。
     pub contrast: f32,
-    /// 高光，-100..=100。
+    /// 高光，-100..=100（局部曝光：只作用于 guided 基底亮度较高的区域）。
     pub highlights: f32,
-    /// 阴影，-100..=100。
+    /// 阴影，-100..=100（局部曝光：只作用于 guided 基底亮度较低的区域）。
     pub shadows: f32,
     /// 白色，-100..=100。
     pub whites: f32,

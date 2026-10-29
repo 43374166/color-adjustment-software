@@ -257,7 +257,16 @@ fn render_cpu_command(args: &[String]) -> Result<(), String> {
         }
         None => decoded.display_proxy(2048),
     };
-    let rendered = fdxmp_core::preview::render_preview_image(&proxy, &params);
+    let params_json = serde_json::to_string(&params).map_err(|err| err.to_string())?;
+    let rendered = fdxmp_core::preview::render_memory_rgba(
+        proxy.as_raw(),
+        proxy.width(),
+        proxy.height(),
+        &params_json,
+    )
+    .map_err(|err| err.to_string())?;
+    let rendered = image::RgbaImage::from_raw(rendered.width, rendered.height, rendered.rgba)
+        .ok_or_else(|| "渲染结果尺寸不匹配".to_string())?;
     rendered.save(output).map_err(|err| err.to_string())?;
     println!(
         "已渲染 {}×{} → {}（CPU，耗时 {:.1} ms，camera-profile={}）",

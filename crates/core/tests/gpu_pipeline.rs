@@ -440,8 +440,8 @@ fn gpu_base_stage_matches_cpu_reference() {
     params.color.wb_reference_kelvin = 5200.0;
     params.light.exposure = 0.4;
     params.light.contrast = 30.0;
-    params.light.highlights = -40.0;
-    params.light.shadows = 30.0;
+    // 高光 / 阴影现在是 CPU 渲染后的局部曝光，GPU 不参与；这条对拍只验证
+    // 仍由 GPU 承担的曝光 / 对比度 / 白 / 黑。
     params.light.whites = -30.0;
     params.light.blacks = 20.0;
     pipeline.render(&context.device, &context.queue, &image, &params);
